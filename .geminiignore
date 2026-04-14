@@ -1,0 +1,108 @@
+# .geminiignore - Exclude directories from Gemini CLI scanning
+# Place this file in /Users/vakandi/EliaAI/
+# Docs: https://geminicli.com/docs/cli/gemini-ignore/
+
+# System directories (cause EPERM errors and memory issues)
+/Library/
+/Library/**
+/System/
+/System/**
+/private/
+/private/**
+/opt/
+/opt/**
+/usr/
+/usr/**
+/bin/
+/sbin/
+/dev/
+/dev/**
+/tmp/
+/tmp/**
+/var/
+/var/**
+
+# Specific system paths causing stack overflow
+/Library/Bluetooth/
+/Library/Trial/
+/Library/Application Support/com.apple.TCC/
+/Library/Application Support/
+/System/Library/
+/System/Volumes/
+
+# Symlinks that may cause recursion
+/proc/
+/sys/
+/cores/
+/home/
+
+# macOS user system paths
+/Users/*/Library/
+/Users/*/Library/**
+/Users/*/.Trash/
+/Users/*/.npm/
+/Users/*/.nvm/
+/Users/*/.cursor/
+/Users/*/.cursor/**
+/Users/*/.vscode/
+/Users/*/.vscode/**
+/Users/*/.config/
+/Users/*/.config/**
+
+# Agent's own large directories
+/Users/*/EliaAI/logs/
+/Users/*/EliaAI/.agent_payloads/
+/Users/*/EliaAI/node_modules/
+
+# Large data directories
+*.log
+logs/
+logs/*.log
+*.db
+*.sqlite
+*.sqlite3
+node_modules/
+.next/
+.nuxt/
+dist/
+build/
+coverage/
+.venv/
+__pycache__/
+*.pyc
+
+# IDE/Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Git
+.git/
+
+# Large media
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.mp3
+*.wav
+*.flac
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.webp
+*.pdf
+*.zip
+*.tar.gz
+*.tar.bz2
+*.rar
+*.7z
+
+# Cache directories
+cache/
+Caches/
+*.cache

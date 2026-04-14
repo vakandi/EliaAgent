@@ -1,0 +1,4 @@
+Do this : 
+/Users/vakandi/EliaAI/MINI_PROMPT.md
+/Users/vakandi/EliaAI/context/TOOLS.md
+/Users/vakandi/EliaAI/context/business.md

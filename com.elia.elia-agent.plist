@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.elia.elia-agent</string>
+    
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>/Users/vakandi/EliaAI/scripts/cron_wrapper.sh</string>
+    </array>
+    
+    <key>RunAtLoad</key>
+    <true/>
+    
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Minute</key><integer>30</integer></dict>
+    </array>
+    
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/vakandi/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/vakandi/.local/bin:/Users/vakandi/.npm-global/bin:/Users/vakandi/.nvm/versions/node/v20.20.2/bin</string>
+        <key>HOME</key>
+        <string>/Users/vakandi</string>
+        <key>USER</key>
+        <string>vakandi</string>
+    </dict>
+    
+    <key>WorkingDirectory</key>
+    <string>/Users/vakandi/EliaAI</string>
+    
+    <key>StandardOutPath</key>
+    <string>/Users/vakandi/EliaAI/logs/cron.log</string>
+    
+    <key>StandardErrorPath</key>
+    <string>/Users/vakandi/EliaAI/logs/cron.log</string>
+    
+    <key>ProcessType</key>
+    <string>Standard</string>
+</dict>
+</plist>

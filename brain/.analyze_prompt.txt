@@ -1,0 +1,217 @@
+# Elia System Analysis - LLM Wiki Style
+
+> This analysis follows Karpathy's LLM Wiki pattern. The brain vault is at `/Users/vakandi/EliaAI/brain/`
+> Obsidian is the IDE. The LLM is the programmer. The wiki is the codebase.
+
+## Brain Navigation (Start Here)
+
+```bash
+# 1. Read the index - your map to everything
+read /Users/vakandi/EliaAI/brain/index.md
+
+# 2. Check the log - what's been done
+read /Users/vakandi/EliaAI/brain/log.md
+
+# 3. Read the schema - how to work with this brain
+read /Users/vakandi/EliaAI/brain/AGENTS.md
+```
+
+## Three-Layer Architecture
+
+### Layer 1: Raw Sources (Immutable)
+```
+/Users/vakandi/EliaAI/brain/raw/
+├── YYYY-MM-DD/           ← Session data by date
+│   ├── run_*.md         ← Run logs
+│   ├── report_*.md      ← Reports sent
+│   └── ide_work_*.md    ← IDE extractions
+├── memory/               ← Memory files
+└── context/             ← Business context
+```
+
+### Layer 2: Wiki Pages (Generated)
+```
+/Users/vakandi/EliaAI/brain/pages/
+├── issues/              ← System problems
+├── mistakes/            ← Errors made (document immediately)
+├── bottlenecks/         ← Performance issues
+├── improvements/       ← Changes made
+├── analysis/            ← This analysis
+└── patterns/           ← Recurring behaviors
+```
+
+### Layer 3: Schema (AGENTS.md)
+Defines conventions, page formats, workflows.
+
+---
+
+## Quick Evidence Mining
+
+```bash
+# Count "en attente" mentions (passive behavior)
+grep -r "en attente\|En attente" /Users/vakandi/EliaAI/brain/raw/ | wc -l
+
+# Find false claims in sessions
+grep -r "FALSE\|fake\|lie\|didn't" /Users/vakandi/EliaAI/brain/raw/**/run_*.md
+
+# Find channel splitting errors
+grep -r "#content\|#reports" /Users/vakandi/EliaAI/brain/raw/**/report*.md
+
+# List most recent sessions
+ls -lt /Users/vakandi/EliaAI/brain/raw/ | head -30
+```
+
+---
+
+## Key Source Files
+
+| File | Path | Lines | Purpose |
+|------|------|-------|---------|
+| PROMPT.md | `/Users/vakandi/EliaAI/PROMPT.md` | 827 | Main operational prompt |
+| MORNING_PROMPT.md | `/Users/vakandi/EliaAI/MORNING_PROMPT.md` | 282 | Daily routine |
+| MEMORY.md | `/Users/vakandi/EliaAI/memory/MEMORY.md` | 1014 | System memory |
+
+---
+
+## Known Failure Patterns (Mine These)
+
+From MEMORY.md critical sections:
+1. **Passive behavior** → "en attente" without pivot
+2. **Channel splitting** → Wrong Discord channel used
+3. **False claims** → Claiming done without verification
+4. **Context missing** → Email sent without checking history
+5. **No previous work check** → Duplicate work
+
+Search commands:
+```bash
+# Passive behavior
+grep -l "en attente" /Users/vakandi/EliaAI/brain/raw/**/run_*.md
+
+# False claims
+grep -r "✅.*generat" /Users/vakandi/EliaAI/brain/raw/**/run_*.md
+
+# Channel errors  
+grep -r "content.*channel\|wrong channel" /Users/vakandi/EliaAI/brain/raw/
+```
+
+---
+
+## Analysis Workflow
+
+### Step 1: Ingest Sources
+Read all three system prompts and MEMORY.md
+
+### Step 2: Mine Raw Data
+Run grep commands above to find evidence
+
+### Step 3: Create Wiki Pages
+Document findings in brain/pages/:
+```bash
+# Create issue page
+cat > /Users/vakandi/EliaAI/brain/pages/issues/issue-[date]-[name].md << 'EOF'
+---
+title: Issue Title
+type: issue
+date: YYYY-MM-DD
+severity: high|medium|low
+status: open
+---
+
+# Issue Title
+
+## What Happened
+Description.
+
+## Evidence
+Links to raw sessions.
+
+## Root Cause
+Why it happened.
+
+## Resolution
+How to fix.
+EOF
+
+# Create mistake page
+cat > /Users/vakandi/EliaAI/brain/pages/mistakes/mistake-[date]-[name].md << 'EOF'
+---
+title: Mistake Title
+type: mistake
+date: YYYY-MM-DD
+severity: high
+recurring: true|false
+---
+
+# Mistake Title
+
+## What Happened
+
+## Impact
+
+## Prevention
+EOF
+```
+
+### Step 4: Update Index
+Edit `/Users/vakandi/EliaAI/brain/index.md` to add new pages
+
+### Step 5: Log Entry
+```bash
+echo "## [YYYY-MM-DD] analysis | System Review" >> /Users/vakandi/EliaAI/brain/log.md
+```
+
+### Step 6: Generate Report
+Save full analysis to:
+`/Users/vakandi/EliaAI/docs/elia-system-analysis-YYYY-MM-DD.md`
+
+---
+
+## Report Template
+
+```markdown
+# Elia System Analysis Report
+
+**Date**: YYYY-MM-DD  
+**Analyst**: Elia
+
+## Executive Summary
+3-5 bullets on key findings.
+
+## 1. Prompt Engineering Issues
+| Issue | Location | Severity | Recommendation |
+|-------|----------|----------|----------------|
+
+## 2. Memory/Context Gaps
+| Gap | Impact | Fix |
+|-----|--------|-----|
+
+## 3. Failure Patterns
+| Pattern | Evidence | Root Cause | Prevention |
+
+## 4. Priority Recommendations
+| Priority | Action | Effort | Impact |
+|---------|--------|--------|--------|
+
+## 5. Implementation Plan
+1. P0 (Critical) - Do immediately
+2. P1 (Important) - Next sprint
+3. P2 (Nice to have) - When time allows
+
+## Appendix: Evidence
+Raw grep results and session links.
+```
+
+---
+
+## Success Criteria
+
+- [ ] All 3 system prompts analyzed
+- [ ] Evidence mined from raw sessions
+- [ ] Failure patterns documented in brain/pages/
+- [ ] Index updated
+- [ ] Log entry added
+- [ ] Full report saved to docs/
+
+---
+
+*Every conclusion goes back to the wiki.*

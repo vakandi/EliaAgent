@@ -1,0 +1,7 @@
+{
+  "type": "file.watcher.updated",
+  "properties": {
+    "file": "/Users/vakandi/.config/opencode/AGENTS.md",
+    "event": "change"
+  }
+}

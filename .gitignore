@@ -1,0 +1,47 @@
+.agent_payloads
+.playwright-mcp
+node_modules
+*.tsv
+*.vtt
+*.gif
+.backups
+
+proxies.txt
+
+
+# Environment variables
+.env
+.env.*
+*.local
+
+setup/backups
+ui_electron/.eliaui-position.json
+ui_electron/store/
+ui_electron/.sisyphus/
+
+# Audio generation outputs
+*.wav
+chunk_*/
+temp_output/
+concat_list.txt
+audio_*.wav
+
+# Logs
+logs/
+brain/raw/logs/
+brain/raw/logs/logs/
+
+# Obsidian vault
+brain/.obsidian/
+
+# State files
+.elia_checkpoint.json
+.elia_state.json
+.scheduler_state
+.sisyphus/
+
+# Secrets/credentials (already in .env but double-check)
+credentials.json
+secrets.json
+*.pem
+*.key

@@ -1,0 +1,50 @@
+#!/bin/bash
+SCRIPT_DIR="/Users/vakandi/EliaAI/tools"
+PYTHON_SCRIPT="$SCRIPT_DIR/google_workspace.py"
+CLOUDCONVERT_SCRIPT="$SCRIPT_DIR/cloudconvert_md_to_docx.py"
+
+import_md() {
+    local input_file="$1"
+    local title="$2"
+    
+    if [ -z "$input_file" ]; then
+        echo "Error: No input file specified"
+        return 1
+    fi
+    
+    # Generate output DOCX path (same dir, same name, .docx extension)
+    local docx_file="${input_file%.md}.docx"
+    
+    echo "Trying CloudConvert MD → DOCX conversion..."
+    
+    # Try CloudConvert first
+    if python3 "$CLOUDCONVERT_SCRIPT" "$input_file" -o "$docx_file" 2>/dev/null; then
+        if [ -f "$docx_file" ]; then
+            echo "CloudConvert success! Importing DOCX to Google Docs..."
+            python3 "$PYTHON_SCRIPT" import-docx "$docx_file" "$title"
+            return $?
+        fi
+    fi
+    
+    # Fallback: basic MD import
+    echo "CloudConvert failed, falling back to basic MD import..."
+    python3 "$PYTHON_SCRIPT" import-md "$input_file" "$title"
+}
+
+case "$1" in
+    create-meet) python3 "$PYTHON_SCRIPT" create-meet "$2" "$3" ;;
+    create-event) python3 "$PYTHON_SCRIPT" create-event "$2" "$3" ;;
+    create-task) python3 "$PYTHON_SCRIPT" create-task "$2" "$3" ;;
+    create-doc) python3 "$PYTHON_SCRIPT" create-doc "$2" "$3" ;;
+    import-md) import_md "$2" "$3" ;;
+    import-docx) python3 "$PYTHON_SCRIPT" import-docx "$2" "$3" ;;
+    upload-file) python3 "$PYTHON_SCRIPT" upload-file "$2" "$3" "$4" ;;
+    list-events) python3 "$PYTHON_SCRIPT" list-events ;;
+    list-tasks) python3 "$PYTHON_SCRIPT" list-tasks ;;
+    list-files) python3 "$PYTHON_SCRIPT" list-files "$2" ;;
+    download-file) python3 "$PYTHON_SCRIPT" download-file "$2" "$3" "$4" ;;
+    help|--help|-h) python3 "$PYTHON_SCRIPT" ;;
+    *) echo "Usage: gws-workspace <command> [args]"
+       echo "Commands: create-meet, create-event, create-task, create-doc, import-md, import-docx, upload-file, list-events, list-tasks, list-files, download-file"
+       ;;
+esac

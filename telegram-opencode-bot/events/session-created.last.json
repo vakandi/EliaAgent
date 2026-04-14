@@ -1,0 +1,18 @@
+{
+  "type": "session.created",
+  "properties": {
+    "sessionID": "ses_2ac59da81ffe6EVhzoswv11ohR",
+    "info": {
+      "id": "ses_2ac59da81ffe6EVhzoswv11ohR",
+      "slug": "jolly-canyon",
+      "version": "1.3.10",
+      "projectID": "global",
+      "directory": "/Users/vakandi",
+      "title": "Jean naming ses_2b0c96c9cffeBbJtZ8lBp1eMhE",
+      "time": {
+        "created": 1775224890750,
+        "updated": 1775224890750
+      }
+    }
+  }
+}
