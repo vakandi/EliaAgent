@@ -19,6 +19,7 @@ let setPositionOverlay = null;
 let agentStatusInterval = null;
 let tray = null;
 let telegramBotProcess = null;
+let discordBotProcess = null;
 let configPath = path.join(__dirname, '..', 'config.json');
 let config = {};
 let ntfyStream = null;
@@ -70,7 +71,7 @@ function loadConfig() {
 
 const WIN_W = 350;
 const WIN_H = 250;
-const positionPath = path.join(__dirname, '..', '.eliaui-position.json');
+const positionPath = path.join(__dirname, '..', '.jarvis-position.json');
 const SET_POSITION_FLAG = process.argv.includes('--set-position');
 
 function getSavedPosition() {
@@ -441,6 +442,11 @@ ipcMain.on('run-morning-routine', () => {
   }
 });
 
+// Run Morning Speak (vocal briefing)
+ipcMain.on('run-morning-speak', () => {
+  runMorningSpeak();
+});
+
 // Close Morning Popup
 ipcMain.on('close-popup', () => {
   if (morningPopup && !morningPopup.isDestroyed()) {
@@ -552,10 +558,11 @@ ipcMain.on('execute-elia-command', () => {
         'minimax': 'minimax'
       };
       const modelValue = modelMap[model] || 'minimax';
-// Run dictate.command in Terminal with ELIAUI_MODEL set so it can pass model to start_agents.sh.
-  // Persist selected model for cron/trigger_opencode.sh (EliaUI choice = cron job model)
-  // ...
-  const cmd = `cd /Users/vakandi/EliaAI && ${proxyExport}export ELIAUI_MODEL=${modelValue} && /Users/vakandi/Documents/dictate.command`;
+      // Run dictate.command in Terminal with JARVIS_MODEL set so it can pass model to start_agents.sh.
+      // Also check proxy state and pass USE_PROXY if enabled.
+      const proxyEnabled = fs.existsSync(proxyStatePath);
+      const proxyExport = proxyEnabled ? 'export USE_PROXY=1 && ' : '';
+      const cmd = `cd /Users/vakandi/EliaAI && ${proxyExport}export JARVIS_MODEL=${modelValue} && /Users/vakandi/Documents/dictate.command`;
       const script = [
         'tell application "Terminal" to activate',
         'tell application "Terminal" to do script ' + JSON.stringify(cmd),
@@ -1018,6 +1025,14 @@ function runMorningSpeak() {
 
 You are Elia's morning briefing assistant. Your task is to gather ALL relevant information and provide a complete spoken briefing to Wael.
 
+CRITICAL: You must SPEAK to Wael during the ENTIRE process, not just at the end. Use elia-voxtral-speak throughout.
+
+SPEAK AT THESE MOMENTS:
+1. AT THE START: "Salut Wael, je démarre le briefing matinal. Je check tout ça."
+2. AFTER EACH CHECK: "Je finishes de checker [Google Calendar / WhatsApp / Telegram / Jira], je te donne le point."
+3. BEFORE SENDING TASKS: "Je t'ajoute [X] tâches sur ton téléphone."
+4. AT THE END: "C'est bon Wael, voici le résumé complet de la matinée."
+
 MUST DO:
 1. CHECK GOOGLE CALENDAR: Use gws-workspace list-events to get today's meetings and events
 2. CHECK TELEGRAM: Read recent messages from Watson IA group (chat ID: -5148361692)
@@ -1031,9 +1046,8 @@ MUST DO:
 AFTER GATHERING ALL INFO:
 - Use gws-workspace create-task to add any important tasks to Wael's phone
 - Use gws-workspace create-event to add any meetings to calendar if missing
-- SPEAK via elia-voxtral-speak (fast, French) → fallback: elia-speak
 
-IMPORTANT: Execute all checks first, then speak the briefing.`;
+IMPORTANT: Speak at EACH step using elia-voxtral-speak (fast, French) → fallback: elia-speak`;
   
   fs.writeFileSync(promptFile, morningPrompt, 'utf8');
   
@@ -1187,10 +1201,10 @@ function isProxychainsInstalled() {
 }
 
 function startTelegramBot() {
-  const botDir = path.join(EliaAIRoot, 'telegram-opencode-bot');
+  const botDir = path.join(EliaAIRoot, 'integrations', 'telegram-opencode-bot');
   const botScript = path.join(botDir, 'dist', 'cli.js');
   if (!fs.existsSync(botScript)) {
-    console.log('Telegram bot: dist missing, run build in telegram-opencode-bot');
+    console.log('Telegram bot: dist missing, run build in integrations/telegram-opencode-bot');
     return;
   }
   const envPath = path.join(botDir, '.env');
@@ -1217,6 +1231,50 @@ function startTelegramBot() {
     });
   } catch (e) {
     console.error('Telegram bot spawn failed:', e.message);
+  }
+}
+
+function startDiscordBot() {
+  const botDir = path.join(EliaAIRoot, 'integrations', 'elia-discord-bot');
+  const botScript = path.join(botDir, 'bot.py');
+  if (!fs.existsSync(botScript)) {
+    console.log('Discord bot: bot.py not found');
+    return;
+  }
+  const envPath = path.join(botDir, '.env');
+  if (fs.existsSync(envPath)) {
+    const envContent = fs.readFileSync(envPath, 'utf8');
+    if (!/DISCORD_BOT_TOKEN\s*=\s*.+/.test(envContent)) {
+      console.log('Discord bot: DISCORD_BOT_TOKEN not set in .env');
+      return;
+    }
+  } else {
+    console.log('Discord bot: .env not found');
+    return;
+  }
+  try {
+    const venvPython = path.join(botDir, 'venv', 'bin', 'python3');
+    const pythonBin = fs.existsSync(venvPython) ? venvPython : 'python3';
+    discordBotProcess = spawn(pythonBin, [botScript], {
+      cwd: botDir,
+      env: { ...process.env },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    discordBotProcess.stdout.on('data', (data) => {
+      console.log('[Discord]', data.toString().trim());
+    });
+    discordBotProcess.stderr.on('data', (data) => {
+      console.error('[Discord Error]', data.toString().trim());
+    });
+    discordBotProcess.on('error', (err) => {
+      console.error('Discord bot error:', err.message);
+      discordBotProcess = null;
+    });
+    discordBotProcess.on('exit', (code, signal) => {
+      discordBotProcess = null;
+    });
+  } catch (e) {
+    console.error('Discord bot spawn failed:', e.message);
   }
 }
 
@@ -1324,5 +1382,9 @@ app.on('before-quit', () => {
   if (telegramBotProcess) {
     telegramBotProcess.kill('SIGTERM');
     telegramBotProcess = null;
+  }
+  if (discordBotProcess) {
+    discordBotProcess.kill('SIGTERM');
+    discordBotProcess = null;
   }
 });

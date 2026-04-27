@@ -65,6 +65,8 @@ EliaAI runs an AI agent (OpenCode) on a schedule and from the **EliaUI** overlay
 - [Subagent System](#subagent-system)
 - [Key files & layout](#key-files--layout)
 - [Troubleshooting](#troubleshooting)
+- [Desktop Shortcuts](#desktop-shortcuts)
+- [Discord Integration](#discord-integration)
 - [Legacy / other backends](#legacy--other-backends)
 - [Telemetry (Langfuse)](#telemetry-langfuse)
 - [SETUP GUIDE: Installing for Yourself](#setup-guide-installing-for-yourself)
@@ -752,6 +754,38 @@ EliaAI/
 - **Cron/LaunchAgent logs**  
   - Cron: `tail -f EliaAI/logs/cron.log`  
   - LaunchAgent: `tail -f EliaAI/logs/launchd.log`
+
+---
+
+## Desktop Shortcuts
+
+EliaAI provides desktop shortcuts for quick access to run the UI without opening Terminal.
+
+### EliaUI.app (Platypus Native App)
+**Location:** `setup/desktop_shortcuts/EliaUI.app/`
+
+A native macOS app created with Platypus. Double-click to launch EliaUI in a clean window.
+
+```bash
+chmod +x setup/desktop_shortcuts/EliaUI.app/Contents/MacOS/*
+```
+
+### EliaUI.command (tmux-based)
+**Location:** `setup/desktop_shortcuts/EliaUI.command`
+
+Opens Terminal with tmux session - all logs display cleanly in one window.
+
+```bash
+chmod +x setup/desktop_shortcuts/EliaUI.command
+cp setup/desktop_shortcuts/EliaUI.command ~/Desktop/
+```
+
+### Other Shortcuts
+| File | Purpose |
+|------|---------|
+| `Elia.command` | Main Elia agent |
+| `Elia-OC` | OpenCode CLI |
+| `EliaDiscord.command` | Discord bot |
 
 ---
 

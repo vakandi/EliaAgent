@@ -1,6 +1,6 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
-contextBridge.exposeInMainWorld('eliaui', {
+contextBridge.exposeInMainWorld('jarvis', {
   onConfig:      (cb) => ipcRenderer.on('config-updated', (_e, data) => cb(data)),
   onMessage:     (cb) => ipcRenderer.on('ntfy-message',   (_e, data) => cb(data)),
   onAgentStatus:     (cb) => ipcRenderer.on('agent-status',     (_e, data) => cb(data)),

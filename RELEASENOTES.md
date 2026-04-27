@@ -1,12 +1,66 @@
 # EliaAI Release Notes - April 2026
 
-## Version: Public Release (April 2026)
+## Version: Public Release v1.0.1 (April 27, 2026)
 
 ### What's New in This Release
 
 ---
 
-## 1. Subworkers System (NEW!)
+## 1. Desktop Shortcuts (NEW!)
+
+### EliaUI.app (Platypus Native App)
+- Native macOS application created with Platypus
+- Double-click to launch EliaUI in clean app window
+- No Terminal window required
+
+### EliaUI.command (tmux-based)
+- Terminal with tmux session for cleaner log display
+- All logs in one organized window
+- Easy desktop shortcut
+
+### Other Shortcuts
+- `Elia.command` - Main Elia agent
+- `Elia-OC` - OpenCode CLI  
+- `EliaDiscord.command` - Discord bot
+
+---
+
+## 2. Discord Integration (NEW!)
+
+Full Discord bot integration at `integrations/elia-discord-bot/`:
+- Chat with Elia in any Discord channel
+- Slash commands: `/elia`, `/elia-reset`, `/elia-new`
+- Typing indicator during processing
+- Session persistence across messages
+
+### Setup
+```bash
+cd integrations/elia-discord-bot
+cp .env.example .env
+# Add your DISCORD_BOT_TOKEN
+pip install -r requirements.txt
+python bot.py
+```
+
+---
+
+## 3. Updated UI (ui_electron/)
+
+- New GIF assets (`elia.gif`, `elia5.gif`, `elia6.gif`)
+- New HTML popups (cron, morning, proxy-error)
+- Updated src files
+
+---
+
+## 4. Subworkers System (Continued)
+
+From v1.0.0 - Autonomous promotion agents now included:
+
+| Component | Purpose |
+|-----------|---------|
+| `bene2luxe-promoter/` | Autonomous agent for Bene2Luxe |
+| `cobou-promoter/` | Autonomous agent for CoBou Agency |
+| `plists/` | macOS LaunchAgent configurations |
 
 ### Overview
 Subworkers are autonomous AI promotion agents that run on a schedule to promote your businesses automatically.

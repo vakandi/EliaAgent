@@ -1,6 +1,6 @@
-# 🔵 EliaUI ntfy — Interface HUD style Iron Man
+# 🔵 JARVIS ntfy — Interface HUD style Iron Man
 
-Interface flottante EliaUI sur macOS qui affiche les notifications ntfy.sh en temps réel.
+Interface flottante JARVIS sur macOS qui affiche les notifications ntfy.sh en temps réel.
 
 ## 📦 Installation
 
@@ -41,7 +41,7 @@ npm start
 
 | Champ | Description |
 |-------|-------------|
-| `identity.name` | Nom affiché en haut (ex: EliaUI) |
+| `identity.name` | Nom affiché en haut (ex: JARVIS) |
 | `identity.subtitle` | Sous-titre |
 | `stats[]` | Cases de stats (CPU, RAM, etc.) |
 | `menu[]` | Items du menu avec sous-éléments |
@@ -57,7 +57,7 @@ Le fichier `config.json` est **surveillé en temps réel** — modifie-le sans r
 
 ```bash
 # Simple
-curl -d "Hello EliaUI" ntfy.sh/MON-TOPIC
+curl -d "Hello JARVIS" ntfy.sh/MON-TOPIC
 
 # Avec titre et priorité
 curl \

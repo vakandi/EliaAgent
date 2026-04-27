@@ -1227,6 +1227,10 @@
     <span>📋 LOGS</span>
   </div>
   
+  <div class="speak-toggle" id="speak-toggle" onclick="toggleSpeak()" title="Activer le briefing vocal" style="position: absolute; bottom: -6px; left: 6px; z-index: 350; width: 22px; height: 22px; border-radius: 50%;">
+    <span style="font-size: 10px;">🔊</span>
+  </div>
+  
   <div id="right-controls">
     <div id="btn-close" title="Fermer"></div>
     <!-- CRON Toggle - First toggle (above OMO) -->
@@ -1310,7 +1314,7 @@ function selectModel(model) {
   }
   
   localStorage.setItem('selectedModel', model);
-  window.eliaui?.saveModelForCron?.(model);
+  window.jarvis?.saveModelForCron?.(model);
 }
 
 function loadSelectedModel() {
@@ -1334,7 +1338,7 @@ function toggleOmo() {
     toggle.classList.remove('enabled');
   }
   localStorage.setItem('omoEnabled', omoEnabled);
-  window.eliaui?.onOmoToggle?.(omoEnabled);
+  window.jarvis?.onOmoToggle?.(omoEnabled);
   if (window.electronAPI) {
     window.electronAPI.send('omo-toggle', omoEnabled);
   }
@@ -1353,7 +1357,7 @@ function toggleRalphUlw() {
     label.textContent = 'RALPH';
   }
   localStorage.setItem('ulwMode', ulwMode);
-  window.eliaui?.onUlwToggle?.(ulwMode);
+  window.jarvis?.onUlwToggle?.(ulwMode);
   if (window.electronAPI) {
     window.electronAPI.send('ulw-toggle', ulwMode);
   }
@@ -1447,6 +1451,11 @@ function showCronManual() {
 
 function openLogsTerminal() {
   window.electronAPI?.send('open-logs-terminal');
+}
+
+function toggleSpeak() {
+  window.electronAPI?.send('run-morning-speak');
+  console.log('Speak triggered');
 }
 
 function selectCronPeriod(interval) {
@@ -1597,7 +1606,7 @@ function startRecordingPhase() {
 function stopRecordingAndGoIdle() {
   clearOrbTimers();
   setOrbState('idle');
-  window.eliaui?.stopRecording();
+  window.jarvis?.stopRecording();
 }
 
 // ── Agent status badge + orb state sync ────────────────────────
@@ -1715,7 +1724,7 @@ function setConnected(ok) {
 }
 
 // ── IPC handlers for model selection ─────────────────────────────
-if (window.eliaui) {
+if (window.jarvis) {
   // Handle get-selected-model request from main process
   window.electronAPI?.onGetSelectedModel?.(() => {
     return selectedModel;
@@ -1774,28 +1783,28 @@ if (window.require) {
     selectModel(model);
   });
 }
-if (window.eliaui) {
-  window.eliaui.onConfig(cfg => renderConfig(cfg));
-  window.eliaui.onMessage(msg => {
+if (window.jarvis) {
+  window.jarvis.onConfig(cfg => renderConfig(cfg));
+  window.jarvis.onMessage(msg => {
     setConnected(true);
     showNotification(msg);
   });
-  window.eliaui.onAgentStatus(updateAgentBadge);
-  window.eliaui.onStatusLiveToggle((enabled) => {
+  window.jarvis.onAgentStatus(updateAgentBadge);
+  window.jarvis.onStatusLiveToggle((enabled) => {
     console.log('Status live toggled:', enabled);
     const contextBadges = document.getElementById('context-badges');
     if (contextBadges) {
       contextBadges.style.display = enabled ? 'flex' : 'none';
     }
   });
-  window.eliaui.onVoiceTriggerToggle((enabled) => {
+  window.jarvis.onVoiceTriggerToggle((enabled) => {
     console.log('Voice trigger toggled:', enabled);
     const debugText = document.getElementById('debug-text');
     if (debugText) {
       debugText.textContent = enabled ? 'Voice ON' : 'Voice OFF';
     }
   });
-  window.eliaui.onOpencodeContext((context) => {
+  window.jarvis.onOpencodeContext((context) => {
     console.log('OpenCode context received:', context);
     const panel = document.getElementById('context-panel');
     if (panel) {
@@ -1815,12 +1824,12 @@ if (window.eliaui) {
       statusEl.style.color = context.running ? 'var(--green)' : 'var(--red)';
     }
   });
-  window.eliaui.getConfig();
+  window.jarvis.getConfig();
 }
 
 // Close button
 document.getElementById('btn-close').addEventListener('click', () => {
-  window.eliaui?.hideWindow();
+  window.jarvis?.hideWindow();
 });
 
 // Orb click (core or wrapper/rings) = start dictate or stop recording
@@ -1834,24 +1843,24 @@ function handleOrbClick(e) {
   // Don't block if agent is working - user should ALWAYS be able to add tasks via voice
   // if (orbState !== 'idle') return;
   startRecordingPhase();
-  window.eliaui?.executeCommand();
+  window.jarvis?.executeCommand();
 }
 
 // Mini orb click - direct oh-my-opencode execution with hardcoded prompt
 function handleMiniOrbClick(e) {
   e.stopPropagation();
   console.log('[MINI-ORB] Clicked');
-  console.log('[MINI-ORB] window.eliaui exists:', !!window.eliaui);
-  window.eliaui?.executeMiniCommand();
+  console.log('[MINI-ORB] window.jarvis exists:', !!window.jarvis);
+  window.jarvis?.executeMiniCommand();
 }
 document.getElementById('orb-wrapper').addEventListener('click', handleOrbClick);
 document.getElementById('orb-core').addEventListener('click', handleOrbClick);
 
-if (window.eliaui) {
-  window.eliaui.onRecordingStarted(() => {
+if (window.jarvis) {
+  window.jarvis.onRecordingStarted(() => {
     if (orbState === 'idle') startRecordingPhase();
   });
-  window.eliaui.onRecordingStopped(() => {
+  window.jarvis.onRecordingStopped(() => {
     if (orbState === 'recording') stopRecordingAndGoIdle();
   });
 }
