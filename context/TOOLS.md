@@ -1,5 +1,11 @@
 # TOOLS.md - Quick Reference
 
+> ⚡ **codemem** (AI Memory) — Auto-captures session context. USE IT to:
+> - Remember tasks, decisions, blockers across sessions
+> - `codemem search "query"` — поиск memories
+> - Auto-injects relevant memories before each prompt
+> ⚠️ NO manual commands — works automatically via plugin
+
 > ⚠️ All commands here = **terminal commands** — use the `bash` tool (not skills).
 
 ---
@@ -22,7 +28,7 @@
    ```
    See section **"ULW-Loop (Autonomous Task Execution)"** (lines 174-200) for full details on how to run and use it.
 
-   Then send a report to Telegram with:
+   Then send a report to Discord #reports with:
    - What MCP failed
    - Error messages
    - Investigation steps taken
@@ -31,9 +37,9 @@
 
 ---
 
-## 🔊 Voice Message Handling (WhatsApp & Telegram)
+## 🔊 Voice Message Handling (WhatsApp Only)
 
-**CRITICAL**: When receiving or sending voice messages via WhatsApp/Telegram, ALWAYS check for existing transcripts before transcribing.
+**CRITICAL**: When receiving or sending voice messages via WhatsApp, ALWAYS check for existing transcripts before transcribing.
 
 ### Voice Message Workflow
 
@@ -52,13 +58,12 @@ run_{source}_{msg_id}_{DD_mmm_YYYY_HHMM}.md
 
 | Field | Description | Example |
 |-------|-------------|---------|
-| `source` | `wa` (WhatsApp) or `tg` (Telegram) | `wa` |
+| `source` | `wa` (WhatsApp) | `wa` |
 | `msg_id` | Message ID from the platform | `msg_abc123` |
 | `DD_mmm_YYYY_HHMM` | Day, month (French), year, time | `29_mars_2026_0945` |
 
 **Examples:**
 - WhatsApp: `run_wa_msg_abc123_29_mars_2026_0945.md`
-- Telegram: `run_tg_msg_xyz789_29_mars_2026_1000.md`
 
 ### Transcript Check Logic
 
@@ -87,7 +92,7 @@ whisper /path/to/audio.ogg --model large-v3 --language French --task transcribe
 ```markdown
 # Voice Message Transcript
 
-**Source:** WhatsApp / Telegram
+**Source:** WhatsApp
 **Message ID:** {msg_id}
 **Timestamp:** {DD_mmm_YYYY_HHMM}
 **Sender:** {sender_name/number}
@@ -103,6 +108,17 @@ whisper /path/to/audio.ogg --model large-v3 --language French --task transcribe
 ## Context & Analysis
 
 {analysis_of_content}
+```
+
+---
+
+## 🖼️ Image Handling (WhatsApp)
+
+```bash
+# Detect: hasMedia=true, mediaType="image" → Download → Analyze
+mcp-cli call whatsapp download_media '{"message_id":"<id>","chat_jid":"<jid>","save_path":"/Users/vakandi/EliaAI/docs/YYYY-MM-DD/"}'
+mcp-cli call vision-mcp analyze_image '{"image_path": "/path/to/image.jpg", "prompt": "Describe this image", "model": "nvidia/nemotron-nano-12b-v2-vl:free"}'
+# Save as: img_wa_{msg_id}_{DD_mmm_YYYY_HHMM}.md
 ```
 
 ---
@@ -125,33 +141,29 @@ mcp-cli call whatsapp list_messages '{"chat_jid":"...","limit":30}'
 mcp-cli call whatsapp send_message '{"recipient":"...","message":"..."}'
 mcp-cli call whatsapp download_media '{"message_id":"...","chat_jid":"..."}'
 
+# 📅 MESSAGE SCHEDULING (NEW!)
+# Schedule a message for future delivery (ISO-8601 format)
+mcp-cli call whatsapp schedule_message '{"recipient":"165558221861055","message":"Bonjour!","scheduled_time":"2026-04-22T09:00:00"}'
+
+# List all scheduled messages (optional: filter by status: pending/sent/failed/cancelled)
+mcp-cli call whatsapp list_scheduled_messages '{"status":"pending","limit":10}'
+
+# Cancel a pending scheduled message
+mcp-cli call whatsapp cancel_scheduled_message '{"message_id":123}'
+
+# Delete a scheduled message from database
+mcp-cli call whatsapp delete_scheduled_message '{"message_id":123}'
+
+# Recipient formats:
+# - Phone number with country code, no + (e.g., "165558221861055")
+# - JID (e.g., "123456789@s.whatsapp.net")
+# - Group JID (e.g., "123456789@g.us")
+
 # ⚠️ VOICE MESSAGE HANDLING: When listing messages, check hasMedia + mediaType="ptt"
 # If voice message detected:
 # 1. Check date → /Users/vakandi/EliaAI/docs/{YYYY-MM-DD}/
 # 2. Search for "wa_{msg_id}" in filenames to check if transcribed
 # 3. If not → download_media → whisper → save as run_wa_{msg_id}_{DD_mmm_YYYY_HHMM}.md
-
-# Telegram (Watson - Personal Account)
-mcp-cli call telegram get_default_group_messages '{"limit":20}'
-mcp-cli call telegram send_msg_to_default_group '{"message":"..."}'
-
-# Rule: Telegram send_msg_to_default_group = URGENT/blockers only | Discord #reports = Regular reports
-
-mcp-cli call telegram get_personal_dms_only '{"limit":20}'
-mcp-cli call telegram get_personal_dms_and_groups '{"limit":50}'
-mcp-cli call telegram send_msg_to_recipient '{"recipient":"@username","message":"Hello!"}'
-mcp-cli call telegram send_voice_to_recipient '{"recipient":"@username","file_path":"/path/to/audio.ogg"}'
-mcp-cli call telegram send_file_to_recipient '{"recipient":"-1001234567890","file_path":"/path/to/file.pdf"}'
-
-# ⚠️ VOICE MESSAGE HANDLING: Check message objects for voice/audio
-# If voice message detected (voice=true or has audio):
-# 1. Check date → /Users/vakandi/EliaAI/docs/{YYYY-MM-DD}/
-# 2. Search for "tg_{msg_id}" in filenames to check if transcribed
-# 3. If not → download audio file → whisper → save as run_tg_{msg_id}_{DD_mmm_YYYY_HHMM}.md
-
-# Telegram (Approvals)
-mcp-cli call telegram send_approval_request '{"text":"Approve this?","chat_id":"..."}'
-mcp-cli call telegram get_approval_responses '{}'
 
 # Discord (Personal Account - your own Discord)
 mcp-cli call discord-mcp discord_get_dms '{"limit":10}'
@@ -159,6 +171,7 @@ mcp-cli call discord-mcp discord_send_dm '{"user_id":"...","message":"..."}'
 
 # Discord Server (EliaWorkSpace - bot account "watson")
 # Get server structure
+# ⚠️ NOTE: Replace with YOUR Discord Bot Token
 bash: cd ~/Documents/EliaVoiceRecorder && DISCORD_BOT_TOKEN="YOUR_BOT_TOKEN_HERE" python3 discord_server_structure.py
 
 # List channels
@@ -286,6 +299,17 @@ mcp-cli call gmail draft_email '{"to":["you@example.com"],"subject":"Subject","b
 mcp-cli call gmail send_email '{"to":["you@example.com"],"subject":"Subject","body":"Plain text body"}'
 mcp-cli call gmail list_email_labels '{}'
 
+# Gmail-tweetsyncai (server id: gmail-tweetsyncai — tweetsyncai@gmail.com)
+## ⚠️ IMPORTANT: This Gmail is for Bene2Luxe Snapchat Ads ONLY!
+## Reason: Snapchat Business Ads requires a personal Gmail to create business ads account. Our business emails (contact@bene2luxe.com, contact@cofibou-distribution) cannot create business ads accounts, so we used tweetsyncai@gmail.com for this purpose.
+## Use this Gmail MCP for:
+## - Bene2Luxe Snapchat Ads management
+## - Any business ads-related communications for Bene2Luxe
+## - DO NOT use for general emails — use contact@bene2luxe.com or contact@cofibou-distribution for that
+mcp-cli call gmail-tweetsyncai search_emails '{"query":"in:inbox newer_than:7d","maxResults":20}'
+mcp-cli call gmail-tweetsyncai read_email '{"messageId":"..."}'
+mcp-cli call gmail-tweetsyncai send_email '{"to":["you@example.com"],"subject":"Subject","body":"Plain text body"}'
+
 # 📧 IONOS Business Email (PRIMARY - Business Emails)
 
 ## Morning Routine Integration
@@ -294,7 +318,7 @@ mcp-cli call gmail list_email_labels '{}'
 1. Run `python3 /Users/vakandi/EliaAI/tools/get_ide_work.sh` - ALWAYS extract IDE work
 2. Check and update Google Calendar with reminders for time-sensitive items
 3. Check and update Google Tasks for new todo items
-4. After gathering data from all sources (WhatsApp, Telegram, Discord, Email), sync findings to Google Workspace
+4. After gathering data from all sources (WhatsApp, Discord, Email), sync findings to Google Workspace
 
 ## Available MCP Servers
 
@@ -367,6 +391,15 @@ mcp-cli call mail_contact_cobou_agency download_attachment '{"account_name":"ion
 mcp-cli call mcp-atlassian create_issue '{"project":"BEN","summary":"...","description":"...","issue_type":"Task"}'
 mcp-cli call mcp-atlassian jira_get_project_issues '{"project_key":"BEN"}'
 
+# Analytics-MCP (Google Analytics 4)
+# Service account needs permission in GA4 first!
+mcp-cli call analytics-mcp get_account_summaries '{}'
+mcp-cli call analytics-mcp get_property_details '{"property_id": "432287363"}'
+mcp-cli call analytics-mcp list_ga4_audiences '{"property_id": "432287363"}'
+mcp-cli call analytics-mcp list_key_events '{"property_id": "432287363"}'
+
+# Full tool list: See /Users/vakandi/.config/opencode/skills/mcp-cli/SKILL.md
+
 # SSH
 mcp-cli call ssh-mpc-server-multisaasdeploy execute-command '{"cmdString":"ls -la"}'
 ```
@@ -378,6 +411,13 @@ mcp-cli call ssh-mpc-server-multisaasdeploy execute-command '{"cmdString":"ls -l
 | B2LUXE BUSINESS | `120363408208578679@g.us` |
 | OGBOUJEE 👜 BUSINESS | `120363425082264099@g.us` |
 | MAYAVANTA | `120363405622746597@g.us` |
+
+### WhatsApp Individual IDs (CRITICAL)
+| Membre | WhatsApp ID | Téléphone | Pays |
+|--------|-----------|---------|------|
+| Thomas | 165558221861055 | +33 6 29 35 22 37 | France |
+| Rida | 131319447212112 | [À confirmer] | [À confirmer] |
+| Ali | 178481677779049 | +41 (Suisse) | ✅ CORRIGÉ |
 
 ---
 
@@ -430,7 +470,7 @@ whisper /path/to/audio.ogg --model large-v3 --language French --task transcribe
 
 ---
 
-## Google Workspace
+## Google Workspace Calendar (Meeting Scheduling)
 
 **Info:** `gws-workspace -h` or `gws-workspace help`
 
@@ -440,6 +480,49 @@ gws-workspace create-task "Task" "Notes"
 gws-workspace import-md "file.md" "Title"
 gws-workspace list-events
 ```
+
+**📅 MEETING SCHEDULING - Elia MUST follow this workflow:**
+
+### For Discord Team Meetings (when Wael asks for a meeting):
+**→ Use Discord Server Events (so all team members can see)**
+```bash
+# Create Discord scheduled event (visible to all team members)
+mcp-cli call discord-server-mcp discord_execute '{
+  "operation": "events.create",
+  "params": {
+    "name": "Weekly Team Sync",
+    "description": "Team sync meeting with Wael",
+    "start_time": "2026-04-25T10:00:00Z",
+    "end_time": "2026-04-25T10:30:00Z",
+    "location": "Voice Channel: Meeting Room"
+  }
+}'
+```
+
+**Example:**
+```bash
+# Create team meeting visible in Discord
+mcp-cli call discord-server-mcp discord_execute '{"operation":"events.create","params":{"name":"Team Sync with Wael","description":"Weekly sync - discuss current projects","start_time":"2026-04-28T10:00:00Z","end_time":"2026-04-28T10:30:00Z","location":"Meeting Room"}}'
+```
+
+### For External Meetings or Personal Tasks:
+**→ Use Google Calendar with Google Meet link**
+```bash
+# Create Google Calendar event with Meet link
+gws-workspace create-event "Meeting Title" "Description"
+
+# Or create directly with Meet link generation (if available):
+python3 /Users/vakandi/EliaAI/tools/google_workspace.py create-event "Meeting" "Desc"
+# The event will have a Google Meet link auto-generated
+```
+
+**Note:** Google Meet links are automatically generated when creating Google Calendar events with video conferencing enabled.
+
+### Summary:
+| Type of Meeting | Where to Create | Tool |
+|----------------|-----------------|------|
+| Discord Team Meeting (Wael asks) | Discord Server | `discord-server-mcp events.create` |
+| External/Personal Meeting | Google Calendar | `gws-workspace create-event` |
 
 ---
 
@@ -485,7 +568,7 @@ elia-voxtral-speak "Message" --play          # play audio
 elia-speak -x "Message"                        # fallback
 ```
 
-**⚠️ When sending a voice message to someone or a group:** ALWAYS use `elia-voxtral-speak` (or `elia-speak -x` as fallback) to generate the voice audio before sending via WhatsApp/Telegram/Discord.
+**⚠️ When sending a voice message to someone or a group:** ALWAYS use `elia-voxtral-speak` (or `elia-speak -x` as fallback) to generate the voice audio before sending via WhatsApp/Discord.
 
 ---
 
@@ -504,49 +587,47 @@ elia-speak -x "Message"                        # fallback
 
 ---
 
-## 🚀 ULW-Loop (Autonomous Task Execution)
+## 🚀 ULW-Loop / Ralph-Loop (Autonomous Task Execution)
 
-**ULW-Loop = Unlimited iterations for executing tasks during cronjob runs**
+**Ralph-Loop = DEFAULT mode for cronjob runs (50 iterations max)**
 
 ### When to Use
 - Task found during cronjob → execute it fully, don't just report
-- Multiple tasks to do → run ulw-loop to process all of them
-- Autonomous work mode → ulw-loop runs until `<promise>DONE</promise>`
+- Multiple tasks to do → run ralph-loop to process all of them
+- Autonomous work mode → runs until `<promise>COMPLETE</promise>` or max iterations
 
-### How to Launch
+### How to Launch (ALWAYS USE THIS FORMAT)
+
 ```
-/ulw-loop
+/ralph-loop
 ```
+
+**⚠️ MANDATORY format for ALL runs:**
+```bash
+# Prefix with /ralph-loop + big-pickle model
+oh-my-opencode run -a elia --model opencode/big-pickle "/ralph-loop YOUR TASK HERE" --attach
+```
+
+**⚠️ ALWAYS use `opencode/big-pickle` model** (free, stable, DEFAULT)
 
 ### What Happens
-- Unlimited iterations until tasks complete
+- Runs with ralph-loop (50 iterations max default)
 - Spawns subagents for parallel execution
 - Delegates to specialized agents (marketing, dev, sales, etc.)
 
-### Running ULW-Loop
-
-**⚠️ IMPORTANT: Always prefix your prompt with `/ulw-loop`**
-
-```bash
-# CRITICAL: Use oh-my-opencode, NOT opencode run!
-# Prefix your task with /ulw-loop to activate the loop
-oh-my-opencode run -a elia "/ulw-loop read @PROMPT.md and do a full check run" --attach
-
-# With completion promise (exits when promise output):
-oh-my-opencode run -a elia "/ulw-loop your task here --completion-promise DONE --max-iterations 0" --attach
-
-# Ralph loop variant (50 iterations max):
-oh-my-opencode run -a elia "/ralph-loop your task here --completion-promise COMPLETE --max-iterations 50" --attach
-```
-
 **⚠️ CRITICAL: Why oh-my-opencode?**
 - Regular `opencode run` does NOT resolve slash commands properly
-- The LLM receives raw `/ulw-loop` text instead of executing the command
+- The LLM receives raw text instead of executing the command
 - Use `oh-my-opencode run -a elia` for proper command execution
 
 ### Using Custom Subagents
 
-**⚠️ IMPORTANT**: Always use `oh-my-opencode run -a elia` then delegate to subagents.
+**⚠️ ALWAYS provide context to subagents!**
+
+When delegating to subagents, ALWAYS include:
+- Relevant file paths (context, docs, reports)
+- Business background needed
+- Specific task details
 
 ```bash
 # Start with elia, then delegate to subagents via task()
@@ -561,6 +642,36 @@ task(category="setbon", ...)        # Marketing & Conversion
 task(category="gilfoyle", ...)      # Backend dev
 task(category="tiktok-youtube-auto", ...) # TikTok/YouTube auto
 ```
+
+### Mandatory Context for Subagents
+
+**ALWAYS give subagents the context they need:**
+
+| Context File | When to Use |
+|-------------|------------|
+| `@context/business.md` | Tasks related to businesses, teams, operations |
+| `@context/TOOLS.md` | Tasks needing tools, MCP, automation |
+| `@memory/MEMORY.md` | Tasks needing long-term memory, blockers |
+| `@docs/YYYY-MM-DD/*.md` | Tasks needing recent work/ reports |
+
+**Example prompts WITH context:**
+```bash
+# GOOD - has context
+task(category="bene2luxe", prompt="Create product listing for Chanel bag. 
+Context: @context/business.md (team roles: Ali handles suppliers)
+Recent: @docs/2026-04-20/morning_report.md
+Tools: @context/TOOLS.md (image generation)")
+
+# BAD - no context
+task(category="bene2luxe", prompt="Create product listing")
+```
+
+**Context paths to reference:**
+- Business context: `/Users/vakandi/EliaAI/context/business.md`
+- Tools: `/Users/vakandi/EliaAI/context/TOOLS.md`
+- Memory: `/Users/vakandi/EliaAI/memory/MEMORY.md`
+- Today docs: `/Users/vakandi/EliaAI/docs/2026-04-20/`
+- Jira: `https://bsbagency.atlassian.net` (project BEN, COBOUAGENC, etc.)
 
 ### High-Value Tasks to Execute
 - Create accounts (Copify, Trendtrack, ad networks)
@@ -658,6 +769,54 @@ The script monitors queue via eval:
 6. **Monitor queue** - Via JavaScript eval
 
 **Documentation**: `/Users/vakandi/Documents/HiggsFieldGenerator/docs/GENERATE_PHOTO_README.md`
+
+---
+
+## 🧠 MemPalace (AI Memory System)
+
+**MemPalace** is an AI memory system that indexes your documentation with semantic search.
+
+### ⚠️ CRITICAL: Docs and Brain are COPIES of each other
+
+**NEVER search both at once** — they contain the SAME content in different formats:
+
+| Folder | Format | Content |
+|--------|--------|---------|
+| `docs/` | Raw daily docs | Original files (chat logs, transcriptions, reports) |
+| `brain/` | Obsidian wiki | Same content but with wiki-links between notes |
+
+**They are mirrors of each other.** Don't combine searches — pick ONE:
+
+- **docs/** = lire le contenu brut, les logs quotidiens
+- **brain/** = lire les notes avec liens wiki (obsidian)
+
+### Quick Commands
+
+```bash
+# Initialize (one-time per folder)
+mempalace init /path/to/folder --yes
+
+# Index content (create vector store)
+mempalace mine /path/to/folder
+
+# Search (pick ONE folder - they are duplicates!)
+mempalace search /Users/vakandi/EliaAI/docs/ "query"
+# OR
+mempalace search /Users/vakandi/EliaAI/brain/ "query"
+```
+
+### Current Setup
+
+**Two wings (DUPLICATES) in the same palace:**
+
+| Wing | Path | Files | Rooms |
+|------|------|-------|-------|
+| `docs` | `/Users/vakandi/EliaAI/docs/` | 803 | diagram_elia_structure, general |
+| `brain` | `/Users/vakandi/EliaAI/brain/` | 857 | linkers, documentation, frontend, raw, general |
+
+**Both contain the same content** — choose one based on search needs:
+- docs: raw files, daily logs, transcriptions
+- brain: Obsidian vault with wiki-links connecting concepts
 
 ---
 

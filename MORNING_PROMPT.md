@@ -120,7 +120,6 @@ gws-workspace list-events
 gws-workspace list-tasks
 
 # 5. Verify MCP is live (use bash tool)
-bash: mcp-cli call telegram get_default_group_messages '{"limit":3}'
 bash: mcp-cli call discord-server-mcp discord_execute '{"operation":"guild.get","params":{}}'
 
 # 6. Run IDE Work Extraction (ALWAYS - track all work done)
@@ -139,9 +138,6 @@ mcp-cli call whatsapp list_chats '{}'
 # Then for each relevant group:
 mcp-cli call whatsapp list_messages '{"chat_jid":"GROUP_JID","limit":30}'
 # Groups: COBOU PowerRangers, B2LUXE BUSINESS, MAYAVANTA, personal contacts
-
-# Telegram
-mcp-cli call telegram get_default_group_messages '{"limit":30}'
 
 # Discord DMs
 mcp-cli call discord-mcp discord_get_dms '{"limit":20}'
@@ -216,7 +212,6 @@ python3 /Users/vakandi/EliaAI/tools/google_workspace.py list-tasks
 
 **THEN, based on new information gathered from:**
 - WhatsApp messages
-- Telegram messages  
 - Discord channels
 - Emails (ProtonMail + IONOS)
 - OpenCode session history

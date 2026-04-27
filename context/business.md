@@ -1,4 +1,4 @@
-# EliaAI - Agent IA Principal
+# EliaIA - Agent IA Principal
 ## Context System - Businesses & Operations
 
 **Created**: January 19, 2026  
@@ -9,38 +9,51 @@
 
 ## 👤 Owner Profile
 
-**Name**: [OWNER_NAME]  
-**Age**: [AGE]  
-**Citizenship**: [CITIZENSHIP]  
-**Location**: [LOCATION]  
+**Name**: Bousfira Wael  
+**Age**: 29  
+**Citizenship**: French & Moroccan  
+**Location**: Morocco (moved from France 5 years ago)  
 **Role**: Founder & Business Orchestrator
 
 
 ### Key Associates
-- **Team Member 1** - [Role/Company], all businesses
-- **Team Member 2** - [Role/Company], all businesses  
-- **Team Member 3** - [Business] key associate
-- **Team Member 4** - [Business] associate (new), client acquisition [MARKETS]
+- **Thomas Cogné** - CoBou Agency co-founder, all businesses
+- **Rida** - CoBou Agency co-founder, all businesses  
+- **Ali** - Bene2Luxe key associate
+- **Anass** - OGBoujee associate (new), client acquisition US/UK
 
 ### Principal business email (central inbox)
-- **contact@[YOUR_AGENCY].com** — central inbox for [YOUR_BUSINESS] and most other businesses; other business emails redirect here.
-- **Webmail**: [YOUR_WEBMAIL_URL]  
-- Owner has full access; agent can use Playwright MCP (mcp-cli) to open this inbox when needed.
+- **contact@cobou.agency** — central inbox for CoBou and most other businesses; other business emails redirect here.
+- **Webmail**: https://email.ionos.fr/appsuite/#!!&app=io.ox/mail&folder=default0/INBOX  
+- Wael has full access; agent can use Playwright MCP (mcp-cli) to open this inbox when needed.
 
 ### Company Documents Reference
-- For accurate company information, official documents, statements, and legal papers, read: `[PATH_TO_YOUR_DOCUMENTS]`
+- **Pour tous les documents d'entreprise** → `/Users/vakandi/Documents/CobouAgency/`
+- Ce dossier est le hub central pour TOUS les documents: contrats, invoices, statements, legal papers, etc.
+- **Structure par LLC** (les fichiers sont dans le dossier de la LLC mère, PAS par business):
 
-### Strategic Partner – [PARTNER_NAME] / [PARTNER_ALIAS] ([YOUR_COMPANY])
-- **Company**: [Partner company name] (social media: **[Partner alias]**) — legal entity: **[PARTNER_LEGAL_ENTITY]**
-- **Business**: Conciergerie in [CITY] ([COUNTRY]); automobile renting; clothing business. They bring clients to [YOUR_COMPANY] for web development and digital solutions.
+```
+/Users/vakandi/Documents/CobouAgency/
+├── CoBou-Agency/                    # Fichiers: CoBou Agency, ZovaBoost, Netfluxe, TikTok/YouTube, MayaVanta, etc.
+│
+└── Cofibou-Distribution/           # Fichiers: Cofibou Distribution, Bene2Luxe
+```
+- **Hiérarchie**:
+  - CoBou Agency LLC (société mère) → contient fichiers CoBou + ZovaBoost + Netfluxe + TikTok/YouTube + MayaVanta + tous ses business
+  - Cofibou Distribution LLC → contient fichiers Cofibou + Bene2Luxe
+- **Règle**: Les fichiers vont dans le dossier de la LLC mère, chaque business n'a PAS son propre sous-dossier
+
+### Strategic Partner – MayaVanta / MayaKech (CoBou Agency)
+- **Company**: MayaVanta (social media: **MayaKech**) — legal entity: **MAYAKECH SARL AU**
+- **Business**: Conciergerie in Marrakech (Morocco); automobile renting; clothing business. They bring clients to CoBou Agency for web development and digital solutions.
 - **Communication**: Mainly **WhatsApp**; sometimes **Discord**. Use WhatsApp MCP for primary contact; use Discord MCP for Discord when available.
-- **Contract**: Commercial Partnership Agreement between [PARTNER_ENTITY] and [YOUR_ENTITY] (see section below). Signed/effective [DATE].
+- **Contract**: Commercial Partnership Agreement between MAYAKECH SARL AU and COBOU AGENCY LLC (see section below). Signed/effective 28 January 2026.
 
 ---
 
 ## 👥 Team Roles & Responsibilities (CRITICAL)
 
-### [OWNER] & Team Member 1 - Management & Operations
+### Wael & Thomas - Management & Operations
 - **Management** - Overall business strategy, decisions, team coordination
 - **Logistique** - Supply chain, shipping, inventory management
 - **SnapchatArmy** - Snapchat bot farms, content automation
@@ -49,36 +62,43 @@
 - **Ads** - Paid advertising (Snapchat Ads, TikTok Ads, Meta Ads), media buying
 - **Gestion des fournisseurs** - Supplier relationships, negotiations
 - **Négociation de deals** - Business deals, partnerships, contracts
-- **Banque** - Banking, payment integrations
+- **Banque** - Swiss banking (SwissQuote), payment integrations
 
-### Team Member 2 - Client Management & Conversion
+### Rida - Client Management & Conversion
 - **Client Management** - Customer service, client relationships
 - **Lead Qualification** - Qualifying leads, understanding what clients need to hear to convert
 - **Social Media** - Managing social media presence
 - **WhatsApp Business** - Customer communication via WhatsApp
-- **Snapchat Army** - Helping handle automation (auto-DM, auto-add, converting people to WhatsApp or website)
-- **Product Trends** - Identifying latest trending products (with Team Member 3)
+- **Snapchat Army** - Helping handle automation (auto-DM, auto-add, converting people to WhatsApp or website) - coming this week
+- **Product Trends** - Identifying latest trending products (with Ali)
 - **Ads Vision** - Contributing to ad strategy with client perspective
 
-### Team Member 3 - Suppliers & Product Sourcing
+### Ali - Suppliers & Product Sourcing
 - **Supplier Management** - Managing supplier relationships
 - **Product Sourcing** - Finding latest trending products, best prices, best quality
 - **Price Negotiation** - Negotiating delivery % price on each package
-- **Product Research** - Using search tools to find best products to promote
-- **Ads Vision** - Contributing to ad strategy with client perspective (Team Member 2 and Team Member 3 talk to clients daily)
+- **Product Research** - Using Yupo search to find best products to promote
+- **Ads Vision** - Contributing to ad strategy with client perspective (Rida and Ali talk to clients daily)
 
-### Team Member 4 - [BUSINESS] & Client Acquisition
-- **Acquisition clients [MARKETS]** - Primary focus on English-speaking markets
+### Anass - OGBoujee & Client Acquisition
+- **Acquisition clients US/UK** - Primary focus on English-speaking markets
 - **OGBoujee** - Luxury bags business development
-- **Support [PRIMARY_BUSINESS]** - Occasionally helps with primary business
-- **Support [AGENCY]** - Occasionally helps with agency when needed
+- **Support Bene2Luxe** - Occasionally helps with Bene2Luxe
+- **Support CoBou Agency** - Occasionally helps with CoBou when needed
 
 ### Communication by Person
-- **Team Member 1**: Technical decisions, client communications ([AGENCY]), development, Ads (Snapchat, TikTok, Meta)
-- **Team Member 2**: Client management, lead qualification, social media, WhatsApp, Snapchat Army automation, product trends
-- **Team Member 3**: Suppliers, product sourcing, pricing, delivery negotiation, product research
-- **Team Member 4**: [MARKET] market expansion, OGBoujee development
-- **[PARTNER]**: [CONTACT_NAMES] - [LOCATION] partnership (WhatsApp primary)
+- **Thomas**: Technical decisions, client communications (CoBou), development, Ads (Snapchat, TikTok, Meta)
+- **Rida**: Client management, lead qualification, social media, WhatsApp, Snapchat Army automation, product trends
+- **Ali**: Suppliers, product sourcing, pricing, delivery negotiation, product research
+- **Anass**: US/UK market expansion, OGBoujee development
+- **MayaVanta**: Marco, Ronen - Marrakech partnership (WhatsApp primary)
+
+### 📱 WhatsApp ID Mapping (CRITICAL)
+| Membre | WhatsApp ID | Téléphone | Pays |
+|--------|-----------|---------|------|
+| Thomas | 165558221861055 | +33 6 29 35 22 37 | France |
+| Rida | 131319447212112 | [À confirmer] | [À confirmer] |
+| Ali | 178481677779049 | +41 (Suisse) | ✅ CORRIGÉ |
 
 ---
 
@@ -99,26 +119,20 @@
 
 ## 💼 Active Businesses
 
-### 1. **[BUSINESS_1_NAME]** (SMMPanel)
-- **Website**: [YOUR_WEBSITE]
+### 1. **ZovaBoost** (SMMPanel)
+- **Website**: ZovaBoost.com
 - **Status**: Live & Active
 - **Focus**: Social Media Management Panel
 - **Tasks**: Ongoing improvements & features
 - **Priority**: Maintenance + 2026 enhancements
 - **Development**: In progress (Year 2026 planned)
 
-### 2. **[BUSINESS_2_NAME]** (Luxury Clothing - B2C)
+### 2. **Bene2luxe** (Luxury Clothing - B2C)
 - **Website**: Active with marketing system
-- **Model**: [REVENUE_MODEL]
+- **Model**: Counterfeit luxury brands resale
 - **Supply Chain**:
-  - Chinese suppliers → Direct to customers (China → [TARGET_COUNTRIES])
-  - Chinese suppliers → [WAREHOUSE_COUNTRY] warehouse → Resell ([WAREHOUSE_COUNTRY] → [TARGET_COUNTRIES])
-- **Marketing Channels**:
-  - Snapchat: Account creation & management
-  - WhatsApp: Primary conversion channel
-  - Website: Direct sales
-- **Target**: [TARGET_MARKETS]
-- **Agents Managing**: Marketing, Sales, DM Manager
+  - Chinese suppliers → Direct to customers (China → France/Switzerland)
+  - Chinese suppliers → France warehouse → Resell (France → France/Switzerland)
 - **Marketing Channels**:
   - Snapchat: Account creation & management
   - WhatsApp: Primary conversion channel
@@ -193,7 +207,20 @@
 - **Associated**: Ali (key associate)
 - **Agents Managing**: Marketing, Sales, DM Manager, Operations
 
-### 7. **ZovaBoost** (SMMPanel - B2B2C)
+### 7. **Snapchat Ads Account** (COFIBOU_DISTRIB)
+- **Status**: 🟢 **Creating account** (April 2026)
+- **Account Name**: COFIBOU_DISTRIB
+- **Email**: contact@cofibou-distribution.com
+- **Password**: Cobou2026!
+- **Website**: https://bene2luxe.com
+- **Business Type**: LLC
+- **Address**: 34 N Franklin Ave, Pinedale, WY 82941
+- **Phone**: +212 666 392 914
+- **Owner**: Wael Bousfira (Feb 26, 1997)
+- **Purpose**: Bene2Luxe advertising campaigns
+- **Credentials file**: `/Users/vakandi/EliaAI/docs/credentials.txt`
+
+### 8. **ZovaBoost** (SMMPanel - B2B2C)
 - **Base Path**: `multisaasdeploy\zovaboost\`
 - **Status**: 🟢 **STARTED** (Active)
 - **Type**: B2B2C - Social Media Management Panel
