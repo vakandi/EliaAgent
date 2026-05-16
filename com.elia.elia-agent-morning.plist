@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.elia.elia-agent-morning</string>
+    
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>/path/to/EliaAI/scripts/trigger_morning.sh</string>
+    </array>
+    
+    <key>RunAtLoad</key>
+    <false/>
+    
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>10</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+    </array>
+    
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/path/to/opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/home/user/.local/bin:/home/user/.npm-global/bin:/home/user/.nvm/versions/node/v20.20.2/bin</string>
+        <key>HOME</key>
+        <string>/home/user</string>
+        <key>USER</key>
+        <string>user</string>
+        <key>NO_PROXY</key>
+        <string>127.0.0.1,localhost,::1</string>
+        <key>no_proxy</key>
+        <string>127.0.0.1,localhost,::1</string>
+    </dict>
+    
+    <key>WorkingDirectory</key>
+    <string>/path/to/EliaAI</string>
+    
+    <key>StandardOutPath</key>
+    <string>/path/to/EliaAI/logs/cron_morning.log</string>
+    
+    <key>StandardErrorPath</key>
+    <string>/path/to/EliaAI/logs/cron_morning.log</string>
+    
+    <key>ProcessType</key>
+    <string>Standard</string>
+</dict>
+</plist>

@@ -1,0 +1,9 @@
+name = "codemem-coordinator"
+main = "../../packages/cloudflare-coordinator-worker/src/index.ts"
+compatibility_date = "2026-03-28"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "COORDINATOR_DB"
+database_name = "codemem-coordinator"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"

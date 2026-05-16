@@ -1,0 +1,33 @@
+# Environment Variables
+
+# Your Telegram bot tokens from @BotFather, separated by commas
+# You can specify one or more tokens to run multiple bot instances
+# Example: TELEGRAM_BOT_TOKENS=1234567890:AABBCCDDEEFFGGHHIIJJKKLLMMNNOOPPQQrrss,9876543210:ZZYYXXWWVVUUTTSSRRQQPPOONNMMllkkjjii
+TELEGRAM_BOT_TOKENS=
+
+# Comma-separated list of Telegram user IDs allowed to use the bot
+# Example: ALLOWED_USER_IDS=123456789,987654321
+ALLOWED_USER_IDS=
+
+# Admin user ID who receives notifications about unauthorized access attempts
+# This user will be notified when someone not in ALLOWED_USER_IDS tries to use the bot
+# Example: ADMIN_USER_ID=123456789
+ADMIN_USER_ID=
+
+# Message Configuration
+# Message auto-delete timeout in milliseconds (default: 10000 = 10 seconds)
+# Time to wait before automatically deleting confirmation messages
+# Set to 0 to disable auto-deletion of messages
+MESSAGE_DELETE_TIMEOUT=10000
+
+# OpenCode Configuration (optional)
+# OpenCode server URL (default: http://localhost:4096)
+# If you have an OpenCode server running on a different host or port, specify it here
+# Example: OPENCODE_SERVER_URL=http://192.168.1.100:4096
+OPENCODE_SERVER_URL=http://localhost:4096
+
+# EliaAI (optional) - Enables /extraprompt to run trigger_opencode_interactive.sh
+# When set, /extraprompt <message> streams agent output to this chat
+# Example: ELIA_HELPER_DIR=/path/to/EliaAI
+# ELIA_HELPER_DIR=
+

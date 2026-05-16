@@ -1,0 +1,186 @@
+/**
+ * Stats routes — GET /api/stats, GET /api/usage.
+ *
+ * Ports Python's viewer_routes/stats.py.
+ */
+
+import { listMaintenanceJobs, type MemoryStore, VERSION } from "@codemem/core";
+import { Hono } from "hono";
+
+function maintenanceJobSortKey(job: {
+	started_at: string | null;
+	updated_at: string;
+	kind: string;
+}): [string, string] {
+	return [job.started_at ?? job.updated_at, job.kind];
+}
+
+function sortActiveMaintenanceJobs<
+	T extends { started_at: string | null; updated_at: string; kind: string },
+>(jobs: T[]): T[] {
+	return [...jobs].sort((a, b) => {
+		const [aTime, aKind] = maintenanceJobSortKey(a);
+		const [bTime, bKind] = maintenanceJobSortKey(b);
+		if (aTime !== bTime) return aTime.localeCompare(bTime);
+		return aKind.localeCompare(bKind);
+	});
+}
+
+/**
+ * Create stats routes. The store factory is called per-request to get a
+ * fresh connection (matching the Python viewer pattern).
+ */
+export function statsRoutes(getStore: () => MemoryStore) {
+	const app = new Hono();
+
+	const parseMetadataJson = (value: unknown): Record<string, unknown> | null => {
+		if (typeof value !== "string" || !value.trim()) return null;
+		try {
+			return JSON.parse(value) as Record<string, unknown>;
+		} catch {
+			return null;
+		}
+	};
+
+	// Keep completed jobs visible in /api/stats for a short window after
+	// finished_at so the health UI has a chance to render success confirmation
+	// for fast-completing backfills (often <1s). Failed jobs stay indefinitely.
+	const RECENTLY_COMPLETED_WINDOW_MS = 120_000;
+
+	app.get("/api/stats", (c) => {
+		const store = getStore();
+		const jobs = listMaintenanceJobs(store.db);
+		const now = Date.now();
+		const surfacedJobs = sortActiveMaintenanceJobs(
+			jobs.filter((job) => {
+				if (job.status === "pending" || job.status === "running" || job.status === "failed") {
+					return true;
+				}
+				if (job.status === "completed" && job.finished_at) {
+					const finished = Date.parse(job.finished_at);
+					if (Number.isFinite(finished) && now - finished <= RECENTLY_COMPLETED_WINDOW_MS) {
+						return true;
+					}
+				}
+				return false;
+			}),
+		).map((job) => ({
+			kind: job.kind,
+			title: job.title,
+			status: job.status,
+			message: job.message,
+			progress: job.progress,
+			finished_at: job.finished_at,
+			error: job.error,
+		}));
+		return c.json({
+			...store.stats(),
+			viewer_pid: process.pid,
+			maintenance_jobs: surfacedJobs,
+		});
+	});
+
+	app.get("/api/runtime", (c) => {
+		return c.json({
+			version: VERSION,
+		});
+	});
+
+	app.get("/api/usage", (c) => {
+		const store = getStore();
+		{
+			const projectFilter = c.req.query("project") || null;
+			const recentPacksQuery = projectFilter
+				? store.db.prepare(
+						`SELECT usage_events.id, usage_events.session_id, usage_events.event,
+						usage_events.tokens_read, usage_events.tokens_written, usage_events.tokens_saved,
+						usage_events.created_at, usage_events.metadata_json
+					 FROM usage_events
+					 JOIN sessions ON sessions.id = usage_events.session_id
+					 WHERE usage_events.event = 'pack' AND sessions.project = ?
+					 ORDER BY usage_events.created_at DESC
+					 LIMIT 10`,
+					)
+				: store.db.prepare(
+						`SELECT id, session_id, event, tokens_read, tokens_written, tokens_saved, created_at, metadata_json
+					 FROM usage_events
+					 WHERE event = 'pack'
+					 ORDER BY created_at DESC
+					 LIMIT 10`,
+					);
+			const eventsGlobal = store.db
+				.prepare(
+					`SELECT event,
+						SUM(tokens_read) AS total_tokens_read,
+						SUM(tokens_written) AS total_tokens_written,
+						SUM(tokens_saved) AS total_tokens_saved,
+						COUNT(*) AS count
+					 FROM usage_events GROUP BY event ORDER BY event`,
+				)
+				.all() as Record<string, unknown>[];
+			const totalsGlobal = store.db
+				.prepare(
+					`SELECT COALESCE(SUM(tokens_read),0) AS tokens_read,
+						COALESCE(SUM(tokens_written),0) AS tokens_written,
+						COALESCE(SUM(tokens_saved),0) AS tokens_saved,
+						COUNT(*) AS count
+					 FROM usage_events`,
+				)
+				.get() as Record<string, unknown>;
+			let eventsFiltered: Record<string, unknown>[] | null = null;
+			let totalsFiltered: Record<string, unknown> | null = null;
+			if (projectFilter) {
+				eventsFiltered = store.db
+					.prepare(
+						`SELECT event,
+							SUM(tokens_read) AS total_tokens_read,
+							SUM(tokens_written) AS total_tokens_written,
+							SUM(tokens_saved) AS total_tokens_saved,
+							COUNT(*) AS count
+						 FROM usage_events
+						 JOIN sessions ON sessions.id = usage_events.session_id
+						 WHERE sessions.project = ?
+						 GROUP BY event ORDER BY event`,
+					)
+					.all(projectFilter) as Record<string, unknown>[];
+				totalsFiltered = store.db
+					.prepare(
+						`SELECT COALESCE(SUM(tokens_read),0) AS tokens_read,
+							COALESCE(SUM(tokens_written),0) AS tokens_written,
+							COALESCE(SUM(tokens_saved),0) AS tokens_saved,
+							COUNT(*) AS count
+						 FROM usage_events
+						 JOIN sessions ON sessions.id = usage_events.session_id
+						 WHERE sessions.project = ?`,
+					)
+					.get(projectFilter) as Record<string, unknown>;
+			}
+			const recentPacksRaw = (
+				projectFilter ? recentPacksQuery.all(projectFilter) : recentPacksQuery.all()
+			) as Record<string, unknown>[];
+			const recentPacks = recentPacksRaw.map((row) => ({
+				id: Number(row.id ?? 0),
+				session_id: row.session_id == null ? null : Number(row.session_id),
+				event: String(row.event ?? "pack"),
+				tokens_read: Number(row.tokens_read ?? 0),
+				tokens_written: Number(row.tokens_written ?? 0),
+				tokens_saved: Number(row.tokens_saved ?? 0),
+				created_at: String(row.created_at ?? ""),
+				metadata_json: parseMetadataJson(row.metadata_json),
+			}));
+
+			return c.json({
+				project: projectFilter,
+				events: projectFilter ? eventsFiltered : eventsGlobal,
+				totals: projectFilter ? totalsFiltered : totalsGlobal,
+				events_global: eventsGlobal,
+				totals_global: totalsGlobal,
+				events_filtered: eventsFiltered,
+				totals_filtered: totalsFiltered,
+				recent_packs: recentPacks,
+			});
+		}
+	});
+
+	return app;
+}

@@ -1,0 +1,50 @@
+{
+	"name": "@codemem/server",
+	"version": "0.29.1",
+	"type": "module",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"source": "./src/index.ts",
+			"import": "./dist/index.js",
+			"types": "./dist/index.d.ts"
+		}
+	},
+	"files": [
+		"dist/",
+		"static/"
+	],
+	"scripts": {
+		"clean": "rm -rf dist tsconfig.tsbuildinfo",
+		"build": "pnpm exec vite build --ssr src/index.ts --outDir dist && pnpm exec tsc --build --force",
+		"typecheck": "pnpm exec tsc --noEmit"
+	},
+	"dependencies": {
+		"@codemem/core": "workspace:^",
+		"@hono/node-server": "catalog:",
+		"drizzle-orm": "catalog:",
+		"hono": "catalog:",
+		"limiter": "catalog:"
+	},
+	"devDependencies": {
+		"@types/better-sqlite3": "catalog:",
+		"@types/node": "^22.15.21",
+		"better-sqlite3": "^12.8.0",
+		"sqlite-vec": "0.1.7-alpha.2",
+		"typescript": "catalog:",
+		"vite": "catalog:",
+		"vitest": "catalog:"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/kunickiaj/codemem.git",
+		"directory": "packages/viewer-server"
+	},
+	"engines": {
+		"node": ">=24"
+	},
+	"license": "MIT",
+	"publishConfig": {
+		"access": "public"
+	}
+}

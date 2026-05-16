@@ -1,0 +1,84 @@
+{
+  "name": "@tommertom/telegramcoder",
+  "version": "0.8.11",
+  "description": "AI-powered Telegram bot with OpenCode integration for intelligent coding assistance via Telegram",
+  "main": "dist/app.js",
+  "bin": {
+    "telegramcoder": "dist/cli.js"
+  },
+  "files": [
+    "dist/**/*",
+    "dot-env.template",
+    "Dockerfile",
+    "docker-compose.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node esbuild.config.js",
+    "build:prod": "NODE_ENV=production node esbuild.config.js",
+    "build:tsc": "tsc --outDir dist",
+    "dev": "nodemon --watch src --ext ts --exec \"node esbuild.config.js && node dist/app.js\"",
+    "start": "node ./dist/cli.js",
+    "watch": "tsc --watch",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "doPublish": "npm run build:prod && npm version patch && npm publish --access public",
+    "pm2:start": "npm run build:prod && pm2 start ecosystem.config.cjs",
+    "pm2:stop": "pm2 stop telegramCoder",
+    "pm2:restart": "npm run build:prod && pm2 startOrRestart ecosystem.config.cjs",
+    "pm2:delete": "pm2 delete telegramCoder",
+    "pm2:logs": "pm2 logs telegramCoder",
+    "pm2:monit": "pm2 monit",
+    "pm2:status": "pm2 status"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "ai",
+    "copilot",
+    "claude",
+    "cursor",
+    "terminal",
+    "xterm",
+    "pty",
+    "coding-assistant",
+    "cli",
+    "automation"
+  ],
+  "author": "Tommertom",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Tommertom/telegramCoder.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Tommertom/telegramCoder/issues"
+  },
+  "homepage": "https://github.com/Tommertom/telegramCoder#readme",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@types/archiver": "^6.0.3",
+    "@types/node": "^24.3.0",
+    "esbuild": "^0.25.11",
+    "nodemon": "^3.1.10",
+    "ts-prune": "^0.10.3",
+    "ts-unused-exports": "^11.0.1",
+    "typescript": "^5.9.2"
+  },
+  "dependencies": {
+    "@ai-sdk/google": "^2.0.11",
+    "@ai-sdk/openai": "^2.0.23",
+    "@google/genai": "^1.24.0",
+    "@opencode-ai/sdk": "^1.0.224",
+    "ai": "^5.0.30",
+    "archiver": "^7.0.1",
+    "dotenv": "^17.2.2",
+    "grammy": "^1.38.2",
+    "node-pty": "^1.0.0",
+    "puppeteer": "^24.25.0",
+    "zod": "^4.1.5"
+  }
+}

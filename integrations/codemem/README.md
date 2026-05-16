@@ -1,0 +1,265 @@
+# codemem
+
+[![CI](https://github.com/kunickiaj/codemem/actions/workflows/ci.yml/badge.svg)](https://github.com/kunickiaj/codemem/actions/workflows/ci.yml) [![codecov](https://codecov.io/gh/kunickiaj/codemem/branch/main/graph/badge.svg)](https://codecov.io/gh/kunickiaj/codemem) [![Release](https://img.shields.io/github/v/release/kunickiaj/codemem)](https://github.com/kunickiaj/codemem/releases)
+
+Persistent memory for [OpenCode](https://opencode.ai) and [Claude Code](https://claude.ai/code). codemem captures what you work on across sessions, retrieves relevant context using hybrid search, and injects relevant context automatically in OpenCode.
+
+- **Local-first** — everything lives in SQLite on your machine
+- **Hybrid retrieval** — FTS5 BM25 lexical search + sqlite-vec semantic search, merged and re-ranked
+- **Automatic injection** — the OpenCode plugin injects context into every prompt, no manual steps
+- **Claude Code plugin support** — install from the codemem marketplace source
+- **Built-in viewer** — browse memories, sessions, and observer output in a local web UI
+- **Peer-to-peer sync** — replicate memories across machines without a central service
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/codemem-dark.png">
+  <img alt="codemem viewer — feed tab" src="docs/images/codemem-light.png">
+</picture>
+
+## Quick start
+
+**Prerequisites:** Node.js 24+ and npm (or pnpm)
+
+### OpenCode
+
+1. Install the OpenCode plugin and MCP config:
+
+```text
+npx -y codemem setup --opencode-only
+```
+
+2. Restart OpenCode.
+
+The OpenCode plugin manages backend execution automatically — no separate global install is required.
+
+3. Verify:
+
+```text
+# Works on fresh installs (no global codemem needed)
+npx -y codemem stats
+npx -y codemem db raw-events-status
+```
+
+That's it. The plugin captures activity, builds memories, and injects context from here on.
+
+If you want `codemem` available directly on your `PATH` for manual commands, install the CLI globally:
+
+```text
+npm install -g codemem
+```
+
+OpenCode plugin and CLI are now split intentionally:
+
+- `@codemem/opencode-plugin` — OpenCode plugin package
+- `codemem` — CLI and MCP commands
+
+### Claude Code (marketplace install)
+
+1. Install codemem's Claude MCP config:
+
+```text
+npx -y codemem setup --claude-only
+```
+
+2. In [Claude Code](https://claude.ai/code), add the codemem marketplace source and install the plugin:
+
+```text
+/plugin marketplace add kunickiaj/codemem
+/plugin install codemem
+```
+
+The Claude plugin starts MCP with the TS CLI (`codemem mcp`).
+
+Claude hook ingestion is HTTP enqueue-first (`POST /api/claude-hooks`) and falls back to direct local DB enqueue via `codemem claude-hook-ingest` when the local server path is unavailable.
+
+Claude hook events share the same raw-event queue pipeline used by OpenCode. `UserPromptSubmit` runs
+capture ingest in the background and injects memory context via Claude `additionalContext` using
+local pack generation by default, with optional HTTP `/api/pack` fallback.
+
+> Migrating from `opencode-mem`? See [docs/rename-migration.md](docs/rename-migration.md).
+
+## How it works
+
+Adapters hook into runtime event systems (OpenCode plugin and Claude hooks). They capture tool calls and conversation messages, flush them through an observer pipeline that produces typed memories, and surface retrieval context for future prompts.
+
+```mermaid
+sequenceDiagram
+participant OC as OpenCode
+participant PL as codemem plugin
+participant ST as MemoryStore
+participant DB as SQLite
+
+OC->>PL: tool.execute.after events
+OC->>PL: experimental.chat.system.transform
+PL->>ST: build_memory_pack with shaped query
+ST->>DB: FTS5 BM25 lexical search
+ST->>DB: sqlite vec semantic search
+ST->>ST: merge rerank and section assembly
+ST-->>PL: pack text
+PL->>OC: inject codemem context
+```
+
+**Retrieval** combines two strategies: keyword search via SQLite FTS5 with BM25 scoring and semantic similarity via sqlite-vec embeddings. In the pack-building path, results from both are merged, deduplicated, and re-ranked using recency and memory-kind boosts.
+
+**Injection** happens automatically. The plugin builds a query from the current session context (first prompt, latest prompt, project, recently modified files), calls `build_memory_pack`, and appends the result to the system prompt via `experimental.chat.system.transform`.
+
+**Memories** are typed — `bugfix`, `feature`, `refactor`, `change`, `discovery`, `decision`, `exploration` — with structured fields like `facts`, `concepts`, `files_read`, and `files_modified` that improve retrieval relevance. Low-signal events are filtered at multiple layers before persistence.
+
+For architecture details, see [docs/architecture.md](docs/architecture.md).
+
+## CLI
+
+| Group | Command | Description |
+|-------|---------|-------------|
+| **Core** | `codemem stats` | Database statistics |
+| | `codemem recent` | Recent memories |
+| | `codemem search <query>` | Search memories |
+| | `codemem pack <context>` | Build a context-aware memory pack |
+| | `codemem pack trace <context>` | Inspect retrieval and pack assembly for a manual query |
+| | `codemem embed` | Backfill semantic embeddings |
+| **Memory** | `codemem memory show <id>` | Print a memory item as JSON |
+| | `codemem memory forget <id>` | Deactivate a memory item |
+| | `codemem memory remember` | Manually add a memory |
+| | `codemem memory inject <context>` | Raw pack text for prompt injection |
+| | `codemem memory export <output>` | Export memories by project |
+| | `codemem memory import <file>` | Import memories (idempotent) |
+| **Viewer** | `codemem serve [start\|stop\|restart]` | Launch / manage the web viewer |
+| **Sync** | `codemem sync enable\|disable` | Enable or disable peer-to-peer sync |
+| | `codemem sync status` | Device info and peer health |
+| | `codemem sync pair` | Generate or accept a pairing payload |
+| | `codemem sync once` | Run one immediate sync pass |
+| | `codemem sync doctor` | Diagnose sync configuration issues |
+| | `codemem sync bootstrap` | Bootstrap sync from a peer snapshot |
+| **Coordinator** | `codemem coordinator` | Self-hosted coordinator admin (groups, devices, invites) |
+| **Database** | `codemem db prune-memories` | Deactivate low-signal memories (`--dry-run` to preview) |
+| | `codemem db prune-observations` | Deactivate low-signal observations |
+| | `codemem db backfill-tags` | Populate missing `tags_text` values |
+| | `codemem db raw-events-status` | Show raw-event queue status |
+| **Config** | `codemem config` | View or update configuration |
+| | `codemem setup` | Interactive first-run setup |
+| **Plumbing** | `codemem mcp` | MCP stdio server |
+| | `codemem claude-hook-ingest` | Claude hook event ingestion (stdin) |
+
+Run `codemem --help` for the full list. Legacy top-level aliases (`export-memories`, `import-memories`, `show`, `forget`, `remember`) still work but are hidden from help.
+
+## MCP tools
+
+To give the LLM direct access to memory tools (search, timeline, pack, remember, forget):
+
+```text
+codemem setup --opencode-only
+```
+
+This updates your OpenCode config to install the plugin and register the MCP server. Restart OpenCode to activate.
+
+## Configuration
+
+Config resolution precedence for runtime commands is:
+
+1. explicit `CODEMEM_CONFIG`
+2. workspace-scoped config derived from `CODEMEM_RUNTIME_ROOT` or `CODEMEM_WORKSPACE_ID`
+3. legacy global config at `~/.config/codemem/config.json{c}`
+
+Environment variables still override file values once a config file has been selected.
+
+Common overrides:
+
+| Variable | Purpose |
+|----------|---------|
+| `CODEMEM_DB` | SQLite database path |
+| `CODEMEM_INJECT_CONTEXT` | `0` to disable automatic context injection |
+| `CODEMEM_VIEWER_HOST`, `CODEMEM_VIEWER_PORT` | Host/port the plugin-managed viewer should start, probe, and restart |
+| `CODEMEM_VIEWER_AUTO` | `0` to disable auto-starting the viewer |
+
+Viewer note:
+
+- The plugin manages one explicit viewer target per runtime. If you run multiple viewers, give each one its own DB/runtime folder instead of sharing `viewer.pid` state next to the same SQLite file.
+
+The viewer includes a grouped Settings modal (`Connection`, `Processing`, `Device Sync`) with shell-agnostic labels and an advanced-controls toggle for technical fields.
+- Settings show effective values (configured or default) and only persist changed fields on save.
+- The viewer HTTP service is intended for localhost-only use. It does not currently provide a general-purpose auth/session layer for safe public exposure.
+
+Observer runtime/auth:
+
+- Runtime options: `api_http` and `claude_sidecar`.
+- `api_http` defaults to `gpt-5.1-codex-mini` (OpenAI path) unless you set `observer_model`.
+- Anthropic direct API calls accept Anthropic model IDs/aliases. codemem maps the common Claude shorthand `claude-4.5-haiku` to Anthropic's direct API alias `claude-haiku-4-5`; you can also set a pinned snapshot like `claude-haiku-4-5-20251001` explicitly.
+- `claude_sidecar` defaults to `claude-4.5-haiku`; if the selected `observer_model` is unsupported by Claude CLI, codemem retries once with Claude's CLI default model.
+- `claude_sidecar` command is configurable with `claude_command` (`CODEMEM_CLAUDE_COMMAND`) as a JSON argv array.
+  - Config file example: `"claude_command": ["wrapper", "claude", "--"]`
+  - Env var example: `CODEMEM_CLAUDE_COMMAND='["wrapper","claude","--"]'`
+- Auth sources: `auto`, `env`, `file`, `command`, `none`.
+- `observer_auth_command` must be a JSON string array (argv), not a space-separated string.
+  - Config file example: `"observer_auth_command": ["iap-auth", "--audience", "example"]`
+  - Env var example: `CODEMEM_OBSERVER_AUTH_COMMAND='["iap-auth","--audience","example"]'`
+- Header templates support `${auth.token}`, `${auth.type}`, and `${auth.source}` (for example `Authorization: Bearer ${auth.token}`).
+- Queue cadence is configurable with `raw_events_sweeper_interval_s` (seconds) in Settings/config.
+
+## Export and import
+
+Share project knowledge with teammates or back up memories across machines.
+
+```text
+# Export current project
+codemem memory export project.json
+
+# Import on another machine (idempotent, safe to re-run)
+codemem memory import project.json --remap-project ~/workspace/myproject
+```
+
+See `codemem memory export --help` and `codemem memory import --help` for full options. Legacy top-level aliases still work but are hidden from help.
+
+## Peer-to-peer sync
+
+Replicate memories across devices without a central server.
+
+```text
+codemem sync enable        # generate device keys
+codemem sync pair          # generate pairing payload
+codemem sync start         # start the viewer-backed sync runtime
+codemem sync once          # run one immediate sync pass
+```
+
+The viewer now includes actor management for mapping multiple peers to one logical person, plus owned-memory visibility controls so project-filtered memories share by default while `Only me` stays a per-memory local override.
+
+Project filters, peer-to-actor assignment, visibility controls, and config keys are documented in [docs/user-guide.md](docs/user-guide.md).
+
+For cross-network setups where peer addresses change frequently or mDNS does not cross VPN/network boundaries, codemem also supports optional coordinator-backed discovery with a self-hosted coordinator. The preferred deployment path is the built-in `codemem coordinator` service; see [docs/coordinator-discovery.md](docs/coordinator-discovery.md).
+
+## Semantic recall
+
+Embeddings are stored in sqlite-vec and written automatically when memories are created. Use `codemem embed` to backfill existing memories. If sqlite-vec cannot load, keyword search still works.
+
+## Alternative install methods
+
+<details>
+<summary>Local development, npx, git install</summary>
+
+### Local development
+
+```text
+pnpm install
+pnpm build
+pnpm run codemem --help
+```
+
+### Via npx (no install)
+
+```text
+npx -y codemem stats
+```
+
+### Plugin for development
+
+Start OpenCode inside the codemem repo directory — the plugin auto-loads from `.opencode/plugin/`.
+
+</details>
+
+## Documentation
+
+- [Architecture](docs/architecture.md) — data flow, retrieval, observer pipeline, design tradeoffs
+- [Coordinator-backed discovery](docs/coordinator-discovery.md) — self-hosted cross-network peer discovery
+- [User guide](docs/user-guide.md) — viewer usage, sync setup, troubleshooting
+- [Plugin reference](docs/plugin-reference.md) — plugin behavior, env vars, stream reliability
+- [Migration guide](docs/rename-migration.md) — migrating from `opencode-mem`
+- [Contributing](CONTRIBUTING.md) — development setup, tests, linting, releases
