@@ -1,0 +1,11 @@
+{
+	"files": [],
+	"references": [
+		{ "path": "packages/core" },
+		{ "path": "packages/cloudflare-coordinator-worker" },
+		{ "path": "packages/mcp-server" },
+		{ "path": "packages/viewer-server" },
+		{ "path": "packages/cli" },
+		{ "path": "packages/ui" }
+	]
+}

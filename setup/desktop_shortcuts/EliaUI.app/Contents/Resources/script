@@ -1,0 +1,66 @@
+#!/bin/zsh
+set -euo pipefail
+IFS=$'\n\t'
+
+# Configuration
+SCRIPT_DIR="$HOME/EliaAI/scripts"
+LOG_DIR="$HOME/EliaAI/logs"
+SESSION_NAME="elia"
+
+log() {
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [EliaUI] $*" >&2
+}
+
+log "=== EliaUI 4-Window Launcher ==="
+
+# Vérifier que tmux est installé
+if ! command -v tmux &>/dev/null; then
+    log "ERROR: tmux not found in PATH"
+    exit 1
+fi
+
+# Créer les dossiers de logs si nécessaire
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+
+# Vérifier si la session existe déjà
+if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    log "Session '$SESSION_NAME' already exists - attaching..."
+    tmux attach -t "$SESSION_NAME"
+    exit 0
+fi
+
+log "Creating new tmux session: $SESSION_NAME"
+
+# Créer la session avec la première fenêtre (Window 0 = Elia-1: OpenCode Server)
+tmux new-session -d -s "$SESSION_NAME" -n "Elia-1-OpenCode"
+
+# Configurer Window 0 - OpenCode Server (port 4096)
+log "Setting up Window 0: OpenCode Server (port 4096)"
+tmux send-keys -t "$SESSION_NAME:0" "bash $SCRIPT_DIR/opencode-serve.sh 4096" Enter
+sleep 0.5
+
+# Créer Window 1 - CodeMem Viewer
+log "Creating Window 1: CodeMem Viewer"
+tmux new-window -t "$SESSION_NAME" -n "Elia-2-CodeMem"
+tmux send-keys -t "$SESSION_NAME:1" "bash $SCRIPT_DIR/codemem-viewer.sh" Enter
+sleep 0.5
+
+# Créer Window 2 - Agents
+log "Creating Window 2: Agents (start_agents.sh)"
+tmux new-window -t "$SESSION_NAME" -n "Elia-3-Agents"
+tmux send-keys -t "$SESSION_NAME:2" "bash $SCRIPT_DIR/start_agents.sh" Enter
+sleep 0.5
+
+# Créer Window 3 - UI
+log "Creating Window 3: UI (elia-ui.sh)"
+tmux new-window -t "$SESSION_NAME" -n "Elia-4-UI"
+tmux send-keys -t "$SESSION_NAME:3" "bash $SCRIPT_DIR/elia-ui.sh" Enter
+sleep 0.5
+
+# Sélectionner Window 0 et attacher
+log "Selecting Window 0 and attaching to session..."
+tmux select-window -t "$SESSION_NAME:0"
+tmux attach -t "$SESSION_NAME"
+
+log "=== EliaUI Launcher Complete ==="

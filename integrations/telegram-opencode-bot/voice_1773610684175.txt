@@ -1,0 +1,3 @@
+ok ça c'est un vocal test juste pour savoir si ça marche ce vocal ce message
+vient du telegram bot donc tu es censé le recevoir sur la même session et me
+dire bonjour et me dire le chiffre que je viens de te dire 9 8 4 4 2

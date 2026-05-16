@@ -1,0 +1,110 @@
+import { Fragment, h } from "preact";
+import { useState } from "preact/hooks";
+import { setFeedScopeFilter, setFeedTypeFilter, setAgentFilter, state } from "../../../lib/state";
+import { feedMetaText } from "../data/meta";
+import type { FeedItem, FeedViewOps } from "../types";
+import { ContextInspectorPanel } from "./ContextInspectorPanel";
+import { FeedList } from "./FeedList";
+import { FeedToggle } from "./FeedToggle";
+
+export function FeedTabView({
+	items,
+	loadingText,
+	ops,
+}: {
+	items: FeedItem[];
+	loadingText?: string;
+	ops: FeedViewOps;
+}) {
+	const [inspectorOpen, setInspectorOpen] = useState(false);
+	return h(
+		Fragment,
+		null,
+		h(
+			"div",
+			{ className: "feed-controls" },
+			h(
+				"div",
+				{ className: "section-meta", id: "feedMeta" },
+				loadingText || feedMetaText(items.length, ops.hasMorePages()),
+			),
+			h(
+				"div",
+				{ className: "feed-controls-right" },
+				h("input", {
+					className: "feed-search",
+					id: "feedSearch",
+					onInput: (event) => {
+						state.feedQuery = String((event.currentTarget as HTMLInputElement).value || "");
+						ops.updateFeedView();
+					},
+					placeholder: "Search title, body, tags…",
+					value: state.feedQuery,
+				}),
+				h(FeedToggle, {
+					active: state.feedScopeFilter,
+					id: "feedScopeToggle",
+					onSelect: (value) => {
+						if (value === state.feedScopeFilter) return;
+						setFeedScopeFilter(value);
+						ops.updateFeedView(true);
+						void ops.loadFeedData();
+					},
+					options: [
+						{ value: "all", label: "All" },
+						{ value: "mine", label: "My memories" },
+						{ value: "theirs", label: "Other people" },
+					],
+				}),
+				h(FeedToggle, {
+					active: state.feedTypeFilter,
+					id: "feedTypeToggle",
+					onSelect: (value) => {
+						if (value === state.feedTypeFilter) return;
+						setFeedTypeFilter(value);
+						ops.updateFeedView();
+					},
+					options: [
+						{ value: "all", label: "All" },
+						{ value: "observations", label: "Observations" },
+						{ value: "summaries", label: "Summaries" },
+					],
+				}),
+				h(FeedToggle, {
+					active: state.agentFilter,
+					id: "agentFilterToggle",
+					onSelect: (value) => {
+						if (value === state.agentFilter) return;
+						setAgentFilter(value);
+						ops.updateFeedView(true);
+						void ops.loadFeedData();
+					},
+					options: [
+						{ value: "all", label: "All Agents" },
+						{ value: "elia", label: "Elia" },
+						{ value: "gilfoyle", label: "Gilfoyle" },
+						{ value: "setbon", label: "Setbon" },
+						{ value: "yourbrand", label: "YourBrand" },
+						{ value: "yourco-agency", label: "YourCo" },
+						{ value: "yourtool", label: "YourTool" },
+						{ value: "yourco-promoter", label: "YourCo Promo" },
+						{ value: "yourbrand-promoter", label: "B2L Promo" },
+					],
+				}),
+				h(
+					"button",
+					{
+						"aria-controls": "contextInspectorPanel",
+						"aria-expanded": inspectorOpen,
+						className: "settings-button feed-inspector-button",
+						onClick: () => setInspectorOpen((current) => !current),
+						type: "button",
+					},
+					inspectorOpen ? "Hide Context Inspector" : "Context Inspector",
+				),
+			),
+		),
+		h(ContextInspectorPanel, { open: inspectorOpen }),
+		h("div", { className: "feed-list", id: "feedList" }, h(FeedList, { items, loadingText, ops })),
+	);
+}
