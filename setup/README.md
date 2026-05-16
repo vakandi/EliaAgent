@@ -1,4 +1,4 @@
-# EliaAI – Elia UI + OpenCode Agent (macOS)
+# EliaAI – Self-Improving AI Agent with Persistent Memory
 
 **⚠️ MODEL: This system uses ONLY free OpenCode models (big-pickle recommended). DO NOT use Claude/GPT/paid models.**
 
@@ -6,6 +6,85 @@ Commit : [main 9691e71] update1763 confirmed working perfectly on MacOS with mem
 
 ---
 
+## 🧠 Self-Improving AI Agent with Persistent Memory
+
+**EliaAI's most powerful feature: the agent remembers everything and gets smarter with every session.**
+
+Unlike traditional AI agents that start from scratch on each interaction, EliaAI uses a **persistent memory system (codemem)** that captures every session, every decision, every fix, and every discovery — then feeds it back into future sessions.
+
+### How It Works
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        CODEMEM LOOP                              │
+│                                                                  │
+│  Agent Session ──→ Captures decisions, bugs, discoveries         │
+│       │                                                          │
+│       ▼                                                          │
+│  SQLite DB (1.3 GB+) ──→ Per-agent indexed memory                │
+│       │                                                          │
+│       ▼                                                          │
+│  On next run → Agent automatically loads relevant past           │
+│  context → avoids previous mistakes, builds on past work         │
+│       │                                                          │
+│       ▼                                                          │
+│  Agent gets smarter every session ──→ Loop repeats               │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Key Features
+
+| Feature | Benefit |
+|---------|---------|
+| **Per-agent memory scoping** | Each subagent (Gilfoyle, Setbon, Picasso, etc.) has its own indexed history — no context pollution |
+| **Automatic context injection** | On each run, the agent automatically loads relevant past sessions, decisions, and bug fixes |
+| **Hybrid search** | Combines semantic (embedding) + keyword search for maximum relevance |
+| **1.3 GB+ knowledge base** | Over 3,400+ sessions indexed — years of accumulated experience |
+| **Sync across devices** | Multiple machines share memory via the team sync system |
+| **Handoff continuity** | Session summaries preserve context across task switches and agent changes |
+
+### Memory Viewer Dashboard
+
+Monitor your agent's memory in real-time: session history, health metrics, and sync status.
+
+![Codemem Sync Viewer](screenshots/codemem-sync-viewer.png)
+
+*The codemem dashboard showing per-agent memory, health status, database size, and sync/team management.*
+
+### What the Agent Remembers
+
+- ✅ **Bug fixes & root causes** — Never makes the same mistake twice
+- ✅ **Business decisions** — Remembers why certain architectural choices were made
+- ✅ **User preferences** — Adapts to your communication style and workflow
+- ✅ **Discovered solutions** — Reuses past solutions instead of reinventing
+- ✅ **Project context** — Understands the full scope of each project
+- ✅ **Dependencies & gotchas** — Remembers which versions work and which break
+
+### The Self-Improvement Cycle
+
+Every time you run EliaAI:
+
+1. **Session runs** — Agent works on your tasks
+2. **Key insights captured** — Decisions, fixes, discoveries, and mistakes are extracted
+3. **Indexed in SQLite** — Stored per-agent with full-text + semantic search
+4. **Next session loads relevant memory** — Agent starts with context from past sessions
+5. **Agent gets smarter** — Knows more, makes fewer mistakes, works faster
+
+This means **the more you use it, the better it gets**. After 3,400+ sessions, the agent has accumulated years of practical experience across backend development, marketing, e-commerce, system administration, and business operations.
+
+### Track Record
+
+| Metric | Value |
+|--------|-------|
+| Total sessions indexed | 3,400+ |
+| Database size | 1.3 GB |
+| Active subagents with scoped memory | 15+ |
+| Continuous improvement | Every session |
+
+> 💡 **The memory system is what makes EliaAI not just an AI assistant, but a continuously improving digital colleague that learns from experience.**
+
+---
 
 ## Elia UI Preview
 
@@ -56,6 +135,7 @@ EliaAI runs an AI agent (OpenCode) on a schedule and from the **Elia** overlay. 
 
 ## Table of Contents
 
+- [Self-Improving AI Agent with Persistent Memory](#-self-improving-ai-agent-with-persistent-memory)
 - [Overview](#overview)
 - [Proxy Switcher](#proxy-switcher)
 - [Elia UI (Electron)](#elia-ui-electron)
@@ -135,13 +215,13 @@ IP:PORT:USERNAME:PASSWORD
 
 Example:
 ```
-[your-proxy-ip:port:user:pass]
-[your-proxy2-ip:port:user:pass]
+45.39.15.65:6495:lwuoryyz:4hj7h5n7ozid
+89.249.196.92:6677:lwuoryyz:4hj7h5n7ozid
 ```
 
 After use, history is appended:
 ```
-[your-proxy-ip:port:user:pass] |last:2026-03-24 01:17:42 |dur:0h 5m
+45.39.15.65:6495:lwuoryyz:4hj7h5n7ozid |last:2026-03-24 01:17:42 |dur:0h 5m
 ```
 
 ### Setup
@@ -242,7 +322,7 @@ To clear all history and start fresh:
 ```bash
 # Clear proxies.txt (keeps proxy list, removes history)
 cat > ~/EliaAI/setup/proxies.txt << 'EOF'
-[your-proxy-ip:port:user:pass]
+45.39.15.65:6495:lwuoryyz:4hj7h5n7ozid
 YOUR_OTHER_PROXY:PORT:USER:PASS
 EOF
 
@@ -1480,7 +1560,7 @@ Each SSH server has a `--blacklist` argument:
     "-y",
     "@fangjunjie/ssh-mcp-server",
     "--host",
-    "[your-server-ip]",
+    "203.0.113.1",
     ...
     "--blacklist",
     "^docker\\s+(exec|run.*postgres|...),..."
