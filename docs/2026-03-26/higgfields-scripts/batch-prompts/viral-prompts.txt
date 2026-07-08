@@ -1,0 +1,45 @@
+# Trending & Viral Content Prompts
+# Use with: free_models.py batch --file viral-prompts.txt
+
+French lifestyle content creator wearing Chanel sneakers, coffee at café, Instagram aesthetic, fashion blogger vibe
+Gen Z fashion content, luxury sneakers and designer accessories, trendy TikTok style, viral format
+Avant et après transformation de style, pièces basiques vs pièces de luxe, impact visuel fort
+Get Ready With Me content, routine matinale avec accessoires luxe, GRWM format trending
+Storytime narration, découverte de marque de luxe accessible, connexion émotionnelle
+French humor content, sketch mode quotidienne, situation relatable avec produits luxe
+POV narration, point de vue première personne, expérience d'achat luxe, storytelling
+Contenu éducatif mode, comment construire une garde-robe capsule, conseils style
+Fashion haul nonboxing, présentation produits luxe reçus, excitement et review
+Comparison content, boutique vs Bene2Luxe, même qualité différents prix, value proposition
+French cultural commentary, analyse tendances mode française, perspective locale
+Behind the scenes content, processus sélection produits, qualité check, authenticité
+Day in my life content, journée type avec produits luxe, aspirational lifestyle
+Transformation narrative, évolution style personnel, avant/après avec Bene2Luxe
+Minimalist aesthetic content, garde-robe épurée, qualité sur quantité, philosophy
+Quiet luxury trend, understatement elegance, moins mais mieux, sophisticated content
+French regional comparison, style Paris vs Marseille vs Lyon, diversité française
+Sustainable luxury content, qualité qui dure, consommation consciente, eco-conscious
+Gift guide content, idées cadeaux luxe, emballage soigné, festive atmosphere
+French celebrity style analysis,reak stars appearance, aspirational content
+Influencer dupe content, alternatives accessibles aux looks célèbres, value
+Outfit repeating content, même pièces différents styles, créativité capsule
+Fashion tips et conseils, hacks style pratiques, utile pour audience
+Luxury travel content, destination glamour avec accessories luxe, aspirational travel
+Before et after home content, intérieur avec touches luxe, lifestyle aspiration
+French holidays celebrations, Noël Easter summers, festive luxury content
+Work from home aesthetic, home office stylé, productivity meets fashion
+Weekend routine content, activities luxe weekend, leisure lifestyle
+Self care et wellness content, skincare luxe, ritual treat yourself
+French art et culture content, musées expositions, intellectual aesthetic
+Street style photography, fashion week dehors, candid fashion shots
+Collab potential content, partnerships avec influenceurs, community building
+Summer transition content, été vers automatically, wardrobe updates, seasonal
+French music culture, lyrics références mode, entertainment crossover
+Podcast clip content, drops audio sur mode, long form content
+Q&A répond questions audience, interactivité, community engagement
+BTS production content, création contenu behind scenes, authenticité
+Unboxing content, packages arrivals, excitement reveal format
+Storage organization content, garde-robe collection, Marie Kondo style
+Fashion psychology content, pourquoi on achète luxe, deeper connection
+Trend forecasting content, predictions saison, ahead of curve
+Personal brand building content, identité style, authenticity storytelling

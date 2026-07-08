@@ -1,0 +1,23 @@
+# Additional Product Prompts - Swiss/Alpine Lifestyle
+# Use with: kling_scripts.py batch --file alpine-prompts.txt
+
+Animated luxury mascott character in Swiss Alps, Matterhorn mountain background, luxury ski resort aesthetic, snow falling gently, adventure animation style
+Animated mascott at cozy Swiss ski lodge, wearing designer winter gear, hot chocolate, mountain view through window, alpine luxury
+Animated luxury mascott character with [[../../wiki/concepts/Luxury-Brands#chanel|Chanel]] sneakers and [[../../wiki/concepts/Luxury-Brands#dior|Dior]] sunglasses, snowy Swiss village background, winter fashion adventure
+Animated mascott exploring Lausanne Olympic Museum, surrounded by sports luxury aesthetic, Swiss precision theme, cultural adventure
+Animated luxury mascott at Swiss chocolate shop, beautiful displays, tasting samples, Swiss quality and craftsmanship, sweet adventure
+Animated mascott in Swiss chalet hotel, fireplace, wooden interior, mountain view, traditional alpine hospitality, cozy atmosphere
+Animated luxury mascott on mountain train with panoramic windows, Swiss Alps scenery visible, scenic journey through Switzerland
+Animated mascott in Geneva with Jet d'Eau fountain, Lake Geneva background, Swiss city luxury aesthetic
+Animated luxury mascott at Swiss watch store, precision craftsmanship, Swiss heritage quality, luxury accessories
+Animated mascott in Gstaad celebrity resort, supercars and helicopters, ultra-luxury Swiss destination, celebrity spotting
+Animated mascott at Swiss cheese farm, tasting raclette, traditional alpine cuisine, culinary adventure
+Animated luxury mascott with [[../../wiki/concepts/Luxury-Brands#louis-vuitton|LV]] bag at Swiss train station, elegant travel aesthetic, Swiss efficiency
+Animated mascott at Interlaken adventure sports, paragliding and hiking, extreme sports in Swiss mountains
+Animated luxury mascott at Zurich Bahnhofstrasse, luxury shopping street, Swiss precision and elegance
+Animated mascott on Swiss balcony with coffee, Alps visible, peaceful mountain morning routine
+Animated luxury mascott at Montreux Jazz Festival, Swiss cultural event, music and luxury lifestyle
+Animated mascott at Swiss wine tasting, vineyard scenery, French-speaking Switzerland cultural experience
+Animated luxury mascott at Lucerne Lake, classic Swiss cityscape, traditional Swiss architecture
+Animated mascott at Swiss farm experience, rural Switzerland, agricultural heritage and quality
+Animated luxury mascott at Geneva luxury hotel, five-star Swiss hospitality, premium service aesthetic

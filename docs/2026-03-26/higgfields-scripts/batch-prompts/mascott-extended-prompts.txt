@@ -1,0 +1,23 @@
+# Mascoot Episode Video Prompts - Extended (Episodes 51-75)
+# Use with: higgfields_master.py mascott --episode N
+
+Animated mascott entering Chanel boutique, greeted by stylish staff, luxury interior, personal shopping experience, Parisian elegance
+Animated mascott in Dior showroom, surrounded by latest collection, fashion week energy, designer boutique atmosphere
+Animated mascott exploring vintage luxury shop in Le Marais, discovering rare pieces, treasure hunting excitement, Paris vintage
+Animated mascott at Parisian brunch spot, avocado toast and coffee, fashion blogger aesthetic, influencer vibes
+Animated mascott at Paris Fashion Week, front row seat, celebrity spotting, runway show energy, fashion industry
+Animated mascott at Musée d'Orsay, artistic aesthetic, impressionist paintings, culture appreciation, French art
+Animated mascott on Seine river cruise, city lights, luxury party, Parisian night scene, romantic adventure
+Animated mascott at PSG match, luxury lounge, sports and fashion combine, Parisian energy, football culture
+Animated mascott doing shopping spree, multiple bags from Chanel Dior LV, happy expression, retail therapy
+Animated mascott at luxury hotel rooftop bar, Paris skyline view, evening cocktails, sophisticated atmosphere
+Animated mascott at French wine bar, tasting Bordeaux, sophisticated evening aesthetic, French culture
+Animated mascott at Parisian concept store, trendy fashion, modern retail, style discovery
+Animated mascott at luxury car showroom, sports cars, French luxury vehicles, automotive elegance
+Animated mascott at Parisian department store, Galeries Lafayette, shopping adventure, luxury retail
+Animated mascott at vintage market, finding treasures, antique hunting, collector's adventure
+Animated mascott at French bakery, croissant and coffee, morning routine, Parisian café culture
+Animated mascott at Parisian bookstore, literary discovery, Shakespeare and Company, intellectual atmosphere
+Animated mascott at luxury spa, French skincare, wellness retreat, pampering experience
+Animated mascott at French restaurant, fine dining, gastronomy, culinary excellence
+Animated mascott at Parisian photography studio, fashion shoot, editorial content creation

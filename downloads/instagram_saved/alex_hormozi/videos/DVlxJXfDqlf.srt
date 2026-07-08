@@ -1,0 +1,100 @@
+1
+00:00:00,000 --> 00:00:03,800
+I sell white label media services to PR firms.
+
+2
+00:00:03,800 --> 00:00:06,520
+We've been stuck at 1.5 million for five years.
+
+3
+00:00:06,520 --> 00:00:07,720
+Agencies come to you.
+
+4
+00:00:07,720 --> 00:00:08,560
+Yeah.
+
+5
+00:00:08,560 --> 00:00:09,760
+They then white label your services
+
+6
+00:00:09,760 --> 00:00:11,160
+and sell your stuff to other people.
+
+7
+00:00:11,160 --> 00:00:12,000
+That's exactly right.
+
+8
+00:00:12,000 --> 00:00:13,480
+Do you have the same number of agencies
+
+9
+00:00:13,480 --> 00:00:15,520
+that are selling your stuff last year as this year
+
+10
+00:00:15,520 --> 00:00:16,920
+and the year before that and the year before that?
+
+11
+00:00:16,920 --> 00:00:18,680
+It's pretty high churn for the most part.
+
+12
+00:00:18,680 --> 00:00:20,080
+Are they churning because they're not using the articles
+
+13
+00:00:20,080 --> 00:00:21,240
+or because the articles are not good?
+
+14
+00:00:21,240 --> 00:00:22,080
+Because they're not using it.
+
+15
+00:00:22,080 --> 00:00:23,480
+You probably need a lower tier
+
+16
+00:00:23,480 --> 00:00:25,960
+that has some sort of usage component added on.
+
+17
+00:00:25,960 --> 00:00:28,440
+So it might be something like $1.99 a month
+
+18
+00:00:28,480 --> 00:00:30,480
+plus $100 per article.
+
+19
+00:00:30,480 --> 00:00:31,320
+You want to be low enough
+
+20
+00:00:31,320 --> 00:00:33,240
+that they don't churn on their bad months.
+
+21
+00:00:33,240 --> 00:00:34,440
+And so that's the fundamental issues.
+
+22
+00:00:34,440 --> 00:00:36,480
+I think that you're priced too high
+
+23
+00:00:36,480 --> 00:00:38,280
+for the majority of your customers
+
+24
+00:00:38,280 --> 00:00:39,440
+and too low for the ones
+
+25
+00:00:39,440 --> 00:00:41,440
+that you're going to maximize profit on.
+

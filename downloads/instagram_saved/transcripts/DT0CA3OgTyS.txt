@@ -1,0 +1,8 @@
+if you are a developer you will find this useful this is a tool that i use to see how my page
+loads in different screens so here i have my phone ipad mac and the best part is that if i actually
+navigate it just navigates across everywhere so it is super easy for me to test this is great
+for individual developers product managers and teams that don't have a matured qa process
+now the tool's name is called as responsibly it is absolutely free if you google you will find it
+now obviously i know that no matter what i say you are going to ask me for a link so i've set up
+an automation comment anything positive and you will get the link share this with someone who
+will find this useful and follow for more

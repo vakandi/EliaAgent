@@ -1,0 +1,88 @@
+1
+00:00:00,000 --> 00:00:03,440
+What kinds of businesses do you think are going to succeed
+
+2
+00:00:03,440 --> 00:00:06,480
+because AI is so prevalent and people get tired of it?
+
+3
+00:00:06,480 --> 00:00:08,720
+I think the businesses that will have disproportionate returns
+
+4
+00:00:08,720 --> 00:00:10,720
+are ones that are very ops heavy.
+
+5
+00:00:10,720 --> 00:00:12,600
+So a marketing agency, for example,
+
+6
+00:00:12,600 --> 00:00:14,960
+that heavily introduces AI,
+
+7
+00:00:14,960 --> 00:00:16,360
+there will never be a lack of businesses
+
+8
+00:00:16,360 --> 00:00:18,760
+that want new customers.
+
+9
+00:00:18,760 --> 00:00:21,160
+The difficulty with scaling that particular type of business
+
+10
+00:00:21,160 --> 00:00:22,800
+is the operational drag and the headcount
+
+11
+00:00:22,800 --> 00:00:23,920
+and the coordination of people.
+
+12
+00:00:23,920 --> 00:00:24,960
+And so if you can have something
+
+13
+00:00:24,960 --> 00:00:26,360
+that has amazing product market fit,
+
+14
+00:00:26,360 --> 00:00:28,160
+which is get more customers for somebody,
+
+15
+00:00:28,200 --> 00:00:30,120
+there's lots of demand there.
+
+16
+00:00:30,120 --> 00:00:32,240
+But do it in a way that allows you to scale the ops
+
+17
+00:00:32,240 --> 00:00:34,080
+so that you have increasing margins
+
+18
+00:00:34,080 --> 00:00:35,240
+and you have less complexity,
+
+19
+00:00:35,240 --> 00:00:36,600
+that becomes incredibly valuable business.
+
+20
+00:00:36,600 --> 00:00:38,880
+So people heavy, ops heavy businesses
+
+21
+00:00:38,880 --> 00:00:40,240
+that are largely digital,
+
+22
+00:00:40,240 --> 00:00:42,640
+those are businesses that will benefit the most.
+

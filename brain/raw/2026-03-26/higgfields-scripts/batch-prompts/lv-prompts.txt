@@ -1,0 +1,13 @@
+# [[../../wiki/concepts/Luxury-Brands#louis-vuitton|Louis Vuitton]] Product Prompts
+# Use with: kling_scripts.py batch --file lv-prompts.txt
+
+[[../../wiki/concepts/Luxury-Brands#louis-vuitton|Louis Vuitton]] monogram bag on luxury display, iconic LV canvas visible, premium leather trim, luxury retail environment, fashion editorial photography
+[[../../wiki/concepts/Luxury-Brands#louis-vuitton|Louis Vuitton]] accessories collection, monogram pattern, premium quality, luxury lifestyle photography, fashion magazine, elegant presentation
+LV bag rotating slowly, heritage craftsmanship visible, premium quality showcase, luxury product photography, classic design
+[[../../wiki/concepts/Luxury-Brands#louis-vuitton|Louis Vuitton]] flat lay, multiple accessories, monogram pattern, leather details, product catalog style, professional photography
+Animated LV lifestyle content, Parisian woman with LV bag, café terrace background, luxury everyday aesthetic
+[[../../wiki/concepts/Luxury-Brands#louis-vuitton|Louis Vuitton]] leather goods detail shots, craftsmanship visible, premium materials, heritage quality, luxury editorial
+Luxury LV packaging presentation, signature box opening, premium unboxing, brand experience
+[[../../wiki/concepts/Luxury-Brands#louis-vuitton|Louis Vuitton]] street style content, urban luxury, fashion-forward outfit, monogram visible, lifestyle photography
+LV accessories rotating showcase, bags wallets belts, monogram and leather pieces, luxury product video
+Animated [[../../wiki/concepts/Luxury-Brands#louis-vuitton|Louis Vuitton]] lifestyle, travel aesthetic, luxury suitcase and accessories, European elegance

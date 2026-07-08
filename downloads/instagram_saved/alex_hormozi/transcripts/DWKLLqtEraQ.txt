@@ -1,0 +1,21 @@
+2026, today, you need to shift away from role-based thinking to workflow-based
+thinking. Let's say that you're like, I want to hire an editor.
+But what we don't typically do is actually to find out on a more granular level,
+what is this person actually responsible for?
+Every single function in the business is just a series of actions when you take
+it at the most granular level.
+And most people just don't take the effort to really think through it.
+So I'll give you like a wild example.
+The first thing that like would begin would be an idea.
+An idea is going to probably require some sort of trend research,
+and then a ranking of things that are doing well.
+That then moves to scripting. And as we go all the way along,
+what we're end up making is one damn YouTube video.
+And we need to break the entire business down into each of these kind of granular
+levels.
+And the reason that's important is because agents are doing each of these things.
+Like I don't know if you've seen our media output is like tripled in the last
+month and we haven't increased our head count at all.
+And we did that because we have prompts that can do 30, 40, 50%.
+They're eating up more and more of the workload so that one person can now do
+the work of three and then it'll be the work of five and the work of 10.

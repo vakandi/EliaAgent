@@ -1,0 +1,28 @@
+1
+00:00:00,000 --> 00:00:07,000
+I still, real-time, have yet to see a truly vibe-coded from A to Z business that is like $100 billion a year.
+
+2
+00:00:07,000 --> 00:00:17,000
+You know, we had a conversation with mjod, who's Replit's CEO, one of the key, I think they're $150 million or something like that, ARR, in a very short time period.
+
+3
+00:00:17,000 --> 00:00:23,000
+We had a conversation about people who use Replit to vibe-code software.
+
+4
+00:00:23,000 --> 00:00:36,000
+And interestingly, I think he mentioned one or two examples, and they have like lots and lots and lots and lots of customers of like $1 million businesses, $2 million businesses that use the vibe-coded software.
+
+5
+00:00:36,000 --> 00:00:46,000
+And so I think that it is getting better and better. Is it there yet? I think it has struggled to have the robustness of, I'll just call it, manual or human-based software.
+
+6
+00:00:46,000 --> 00:00:55,000
+But I think that will get fixed in time and probably relatively quickly. But for right now, it still does take time and takes years to make a truly good product that is also scalable.
+
+7
+00:00:55,000 --> 00:01:01,000
+So sure, maybe you can sell it to a handful of people, but can it support a million users? Not currently. The vibe-coding world.
+

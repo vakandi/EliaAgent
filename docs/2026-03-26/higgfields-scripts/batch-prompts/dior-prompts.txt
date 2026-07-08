@@ -1,0 +1,13 @@
+# Dior Product Prompts
+# Use with: kling_scripts.py batch --file dior-prompts.txt
+
+Dior B23 white canvas sneakers with transparent sole and black square logo rotating slowly, luxury sneaker photography, clean white background, fashion editorial
+Close-up Dior B23 white canvas sneakers, iconic transparent sole detail, black Dior square logo, luxury product photography, high-end fashion magazine, 4K
+Dior white sneakers on white marble surface, clean luxury aesthetic, fashion photography, soft shadows, premium product presentation
+Dior D-BEJE 3 sunglasses with grey gradient lens rotating slowly, luxury eyewear photography, clean studio background, fashion editorial, premium quality
+Dior sunglasses on velvet display, grey gradient lens reflecting light, luxury boutique aesthetic, premium product photography
+Dior B23 lifestyle content, stylish man wearing white canvas sneakers, urban street style, fashion editorial photography
+Dior sunglasses detail shots, grey gradient lens, premium frame quality, luxury eyewear catalog photography, fashion magazine style
+Animated Dior sneakers and sunglasses lifestyle, Mediterranean lifestyle, luxury summer fashion, European aesthetic
+Dior B23 flat lay multiple angles, white canvas texture, transparent sole detail, black logo highlight, product catalog style
+Luxury Dior packaging reveal, white box opening, brand presentation, premium unboxing experience

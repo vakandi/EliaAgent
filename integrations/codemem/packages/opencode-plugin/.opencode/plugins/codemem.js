@@ -1493,33 +1493,41 @@ export const OpencodeMemPlugin = async ({
       filesModified: sessionContext.filesModified,
     });
 
+  /** Matches viewer feed chips + `buildProjectParams` base/agent convention. */
+  const normalizeOpenCodeAgentLabel = (raw) => {
+    if (!raw) return "";
+    const s = String(raw)
+      // strip common zero-width chars that show up in OpenCode agent labels
+      .replace(/[\u200B-\u200D\uFEFF]/g, "")
+      .trim()
+      .toLowerCase();
+    if (!s) return "";
+    if (s.includes("gilfoyle")) return "gilfoyle";
+    if (s.includes("elia")) return "elia";
+    if (s.includes("setbon")) return "setbon";
+    if (s.includes("bene2luxe-promoter")) return "bene2luxe-promoter";
+    if (s.includes("cobou-promoter")) return "cobou-promoter";
+    if (s.includes("bene2luxe")) return "bene2luxe";
+    if (s.includes("cobou-agency") || s.includes("cobou agency")) return "cobou-agency";
+    if (s.includes("zovaboost")) return "zovaboost";
+    // Fallback: take first token (before spaces/dashes) to avoid long labels.
+    return s.split(/[\s-]+/)[0] || "";
+  };
+
   const resolveAgentScope = () => {
     const base = resolveProjectName(project, cwd);
-    const agent = sessionContext.currentAgent;
-    const normalizeAgentId = (raw) => {
-      if (!raw) return "";
-      const s = String(raw)
-        // strip common zero-width chars that show up in OpenCode agent labels
-        .replace(/[\u200B-\u200D\uFEFF]/g, "")
-        .trim()
-        .toLowerCase();
-      if (!s) return "";
-      // Map rich labels to stable ids used by the UI feed selector
-      if (s.includes("gilfoyle")) return "gilfoyle";
-      if (s.includes("elia")) return "elia";
-      if (s.includes("setbon")) return "setbon";
-      if (s.includes("bene2luxe-promoter")) return "bene2luxe-promoter";
-      if (s.includes("cobou-promoter")) return "cobou-promoter";
-      if (s.includes("bene2luxe")) return "bene2luxe";
-      if (s.includes("cobou-agency") || s.includes("cobou agency")) return "cobou-agency";
-      if (s.includes("zovaboost")) return "zovaboost";
-      if (s.includes("cobou-promoter")) return "cobou-promoter";
-      // Fallback: take first token (before spaces/dashes) to avoid long labels.
-      return s.split(/[\s-]+/)[0] || "";
-    };
-    const agentId = normalizeAgentId(agent);
+    const agentId = normalizeOpenCodeAgentLabel(sessionContext.currentAgent);
     if (!agentId) return base || null;
     return base ? `${base}/${agentId}` : agentId;
+  };
+
+  const buildMemRecentCliArgs = (limitStr) => {
+    const args = ["recent", "--limit", limitStr];
+    const scopedProject = resolveAgentScope();
+    if (scopedProject) {
+      args.push("--project", scopedProject);
+    }
+    return args;
   };
 
   const describeInjectQuery = (query) => {
@@ -2422,33 +2430,37 @@ export const OpencodeMemPlugin = async ({
     },
     tool: {
       "mem-status": tool({
-        description: "Show codemem stats and recent entries",
+        description:
+          "Show codemem stats (global DB) and recent entries scoped to the current OpenCode agent/project when known",
         args: {},
         async execute() {
           const stats = await runCli(["stats"]);
-          const recent = await runCli(["recent", "--limit", "5"]);
+          const scope = resolveAgentScope();
+          const recent = await runCli(buildMemRecentCliArgs("5"));
           const lines = [
             `viewer: http://${viewerHost}:${viewerPort}`,
             `log: ${logPath || "disabled"}`,
+            `recent query --project: ${scope || "(default: repo root / CODEMEM_PROJECT)"}`,
           ];
           if (stats.exitCode === 0 && stats.stdout.trim()) {
-            lines.push("", "stats:", stats.stdout.trim());
+            lines.push("", "stats (global database):", stats.stdout.trim());
           }
           if (recent.exitCode === 0 && recent.stdout.trim()) {
-            lines.push("", "recent:", recent.stdout.trim());
+            lines.push("", "recent (scoped):", recent.stdout.trim());
           }
           return lines.join("\n");
         },
       }),
 
       "mem-recent": tool({
-        description: "Show recent codemem entries",
+        description:
+          "Show recent codemem entries for the current session agent when known (same --project convention as inject/pack)",
         args: {
           limit: tool.schema.number().optional(),
         },
         async execute({ limit }) {
           const safeLimit = Number.isFinite(limit) ? String(limit) : "5";
-          const recent = await runCli(["recent", "--limit", safeLimit]);
+          const recent = await runCli(buildMemRecentCliArgs(safeLimit));
           if (recent.exitCode === 0) {
             return recent.stdout.trim() || "No recent memories.";
           }
@@ -2457,7 +2469,7 @@ export const OpencodeMemPlugin = async ({
       }),
 
       "mem-stats": tool({
-        description: "Show codemem stats",
+        description: "Show codemem stats for the entire local database (not agent-filtered)",
         args: {},
         async execute() {
           const stats = await runCli(["stats"]);

@@ -1,0 +1,13 @@
+# [[../../wiki/concepts/Luxury-Brands#chanel|Chanel]] La Pause Product Prompts
+# Use with: kling_scripts.py batch --file [[../../wiki/concepts/Luxury-Brands#chanel|Chanel]]-prompts.txt
+
+Luxury [[../../wiki/concepts/Luxury-Brands#chanel|Chanel]] La Pause sneakers in grey suede with green sole rotating slowly on white marble floor, studio photography, soft lighting, fashion editorial
+Close-up of [[../../wiki/concepts/Luxury-Brands#chanel|Chanel]] grey suede sneakers with signature green sole, luxury product photography, clean white background, fashion magazine style, 4K
+[[../../wiki/concepts/Luxury-Brands#chanel|Chanel]] sneakers displayed elegantly on designer pedestal, grey suede texture visible, green sole accent, luxury retail environment, professional product shot
+[[../../wiki/concepts/Luxury-Brands#chanel|Chanel]] La Pause grey suede sneakers on minimalist display, premium quality showcase, fashion boutique aesthetic, natural studio lighting
+Fashion editorial shot of [[../../wiki/concepts/Luxury-Brands#chanel|Chanel]] sneakers, grey suede with green sole, luxury lifestyle context, soft shadows, professional photography
+Animated [[../../wiki/concepts/Luxury-Brands#chanel|Chanel]] sneakers lifestyle content, Parisian woman wearing La Pause sneakers, street style fashion, elegant casual outfit
+[[../../wiki/concepts/Luxury-Brands#chanel|Chanel]] sneakers rotating 360 degrees, luxury product video, white background, soft studio lighting, fashion commercial style
+[[../../wiki/concepts/Luxury-Brands#chanel|Chanel]] La Pause grey suede detail shots, green sole highlight, craftsmanship visible, luxury sneaker photography, high-end editorial
+Luxury sneakers unboxing experience, [[../../wiki/concepts/Luxury-Brands#chanel|Chanel]] packaging, tissue paper reveal, premium presentation, gift box opening
+[[../../wiki/concepts/Luxury-Brands#chanel|Chanel]] sneakers flat lay, multiple angles, grey suede texture, green sole visible, product catalog style photography

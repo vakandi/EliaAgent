@@ -1,0 +1,23 @@
+# Côte d'Azur & French Riviera Lifestyle Prompts
+# Use with: kling_scripts.py batch --file riviera-prompts.txt
+
+Animated luxury mascott at Nice beach, Mediterranean blue water, Promenade des Anglais background, French Riviera lifestyle
+Animated mascott on Cannes La Croisette, Palais des Festivals visible, film festival atmosphere, glamorous French Riviera
+Animated luxury mascott at Monaco Casino Square, supercars, F1 track visible, extreme wealth Monte Carlo atmosphere
+Animated mascott in Saint-Tropez port, giant yachts, trendy restaurants, famous jet-set destination
+Animated luxury mascott at Antibes yacht harbor, massive boats, nautical atmosphere, Mediterranean sailing culture
+Animated mascott at Provençal market, lavender, olives, local specialties, Mediterranean food culture
+Animated luxury mascott at Grasse perfume factory, smelling scents, French fragrance art, luxury perfumes
+Animated luxury mascott watching Mediterranean sunset, orange sky reflecting on blue water, peaceful Côte d'Azur evening
+Animated luxury mascott on French Riviera yacht, Mediterranean sea, luxury sailing, coastal elegance
+Animated mascott at Cannes beach club, luxury loungers, Mediterranean sun, summer lifestyle content
+Animated luxury mascott at Villa Ephrussi de Rothschild, French Riviera estate, Belle Époque architecture
+Animated mascott at Eze village, Mediterranean views, French Riviera hilltop town, scenic adventure
+Animated luxury mascott at Monaco harbor, luxury yachts and supercars, Monte Carlo glamour
+Animated mascott at Saint-Tropez beach, Pampelonne beach scene, French Riviera summer fashion
+Animated luxury mascott at Grasse flower fields, lavender and roses, perfume ingredient scenery
+Animated luxury mascott at Cannes luxury hotel, French Riviera hospitality, five-star service
+Animated mascott at Mediterranean beach café, pastis and seafood, Provençal lunch aesthetic
+Animated luxury mascott at Monaco Formula 1 circuit, racing heritage, sports luxury
+Animated mascott at French Riviera art gallery, contemporary art, cultural sophistication
+Animated luxury mascott at Nice old town, Cours Saleya market, authentic Provençal atmosphere

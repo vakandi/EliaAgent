@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Elia AI - Architecture Système</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'SF Pro Display', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: linear-gradient(135deg, #0a0a1a 0%, #1a1a2e 50%, #16213e 100%);
+            min-height: 100vh;
+            padding: 40px;
+            color: #e0e0e0;
+        }
+        
+        h1 {
+            text-align: center;
+            font-size: 3em;
+            background: linear-gradient(90deg, #ffd700, #ff6b6b, #4ecdc4);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 10px;
+            font-weight: 800;
+        }
+        
+        .subtitle {
+            text-align: center;
+            color: #888;
+            font-size: 1.2em;
+            margin-bottom: 50px;
+        }
+        
+        .diagram-container {
+            display: flex;
+            flex-direction: column;
+            gap: 40px;
+            align-items: center;
+        }
+        
+        .layer {
+            display: flex;
+            gap: 20px;
+            flex-wrap: wrap;
+            justify-content: center;
+            position: relative;
+        }
+        
+        .box {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 16px;
+            padding: 20px 30px;
+            text-align: center;
+            backdrop-filter: blur(10px);
+            transition: all 0.3s ease;
+            position: relative;
+        }
+        
+        .box:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
+        }
+        
+        .box-icon {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        
+        .box-title {
+            font-weight: 600;
+            font-size: 1.1em;
+            color: #fff;
+        }
+        
+        .box-desc {
+            font-size: 0.85em;
+            color: #888;
+            margin-top: 8px;
+        }
+        
+        .global {
+            border-color: #ffd700;
+            box-shadow: 0 0 30px rgba(255, 215, 0, 0.2);
+        }
+        
+        .global .box-title {
+            color: #ffd700;
+        }
+        
+        .config {
+            border-color: #4ecdc4;
+        }
+        
+        .config .box-title {
+            color: #4ecdc4;
+        }
+        
+        .cron {
+            border-color: #ff6b6b;
+        }
+        
+        .cron .box-title {
+            color: #ff6b6b;
+        }
+        
+        .comm {
+            border-color: #a855f7;
+        }
+        
+        .comm .box-title {
+            color: #a855f7;
+        }
+        
+        .business {
+            border-color: #22c55e;
+        }
+        
+        .business .box-title {
+            color: #22c55e;
+        }
+        
+        .arrow-down {
+            text-align: center;
+            font-size: 2em;
+            color: #555;
+            margin: 10px 0;
+        }
+        
+        .arrow-right {
+            display: flex;
+            align-items: center;
+            color: #555;
+            font-size: 1.5em;
+        }
+        
+        .label {
+            background: rgba(255, 215, 0, 0.2);
+            color: #ffd700;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 0.9em;
+            font-weight: 600;
+            text-align: center;
+            margin: 20px 0;
+        }
+        
+        .key-points {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 20px;
+            padding: 40px;
+            margin-top: 60px;
+            max-width: 900px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+        
+        .key-points h2 {
+            color: #ffd700;
+            margin-bottom: 30px;
+            font-size: 1.8em;
+        }
+        
+        .key-points ul {
+            list-style: none;
+            padding: 0;
+        }
+        
+        .key-points li {
+            padding: 15px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            font-size: 1.1em;
+            display: flex;
+            align-items: flex-start;
+            gap: 15px;
+        }
+        
+        .key-points li:last-child {
+            border-bottom: none;
+        }
+        
+        .key-points .icon {
+            font-size: 1.3em;
+        }
+        
+        .highlight {
+            color: #4ecdc4;
+            font-weight: 600;
+        }
+        
+        .highlight-gold {
+            color: #ffd700;
+            font-weight: 600;
+        }
+    </style>
+</head>
+<body>
+    <h1>🤖 Elia AI</h1>
+    <p class="subtitle">Architecture Système - Explication pour Sebbon</p>
+    
+    <div class="diagram-container">
+        <!-- Couche 1: OpenCode Global -->
+        <div class="label">🌍 OpenCode Global (chargé dans TOUS les dossiers)</div>
+        <div class="layer">
+            <div class="box global" style="min-width: 300px;">
+                <div class="box-icon">📋</div>
+                <div class="box-title">AGENTS.md</div>
+                <div class="box-desc">~/.config/opencode/AGENTS.md<br>
+                <span class="highlight-gold">PERSONNALITÉ GLOBALE</span><br>
+                Définit: nom, règles, businesses, ton</div>
+            </div>
+        </div>
+        
+        <div class="arrow-down">↓</div>
+        
+        <!-- Couche 2: Dossier EliaAI -->
+        <div class="label">📁 Dossier EliaAI (/Users/vakandi/EliaAI/)</div>
+        <div class="layer">
+            <div class="box config">
+                <div class="box-icon">📝</div>
+                <div class="box-title">PROMPT.md</div>
+                <div class="box-desc">Routine matinale<br>Workflow quotidien</div>
+            </div>
+            
+            <div class="box config">
+                <div class="box-icon">🧠</div>
+                <div class="box-title">MEMORY.md</div>
+                <div class="box-desc">Mémoire persistente<br>Context & apprentissages</div>
+            </div>
+            
+            <div class="box config">
+                <div class="box-icon">🔧</div>
+                <div class="box-title">TOOLS.md</div>
+                <div class="box-desc">Commandes MCP<br>Outils disponibles</div>
+            </div>
+        </div>
+        
+        <div class="arrow-down">↓</div>
+        
+        <!-- Couche 3: Cron System -->
+        <div class="label">⏰ Système Cron (Automatisation)</div>
+        <div class="layer">
+            <div class="box cron">
+                <div class="box-icon">⏰</div>
+                <div class="box-title">macOS Cron</div>
+                <div class="box-desc">Toutes les 30 min</div>
+            </div>
+            
+            <div class="arrow-right">→</div>
+            
+            <div class="box cron">
+                <div class="box-icon">📜</div>
+                <div class="box-title">cron_wrapper.sh</div>
+                <div class="box-desc">Wrapper d'exécution<br>Charge l'environnement</div>
+            </div>
+            
+            <div class="arrow-right">→</div>
+            
+            <div class="box cron">
+                <div class="box-icon">🚀</div>
+                <div class="box-title">start_agents.sh</div>
+                <div class="box-desc">Lance OpenCode<br>Instance Elia</div>
+            </div>
+        </div>
+        
+        <div class="arrow-down">↓</div>
+        
+        <!-- Couche 4: Communication -->
+        <div class="label">📱 Communication (MCP Servers)</div>
+        <div class="layer">
+            <div class="box comm">
+                <div class="box-icon">💬</div>
+                <div class="box-title">WhatsApp</div>
+                <div class="box-desc">Groupes business</div>
+            </div>
+            
+            <div class="box comm">
+                <div class="box-icon">✈️</div>
+                <div class="box-title">Telegram</div>
+                <div class="box-desc">Input principal</div>
+            </div>
+            
+            <div class="box comm">
+                <div class="box-icon">🎮</div>
+                <div class="box-title">Discord</div>
+                <div class="box-desc">DMs & contacts</div>
+            </div>
+            
+            <div class="box comm">
+                <div class="box-icon">📧</div>
+                <div class="box-title">Email</div>
+                <div class="box-desc">ProtonMail, IONOS</div>
+            </div>
+        </div>
+        
+        <div class="arrow-down">↓</div>
+        
+        <!-- Couche 5: Businesses -->
+        <div class="label">💼 Entreprises Gérées</div>
+        <div class="layer">
+            <div class="box business">
+                <div class="box-icon">👜</div>
+                <div class="box-title">Bene2Luxe</div>
+                <div class="box-desc">Luxury Fashion</div>
+            </div>
+            
+            <div class="box business">
+                <div class="box-icon">📈</div>
+                <div class="box-title">ZovaBoost</div>
+                <div class="box-desc">SMMPanel</div>
+            </div>
+            
+            <div class="box business">
+                <div class="box-icon">🏢</div>
+                <div class="box-title">CoBou Agency</div>
+                <div class="box-desc">Digital Solutions</div>
+            </div>
+            
+            <div class="box business">
+                <div class="box-icon">�</div>
+                <div class="box-title">MayaVanta</div>
+                <div class="box-desc">Conciergerie</div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="key-points">
+        <h2>🎯 Points Clés pour Sebbon</h2>
+        <ul>
+            <li>
+                <span class="icon">📋</span>
+                <span><span class="highlight-gold">AGENTS.md GLOBAL</span>: Chaque instance OpenCode charge ~/.config/opencode/AGENTS.md en premier - c'est ce fichier qui définit la personnalité d'Elia</span>
+            </li>
+            <li>
+                <span class="icon">🔄</span>
+                <span><span class="highlight">INSTANCE SPÉCIFIQUE</span>: Chaque dossier peut avoir son propre AGENTS.md qui override le global (pas utilisé ici)</span>
+            </li>
+            <li>
+                <span class="icon">⏰</span>
+                <span><span class="highlight">CRON JOB</span>: macOS Cron exécute le wrapper toutes les 30 minutes → lance OpenCode avec le dossier EliaAI</span>
+            </li>
+            <li>
+                <span class="icon">🧠</span>
+                <span><span class="highlight">MÉMOIRE</span>: MEMORY.md conserve le contexte entre les executions - Elia "se souvient" des conversations passées</span>
+            </li>
+            <li>
+                <span class="icon">🔌</span>
+                <span><span class="highlight">MCP SERVERS</span>: OpenCode utilise des "Model Context Protocol" servers pour WhatsApp, Telegram, Discord, Jira, SSH - tout est automatisé</span>
+            </li>
+        </ul>
+    </div>
+</body>
+</html>

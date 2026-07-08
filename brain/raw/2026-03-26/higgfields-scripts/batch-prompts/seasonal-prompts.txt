@@ -1,0 +1,33 @@
+# Seasonal & Event-Based Prompts
+# Use with: kling_scripts.py batch --file seasonal-prompts.txt
+
+Spring fashion content, luxury sneakers with floral dress, Parisian spring aesthetic, soft lighting, fashion editorial
+Easter weekend fashion, designer accessories with pastel outfit, European spring lifestyle, fashion magazine
+Spring luxury content, [[../../wiki/concepts/Luxury-Brands#chanel|Chanel]] sneakers with light trench coat, Parisian streets, warm sunlight, fashion editorial
+Summer beach fashion, luxury sneakers with swimsuit, Mediterranean beach style, resort aesthetic
+Summer vacation content, designer accessories, luxury luggage, travel aesthetic, holiday fashion
+Back to school fashion, luxury sneakers with casual outfit, student style, European aesthetic
+Autumn transition fashion, [[../../wiki/concepts/Luxury-Brands#chanel|Chanel]] sneakers with blazer, fall aesthetic, layered outfit, fashion editorial
+Winter luxury content, designer sneakers with winter coat, cozy aesthetic, cold weather fashion
+New Year fashion content, luxury accessories, celebration aesthetic, festive outfit, party style
+Valentine's Day fashion, luxury gifts, romantic aesthetic, couple outfit, love-themed content
+Mother's Day gift content, luxury accessories, elegant presentation, gift guide, appreciation aesthetic
+Father's Day fashion, designer accessories for men, luxury gifts, paternal style, gift guide
+Summer festival fashion, luxury sneakers with festival outfit, outdoor event aesthetic, music festival style
+Autumn harvest content, cozy fashion, warm colors, seasonal aesthetic, fall style
+Winter holiday content, luxury accessories, festive presentation, Christmas gift guide, holiday aesthetic
+Spring cleaning fashion, wardrobe refresh, luxury pieces, minimalist aesthetic, organization content
+Summer road trip content, luxury travel accessories, adventure aesthetic, road trip fashion
+Paris Fashion Week content, runway looks, designer trends, fashion editorial, luxury style
+Swiss winter sports content, luxury ski gear, alpine fashion, winter vacation aesthetic
+Mediterranean summer content, yacht fashion, coastal luxury, summer style, Riviera aesthetic
+Graduation fashion content, luxury accessories, celebratory outfit, achievement aesthetic
+Wedding guest fashion, luxury accessories, elegant outfit, special occasion style
+Summer music festival content, luxury accessories, festival aesthetic, outdoor event style
+Autumn layering content, luxury pieces, transitional fashion, layered outfit aesthetic
+Winter cozy content, luxury knitwear, warm accessories, hygge aesthetic, comfort fashion
+Spring renewal content, wardrobe refresh, new season aesthetic, fresh start fashion
+Summer sunset content, luxury beach accessories, golden hour aesthetic, Mediterranean vibes
+Autumn harvest festival content, luxury country aesthetic, seasonal celebration, rustic luxury
+Winter wonderland content, luxury snow accessories, alpine fashion, snowy aesthetic
+New season wardrobe content, luxury basics, essential pieces, capsule wardrobe aesthetic

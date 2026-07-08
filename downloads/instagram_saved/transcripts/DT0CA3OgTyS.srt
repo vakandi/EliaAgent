@@ -1,0 +1,32 @@
+1
+00:00:00,000 --> 00:00:04,780
+if you are a developer you will find this useful this is a tool that i use to see how my page
+
+2
+00:00:04,780 --> 00:00:11,220
+loads in different screens so here i have my phone ipad mac and the best part is that if i actually
+
+3
+00:00:11,220 --> 00:00:16,920
+navigate it just navigates across everywhere so it is super easy for me to test this is great
+
+4
+00:00:16,920 --> 00:00:21,920
+for individual developers product managers and teams that don't have a matured qa process
+
+5
+00:00:21,920 --> 00:00:27,760
+now the tool's name is called as responsibly it is absolutely free if you google you will find it
+
+6
+00:00:27,760 --> 00:00:32,080
+now obviously i know that no matter what i say you are going to ask me for a link so i've set up
+
+7
+00:00:32,080 --> 00:00:36,940
+an automation comment anything positive and you will get the link share this with someone who
+
+8
+00:00:36,940 --> 00:00:38,600
+will find this useful and follow for more
+

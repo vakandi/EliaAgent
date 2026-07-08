@@ -1,0 +1,230 @@
+{
+  "main": {
+    "id": "7669f0e88589c732",
+    "type": "split",
+    "children": [
+      {
+        "id": "d10bdaaba6f35109",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "e6342e38610b1480",
+            "type": "leaf",
+            "state": {
+              "type": "graph",
+              "state": {},
+              "icon": "lucide-git-fork",
+              "title": "Graph view"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "26904339f47e4862",
+    "type": "split",
+    "children": [
+      {
+        "id": "0d90802b6bda20fc",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "1ef21ed2de7780f1",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false
+              },
+              "icon": "lucide-folder-closed",
+              "title": "Files"
+            }
+          },
+          {
+            "id": "e7f4f381783a2d2e",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "Search"
+            }
+          },
+          {
+            "id": "6357f4d14b11ee58",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {},
+              "icon": "lucide-bookmark",
+              "title": "Bookmarks"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300
+  },
+  "right": {
+    "id": "1d6347c90c202fa7",
+    "type": "split",
+    "children": [
+      {
+        "id": "a7287b37df43fef9",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "d73f6b89734acb2c",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "Backlinks"
+            }
+          },
+          {
+            "id": "47194d4ad4510bba",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "Outgoing links"
+            }
+          },
+          {
+            "id": "69838e04fdb14664",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "Tags"
+            }
+          },
+          {
+            "id": "3c022ff3b027da34",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "All properties"
+            }
+          },
+          {
+            "id": "cf173e8108f672d7",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "Outline"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:Open quick switcher": false,
+      "graph:Open graph view": false,
+      "canvas:Create new canvas": false,
+      "daily-notes:Open today's daily note": false,
+      "templates:Insert template": false,
+      "command-palette:Open command palette": false,
+      "bases:Create new base": false
+    }
+  },
+  "active": "e6342e38610b1480",
+  "lastOpenFiles": [
+    "raw/2026-03-16/topo_bene2luxe_scaling.md",
+    "raw/2026-04-10/run_10_avril_2026_2100.md",
+    "raw/2026-04-10/run_10_avril_2026_21h00.md",
+    "raw/2026-04-10/run_10_avril_2026_20h00.md",
+    "raw/2026-04-10/next_run_prep_2200.md",
+    "raw/2026-04-10/next_run_prep_0505.md",
+    "raw/2026-04-11/next_run_prep_1630.md",
+    "Untitled 1.canvas",
+    "raw/2026-03-26/content-strategy-bene2luxe.md",
+    "raw/2026-04-01/run_01_avril_2026_1130.md",
+    "linkers/fix_log_links.py",
+    "linkers/log_linker.py",
+    "raw/2026-04-05/ugc-assets/ugc-scripts.md",
+    "2026-04-11.md",
+    "linkers/comprehensive_linker.py",
+    "linkers/log_bulk_linker.py",
+    "raw/2026-03-27/run_27_mars_2026_soir.md",
+    "raw/2026-03-18/windsurf_work_225924.md",
+    "linkers/master_bulk_linker.py",
+    "linkers/30_misc.py",
+    "linkers/29_misc.py",
+    "linkers/28_misc.py",
+    "linkers/27_misc.py",
+    "linkers/26_misc.py",
+    "raw/2026-04-09/run_09_avril_2026_1700.md",
+    "raw/2026-04-09/next_run_prep_1600.md",
+    "raw/2026-04-09/run_09_avril_2026_1715.md",
+    "raw/2026-04-09/run_09_avril_2026_1600.md",
+    "raw/2026-04-09/run_09_avril_2026_1815.md",
+    "raw/2026-04-09/next_run_prep_1815.md",
+    "raw/2026-04-09/run_09_avril_2026_1535.md",
+    "raw/sisyphus-analysis.md",
+    "raw/investigation_ulw_loop_report.md",
+    "raw/2026-04-11/windsurf_work_172838.md",
+    "raw/2026-04-11/windsurf_work_164026.md",
+    "raw/2026-04-11/windsurf_work_032805.md",
+    "raw/2026-04-11/windsurf_work_032615.md",
+    "raw/docs/2026-03-26/mascott_bene2luxe.png",
+    "raw/docs/2026-04-06/higgsfield-current.png",
+    "raw/docs/2026-03-24/ali-products/image_20260324_125156.jpg",
+    "raw/docs/2026-03-24/ali-products/image_20260324_124231.jpg",
+    "raw/docs/2026-03-24/ali-products/image_20260324_122637.jpg",
+    "raw/docs/2026-04-05/ugc-assets/img_5.webp",
+    "raw/docs/2026-04-05/ugc-assets/img_5.png",
+    "raw/docs/2026-04-05/ugc-assets/img_4.webp",
+    "raw/docs/2026-04-05/ugc-assets/img_4.png",
+    "raw/docs/2026-04-05/ugc-assets/img_3.webp",
+    "Untitled.canvas"
+  ]
+}

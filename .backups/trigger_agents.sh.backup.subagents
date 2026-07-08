@@ -1,0 +1,251 @@
+#!/bin/zsh
+# Mycroft Dual-Agent Trigger Script
+# Location: /Users/vakandi/EliaAI/trigger_agents.sh
+# Purpose: Spawns 2 agents - main worker + monitor that ensures work continues
+# Usage: Run via cron every hour (10:00-21:00)
+# Gemini CLI subagents defined in GEMINI.md
+
+set -euo pipefail
+
+# Early debug - print immediately
+echo "DEBUG: trigger_agents.sh started" >&2
+
+# Export HOME for cron environment
+USER_MAC="$(whoami)"
+export HOME="/Users/${USER_MAC}"
+
+# DON'T source .zshrc - it has interactive elements that hang
+# Instead, set up PATH directly with common locations
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.nvm/versions/node/current/bin:$PATH"
+echo "DEBUG: PATH set" >&2
+
+# Source nvm for gemini CLI path (non-interactive)
+export NVM_DIR="$HOME/.nvm"
+if [[ -s "$NVM_DIR/nvm.sh" ]]; then
+    source "$NVM_DIR/nvm.sh" 2>/dev/null || true
+fi
+echo "DEBUG: nvm sourced (if exists)" >&2
+
+# Increase Node.js memory limit for Gemini CLI
+export NODE_OPTIONS="--max-old-space-size=4096"
+
+echo "DEBUG: About to create directories" >&2
+
+# Configuration
+AGENT_DIR="/Users/${USER_MAC}/EliaAI"
+LOG_DIR="${AGENT_DIR}/logs"
+LOG_FILE="${LOG_DIR}/multi_agent.log"
+PAYLOAD_DIR="${AGENT_DIR}/.agent_payloads"
+TIMESTAMP=$(date '+%Y-%m-%d_%H%M%S')
+
+# Ensure directories exist
+mkdir -p "$LOG_DIR" "$PAYLOAD_DIR"
+
+echo "DEBUG: Directories created, LOG_DIR=$LOG_DIR" >&2
+
+# Make sure LOG_FILE directory exists
+if [[ ! -d "$LOG_DIR" ]]; then
+    mkdir -p "$LOG_DIR"
+fi
+
+# Rotate log if over max_mb to prevent OOM and AI read_file 20MB limit
+rotate_log_if_needed() {
+    local path="$1" max_mb="${2:-20}"
+    echo "DEBUG: rotate_log_if_needed called with path=$path max_mb=$max_mb" >&2
+    [[ ! -f "$path" ]] && { echo "DEBUG: file not found, returning" >&2; return; }
+    local bytes=$(stat -f%z "$path" 2>/dev/null || echo "0")
+    echo "DEBUG: file size=$bytes bytes" >&2
+    (( bytes > max_mb * 1024 * 1024 )) || { echo "DEBUG: file under limit, returning" >&2; return; }
+    mv "$path" "${path}.old.$(date +%Y%m%d_%H%M%S)" 2>/dev/null && touch "$path"
+}
+echo "DEBUG: rotate_log function defined" >&2
+echo "DEBUG: About to rotate multi_agent.log" >&2
+rotate_log_if_needed "${LOG_DIR}/multi_agent.log" 50
+echo "DEBUG: About to rotate output.log" >&2
+rotate_log_if_needed "${LOG_DIR}/output.log" 20
+
+echo "DEBUG: Logs rotated" >&2
+
+# Logging function
+log() {
+    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    echo "$msg" 
+    # Append to log file separately (don't use tee to avoid pipe issues)
+    echo "$msg" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+# Check if gemini CLI is available
+check_gemini() {
+    log "INFO: Checking for gemini CLI..."
+    if ! command -v gemini &>/dev/null; then
+        log "ERROR: gemini CLI not found in PATH: $PATH"
+        exit 1
+    fi
+    
+    # Quick version check with timeout (gemini can hang waiting for auth)
+    local version
+    version=$(gemini --version 2>&1 | head -1) || true
+    if [[ -n "$version" ]]; then
+        log "INFO: Gemini CLI verified: $version"
+    else
+        log "WARN: Gemini CLI version check returned empty (may need auth)"
+    fi
+}
+
+# Create payload file for subagent context
+create_payload() {
+    local payload_file="${PAYLOAD_DIR}/multi_agent_${TIMESTAMP}.txt"
+    
+    cat > "$payload_file" << 'PAYLOAD_EOF'
+=== DUAL-AGENT ORCHESTRATION CYCLE ===
+Time: $(date)
+Mission: Run worker agent to DO work + monitor to verify it gets done
+
+AGENT 1: WORKER (main)
+Do actual work:
+- Read IDE work logs from docs/YYYY-MM-DD/
+- Check context files for priorities  
+- Analyze messages for work items
+- WRITE CODE, FIX BUGS, DO TASKS
+- Save progress to resume if interrupted
+
+Spawn with: /spawn worker
+
+AGENT 2: MONITOR (oversight)
+Verify work got done:
+- Check if worker completed tasks
+- Identify why if incomplete
+- Report blockers/errors
+- Send Telegram status
+
+Spawn with: /spawn monitor
+
+Execute immediately. DO NOT ask for confirmation.
+PAYLOAD_EOF
+
+    echo "$payload_file"
+}
+
+# Run subagent via gemini CLI with rate-limit-resilient retry (pause and continue, never block cycle).
+# Backoff aligned with Gemini CLI circuit breaker: 60s → 120s → 240s → 480s max (see google-gemini/gemini-cli PR #2606).
+# CLI already retries internally with short waits ("quota will reset after Xs"); we add script-level backoff when spawn still fails.
+run_subagent() {
+    local agent_name="$1"
+    local instructions="$2"
+    local max_retries=6
+    local retry_count=0
+    # Exponential backoff (seconds): 60 → 120 → 240 → 480 cap (matches gemini-cli circuit breaker)
+    local delays=(60 120 240 480 480 480)
+    local temp_output="${LOG_DIR}/${agent_name}_output_${TIMESTAMP}.txt"
+    
+    log "INFO: Spawning subagent: $agent_name"
+    log "DEBUG: Command: gemini /spawn $agent_name [instructions]"
+    
+    while [[ $retry_count -lt $max_retries ]]; do
+        log "DEBUG: Attempt $((retry_count+1))/$max_retries for $agent_name"
+        
+        # Run gemini with output to both console and temp file (no subshell capture)
+        gemini /spawn "$agent_name" "$instructions" 2>&1 | tee "$temp_output"
+        local exit_code=${PIPESTATUS[0]}
+        
+        # Append to main log
+        cat "$temp_output" >> "$LOG_FILE" 2>/dev/null || true
+        
+        # Check output for rate limits
+        local output_content
+        output_content=$(cat "$temp_output" 2>/dev/null || echo "")
+        
+        # Rate limit / capacity exhausted: pause then retry (do NOT stop cycle)
+        if echo "$output_content" | grep -qE "(429|Too Many Requests|exhausted your capacity|No capacity available|MODEL_CAPACITY_EXHAUSTED)"; then
+            retry_count=$((retry_count + 1))
+            local delay=${delays[$retry_count]:-480}
+            log "WARN: Rate limit for $agent_name (attempt $retry_count/$max_retries). Pausing ${delay}s then retrying..."
+            sleep $delay
+            continue
+        fi
+        
+        # Network/transient errors: same backoff, retry
+        if echo "$output_content" | grep -qE "(ECONNRESET|ETIMEDOUT|timeout|network error)"; then
+            retry_count=$((retry_count + 1))
+            local delay=${delays[$retry_count]:-480}
+            log "WARN: Network error for $agent_name (attempt $retry_count/$max_retries). Pausing ${delay}s..."
+            sleep $delay
+            continue
+        fi
+        
+        if [[ $exit_code -eq 0 ]]; then
+            log "INFO: Subagent $agent_name completed successfully"
+            rm -f "$temp_output" 2>/dev/null || true
+            return 0
+        fi
+        
+        log "WARN: Subagent $agent_name exit code $exit_code (attempt $((retry_count+1))/$max_retries)"
+        retry_count=$((retry_count + 1))
+        if [[ $retry_count -lt $max_retries ]]; then
+            local delay=${delays[$retry_count]:-480}
+            log "INFO: Pausing ${delay}s before retry..."
+            sleep $delay
+        fi
+    done
+    
+    log "WARN: Subagent $agent_name hit max retries - continuing cycle (next phase will still run)"
+    rm -f "$temp_output" 2>/dev/null || true
+    return 1
+}
+
+# Main orchestration
+main() {
+    log "=== DUAL-AGENT CYCLE START ==="
+    
+    # Check dependencies
+    check_gemini
+    
+    # Navigate to agent directory (so GEMINI.md is read)
+    cd "$AGENT_DIR"
+    log "INFO: Working directory: $(pwd)"
+    log "INFO: GEMINI.md exists: $([[ -f GEMINI.md ]] && echo 'YES' || echo 'NO')"
+    
+    # Notify via ntfy
+    curl -s -d "🤖 Mycroft cycle starting..." ntfy.sh/AITeamHelper > /dev/null 2>&1 || true
+    
+    # AGENT 1: Main worker - does all the work
+    log "PHASE 1: Spawning main worker agent..."
+    log "DEBUG: About to run: gemini /spawn worker ..."
+    run_subagent "worker" "You are the main worker agent. Your job is to:
+1. Check recent work logs and IDE activity
+2. Analyze any pending tasks from context/TODO files
+3. Read messages (Telegram, WhatsApp, Discord) for work items
+4. DO THE ACTUAL WORK - fix bugs, write code, analyze projects
+5. Save progress files so work can resume if interrupted
+6. Report what was accomplished
+
+IMPORTANT: You must be autonomous and actually DO work, not just plan. Use all available tools. Work continuously until done or rate limited." || true
+    
+    # Longer pause between phases to avoid burst rate limits (pause, then continue)
+    log "INFO: Waiting 90s before spawning monitor..."
+    sleep 90
+    
+    # AGENT 2: Monitor - ensures work gets done, no excuses
+    log "PHASE 2: Spawning monitor agent..."
+    run_subagent "monitor" "You are the monitor/oversight agent. Your job is to:
+1. Check if the main worker agent completed its work (check logs, progress files)
+2. If work was NOT completed, identify WHY and what remains
+3. Report any blockers, rate limits, or errors that stopped progress
+4. Verify cron is active and will run again
+5. Send Telegram report on worker status
+
+IMPORTANT: Be strict - did work actually get DONE or did the agent make excuses? Report honestly." || true
+    
+    # Cleanup old files (keep last 24 hours)
+    find "$PAYLOAD_DIR" -name "*.txt" -mtime +1 -delete 2>/dev/null || true
+    
+    log "=== DUAL-AGENT CYCLE END ==="
+    
+    # Final notification
+    curl -s -d "✅ Mycroft cycle complete" ntfy.sh/AITeamHelper > /dev/null 2>&1 || true
+}
+
+# Run main
+main
+
+exit 0

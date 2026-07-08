@@ -1,0 +1,176 @@
+1
+00:00:00,000 --> 00:00:01,760
+If you had to guess what menu sells more,
+
+2
+00:00:01,760 --> 00:00:03,340
+menu number one or menu number two?
+
+3
+00:00:03,340 --> 00:00:04,560
+Researchers actually looked at this
+
+4
+00:00:04,560 --> 00:00:05,680
+and figured out what the answer was.
+
+5
+00:00:05,680 --> 00:00:07,560
+So they did this test with a bunch of jam stands
+
+6
+00:00:07,560 --> 00:00:09,800
+where they had one stand that had 24 types of jam
+
+7
+00:00:09,800 --> 00:00:11,220
+and another stand that had only six.
+
+8
+00:00:11,220 --> 00:00:12,400
+And they had people walk up to it.
+
+9
+00:00:12,400 --> 00:00:14,560
+What was interesting is that one of these jam stands
+
+10
+00:00:14,560 --> 00:00:15,940
+converted significantly higher than the other.
+
+11
+00:00:15,940 --> 00:00:18,040
+And you might think, oh, the more selection people have,
+
+12
+00:00:18,040 --> 00:00:20,000
+the more likely they are to buy the perfect thing for them.
+
+13
+00:00:20,000 --> 00:00:21,280
+But in reality, what ended up happening
+
+14
+00:00:21,280 --> 00:00:23,360
+is that people were 10 times more likely to buy
+
+15
+00:00:23,360 --> 00:00:24,280
+when they had fewer selections
+
+16
+00:00:24,280 --> 00:00:26,400
+because the decision was easier.
+
+17
+00:00:26,400 --> 00:00:28,280
+We actually implemented this kind of perspective
+
+18
+00:00:28,400 --> 00:00:30,320
+with a portfolio company right as we invested.
+
+19
+00:00:30,320 --> 00:00:31,680
+And they had a kind of like,
+
+20
+00:00:31,680 --> 00:00:33,200
+choose your own adventure type thing.
+
+21
+00:00:33,200 --> 00:00:34,840
+Like whatever you can think of, we'll sell it to you.
+
+22
+00:00:34,840 --> 00:00:36,480
+And so what we looked at when we pulled all the data
+
+23
+00:00:36,480 --> 00:00:37,480
+was we figured out that there are actually
+
+24
+00:00:37,480 --> 00:00:38,800
+two customer avatars they had
+
+25
+00:00:38,800 --> 00:00:40,400
+and they bought two very different sets of things.
+
+26
+00:00:40,400 --> 00:00:42,560
+And so we said, okay, what is 80% of the time
+
+27
+00:00:42,560 --> 00:00:44,600
+this person buy and what is 80% of the time this person buy?
+
+28
+00:00:44,600 --> 00:00:46,760
+And then we completely consolidated to choice A
+
+29
+00:00:46,760 --> 00:00:48,640
+and choice B for customer A and customer B.
+
+30
+00:00:48,640 --> 00:00:50,840
+What happened is we were able to actually sell more people
+
+31
+00:00:50,840 --> 00:00:53,280
+at higher prices, templatize the solution on the back
+
+32
+00:00:53,280 --> 00:00:54,520
+and sort of expand margin
+
+33
+00:00:54,520 --> 00:00:55,800
+because we were able to do the same thing
+
+34
+00:00:55,800 --> 00:00:57,560
+for more times for more people
+
+35
+00:00:57,560 --> 00:00:59,640
+and it would on ramp sales people faster
+
+36
+00:00:59,640 --> 00:01:00,800
+because they didn't have to learn the whole menu.
+
+37
+00:01:00,800 --> 00:01:01,920
+They only had to learn two things
+
+38
+00:01:01,920 --> 00:01:03,520
+and then customers transacted faster
+
+39
+00:01:03,520 --> 00:01:05,200
+and we cut the sales time in half.
+
+40
+00:01:05,200 --> 00:01:06,200
+If you believe in free markets
+
+41
+00:01:06,200 --> 00:01:07,640
+is the best way to incentivize people
+
+42
+00:01:07,640 --> 00:01:09,000
+and you believe in pro-capitalism,
+
+43
+00:01:09,000 --> 00:01:10,080
+you'll like my money making stuff,
+
+44
+00:01:10,080 --> 00:01:11,400
+you can fall for more of it.
+

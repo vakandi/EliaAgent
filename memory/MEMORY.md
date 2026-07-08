@@ -87,7 +87,7 @@
 
 ### Email Access (UPDATED 2026-03-30)
 
-**Gmail account**: [YOUR_EMAIL] - Wael's personal Gmail
+**Gmail account**: wael.bousfira@gmail.com - Wael's personal Gmail
 - Access via mcp-cli: `mcp-cli call gmail search_emails '{"query":"in:inbox","limit":20}'`
 
 ### Principal Business Email (central inbox)
@@ -100,9 +100,9 @@
 
 ### Primary Business Email (ProtonMail)
 
-- **Address**: [YOUR_PROTON_EMAIL]
-  - **Webmail**: https://mail.proton.me/u/1/inbox
-  - **Role**: Primary business email with most business and bank account related stuff
+- **Address**: wael.bousfira@protonmail.com
+- **Webmail**: https://mail.proton.me/u/1/inbox
+- **Role**: Primary business email with most business and bank account related stuff
 - **Access**: Only accessible through agent-browser command line
 - **Command ready to go**: agent-browser --profile ~/.agent-browser-profile open https://mail.proton.me/u/1/inbox
 
@@ -241,6 +241,28 @@ When they message through WhatsApp/Telegram/Discord/Email, always:
 3. Pre-document your recommendations for the next run
 
 
+## oh-my-opencode (Autonomous AI Execution)
+
+**⚠️ CRITICAL: ALWAYS use the agent flag (-a)!**
+
+```bash
+# Code tasks → use gilfoyle agent
+oh-my-opencode run -a gilfoyle "Create account on OceanPayment.com with contact@cofibou-distribution.com" --max-iterations 5
+
+# Marketing tasks → use setbon agent  
+oh-my-opencode run -a setbon "Write ad copy for luxury handbags" --max-iterations 3
+
+# Default (general)
+oh-my-opencode run "Your task here" --max-iterations 5
+```
+
+**Agent selection:**
+- `-a gilfoyle` - Backend dev, code, API integration, account creation
+- `-a setbon` - Marketing, content, copywriting
+- `-a elia` - General tasks (default if no flag)
+
+**NEVER just use "run" without -a flag!**
+
 ## Tools & MCP
 
 - Use mcp-cli for all tool interactions (SSH, WhatsApp, Telegram, exec, etc.).
@@ -249,7 +271,7 @@ When they message through WhatsApp/Telegram/Discord/Email, always:
 - This unified approach gives access to all integrated services.
 - **Browser automation**: Use agent-browser CLI (fast native Rust, replaces Playwright MCP)
 - **Principal business email**: contact@cobou.agency — central inbox at https://email.ionos.fr/appsuite/#!!&app=io.ox/mail&folder=default0/INBOX; other business emails redirect here. Access via agent-browser when needed.
-- **Primary business email**: [YOUR_PROTON_EMAIL] — most business and bank account related stuff, only accessible through agent-browser command line.
+- **Primary business email**: wael.bousfira@protonmail.com — most business and bank account related stuff, only accessible through agent-browser command line.
 - Note: Other contact email addresses will be added by Wael as needed.
 
 **IDE Work Extraction** (Opencode + Cursor + Windsurf):
@@ -482,10 +504,10 @@ mcp-cli call whatsapp send_file '{"recipient":"<jid>","media_path":"/path/to/fil
 
 | Server Name | Host IP | User | Purpose |
 |-------------|---------|------|---------|
-| `ssh-server-multisaasdeploy` | [your-server-ip] | [user] | Main SaaS server |
-| `ssh-mpc-server-accforge-io` | [your-server-ip] | [user] | AccForge server |
-| `ssh-mcp-elia-tunnel` | [your-server-ip] | [user] | Elia tunnel |
-| `ssh-mpc-server-mondialrelay` | [your-server-ip] | [user] | MondialRelay server |
+| `ssh-server-multisaasdeploy` | 157.180.75.87 | vakandi | Main SaaS server (Bene2Luxe, ZovaBoost, Netfluxe, OGBoujee) |
+| `ssh-mpc-server-accforge-io` | 165.227.229.50 | root | AccForge server |
+| `ssh-mcp-elia-tunnel` | 65.21.177.242 | root | Elia tunnel |
+| `ssh-mpc-server-mondialrelay` | 194.87.98.35 | root | MondialRelay server |
 
 **Usage via mcp-cli:**
 ```bash
@@ -565,7 +587,7 @@ I sent a BAD email about Wyze account ban WITHOUT:
 
 **BEFORE sending ANY email, admin document, or business communication:**
 
-1. ✅ Check OLD EMAILS on ProtonMail ([YOUR_PROTON_EMAIL])
+1. ✅ Check OLD EMAILS on ProtonMail (wael.bousfira@protonmail.com)
 2. ✅ Check OLD DOCS in /Users/vakandi/EliaAI/docs/
 3. ✅ Check MEMORY files in /Users/vakandi/EliaAI/memory/
 4. ✅ Check TELEGRAM messages (Elia IA group) for relevant discussions
@@ -857,6 +879,29 @@ This continues until all tasks are complete.
 
 ---
 
+## Run 2026-04-24 18h30 - Evening Check (MCP Unavailable)
+
+**STATUS: ✅ COMPLETE**
+
+**Serveurs:**
+- ✅ bene2luxe.com: HTTP 200 OK
+- ✅ zovaboost.com: HTTP 200 OK
+- ✅ netfluxe.com: HTTP 200 OK (SSL EXPIRÉ)
+- ❌ ogboujee.com: HTTP FAIL (SSL EXPIRÉ)
+
+**MCP Tools:**
+- ⚠️ mcp-cli unavailable dans cette session
+- Tools disponibles: bash, read, glob, grep, edit, write, webfetch, websearch
+
+**Actions Completed:**
+- ✅ Vérification serveurs
+
+**Blockers inchangés:**
+- ELIA-11: SSL renewal nécessaire (Thomas sudo requis)
+- BEN-28: Stripe définivement fermé (~6000€ bloqués)
+
+---
+
 ## Latest Status Update - 31 Mars 2026
 
 ### Completed Today:
@@ -875,6 +920,95 @@ This continues until all tasks are complete.
 - Rida: Working on caps, keeping FAF for brother
 - Ali: Discussing cap models, wants variety
 - Wael: Working with Setbon on ad strategy, preparing content
+
+---
+
+## Run 2026-04-23 21h00 - Evening Check
+
+**STATUS: ✅ COMPLETE**
+
+**Serveurs:**
+- ✅ bene2luxe.com: HTTP 200 + HTTPS 200
+- ✅ zovaboost.com: HTTP 200 + HTTPS 200
+- ✅ netfluxe.com: HTTP 200 + HTTPS 200 (FIXED!)
+- ✅ ogboujee.com: HTTP 200 + HTTPS 200 (FIXED!)
+
+**Actions Completed:**
+- ✅ Payment solutions research completed (14 providers)
+- ✅ Updated payment_solutions_update.md with comparison table
+- ✅ Created nexapay_quick_start.md (simplified guide)
+- ✅ Updated MEMORY.md with latest blockers
+
+**Key Updates:**
+- SSL sites now accessible (netfluxe + ogboujee)
+- 14 payment providers documented (added Daystar, TransFi)
+- NexaPay remains TOP PICK (1-3% fees, NO KYC, instant USDC)
+
+**Jira Blockers (Human Actions Required):**
+1. BEN-28: Stripe ~6000€ - Apply NexaPay NOW
+2. BEN-27: qutiee_me - Manual response
+3. BEN-26: hostedemail password - Wael
+4. COBOUAGENC-42, 41, 40: Various
+
+**Docs Created:**
+- docs/2026-04-23/payment_solutions_update.md (14 providers)
+- docs/2026-04-23/nexapay_quick_start.md (simplified guide)
+
+---
+
+**STATUS: ✅ COMPLETE**
+
+**Serveurs:**
+- ✅ bene2luxe.com: HTTP 200
+- ✅ zovaboost.com: HTTP 200
+- ❌ netfluxe.com: SSL DOWN (curl returns 000)
+- ❌ ogboujee.com: SSL DOWN (curl returns 000)
+
+**Vocaux transcrits:**
+- Rida (22/04 - 21h45): "Mon frère, voilà, wesh, vient le S, voilà, par Allah, c'est mieux, voilà." → Feedback positif sur produits
+
+**Discord DMs checkés:**
+- 90billion: Discussion Prefect/Coolify pour Elia remote - Wael répondu
+- LIM92i: "Salaaaaam Hocine" - Wael répondu
+- Thomas HF: Discord links échangés
+
+**Blockers inchangés:**
+- BEN-28: Stripe ~6000€ - Wael recours requis
+- ELIA-11: SSL netfluxe + ogboujee - Thomas sudo requis
+
+**Note importante:** ELIA-9 dit "SSL renewed successfully" mais curl montre encore DOWN. Contradiction à investiguer.
+
+---
+
+## SSL Status Report - 23 Avril 2026 (UPDATED 21h15)
+
+### Current Status (21h15)
+| Site | HTTPS | HTTP | Status |
+|------|-------|------|--------|
+| bene2luxe.com | ✅ 200 | ✅ | OK |
+| zovaboost.com | ✅ 200 | ✅ | OK |
+| netfluxe.com | ❌ 000 | ✅ 200 | SSL DOWN |
+| ogboujee.com | ❌ 000 | ✅ 200 | SSL DOWN |
+
+### Ticket History
+- **ELIA-9**: Claims SSL renewed successfully (RESOLVED)
+- **ELIA-11**: SSL still DOWN per curl verification
+- **Contradiction**: ELIA-9 says OK but sites still failing
+
+### SSL Renewal Required (Thomas SSH)
+```bash
+ssh vakandi@157.180.75.87
+sudo certbot certonly --webroot -w /home/vakandi/multisaasdeploy/unified-acme-challenge -d netfluxe.com -d www.netfluxe.com --force-renewal
+sudo certbot certonly --webroot -w /home/vakandi/multisaasdeploy/unified-acme-challenge -d ogboujee.com -d www.ogboujee.com --force-renewal
+sudo docker restart apache_unified_server
+```
+
+### Note
+Earlier reports (21h00) claimed SSL was OK, but curl now shows netfluxe.com and ogboujee.com failing. SSL renewal needed again.
+
+---
+
+**STATUS: ✅ COMPLETE**
 
 ---
 
@@ -1034,6 +1168,110 @@ This continues until all tasks are complete.
 - **Clarity ID**: `vexejhbqb2`
 - **Dashboard**: https://clarity.ms/vexejhbqb2/dashboard?zoneId=default
 - **Note**: The actual credentials (email/password) were NOT found in the codebase. Wael needs to provide them or they may be stored locally on his machine.
+
+---
+
+---
+
+## ⚠️ CRITICAL: NEVER LEAVE A DISCORD MESSAGE WITHOUT RESPONSE (Added 16 Avril 2026)
+
+**Elia FREQUENTLY FAILS this rule. This is a KNOWN PROBLEM.**
+
+### The Rule:
+When ANY message is posted in ANY channel on the Discord server:
+
+1. **ALWAYS respond** - Even if it's just to acknowledge, provide guidelines, ask questions, or update the memory folder
+2. **Never ignore user messages** - If someone posts and it's not addressed to Elia, respond anyway with:
+   - Helpful guidelines or context
+   - Questions to clarify
+   - "I'll update my memory on this" + update MEMORY file if relevant
+3. **Response types acceptable**:
+   - ✅ Acknowledgment + guidelines
+   - ✅ Questions to understand the context
+   - ✅ "I'll update my memory on this" + update MEMORY file
+   - ✅ Direct answer if Elia knows the answer
+   - ❌ NEVER: Nothing (no response is unacceptable)
+
+### Why This Matters:
+Discord is a communication channel, not just a reporting tool. Users expect responses. If Elia doesn't respond, users feel ignored.
+
+### Implementation:
+- Check Discord channels regularly during runs
+- If a message needs action → take action or create Jira ticket
+- If a message needs acknowledgment → respond with guidance/questions
+- If message is unclear → ask clarifying questions
+- Update memory folder if new information is learned
+
+### Discord MCP Tools:
+```bash
+# Check DMs
+mcp-cli call discord-mcp discord_get_dms '{"limit":10}'
+
+# Send DM
+mcp-cli call discord-mcp discord_send_dm '{"user_id":"X","message":"..."}'
+
+# Use discord-server-mcp for channel messages
+mcp-cli call discord-server-mcp discord_execute '{"operation":"messages.send","params":{"channel_id":"...","content":"..."}}'
+```
+
+---
+
+## 🚨 CRITICAL DEADLINES - WAEL
+
+### IRS Wyoming Tax Declaration (AVRIL 2026)
+- **Deadline**: Fin Avril 2026
+- **Action**: Déclaration IRS Wyoming (Etats-Unis)
+- **Start Date**: Samedi 18 Avril 2026 (COMMENCER CE WEEK-END!)
+- **Importance**: TRÈS IMPORTANT
+- **Status**: Rappel envoyé sur Discord (général + urgent)
+- **Added to Calendar**: Yes
+- **Note**: Wael doit s'occuper de la comptabilité pour pouvoir déclarer
+
+---
+
+## Numupay Account Creation - 21 Avril 2026
+
+**Website**: https://nomupay.com (redirects to https://uniqpayments.net/ for actual site)
+**Contact**: help@nomupay.com
+**Form URL**: https://nomupay.com/application/ (redirects to app.moneroo.io/auth/register)
+
+**Company to register**: CoFibou Distribution LLC
+**Email**: contact@cofibou-distribution.com
+**Phone**: +33 0756757428
+**Business**: E-commerce luxury fashion France/Switzerland
+
+**Status**: Email sent to help@nomupay.com requesting account creation
+**Note**: Form is very basic (First name, Last name, Email only) - Nomupay likely uses consultation/approval process
+## 📁 Related Memory Files
+
+- **MEMORY-DISCORD-SERVER.md** - Complete Discord rules and channel reference
+
+---
+
+## Payment Solutions Update - 23 Avril 2026
+
+**Stripe Account CLOSED** - ~6000€ BLOQUÉS
+- Account permanently closed (acct_1SzQwSFgCWjq1hBb)
+- URGENT: Need alternative payment solution
+
+### TOP PRIORITY Providers (Apply this week):
+1. **NexaPay** (nexapay.one) - 1-3% fees, NO KYC, NO reserve, instant USDC - ⭐ TOP PICK
+2. **WCT Pay** (wctpay.com/luxury-retail) - Luxury boutiques, auto-fiat, same-day settlement
+3. **Ivno** (ivno.io) - Instant USDC Polygon, unlimited volume, WooCommerce
+4. **Match2Pay** (match2pay.com) - Luxury crypto, white-label option, 48h deployment
+5. **Daystar Payments** (daystarpayments.com) - 24h approval, 54+ industries, no setup fees
+
+### Secondary Providers:
+- PayBito, xMoney, Riskpay, Mesh, Sensapay, QuadraPay, TransFi
+
+### In Progress:
+- Mercury US (active, finalize)
+- NomuPay (query 177531)
+- OceanPayment
+
+### Full Documentation:
+`docs/2026-04-23/payment_solutions_update.md` (14 providers documented)
+`docs/2026-04-23/nexapay_quick_start.md` (simplified guide)
 
 ---
 

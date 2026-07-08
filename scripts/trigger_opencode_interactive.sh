@@ -4,6 +4,17 @@
 
 set -euo pipefail
 
+# ============================================================
+# SCHEDULER DISABLE GUARD
+# If .scheduler_disabled exists, exit immediately without running.
+# Create this file to permanently disable all scheduled/interactive agent runs:
+#   touch ~/EliaAI/.scheduler_disabled
+# ============================================================
+if [[ -f "$HOME/EliaAI/.scheduler_disabled" ]]; then
+    echo "[GUARD] .scheduler_disabled found — agent disabled. Exiting."
+    exit 0
+fi
+
 USER_MAC="$(whoami)"
 export HOME="/Users/${USER_MAC}"
 
@@ -65,22 +76,22 @@ start_mcp_servers() {
             case "$server" in
                 "telegram")
                     cd /Users/vakandi/Documents/mcps_server/telegram-mcp-server 2>/dev/null && \
-                    TELEGRAM_API_ID="29625025" \
-                    TELEGRAM_API_HASH="d9c784ff0c5b2a189c3292193711701f" \
-                    TG_BOT_TOKEN="8532030884:AAEwz4uDw-yqBmTkYp8GUAPlp2ZumqJs6EY" \
-                    TG_CHAT_ID="-1003640048371" \
-                    TG_USER_ID="5660154750" \
+                    TELEGRAM_API_ID="${TELEGRAM_API_ID:-}" \
+                    TELEGRAM_API_HASH="${TELEGRAM_API_HASH:-}" \
+                    TG_BOT_TOKEN="${TG_BOT_TOKEN:-}" \
+                    TG_CHAT_ID="${TG_CHAT_ID:-}" \
+                    TG_USER_ID="${TG_USER_ID:-}" \
                     DISABLE_APPROVALS_POLLING="true" \
                     node dist/index.js >> "$LOG_DIR/mcp_telegram.log" 2>&1 &
                     ;;
                 "mcp-atlassian")
                     cd /Users/vakandi && \
                     JIRA_URL="https://bsbagency.atlassian.net" \
-                    JIRA_USERNAME="wael.bousfira@gmail.com" \
-                    JIRA_API_TOKEN="[your-jira-api-token]" \
-                    CONFLUENCE_URL="[your-confluence-url]" \
-                    CONFLUENCE_USERNAME="[your-email]" \
-                    CONFLUENCE_API_TOKEN="[your-confluence-api-token]" \
+                    JIRA_USERNAME="${JIRA_USERNAME:-}" \
+                    JIRA_API_TOKEN="${JIRA_API_TOKEN:-}" \
+                    CONFLUENCE_URL="https://bsbagency.atlassian.net/wiki" \
+                    CONFLUENCE_USERNAME="${CONFLUENCE_USERNAME:-}" \
+                    CONFLUENCE_API_TOKEN="${CONFLUENCE_API_TOKEN:-}" \
                     /Users/vakandi/.local/bin/uvx mcp-atlassian >> "$LOG_DIR/mcp_atlassian.log" 2>&1 &
                     ;;
                 "bene2luxe_mcp")
@@ -550,45 +561,51 @@ fi
 echo "DEBUG: FULL_LOOP_MESSAGE length = ${#FULL_LOOP_MESSAGE}"
 echo "DEBUG: FIRST 200 chars = ${FULL_LOOP_MESSAGE:0:200}"
 
-# Always start our own server instance (don't rely on existing ones that may be broken)
+# Check if existing server is healthy — if so, reuse instead of destroying it
+SERVER_HEALTHY=false
 if nc -z 127.0.0.1 $OPENCODE_PORT 2>/dev/null; then
-    echo "[SERVER] Existing server detected on port $OPENCODE_PORT - stopping it first..."
     SERVER_PID=$(lsof -ti :$OPENCODE_PORT 2>/dev/null | head -1)
-    if [[ -n "$SERVER_PID" ]]; then
-        kill -9 $SERVER_PID 2>/dev/null || true
-        sleep 2
-    fi
-fi
-
-echo "[SERVER] Starting fresh server on port $OPENCODE_PORT..."
-if [[ -n "${PROXY_HTTP:-}" ]]; then
-    # IMPORTANT: OpenCode serve does NOT need HTTP_PROXY. If the proxy env vars
-    # are present, the OpenCode binary's HTTP client routes ALL requests through
-    # the proxy — including local plugin → viewer (127.0.0.1:38888) requests.
-    # The Webshare proxy returns 403 for localhost destinations
-    # (client_connect_invalid_ip), breaking the codemem plugin.
-    # Only the RUN command (inherits proxy from shell) needs outbound proxy access.
-    nohup env NO_PROXY="127.0.0.1,localhost,::1" no_proxy="127.0.0.1,localhost,::1" "$OPENCODE_BIN" serve --port $OPENCODE_PORT \
-        > /tmp/opencode_server_${OPENCODE_PORT}.log 2>&1 &
-else
-    nohup "$OPENCODE_BIN" serve --port $OPENCODE_PORT \
-        > /tmp/opencode_server_${OPENCODE_PORT}.log 2>&1 &
-fi
-SERVER_PID=$!
-
-# Wait for server to become available (up to 10 seconds)
-echo "[SERVER] Waiting for server to become available on port $OPENCODE_PORT..."
-for i in $(seq 1 10); do
-    if nc -z 127.0.0.1 $OPENCODE_PORT 2>/dev/null; then
-        echo "[SERVER] Server started successfully on port $OPENCODE_PORT (PID: $SERVER_PID, attempt: ${i}s)"
-        break
-    fi
-    if [[ $i -eq 10 ]]; then
-        echo "[SERVER] WARNING: Server may not have started properly after 10s - check /tmp/opencode_server_${OPENCODE_PORT}.log"
+    if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo "[SERVER] Existing healthy server on port $OPENCODE_PORT (PID: $SERVER_PID) — reusing"
+        SERVER_HEALTHY=true
     else
+        echo "[SERVER] Stale process on port $OPENCODE_PORT — cleaning up"
+        kill -9 $SERVER_PID 2>/dev/null || true
         sleep 1
     fi
-done
+fi
+
+if [[ "$SERVER_HEALTHY" != "true" ]]; then
+    echo "[SERVER] Starting fresh server on port $OPENCODE_PORT..."
+    if [[ -n "${PROXY_HTTP:-}" ]]; then
+        # IMPORTANT: OpenCode serve does NOT need HTTP_PROXY. If the proxy env vars
+        # are present, the OpenCode binary's HTTP client routes ALL requests through
+        # the proxy — including local plugin → viewer (127.0.0.1:38888) requests.
+        # The Webshare proxy returns 403 for localhost destinations
+        # (client_connect_invalid_ip), breaking the codemem plugin.
+        # Only the RUN command (inherits proxy from shell) needs outbound proxy access.
+        nohup env NO_PROXY="127.0.0.1,localhost,::1" no_proxy="127.0.0.1,localhost,::1" "$OPENCODE_BIN" serve --port $OPENCODE_PORT \
+            > /tmp/opencode_server_${OPENCODE_PORT}.log 2>&1 &
+    else
+        nohup "$OPENCODE_BIN" serve --port $OPENCODE_PORT \
+            > /tmp/opencode_server_${OPENCODE_PORT}.log 2>&1 &
+    fi
+    SERVER_PID=$!
+
+    # Wait for server to become available (up to 10 seconds)
+    echo "[SERVER] Waiting for server to become available on port $OPENCODE_PORT..."
+    for i in $(seq 1 10); do
+        if nc -z 127.0.0.1 $OPENCODE_PORT 2>/dev/null; then
+            echo "[SERVER] Server started successfully on port $OPENCODE_PORT (PID: $SERVER_PID, attempt: ${i}s)"
+            break
+        fi
+        if [[ $i -eq 10 ]]; then
+            echo "[SERVER] WARNING: Server may not have started properly after 10s - check /tmp/opencode_server_${OPENCODE_PORT}.log"
+        else
+            sleep 1
+        fi
+    done
+fi
 
 
 echo ""

@@ -1,0 +1,68 @@
+1
+00:00:00,000 --> 00:00:02,400
+5 GitHub URL Has That Feel Illegal To Know
+
+2
+00:00:02,400 --> 00:00:05,440
+1. Change github.com to gitmcp.io
+
+3
+00:00:05,440 --> 00:00:10,800
+This generates a .mcp config file that you can use to feed your entire project structure to
+
+4
+00:00:10,800 --> 00:00:16,240
+AI agents like Cursor so that they actually understand your code context without hallucinating.
+
+5
+00:00:16,240 --> 00:00:18,320
+2. Replace hub with ingest
+
+6
+00:00:18,320 --> 00:00:22,160
+This turns the entire repository into a single text prompt.
+
+7
+00:00:22,160 --> 00:00:26,800
+It is perfect for passing a massive code base into ChatGPT, Cloud, or Gemini.
+
+8
+00:00:26,800 --> 00:00:29,680
+3. Change github.com to gitdiagram.com
+
+9
+00:00:29,680 --> 00:00:32,720
+This instantly turns your code into a visual flowchart
+
+10
+00:00:32,720 --> 00:00:36,000
+so you can understand the architecture without reading a single line.
+
+11
+00:00:36,000 --> 00:00:38,400
+4. Change github to githubbox.com
+
+12
+00:00:38,400 --> 00:00:43,280
+This opens the repo in code sandbox so that you can actually run and test the project
+
+13
+00:00:43,280 --> 00:00:45,120
+in the browser without cloning it.
+
+14
+00:00:45,120 --> 00:00:48,480
+Finally, just press dot on your keyboard or change com to dev.
+
+15
+00:00:48,480 --> 00:00:51,600
+This opens a full VS Code editor right in the browser.
+
+16
+00:00:51,600 --> 00:00:53,040
+This feels like cheat codes.
+
+17
+00:00:53,040 --> 00:00:55,520
+Comment link and I'll send you the detailed list.
+

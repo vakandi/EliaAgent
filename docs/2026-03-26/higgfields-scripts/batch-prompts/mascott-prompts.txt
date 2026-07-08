@@ -1,0 +1,13 @@
+# Mascoot Episode Prompts (Short Versions)
+# Use with: higgfields_master.py mascott --episode N
+
+Animated luxury mascott character in Paris, Eiffel Tower background, adventure animation, vibrant colors, vertical 9:16 format
+Animated mascott sitting at Parisian café terrace, wearing designer sneakers, holding coffee, Paris street background, golden hour
+Animated mascott on boat cruise on Seine river, passing Eiffel Tower, sunset lighting, Parisian skyline, romantic adventure
+Animated mascott inside luxury boutique, surrounded by Chanel Dior LV products, amazed expression, shopping excitement
+Animated luxury mascott character in Swiss Alps, Matterhorn mountain, ski resort aesthetic, snow adventure, cartoon style
+Animated mascott at cozy Swiss chalet, fireplace, wooden interior, mountain view, alpine hospitality, warm atmosphere
+Animated mascott on Côte d'Azur beach, Mediterranean blue water, Nice beach, yachts visible, summer luxury lifestyle
+Animated mascott at Monte Carlo Casino Square, supercars, glamorous atmosphere, Monaco luxury, adventure cartoon
+Animated mascott with shopping bags from Chanel Dior LV, Paris streets, happy expression, shopping spree excitement
+Animated luxury mascott character exploring vintage luxury shop, discovering rare pieces, treasure hunting excitement

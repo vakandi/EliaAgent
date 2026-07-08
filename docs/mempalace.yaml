@@ -1,0 +1,10 @@
+wing: docs
+rooms:
+- name: biyou
+  description: Files from BIYOU/
+  keywords:
+  - biyou
+  - biyou
+- name: general
+  description: Files that don't fit other rooms
+  keywords: []

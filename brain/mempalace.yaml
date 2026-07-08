@@ -1,0 +1,25 @@
+wing: brain
+rooms:
+- name: linkers
+  description: Files from linkers/
+  keywords:
+  - linkers
+  - linkers
+- name: documentation
+  description: Files from wiki/
+  keywords:
+  - documentation
+  - wiki
+- name: frontend
+  description: Files from pages/
+  keywords:
+  - frontend
+  - pages
+- name: raw
+  description: Files from raw/
+  keywords:
+  - raw
+  - raw
+- name: general
+  description: Files that don't fit other rooms
+  keywords: []

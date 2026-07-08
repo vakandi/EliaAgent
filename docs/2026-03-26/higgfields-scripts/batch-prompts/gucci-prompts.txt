@@ -1,0 +1,13 @@
+# Gucci Product Prompts
+# Use with: kling_scripts.py batch --file gucci-prompts.txt
+
+Gucci accessories with iconic double-G hardware, premium Italian leather rotating slowly, luxury brand aesthetic, fashion editorial photography
+Close-up of Gucci GG buckle detail, premium leather texture, luxury craftsmanship, high-end fashion photography, signature hardware visible
+Gucci belt on luxury display, signature hardware, Italian leather quality visible, fashion magazine style, premium accessory
+Gucci GG belt lifestyle content, stylish outfit featuring double-G buckle, casual luxury aesthetic, fashion editorial
+Animated Gucci lifestyle, Mediterranean lifestyle, summer fashion, luxury accessories, European aesthetic
+Gucci leather goods detail shots, Italian craftsmanship visible, premium materials, heritage quality, luxury editorial
+Luxury Gucci packaging presentation, signature green box opening, premium unboxing experience, brand presentation
+Gucci flat lay, multiple accessories, GG logo visible, leather textures, product catalog style, professional photography
+Gucci sneakers rotating showcase, luxury footwear, Italian quality, fashion product video
+Animated Gucci lifestyle content, street style fashion, urban luxury, fashion-forward aesthetic

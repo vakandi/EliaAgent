@@ -1,0 +1,11 @@
+{
+  "sessionID": "ses_28150b809ffePnLdsP9zv4IrMV",
+  "updatedAt": "2026-04-11T22:51:16.812Z",
+  "sources": {
+    "stop": {
+      "state": "stopped",
+      "reason": "continuation stopped",
+      "updatedAt": "2026-04-11T22:51:16.812Z"
+    }
+  }
+}

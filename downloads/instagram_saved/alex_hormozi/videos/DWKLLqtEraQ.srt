@@ -1,0 +1,84 @@
+1
+00:00:00,000 --> 00:00:04,880
+2026, today, you need to shift away from role-based thinking to workflow-based
+
+2
+00:00:04,880 --> 00:00:08,520
+thinking. Let's say that you're like, I want to hire an editor.
+
+3
+00:00:08,600 --> 00:00:12,160
+But what we don't typically do is actually to find out on a more granular level,
+
+4
+00:00:12,180 --> 00:00:14,000
+what is this person actually responsible for?
+
+5
+00:00:14,080 --> 00:00:18,280
+Every single function in the business is just a series of actions when you take
+
+6
+00:00:18,280 --> 00:00:19,320
+it at the most granular level.
+
+7
+00:00:19,320 --> 00:00:21,880
+And most people just don't take the effort to really think through it.
+
+8
+00:00:21,880 --> 00:00:23,240
+So I'll give you like a wild example.
+
+9
+00:00:23,360 --> 00:00:26,600
+The first thing that like would begin would be an idea.
+
+10
+00:00:26,920 --> 00:00:31,480
+An idea is going to probably require some sort of trend research,
+
+11
+00:00:31,720 --> 00:00:34,520
+and then a ranking of things that are doing well.
+
+12
+00:00:34,560 --> 00:00:38,160
+That then moves to scripting. And as we go all the way along,
+
+13
+00:00:38,200 --> 00:00:40,080
+what we're end up making is one damn YouTube video.
+
+14
+00:00:40,120 --> 00:00:44,040
+And we need to break the entire business down into each of these kind of granular
+
+15
+00:00:44,040 --> 00:00:44,880
+levels.
+
+16
+00:00:44,880 --> 00:00:48,080
+And the reason that's important is because agents are doing each of these things.
+
+17
+00:00:48,200 --> 00:00:51,080
+Like I don't know if you've seen our media output is like tripled in the last
+
+18
+00:00:51,480 --> 00:00:53,160
+month and we haven't increased our head count at all.
+
+19
+00:00:53,680 --> 00:00:57,640
+And we did that because we have prompts that can do 30, 40, 50%.
+
+20
+00:00:57,640 --> 00:01:00,560
+They're eating up more and more of the workload so that one person can now do
+
+21
+00:01:00,560 --> 00:01:03,280
+the work of three and then it'll be the work of five and the work of 10.
+

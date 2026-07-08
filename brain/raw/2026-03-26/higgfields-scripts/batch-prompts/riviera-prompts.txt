@@ -1,0 +1,23 @@
+# [[../../../../wiki/concepts/Luxury-Brands#cote-dazur|Côte d'Azur]] & [[../../../../wiki/concepts/Luxury-Brands#french-riviera|French Riviera]] Lifestyle Prompts
+# Use with: kling_scripts.py batch --file riviera-prompts.txt
+
+Animated luxury mascott at [[../../../../wiki/concepts/Luxury-Brands#nice|Nice]] beach, [[../../../../wiki/concepts/Luxury-Brands#mediterranean|Mediterranean]] blue water, Promenade des Anglais background, [[../../../../wiki/concepts/Luxury-Brands#french-riviera|French Riviera]] lifestyle
+Animated mascott on [[../../../../wiki/concepts/Luxury-Brands#cannes|Cannes]] La Croisette, Palais des Festivals visible, film festival atmosphere, glamorous [[../../../../wiki/concepts/Luxury-Brands#french-riviera|French Riviera]]
+Animated luxury mascott at [[../../../../wiki/concepts/Luxury-Brands#monaco|Monaco]] Casino Square, supercars, F1 track visible, extreme wealth Monte Carlo atmosphere
+Animated mascott in [[../../../../wiki/concepts/Luxury-Brands#saint-tropez|Saint-Tropez]] port, giant yachts, trendy restaurants, famous jet-set destination
+Animated luxury mascott at [[../../../../wiki/concepts/Luxury-Brands#antibes|Antibes]] yacht harbor, massive boats, nautical atmosphere, [[../../../../wiki/concepts/Luxury-Brands#mediterranean|Mediterranean]] sailing culture
+Animated mascott at Provençal market, lavender, olives, local specialties, [[../../../../wiki/concepts/Luxury-Brands#mediterranean|Mediterranean]] food culture
+Animated luxury mascott at [[../../../../wiki/concepts/Luxury-Brands#grasse|Grasse]] perfume factory, smelling scents, French fragrance art, luxury perfumes
+Animated luxury mascott watching [[../../../../wiki/concepts/Luxury-Brands#mediterranean|Mediterranean]] sunset, orange sky reflecting on blue water, peaceful [[../../../../wiki/concepts/Luxury-Brands#cote-dazur|Côte d'Azur]] evening
+Animated luxury mascott on [[../../../../wiki/concepts/Luxury-Brands#french-riviera|French Riviera]] yacht, [[../../../../wiki/concepts/Luxury-Brands#mediterranean|Mediterranean]] sea, luxury sailing, coastal elegance
+Animated mascott at [[../../../../wiki/concepts/Luxury-Brands#cannes|Cannes]] beach club, luxury loungers, [[../../../../wiki/concepts/Luxury-Brands#mediterranean|Mediterranean]] sun, summer lifestyle content
+Animated luxury mascott at Villa Ephrussi de Rothschild, [[../../../../wiki/concepts/Luxury-Brands#french-riviera|French Riviera]] estate, Belle Époque architecture
+Animated mascott at [[../../../../wiki/concepts/Luxury-Brands#eze|Eze]] village, [[../../../../wiki/concepts/Luxury-Brands#mediterranean|Mediterranean]] views, [[../../../../wiki/concepts/Luxury-Brands#french-riviera|French Riviera]] hilltop town, scenic adventure
+Animated luxury mascott at [[../../../../wiki/concepts/Luxury-Brands#monaco|Monaco]] harbor, luxury yachts and supercars, Monte Carlo glamour
+Animated mascott at [[../../../../wiki/concepts/Luxury-Brands#saint-tropez|Saint-Tropez]] beach, Pampelonne beach scene, [[../../../../wiki/concepts/Luxury-Brands#french-riviera|French Riviera]] summer fashion
+Animated luxury mascott at [[../../../../wiki/concepts/Luxury-Brands#grasse|Grasse]] flower fields, lavender and roses, perfume ingredient scenery
+Animated luxury mascott at [[../../../../wiki/concepts/Luxury-Brands#cannes|Cannes]] luxury hotel, [[../../../../wiki/concepts/Luxury-Brands#french-riviera|French Riviera]] hospitality, five-star service
+Animated mascott at [[../../../../wiki/concepts/Luxury-Brands#mediterranean|Mediterranean]] beach café, pastis and seafood, Provençal lunch aesthetic
+Animated luxury mascott at [[../../../../wiki/concepts/Luxury-Brands#monaco|Monaco]] Formula 1 circuit, racing heritage, sports luxury
+Animated mascott at [[../../../../wiki/concepts/Luxury-Brands#french-riviera|French Riviera]] art gallery, contemporary art, cultural sophistication
+Animated luxury mascott at [[../../../../wiki/concepts/Luxury-Brands#nice|Nice]] old town, Cours Saleya market, authentic Provençal atmosphere

@@ -180,7 +180,7 @@ mcp-cli call discord-mcp discord_send_dm '{"user_id":"...","message":"..."}'
 
 # Discord Server (EliaWorkSpace - bot account "watson")
 # Get server structure
-bash: cd ~/Documents/EliaVoiceRecorder && DISCORD_BOT_TOKEN="[your-discord-bot-token]" python3 discord_server_structure.py
+bash: cd ~/Documents/EliaVoiceRecorder && DISCORD_BOT_TOKEN="<your-discord-bot-token>" python3 discord_server_structure.py
 
 # List channels
 mcp-cli call discord-server-mcp discord_execute '{"operation":"channels.list","params":{}}'

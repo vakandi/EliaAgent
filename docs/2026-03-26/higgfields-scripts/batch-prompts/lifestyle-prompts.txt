@@ -1,0 +1,13 @@
+# Lifestyle & Trends Prompts
+# Use with: free_models.py batch --file lifestyle-prompts.txt
+
+Parisian woman wearing Chanel sneakers and Dior sunglasses, street style fashion, elegant casual outfit, Parisian café background, fashion editorial
+Luxury sneakers on designer coffee table, grey suede and white canvas, lifestyle home interior, warm lighting, fashion magazine spread
+Premium sneakers displayed in minimalist luxury apartment, natural light from window, fashion editorial, European interior
+French street style fashion, fashion-forward outfit with luxury sneakers, Parisian architecture background, editorial photography
+Luxury lifestyle content, designer sneakers and accessories, minimalist apartment interior, natural light, fashion influencer style
+Premium fashion showcase, multiple luxury brands displayed elegantly, lifestyle photography, European aesthetic
+Fashion blogger with designer collection, Instagram aesthetic, perfectly curated flat lay, luxury lifestyle content
+French lifestyle content creator, coffee at café, luxury accessories, intellectual aesthetic, fashion magazine
+Animated French fashion content, Gen Z aesthetic, trendy outfit with luxury sneakers, viral TikTok style
+Minimalist luxury lifestyle, neutral colors, one statement piece, Chanel sneakers in grey, French aesthetic

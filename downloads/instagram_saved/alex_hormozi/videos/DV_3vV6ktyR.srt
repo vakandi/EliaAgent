@@ -1,0 +1,116 @@
+1
+00:00:00,000 --> 00:00:05,160
+I want direct to consumer brand. We are doing over five millions per year.
+
+2
+00:00:05,160 --> 00:00:06,160
+What's profit?
+
+3
+00:00:06,160 --> 00:00:09,840
+Over 70%. I would like to be in 10 millions per month.
+
+4
+00:00:09,840 --> 00:00:14,880
+The advice to double the business is different than the advice to 20%.
+
+5
+00:00:14,880 --> 00:00:16,600
+Which one would you rather me answer?
+
+6
+00:00:16,600 --> 00:00:17,400
+Double.
+
+7
+00:00:17,400 --> 00:00:18,400
+I mean, spend more payback.
+
+8
+00:00:18,400 --> 00:00:19,400
+Okay, so let's go to the other one.
+
+9
+00:00:19,400 --> 00:00:21,000
+No, no.
+
+10
+00:00:21,000 --> 00:00:23,440
+Well, your margin is going to start compressing
+
+11
+00:00:23,440 --> 00:00:26,640
+as you spend more and more dollars in advertising.
+
+12
+00:00:26,640 --> 00:00:29,920
+The only way you can counteract that
+
+13
+00:00:29,920 --> 00:00:31,840
+is two things. One is product driven.
+
+14
+00:00:31,840 --> 00:00:33,920
+You're getting some left word of mouth that
+
+15
+00:00:33,920 --> 00:00:35,680
+for every one person who buys the bag,
+
+16
+00:00:35,680 --> 00:00:38,120
+they send you another 0.2 people who send the bag.
+
+17
+00:00:38,120 --> 00:00:40,560
+So that offsets CAC at scale, which is word of mouth.
+
+18
+00:00:40,560 --> 00:00:43,200
+The second thing that offsets CAC at scale
+
+19
+00:00:43,200 --> 00:00:45,360
+is going to be brand reputation,
+
+20
+00:00:45,360 --> 00:00:46,840
+because you can say whatever you want about yourself
+
+21
+00:00:46,840 --> 00:00:48,840
+that the product sucks, that will end.
+
+22
+00:00:48,840 --> 00:00:50,680
+The brand lift that you're going to get,
+
+23
+00:00:50,680 --> 00:00:52,880
+especially because you're unpaid as your primary,
+
+24
+00:00:52,880 --> 00:00:54,160
+that you're going to get from being able to whitelist
+
+25
+00:00:54,160 --> 00:00:57,560
+and have different avatars that already have brand recognition or mutation,
+
+26
+00:00:57,640 --> 00:01:01,400
+where your stuff is going to be more difficult to calculate,
+
+27
+00:01:01,400 --> 00:01:03,040
+but I can tell you when it's not there,
+
+28
+00:01:03,040 --> 00:01:05,240
+is that you won't be able to scale.
+
+29
+00:01:05,240 --> 00:01:07,720
+So that's what you have to build towards.
+

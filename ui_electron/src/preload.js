@@ -28,6 +28,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onToggleStates: (callback) => {
     ipcRenderer.on('toggle-states', (_event, states) => callback(states));
   },
+  onSubworkers: (callback) => {
+    ipcRenderer.on('subworkers-list', (_event, data) => callback(data));
+  },
+  onSubworkerToggled: (callback) => {
+    ipcRenderer.on('subworker-toggled', (_event, result) => callback(result));
+  },
   removeAllListeners: (channel) => ipcRenderer.removeAllListeners(channel),
 });
 
@@ -37,4 +43,14 @@ contextBridge.exposeInMainWorld('popupAPI', {
   close: () => ipcRenderer.send('close-popup'),
   openUrl: (url) => ipcRenderer.send('open-url', url),
   openLogsTerminal: () => ipcRenderer.send('open-logs-terminal'),
+  openSubworkerLogs: (name) => ipcRenderer.send('open-subworker-logs', name),
+  openSubworkerLogFile: (path) => ipcRenderer.send('open-subworker-log-file', path),
+  getSubworkerRuns: (name) => ipcRenderer.send('get-subworker-runs', name),
+});
+
+// Extend electronAPI with subworker runs reply
+contextBridge.exposeInMainWorld('subworkerRunsAPI', {
+  onSubworkerRuns: (callback) => {
+    ipcRenderer.on('subworker-runs', (_event, data) => callback(data));
+  },
 });

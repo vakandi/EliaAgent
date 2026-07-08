@@ -1,0 +1,17 @@
+5 GitHub URL Has That Feel Illegal To Know
+1. Change github.com to gitmcp.io
+This generates a .mcp config file that you can use to feed your entire project structure to
+AI agents like Cursor so that they actually understand your code context without hallucinating.
+2. Replace hub with ingest
+This turns the entire repository into a single text prompt.
+It is perfect for passing a massive code base into ChatGPT, Cloud, or Gemini.
+3. Change github.com to gitdiagram.com
+This instantly turns your code into a visual flowchart
+so you can understand the architecture without reading a single line.
+4. Change github to githubbox.com
+This opens the repo in code sandbox so that you can actually run and test the project
+in the browser without cloning it.
+Finally, just press dot on your keyboard or change com to dev.
+This opens a full VS Code editor right in the browser.
+This feels like cheat codes.
+Comment link and I'll send you the detailed list.

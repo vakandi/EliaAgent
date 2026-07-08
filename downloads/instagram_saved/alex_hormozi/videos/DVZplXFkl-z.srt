@@ -1,0 +1,124 @@
+1
+00:00:00,000 --> 00:00:02,520
+we help financial advisory businesses scale.
+
+2
+00:00:02,520 --> 00:00:04,860
+On average right now, we're doing about 45K a month.
+
+3
+00:00:04,860 --> 00:00:05,700
+Problem?
+
+4
+00:00:05,700 --> 00:00:07,360
+I'm the main point of failure.
+
+5
+00:00:07,360 --> 00:00:09,200
+Can you get customers easily right now?
+
+6
+00:00:09,200 --> 00:00:10,040
+Yeah.
+
+7
+00:00:10,040 --> 00:00:11,040
+Okay, so getting customers is not a problem.
+
+8
+00:00:11,040 --> 00:00:12,480
+So the issue is delivering for the customers.
+
+9
+00:00:12,480 --> 00:00:14,440
+Yeah, like I haven't lost any clients,
+
+10
+00:00:14,440 --> 00:00:16,080
+but if I were to double it right now,
+
+11
+00:00:16,080 --> 00:00:18,800
+I would start not being able to service clients.
+
+12
+00:00:18,800 --> 00:00:21,260
+Step one is you need to think in workflows rather than roles.
+
+13
+00:00:21,260 --> 00:00:24,540
+Almost all asset creation has become incredibly commoditized.
+
+14
+00:00:24,540 --> 00:00:26,220
+Like you're building out those flows,
+
+15
+00:00:26,220 --> 00:00:27,960
+which when a new customer comes in,
+
+16
+00:00:27,960 --> 00:00:30,360
+that should kick off a process that then spins up VSL,
+
+17
+00:00:30,360 --> 00:00:32,240
+spins up ads, spins up creative.
+
+18
+00:00:32,240 --> 00:00:34,160
+So how many hours a day you spend building it?
+
+19
+00:00:34,160 --> 00:00:35,520
+Oh, it's all of my time right now.
+
+20
+00:00:35,520 --> 00:00:37,480
+The bad news is that you don't have any real problems
+
+21
+00:00:37,480 --> 00:00:38,320
+with your business.
+
+22
+00:00:38,320 --> 00:00:40,280
+You know what your constraint is, which is delivery.
+
+23
+00:00:40,280 --> 00:00:41,480
+The next constraint that's gonna come up
+
+24
+00:00:41,480 --> 00:00:42,360
+is gonna be sales.
+
+25
+00:00:42,360 --> 00:00:45,520
+Plug them into the AI and then ask for the recurring themes
+
+26
+00:00:45,520 --> 00:00:47,800
+that people say their problems are before they buy.
+
+27
+00:00:47,800 --> 00:00:50,820
+Take that list of problems, reintegrate that into the VSL.
+
+28
+00:00:50,820 --> 00:00:53,400
+We did this and it literally doubled our acquisition.
+
+29
+00:00:53,400 --> 00:00:54,760
+We literally just took only the pain points
+
+30
+00:00:54,760 --> 00:00:56,980
+that people said, put those in, and then we're like,
+
+31
+00:00:56,980 --> 00:00:59,900
+we literally made a document called Why People Buy.
+
