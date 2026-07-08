@@ -1,3 +1,10 @@
+# Voice transcription files
+voice_msg_yourbrand.tsv
+voice_msg_yourbrand.vtt
+
+# Backups
+setup/backups/
+
 # Personal data - NEVER commit
 brain/
 docs/

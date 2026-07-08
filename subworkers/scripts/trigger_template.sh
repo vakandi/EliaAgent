@@ -55,6 +55,23 @@ if ! command -v oh-my-opencode &>/dev/null; then
   exit 1
 fi
 
+# ── Binary integrity check ─────────────────────────────────
+# Detect oh-my-opencode installations where the bun global package
+# is a symlink to a local source checkout. This causes EPERM errors
+# on macOS because Node.js can't read files through the symlink
+# due to provenance/security extended attributes.
+BUN_PKG="$HOME/.bun/install/global/node_modules/oh-my-opencode"
+if [[ -L "$BUN_PKG" ]]; then
+  TARGET=$(readlink "$BUN_PKG")
+  log "FATAL: oh-my-opencode global package is a symlink (broken install)"
+  log "       $BUN_PKG -> $TARGET"
+  log ""
+  log "This happens when 'bun install -g' was run from a local project directory"
+  log "instead of from the npm registry. Fix by reinstalling properly:"
+  log "  rm -rf \"$BUN_PKG\" && bun install -g oh-my-opencode"
+  exit 1
+fi
+
 log "Starting $AGENT_ID trigger..."
 
 # ── .enabled gate ─────────────────────────────────────────
