@@ -7,6 +7,12 @@ setlocal EnableDelayedExpansion
 set "AGENT_DIR=%~dp0"
 set "TRIGGER_SCRIPT=%~dp0trigger_opencode_interactive.bat"
 
+REM Scheduler disabled guard - matches cron_wrapper.sh / start_agents.sh pattern
+if exist "%AGENT_DIR%.scheduler_disabled" (
+    echo [%date% %time%] Scheduler DISABLED - exiting
+    exit /b 0
+)
+
 REM ─── Color variables (empty = plain text, set codes for ANSI-capable terminals) ───
 set "CYAN="
 set "YELLOW="

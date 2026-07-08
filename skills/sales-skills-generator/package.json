@@ -1,0 +1,105 @@
+{
+  "name": "sales-skills-generator",
+  "version": "1.0.0",
+  "description": "Sales Skills Generator - Génère automatiquement des compétences de vente à partir des analyses YouTube",
+  "author": "Mycroft IA",
+  "category": "skill-generation",
+  "tags": [
+    "sales",
+    "skills",
+    "generation",
+    "youtube",
+    "marketing",
+    "training"
+  ],
+  "dependencies": [
+    "pandas",
+    "jinja2",
+    "markdown",
+    "pdfkit",
+    "openpyxl",
+    "PyYAML",
+    "matplotlib",
+    "seaborn"
+  ],
+  "commands": [
+    {
+      "name": "generate-sales-skills",
+      "description": "Générer des compétences de vente à partir d'une analyse YouTube",
+      "usage": "python generator.py --input \"analysis.json\" --output \"skills_output/\"",
+      "example": "python generator.py --input \"hormozi_analysis.json\" --output \"sales_skills/\""
+    },
+    {
+      "name": "batch-generate",
+      "description": "Générer plusieurs skills à partir d'analyses multiples",
+      "usage": "python generator.py --input \"batch_analyses/\" --batch --output \"skill_collection/\"",
+      "example": "python generator.py --input \"analyses/\" --batch --output \"generated_skills/\""
+    },
+    {
+      "name": "export-for-openclaw",
+      "description": "Exporter les skills au format OpenClaw",
+      "usage": "python generator.py --input \"analysis.json\" --format \"openclaw\" --output \"openclaw_skills/\"",
+      "example": "python generator.py --input \"analysis.json\" --format \"openclaw\" --output \"skills/\""
+    }
+  ],
+  "config": {
+    "skill_templates": {
+      "objection_handling": {
+        "beginner": {"estimated_time": "3-4 hours", "exercises_count": 5},
+        "intermediate": {"estimated_time": "5-6 hours", "exercises_count": 8},
+        "advanced": {"estimated_time": "8-10 hours", "exercises_count": 12}
+      },
+      "closing_techniques": {
+        "beginner": {"estimated_time": "2-3 hours", "exercises_count": 4},
+        "intermediate": {"estimated_time": "4-5 hours", "exercises_count": 7},
+        "advanced": {"estimated_time": "6-8 hours", "exercises_count": 10}
+      }
+    },
+    "learning_path_settings": {
+      "phases": {
+        "foundation": {"weight": 0.25, "focus": "Understanding concepts"},
+        "practice": {"weight": 0.5, "focus": "Hands-on application"},
+        "mastery": {"weight": 0.25, "focus": "Real-world application"}
+      }
+    },
+    "export_formats": ["json", "openclaw", "markdown", "pdf"]
+  },
+  "installation": {
+    "windows": "install.bat",
+    "linux": "install.sh",
+    "macos": "install.sh"
+  },
+  "input_formats": [
+    "youtube_analysis_json",
+    "batch_analysis_folder"
+  ],
+  "output_formats": [
+    "skill_json",
+    "openclaw_format",
+    "markdown_document",
+    "pdf_report"
+  ],
+  "features": [
+    "Génération automatique de skills de vente",
+    "Adaptation par niveau de difficulté",
+    "Création de parcours d'apprentissage",
+    "Génération d'exercices pratiques",
+    "Calcul de métriques de succès",
+    "Export OpenClaw natif",
+    "Traitement par lots",
+    "Qualité et validation intégrées"
+  ],
+  "target_audience": [
+    "Formateurs en vente",
+    "Managers d'équipe commerciale",
+    "Consultants vente",
+    "Entrepreneurs",
+    "Responsables formation"
+  ],
+  "use_cases": [
+    "Créer des programmes de formation à partir de vidéos YouTube",
+    "Générer des compétences de vente structurées",
+    "Automatiser la création de contenu pédagogique",
+    "Créer des bibliothèques de skills pour OpenClaw"
+  ]
+}

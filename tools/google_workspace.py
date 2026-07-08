@@ -68,9 +68,9 @@ def get_oauth_credentials():
 
 
 def create_calendar_event(
-    summary, description, start_time, end_time, timezone="Europe/Paris", reminders=None
+    summary, description, start_time, end_time, timezone="Europe/Paris", reminders=None, with_meet=False
 ):
-    """Create an event in Google Calendar with optional reminders
+    """Create an event in Google Calendar with optional reminders and Google Meet
 
     Args:
         summary: Event title
@@ -79,6 +79,7 @@ def create_calendar_event(
         end_time: ISO format end time
         timezone: Timezone (default: Europe/Paris)
         reminders: List of minutes before event to remind (e.g., [5, 15, 30, 60, 1440] for 5min, 15min, 30min, 1hour, 1day)
+        with_meet: If True, automatically creates a Google Meet video conference link
 
     Example:
         create_calendar_event(
@@ -86,14 +87,15 @@ def create_calendar_event(
             "Discuss Q2 goals",
             "2026-04-15T14:00:00",
             "2026-04-15T15:00:00",
-            reminders=[15, 60]  # 15 min and 1 hour before
+            reminders=[15, 60],
+            with_meet=True
         )
     """
     try:
         creds = get_oauth_credentials()
         calendar_service = build("calendar", "v3", credentials=creds)
 
-        event = {
+        event_body = {
             "summary": summary,
             "description": description,
             "start": {
@@ -106,22 +108,45 @@ def create_calendar_event(
             },
         }
 
+        # Add Google Meet video conference if requested
+        if with_meet:
+            event_body["conferenceData"] = {
+                "createRequest": {
+                    "conferenceSolutionKey": {"type": "hangoutsMeet"},
+                    "requestId": f"meet-{datetime.now().timestamp()}",
+                }
+            }
+
         # Add custom reminders if provided
         if reminders:
-            event["reminders"] = {
+            event_body["reminders"] = {
                 "useDefault": False,
                 "overrides": [
                     {"method": "popup", "minutes": minutes} for minutes in reminders
                 ],
             }
 
-        event = (
-            calendar_service.events().insert(calendarId="primary", body=event).execute()
-        )
+        insert_kwargs = {
+            "calendarId": "primary",
+            "body": event_body,
+        }
+        if with_meet:
+            insert_kwargs["conferenceDataVersion"] = 1
+
+        event = calendar_service.events().insert(**insert_kwargs).execute()
+
+        meet_link = ""
+        if with_meet:
+            entry_points = event.get("conferenceData", {}).get("entryPoints", [])
+            for ep in entry_points:
+                if ep.get("entryPointType") == "video":
+                    meet_link = ep.get("uri", "")
+
         return {
             "success": True,
             "event_id": event.get("id"),
             "url": f"https://calendar.google.com/calendar/event/{event.get('id')}",
+            "meet_link": meet_link,
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -722,6 +747,42 @@ if __name__ == "__main__":
             print(f"✅ Event created: {result['url']}")
             if reminders:
                 print(f"   Reminders set: {reminders}")
+        else:
+            print(f"❌ Error: {result['error']}")
+
+    elif command == "create-meet":
+        summary = sys.argv[2] if len(sys.argv) > 2 else "Google Meet"
+        description = sys.argv[3] if len(sys.argv) > 3 else ""
+
+        if len(sys.argv) > 4 and sys.argv[4]:
+            try:
+                start_time = datetime.fromisoformat(sys.argv[4])
+            except ValueError:
+                start_time = datetime.now() + timedelta(hours=1)
+        else:
+            start_time = datetime.now() + timedelta(hours=1)
+
+        if len(sys.argv) > 5 and sys.argv[5]:
+            try:
+                end_time = datetime.fromisoformat(sys.argv[5])
+            except ValueError:
+                end_time = start_time + timedelta(hours=1)
+        else:
+            end_time = start_time + timedelta(hours=1)
+
+        result = create_calendar_event(
+            summary,
+            description,
+            start_time.isoformat(),
+            end_time.isoformat(),
+            with_meet=True,
+        )
+
+        if result["success"]:
+            meet_link = result.get("meet_link", "")
+            print(f"✅ Google Meet created: {result['url']}")
+            if meet_link:
+                print(f"🔗 Meet link: {meet_link}")
         else:
             print(f"❌ Error: {result['error']}")
 

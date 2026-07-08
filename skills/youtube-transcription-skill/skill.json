@@ -1,0 +1,76 @@
+{
+  "name": "youtube-transcription-skill",
+  "version": "1.0.0",
+  "description": "YouTube Transcription Skill - Télécharge et transcrit des vidéos YouTube pour créer des compétences de vente basées sur Alex Hormozi",
+  "author": "Mycroft IA",
+  "category": "content-analysis",
+  "tags": [
+    "youtube",
+    "transcription", 
+    "sales",
+    "video-analysis",
+    "alex-hormozi",
+    "skill-creation"
+  ],
+  "dependencies": [
+    "yt-dlp",
+    "openai-whisper",
+    "youtube-transcript-api",
+    "requests"
+  ],
+  "commands": [
+    {
+      "name": "transcribe-youtube",
+      "description": "Transcrire une vidéo YouTube et créer un skill de vente",
+      "usage": "python main.py --url \"URL_YOUTUBE\" --create-skill",
+      "example": "python main.py --url \"https://youtube.com/watch?v=abc123\" --create-skill"
+    },
+    {
+      "name": "batch-transcribe",
+      "description": "Transcrire plusieurs vidéos d'une playlist",
+      "usage": "python main.py --url \"PLAYLIST_URL\" --batch --create-skill",
+      "example": "python main.py --url \"https://youtube.com/playlist?list=abc123\" --batch --create-skill"
+    }
+  ],
+  "config": {
+    "whisper_model": "base",
+    "output_dir": "skills_output",
+    "max_concurrent_downloads": 3
+  },
+  "installation": {
+    "windows": "install.bat",
+    "linux": "install.sh",
+    "macos": "install.sh"
+  },
+  "input_formats": [
+    "youtube_url",
+    "playlist_url"
+  ],
+  "output_formats": [
+    "json",
+    "skill",
+    "markdown"
+  ],
+  "features": [
+    "Téléchargement automatique de vidéos YouTube",
+    "Transcription avec Whisper AI",
+    "Extraction de concepts de vente",
+    "Détection de frameworks de vente",
+    "Création de skills structurés",
+    "Support de playlists",
+    "Nettoyage automatique des fichiers"
+  ],
+  "target_audience": [
+    "Formateurs en vente",
+    "Coaches",
+    "Vendeurs",
+    "Entrepreneurs",
+    "Développeurs de compétences"
+  ],
+  "use_cases": [
+    "Créer des compétences de vente à partir de vidéos d'experts",
+    "Analyser le contenu d'Alex Hormozi pour créer des frameworks",
+    "Générer du contenu éducatif structuré",
+    "Automatiser la création de compétences à partir de vidéos"
+  ]
+}

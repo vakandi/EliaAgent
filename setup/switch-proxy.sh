@@ -20,19 +20,20 @@ parse_last() {
 
 time_ago() {
     local ts="$1"
-    [ -z "$ts" ] && echo "never"
+    [ -z "$ts" ] && { echo "never"; return; }
     le=$(date -j -f "%Y-%m-%d %H:%M:%S" "$ts" +%s 2>/dev/null)
-    [ -z "$le" ] && echo "unknown"
+    [ -z "$le" ] && { echo "unknown"; return; }
     diff=$(($(date +%s) - le))
-    [ $diff -lt 60 ] && echo "${diff}s ago"
-    [ $diff -lt 3600 ] && echo "$((diff/60))m ago"
-    [ $diff -lt 86400 ] && echo "$((diff/3600))h ago"
-    echo "$((diff/86400))d ago"
+    if [ $diff -lt 60 ]; then echo "${diff}s ago"
+    elif [ $diff -lt 3600 ]; then echo "$((diff/60))m ago"
+    elif [ $diff -lt 86400 ]; then echo "$((diff/3600))h ago"
+    else echo "$((diff/86400))d ago"
+    fi
 }
 
 check_proxy() {
     local ip=$1 port=$2 user=$3 pass=$4
-    wget -q -O - --no-check-certificate -e "https_proxy=http://$user:$pass@$ip:$port" https://api.ipify.org --timeout=5 2>/dev/null
+    curl -s --max-time 5 --proxy "http://$user:$pass@$ip:$port" https://api.ipify.org 2>/dev/null
 }
 
 echo "🔄 Proxy Switcher"
