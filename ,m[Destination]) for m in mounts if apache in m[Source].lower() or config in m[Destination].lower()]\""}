@@ -1,0 +1,3 @@
+Error [INVALID_JSON_ARGUMENTS]: Invalid JSON in tool arguments
+  Details: Parse error: JSON Parse error: Unterminated string
+  Suggestion: Use valid JSON: '{"path": "./file.txt"}'. Run 'mcp-cli info <server> <tool>' for the schema.

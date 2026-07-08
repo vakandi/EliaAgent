@@ -1,0 +1,85 @@
+{
+  "name": "youtube-transcription-skill",
+  "version": "1.0.0",
+  "description": "YouTube Transcription Skill - Télécharge et transcrit les vidéos YouTube",
+  "author": "Mycroft IA",
+  "category": "content-processing",
+  "tags": [
+    "youtube",
+    "transcription",
+    "download",
+    "whisper",
+    "nlp"
+  ],
+  "dependencies": [
+    "yt-dlp",
+    "openai-whisper",
+    "youtube-transcript-api",
+    "requests"
+  ],
+  "commands": [
+    {
+      "name": "transcribe-youtube",
+      "description": "Transcrire une vidéo YouTube",
+      "usage": "python main.py --url \"URL_VIDEO\" --output \"transcription.json\"",
+      "example": "python main.py --url \"https://youtube.com/watch?v=abc123\" --output \"hormozi_transcription.json\""
+    },
+    {
+      "name": "transcribe-playlist",
+      "description": "Transcrire une playlist YouTube",
+      "usage": "python main.py --playlist \"PLAYLIST_URL\" --batch --output \"transcriptions/\"",
+      "example": "python main.py --playlist \"https://youtube.com/playlist?list=xyz\" --batch"
+    },
+    {
+      "name": "create-skill",
+      "description": "Créer un skill à partir de la transcription",
+      "usage": "python main.py --url \"URL_VIDEO\" --create-skill --output \"skill_output/\"",
+      "example": "python main.py --url \"https://youtube.com/watch?v=abc123\" --create-skill"
+    }
+  ],
+  "config": {
+    "transcription_settings": {
+      "model": "base",
+      "language": "auto",
+      "output_format": "json"
+    },
+    "download_settings": {
+      "quality": "best",
+      "format": "mp4",
+      "subtitle": true
+    },
+    "processing_settings": {
+      "clean_text": true,
+      "remove_silence": true,
+      "segment_by_speaker": true
+    }
+  },
+  "installation": {
+    "windows": "install.bat",
+    "linux": "install.sh",
+    "macos": "install.sh"
+  },
+  "input_formats": [
+    "youtube_url",
+    "playlist_url"
+  ],
+  "output_formats": [
+    "transcription_json",
+    "skill_json",
+    "markdown",
+    "txt"
+  ],
+  "features": [
+    "Téléchargement de vidéos YouTube",
+    "Transcription avec Whisper AI",
+    "Génération de skills",
+    "Support playlists",
+    "Nettoyage automatique du texte"
+  ],
+  "target_audience": [
+    "Content creators",
+    "Researchers",
+    "Educators",
+    "Sales trainers"
+  ]
+}

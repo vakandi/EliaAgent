@@ -1,0 +1,36 @@
+{
+  "name": "cursor-prompt-monitor",
+  "version": "1.0.0",
+  "description": "Monitor and collect prompts from Cursor, Windsurf, and Kiro IDEs",
+  "author": "Eurus IA",
+  "license": "MIT",
+  "main": "index.js",
+  "scripts": {
+    "test": "node test.js",
+    "monitor": "node monitor.js",
+    "analyze": "node analyzer.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "fs-extra": "^11.1.1",
+    "chokidar": "^3.5.3",
+    "moment": "^2.29.4",
+    "lodash": "^4.17.21"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "nodemon": "^3.0.0"
+  },
+  "keywords": [
+    "cursor",
+    "windsurf",
+    "kiro",
+    "prompt-monitoring",
+    "ide",
+    "productivity",
+    "context-awareness"
+  ],
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}

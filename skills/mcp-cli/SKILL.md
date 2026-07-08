@@ -131,6 +131,32 @@ mcp-cli call discord-server-mcp discord_discover
 mcp-cli call discord-server-mcp discord_execute '{"action":"send_message","channel":"...","content":"..."}'
 ```
 
+### Vercel MCP (Project Management & Deployments)
+```bash
+# Get teams first
+mcp-cli call vercel-cli list_teams '{}'
+
+# List all projects
+mcp-cli call vercel-cli list_projects '{"teamId":"team_xxx"}'
+
+# Project details
+mcp-cli call vercel-cli get_project '{"projectId":"prj_xxx","teamId":"team_xxx"}'
+
+# Deployments
+mcp-cli call vercel-cli list_deployments '{"projectId":"prj_xxx","teamId":"team_xxx"}'
+mcp-cli call vercel-cli get_deployment '{"deploymentId":"dpl_xxx","teamId":"team_xxx"}'
+
+# Domains
+mcp-cli call vercel-cli list_domains '{"projectId":"prj_xxx","teamId":"team_xxx"}'
+
+# Environment variables
+mcp-cli call vercel-cli get_env_vars '{"projectId":"prj_xxx","teamId":"team_xxx"}'
+mcp-cli call vercel-cli create_env_var '{"projectId":"prj_xxx","teamId":"team_xxx","key":"KEY","value":"secret","type":"encrypted","target":["production"]}'
+
+# Logs
+mcp-cli call vercel-cli get_logs '{"deploymentId":"dpl_xxx","teamId":"team_xxx"}'
+```
+
 ## Common Issues
 
 | Issue | Solution |
