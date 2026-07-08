@@ -44,19 +44,19 @@ Each step references files from previous steps. Doing them in order is critical.
 **Before creating anything**, read these reference files to understand the conventions:
 
 ```bash
-cat /path/to/EliaAI/subworkers/SUBWORKERS_SYSTEM.md
-cat /path/to/EliaAI/subworkers/scripts/trigger_template.sh
-cat /path/to/config/opencode/opencode.json | python3 -c "import sys,json; d=json.load(sys.stdin); print(json.dumps(d.get('agent',{}), indent=2))"
-ls /path/to/config/opencode/agents/
-ls /path/to/EliaAI/subworkers/scripts/
-ls /path/to/EliaAI/subworkers/plists/
+cat /path/to/subworkers/SUBWORKERS_SYSTEM.md
+cat /path/to/subworkers/scripts/trigger_template.sh
+cat /path/to/opencode.json | python3 -c "import sys,json; d=json.load(sys.stdin); print(json.dumps(d.get('agent',{}), indent=2))"
+ls /path/to/opencode/agents/
+ls /path/to/subworkers/scripts/
+ls /path/to/subworkers/plists/
 ```
 
-Also read the newest subworker (mirorpay-seo) — it follows the current system with workspace isolation:
+Also read the newest subworker (`my-agent`) — it follows the current system with workspace isolation:
 ```bash
-cat /path/to/EliaAI/subworkers/mirorpay-seo/PROMPT.md
-cat /path/to/EliaAI/subworkers/scripts/trigger_mirorpay_seo.sh
-ls -la /path/to/EliaAI/subworkers/mirorpay-seo/workspace/
+cat /path/to/subworkers/my-agent/PROMPT.md
+cat /path/to/subworkers/scripts/trigger_my_agent.sh
+ls -la /path/to/subworkers/my-agent/workspace/
 ```
 
 ---
@@ -66,8 +66,8 @@ ls -la /path/to/EliaAI/subworkers/mirorpay-seo/workspace/
 Every new subworker MUST be registered in both `opencode.json` AND `oh-my-openagent.json`.
 
 ### Conventions
-- **Agent ID**: kebab-case, descriptive (e.g., `yourbrand-suppliers`, `mirorpay-seo`)
-- **Agent name** (for trigger scripts): underscore version of Agent ID (`yourbrand_suppliers`, `mirorpay_seo`)
+- **Agent ID**: kebab-case, descriptive (e.g., `my-custom-agent`, `scheduler-bot`)
+- **Agent name** (for trigger scripts): underscore version of Agent ID (`my_custom_agent`, `scheduler_bot`)
 - **Mode**: always `"primary"` for scheduled autonomous agents
 
 ### File 1: `~/.config/opencode/opencode.json`
@@ -77,7 +77,7 @@ Add to the `"agent"` section:
 ```python
 import json
 
-with open('/path/to/config/opencode/opencode.json') as f:
+with open('/path/to/opencode.json') as f:
     data = json.load(f)
 
 data['agent']['<agent-id>'] = {
@@ -85,7 +85,7 @@ data['agent']['<agent-id>'] = {
     "mode": "primary"
 }
 
-with open('/path/to/config/opencode/opencode.json', 'w') as f:
+with open('/path/to/opencode.json', 'w') as f:
     json.dump(data, f, indent=2)
     f.write('\n')
 ```
@@ -108,7 +108,7 @@ data['agents']['<agent-id>'] = {
 data['categories']['<agent-id>'] = {
     "model": "opencode/big-pickle",
     "description": "<short description>",
-    "prompt_append": "**FIRST: Read /path/to/EliaAI/subworkers/<agent-id>/PROMPT.md for your full instructions.**\n\nYou are <agent-id>. Execute your assigned task. Always respect your workspace constraint."
+    "prompt_append": "**FIRST: Read /path/to/subworkers/<agent-id>/PROMPT.md for your full instructions.**\n\nYou are <agent-id>. Execute your assigned task. Always respect your workspace constraint."
 }
 ```
 
@@ -138,7 +138,7 @@ The agent personality file in `~/.config/opencode/agents/` serves as the agent's
 when the subworker triggers. ALWAYS include YAML frontmatter.
 
 **YAML frontmatter fields:**
-- `name`: Must match agent ID (e.g., `mirorpay-seo`)
+- `name`: Must match agent ID (e.g., `my-custom-agent`)
 - `slug`: Same as name
 - `description`: Short description
 - `model`: `opencode/big-pickle`
@@ -178,7 +178,7 @@ Tu es un [role] spécialisé en [domain]. [1-2 sentence identity].
 - ❌ [What to avoid]
 ```
 
-**Path:** `/path/to/config/opencode/agents/<agent-id>.md`
+**Path:** `/path/to/opencode/agents/<agent-id>.md`
 
 ---
 
@@ -186,7 +186,7 @@ Tu es un [role] spécialisé en [domain]. [1-2 sentence identity].
 
 Create the detailed workflow document. This is the MAIN file the agent reads at runtime.
 
-**Location:** `/path/to/EliaAI/subworkers/<agent-id>/PROMPT.md`
+**Location:** `/path/to/subworkers/<agent-id>/PROMPT.md`
 
 **Required sections:**
 1. **SOURCE DE VÉRITÉ** — List all personality files to read first (from `~/.config/opencode/agents/`)
@@ -225,12 +225,12 @@ AGENT_NAME="<underscore_agent_name>"
 source "$(dirname "$0")/trigger_template.sh"
 ```
 
-The only configuration variable is `AGENT_NAME` (underscore convention, e.g., `mirorpay_seo`).
-The template derives the agent ID as `AGENT_ID="${AGENT_NAME//_/-}"` (e.g., `mirorpay-seo`).
+The only configuration variable is `AGENT_NAME` (underscore convention, e.g., `my_custom_agent`).
+The template derives the agent ID as `AGENT_ID="${AGENT_NAME//_/-}"` (e.g., `my-custom-agent`).
 
 **Make it executable:**
 ```bash
-chmod +x /path/to/EliaAI/subworkers/scripts/trigger_<agent_name>.sh
+chmod +x /path/to/subworkers/scripts/trigger_<agent_name>.sh
 ```
 
 ### What the template handles for you
@@ -256,7 +256,7 @@ MUST also create the per-agent `opencode.json` to restrict file access.
 ### 5.1 Create workspace directory
 
 ```bash
-mkdir -p /path/to/EliaAI/subworkers/<agent-id>/workspace
+mkdir -p /path/to/subworkers/<agent-id>/workspace
 ```
 
 ### 5.2 Create per-agent `workspace/opencode.json`
@@ -277,11 +277,11 @@ full MCP/API access but cannot read/write files outside `workspace/`.
   },
   "permissions": {
     "read": {
-      "allow": ["/path/to/EliaAI/subworkers/<agent-id>/workspace/**"],
+      "allow": ["/path/to/subworkers/<agent-id>/workspace/**"],
       "deny": ["**"]
     },
     "write": {
-      "allow": ["/path/to/EliaAI/subworkers/<agent-id>/workspace/**"],
+      "allow": ["/path/to/subworkers/<agent-id>/workspace/**"],
       "deny": ["**"]
     },
     "execute": {
@@ -313,8 +313,8 @@ OpenCode won't load the per-agent config. The template handles this automaticall
 Creates a scheduled LaunchAgent. The plist runs the trigger script at the specified interval.
 
 **Naming conventions in the plist:**
-- `<agent-id>` = hyphenated (e.g., `mirorpay-seo`) — used in Label and folder paths
-- `<agent_name>` = underscored (e.g., `mirorpay_seo`) — used in trigger script filename and log file
+- `<agent-id>` = hyphenated (e.g., `my-custom-agent`) — used in Label and folder paths
+- `<agent_name>` = underscored (e.g., `my_custom_agent`) — used in trigger script filename and log file
 
 **Template:**
 ```xml
@@ -329,7 +329,7 @@ Creates a scheduled LaunchAgent. The plist runs the trigger script at the specif
     <key>ProgramArguments</key>
     <array>
         <string>/bin/zsh</string>
-        <string>/path/to/EliaAI/subworkers/scripts/trigger_<agent_name>.sh</string>
+        <string>/path/to/subworkers/scripts/trigger_<agent_name>.sh</string>
     </array>
 
     <key>RunAtLoad</key>
@@ -347,17 +347,17 @@ Creates a scheduled LaunchAgent. The plist runs the trigger script at the specif
         <key>PATH</key>
         <string>/path/to/opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>HOME</key>
-        <string>/home/user</string>
+        <string>/path/to/home</string>
     </dict>
 
     <key>WorkingDirectory</key>
     <string>/path/to/EliaAI</string>
 
     <key>StandardOutPath</key>
-    <string>/path/to/EliaAI/subworkers/logs/<agent_name>.log</string>
+    <string>/path/to/subworkers/logs/<agent_name>.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/path/to/EliaAI/subworkers/logs/<agent_name>.log</string>
+    <string>/path/to/subworkers/logs/<agent_name>.log</string>
 </dict>
 </plist>
 ```
@@ -371,7 +371,7 @@ Creates a scheduled LaunchAgent. The plist runs the trigger script at the specif
 
 ## Step 7: Update SUBWORKERS_SYSTEM.md
 
-Edit `/path/to/EliaAI/subworkers/SUBWORKERS_SYSTEM.md` to register the new subworker:
+Edit `/path/to/subworkers/SUBWORKERS_SYSTEM.md` to register the new subworker:
 
 1. **Directory Structure** (§2) — Add the new folder, script, plist, and log entries to the tree
 2. **Creating a New Subworker** (§2.1) — Add `mkdir -p` and `.enabled` commands for the new agent
@@ -389,7 +389,7 @@ The subworker is disabled by default. To enable it later, create the `.enabled` 
 
 ```bash
 # Disabled by default (skip this in the initial creation)
-# touch /path/to/EliaAI/subworkers/<agent-id>/.enabled
+# touch /path/to/subworkers/<agent-id>/.enabled
 ```
 
 Only create `.enabled` if the user explicitly asks to activate the subworker. By default,
