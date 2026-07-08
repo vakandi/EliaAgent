@@ -215,13 +215,13 @@ IP:PORT:USERNAME:PASSWORD
 
 Example:
 ```
-45.39.15.65:6495:lwuoryyz:4hj7h5n7ozid
-89.249.196.92:6677:lwuoryyz:4hj7h5n7ozid
+[redacted-proxy]
+[redacted-proxy]
 ```
 
 After use, history is appended:
 ```
-45.39.15.65:6495:lwuoryyz:4hj7h5n7ozid |last:2026-03-24 01:17:42 |dur:0h 5m
+[redacted-proxy] |last:2026-03-24 01:17:42 |dur:0h 5m
 ```
 
 ### Setup
@@ -322,7 +322,7 @@ To clear all history and start fresh:
 ```bash
 # Clear proxies.txt (keeps proxy list, removes history)
 cat > ~/EliaAI/setup/proxies.txt << 'EOF'
-45.39.15.65:6495:lwuoryyz:4hj7h5n7ozid
+[redacted-proxy]
 YOUR_OTHER_PROXY:PORT:USER:PASS
 EOF
 
