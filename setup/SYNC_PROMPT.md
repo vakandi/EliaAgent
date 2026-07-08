@@ -18,6 +18,26 @@ Your task is to SYNC the private repo to the public repo, cleaning all sensitive
 
 **⚠️ This sync process has a history of breaking things. Follow these rules strictly.**
 
+### ⚠️ CATASTROPHIC LEAK (July 8, 2026): brain/, docs/, memory/, wiki/, hidden dirs EXPOSED
+
+**The ENTIRE private data was pushed to a public GitHub repo for 12+ commits.** Including:
+- `brain/` (raw/cleaned/obsidian — LLM training data, private notes)
+- `docs/`, `logs/`, `memory/`, `research/`, `downloads/`
+- `wiki/` (wikis for ALL businesses: strategy, team, pricing)
+- `context/` (real TOOLS.md with server IPs, real business info)
+- Hidden files: `.backups/`, `.prompt_backup/`, `.sisyphus/`, `.morning_briefing_prompt.txt`
+- All real names, emails, server IPs, API keys in git history
+
+**Root cause**: Copying too broadly without checking WHAT was already in the target. The target repo accumulated sensitive data over many syncs.
+
+**Fix**: 9 passes of `git filter-repo` to surgically remove dirs, paths, and text replacements. 3178 → 3030 files. All names, IPs, emails, business names → placeholders.
+
+**NEW RULES**:
+- Verify the ENTIRE target filesystem (not just `git diff --cached`)
+- Remove business-specific dirs (`wiki/`, `context/`) from public repo entirely
+- Remove ALL hidden files/dirs before push
+- Run `git filter-repo` on the TARGET, not the source (source stays intact)
+
 ### 1. NEVER let shell eat `${}` template literals
 
 Files in EliaAI contain JavaScript/TypeScript template literals like `` `Hello ${name}` `` and bash `${VARIABLE}` references. During `cp -R`, `echo`, or `cat` operations, the shell interprets `${...}` and can silently mangle file contents.
@@ -47,14 +67,43 @@ GitHub has **automatic secret scanning**. It will BLOCK pushes containing:
 
 **⚠️ CRITICAL LESSON (July 8, 2026)**: I failed to check for Atlassian API tokens (`ATATT3...`) and Discord bot tokens before pushing. GitHub auto-detected them and revoked the PAT. ALWAYS run ALL checks below before any commit.
 
-**Pre-push verification checklist:**
-```bash
-# 1. Check staged changes for sensitive patterns
-cd /path/to/EliaAgent
-git diff --cached | grep -iE 'api.?key|secret|token|password|credential|\.env|proxy|user|discord|surname|co.?bou|bene.?luxe|157\.180|login|ssh-'
+**⚠️ CRITICAL — Verify the TARGET filesystem, NOT just git diff:**
 
-# 2. Check for any private business names
-git diff --cached | grep -iE 'surname|yourname|co.?bou|bene.?luxe|yourventures|yourbrand2'
+`git diff --cached` only shows what changed in the NEXT commit. It does NOT detect files that were ALREADY committed with private data. You MUST scan the ENTIRE working tree of the TARGET repo.
+
+**Pre-push verification checklist (TWO-STEP):**
+
+**Step A — Scan the ENTIRE target repo (catch already-committed leaks):**
+```bash
+cd /path/to/EliaAgent
+
+echo "=== Scan for real names (customize for YOUR name) ==="
+grep -rni '\[YOUR-NAME\]\|\[YOUR-SURNAME\]' --include='*.md' --include='*.sh' --include='*.js' --include='*.ts' . 2>/dev/null | grep -v '.git/' | grep -v 'SYNC_PROMPT.md'
+
+echo "=== Scan for real business names (update with YOUR businesses) ==="
+grep -rni '\[YOUR-BUSINESS-1\]\|\[YOUR-BUSINESS-2\]' --include='*.md' --include='*.sh' --include='*.js' --include='*.ts' . 2>/dev/null | grep -v '.git/'
+
+echo "=== Scan for real IPs ==="
+grep -rnE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' --include='*.md' --include='*.sh' --include='*.js' --include='*.ts' --include='*.json' --include='*.plist' . 2>/dev/null | grep -v '.git/' | grep -v '127.0.0.1\|0.0.0.0\|255\|8.8.8.8\|1.1.1.1\|192\.168\.'
+
+echo "=== Scan for real emails ==="
+grep -rnE '\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b' --include='*.md' --include='*.sh' --include='*.js' --include='*.ts' . 2>/dev/null | grep -v '.git/' | grep -v 'example.com\|@g.us\|account[0-9]\|fonts\.google\|sil\.org\|youtube.com\|OFL\.txt'
+
+echo "=== Scan for API keys ==="
+grep -rn 'api_key\|api-key\|API_KEY\|ATATT' --include='*.md' --include='*.sh' --include='*.js' --include='*.ts' --include='*.py' . 2>/dev/null | grep -v '.git/' | grep -v 'node_modules/'
+
+echo "=== Scan for hidden files with personal data ==="
+find . -maxdepth 2 -name '.*' -type f 2>/dev/null | grep -v '.git/' | grep -v '.gitignore' | grep -v '.DS_Store'
+```
+
+**Step B — Check staged changes (for incremental commits):**
+```bash
+# 1. Check staged changes for sensitive patterns (update with YOUR patterns)
+cd /path/to/EliaAgent
+git diff --cached | grep -iE 'api.?key|secret|token|password|credential|\.env|proxy|login|ssh-'
+
+# 2. Check for any private business names (update with YOUR names)
+git diff --cached | grep -iE '\[YOUR-NAME\]|\[YOUR-BUSINESS\]'
 
 # 3. Check for server IPs
 git diff --cached | grep -E '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b'
@@ -65,20 +114,20 @@ git diff --cached | grep -E '\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'
 # 5. ⚠️ Check for Atlassian tokens (ATATT prefix - GitHub auto-detects these)
 git diff --cached | grep 'ATATT'
 
-# 6. ⚠️ Check for Discord bot tokens (base64-encoded snowflake format)
+# 6. ⚠️ Check for Discord bot tokens
 git diff --cached | grep -E 'DISCORD_BOT_TOKEN|ND[A-Za-z0-9]+\.'
 
-# 7. ⚠️ Check for hardcoded Telegram credentials
+# 7. ⚠️ Check for Telegram credentials
 git diff --cached | grep -E 'TELEGRAM_API_[A-Z]+=|TG_BOT_TOKEN|TG_CHAT_ID|TG_USER_ID='
 
-# 8. ⚠️ Check for any hardcoded JIRA/CONFLUENCE tokens
+# 8. ⚠️ Check for JIRA/CONFLUENCE tokens
 git diff --cached | grep -E 'JIRA_API_TOKEN|CONFLUENCE_API_TOKEN|JIRA_USERNAME|CONFLUENCE_USERNAME='
 
-# 9. ⚠️ Check for Node.js Discord bot tokens (often start with MT or Nt)
+# 9. ⚠️ Check for Node.js Discord bot tokens
 git diff --cached | grep -E '"[A-Za-z0-9]{20,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{27,}"'
 ```
 
-**If ANY of these find matches, DO NOT COMMIT. Fix the files first.**
+**If Step A finds ANYTHING, STOP. Run `git filter-repo` on the target repo before adding new commits. The target must be spotless FIRST.**
 
 ### 3. NEVER `git rm` without `--cached` on the private repo — breaks credentials on disk
 
@@ -203,12 +252,14 @@ Or use explore agent for deeper analysis.
 - `context/TOOLS.md` - Tools reference
 - `context/business.md` - Business info
 
-**NEVER Copy:**
+**NEVER Copy (Source):**
 - `.env` - Real credentials
 - `logs/` - Runtime logs
 - `docs/YYYY-MM-DD/` - Daily logs
-- `brain/obsidian/` - Private wiki
+- `brain/` — ALL of brain/ (raw, cleaned, obsidian) — personal data, LLM training data, private notes
 - `memory/*-CREDENTIALS.md` - Secrets
+- `research/` - Market research data
+- `downloads/` - Downloaded content
 - `node_modules/` - NPM packages
 - `venv/`, `__pycache__/` - Python caches
 - `setup/proxies.txt` - Proxy list with real IP:PORT:USER:PASS
@@ -216,7 +267,21 @@ Or use explore agent for deeper analysis.
 - `integrations/elia-discord-bot/logs/` - Bot runtime logs
 - `integrations/elia-discord-bot/sessions.json` - Active sessions
 - `.scheduler_state` - Scheduler state files
-- **`subworkers/*/`** — All subworker agent dirs (yourbrand-suppliers, mirorpay-*, mirrorpay-*, tiktok-content, reddit-saas-scraper, etc.). Subworkers contain private business prompts, anchor memory, and workspace data. **NEVER COPY.**
+- `store/` - Electron user data
+
+**REMOVE from Target (after copy) — business-specific dirs:**
+- `context/` — Contains YOUR real business info (TOOLS.md with server IPs, business.md, jira-projects.md). Remove entirely. Users set up their own.
+- `wiki/` — Contains YOUR business wikis. Remove entirely. Users create their own.
+- `.backups/` — Personal prompt backups. Remove.
+- `.prompt_backup/` — Personal prompt backups. Remove.
+- `.sisyphus/` — Runtime state with personal paths. Remove.
+- `.opencode/` — Configuration with personal paths. Keep only if generic.
+- `.morning_briefing_prompt.txt` — Personal info. Remove.
+
+**⚠️ The action of filtering is on the TARGET, not the source.** Source keeps ALL data intact. Target gets filtered.
+
+**NEVER Copy (Subworkers):**
+- **`subworkers/*/`** — All subworker agent dirs. Subworkers contain private business prompts, anchor memory, workspace data. **NEVER COPY.**
   - Exception: `subworkers/SUBWORKERS_SYSTEM.md` and `subworkers/SETUP_TOOLS.md` are generic HOW-TO docs that CAN be synced.
   - Exception: `subworkers/plists/` and `subworkers/scripts/` can contain EXAMPLE templates (not business-specific).
 - **EliaAI PROMPT.md** — Contains personal info, real business context, team members. Use a CLEANED version for public (or don't copy at all).
@@ -273,18 +338,25 @@ Run these checks BEFORE staging files:
 ```bash
 cd /path/to/EliaAgent
 
-echo "=== Checking for business names ==="
-grep -rni 'surname\|user\|co.bou\|bene.luxe\|yourventures\|yourbrand2\|yourtool\|yourproject\|yourco' \
-  --include='*.md' --include='*.sh' --include='*.js' --include='*.ts' --include='*.json' --include='*.html' \
-  . 2>/dev/null | grep -v '.git/' | grep -v 'SYNC_PROMPT.md' | grep -v 'SYNC_REVERSE'
+echo "=== Checking for personal names (customize for YOUR name) ==="
+grep -rni '\[YOUR-NAME\]\|\[YOUR-SURNAME\]' \
+  --include='*.md' --include='*.sh' --include='*.js' --include='*.ts' --include='*.json' \
+  . 2>/dev/null | grep -v '.git/' | grep -v 'SYNC_PROMPT.md'
+
+echo "=== Checking for business names (update with YOUR businesses) ==="
+grep -rni '\[YOUR-BUSINESS-1\]\|\[YOUR-BUSINESS-2\]' \
+  --include='*.md' --include='*.sh' --include='*.js' --include='*.ts' --include='*.json' \
+  . 2>/dev/null | grep -v '.git/'
 
 echo "=== Checking for server IPs ==="
 grep -rnE '([0-9]{1,3}\.){3}[0-9]{1,3}' \
-  --include='*.md' --include='*.sh' --include='*.js' --include='*.ts' --include='*.json' --include='*.html' \
-  . 2>/dev/null | grep -v '.git/' | grep -v 'node_modules/' | grep -v '127.0.0.1\|0.0.0.0\|255\|8.8.8.8\|1.1.1.1'
+  --include='*.md' --include='*.sh' --include='*.js' --include='*.ts' --include='*.json' \
+  . 2>/dev/null | grep -v '.git/' | grep -v '127.0.0.1\|0.0.0.0\|255\|8.8.8.8\|1.1.1.1'
+
+echo "=== Checking for hidden files ==="
+find . -maxdepth 2 -name '.*' -type f 2>/dev/null | grep -v '.git/' | grep -v '.gitignore' | grep -v '.DS_Store'
 
 echo "=== Checking for template literal integrity ==="
-# Compare a known file with template literals between source and target
 diff <(grep -c '\${' /path/to/EliaAI/setup/README.md) <(grep -c '\${' /path/to/EliaAgent/setup/README.md) || echo "⚠️  Template literal count mismatch!"
 ```
 
@@ -469,21 +541,33 @@ If you accidentally pushed private data:
 ## Safety Checklist (Run Before Each Commit)
 
 ```
-[ ] Sensitive files excluded (.env, logs, proxies.txt, etc.)
-[ ] No business names in clean files
-[ ] No server IP addresses in clean files
-[ ] No API keys or tokens in clean files
-[ ] No personal names in clean files
-[ ] No Atlassian tokens (ATATT3...) in clean files
-[ ] No Discord bot tokens in clean files
-[ ] No Telegram bot tokens/hash/ids in clean files
-[ ] No JIRA/CONFLUENCE usernames or tokens in clean files
+=== STEP A: FULL TARGET REPO SCAN (CATCH ALREADY-COMMITTED LEAKS) ===
+[ ] grep -rni '[YOUR-NAME]' entire target repo → only in SYNC_PROMPT.md
+[ ] grep -rni '[YOUR-BUSINESS-1]' entire target → only in SYNC_PROMPT.md
+[ ] grep -rnE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' target → only localhost/rfc1918
+[ ] grep -rnE '\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b' → only example.com
+[ ] grep -rn 'ATATT\|api_key' target → 0 matches
+[ ] find . -name '.*' -type f → only .gitignore, .DS_Store
+[ ] No brain/, docs/, logs/, memory/, research/, downloads/ in target
+[ ] No wiki/ or context/ in target (users set up their own)
+
+=== STEP B: STAGED CHANGES CHECK ===
+[ ] Sensitive files excluded (.env, logs, proxies, etc.)
+[ ] No business names in staged files
+[ ] No server IP addresses in staged files
+[ ] No API keys or tokens in staged files
+[ ] No personal names in staged files
+[ ] No tokens (ATATT, DISCORD, TELEGRAM, JIRA) in staged files
+[ ] `git diff --cached` reviewed for sensitive data (run all 9 checks)
+
+=== STEP C: GENERAL ===
 [ ] Template literals (${...}) are intact after copy
-[ ] `git diff --cached` reviewed for sensitive data (RUN ALL 9 CHECKS)
-[ ] NEVER `git rm` on source repo — only `--cached` (keeps files on disk)
+[ ] NEVER `git rm` on source repo — only `--cached`
 [ ] Integration `.env` files restored to disk after cleanup
 [ ] Incremental push working (not batching all commits)
 [ ] GitHub web UI shows correct content
+
+=== IF ANY STEP A CHECK FAILS: STOP. RUN FILTER-REPO ON TARGET FIRST. ===
 ```
 
 ---

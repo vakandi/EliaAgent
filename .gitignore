@@ -1,0 +1,25 @@
+# Personal data - NEVER commit
+brain/
+docs/
+logs/
+memory/
+research/
+downloads/
+.env
+.backups/
+.prompt_backup/
+.sisyphus/
+.morning_briefing_prompt.txt
+.agent_payloads/
+.playwright-mcp/
+.scheduler_disabled
+store/
+
+# Dependencies
+node_modules/
+venv/
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
