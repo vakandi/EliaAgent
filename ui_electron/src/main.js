@@ -27,12 +27,14 @@ let isProcessingCron = false;
 let isProcessingMorning = false;
 let morningPopup = null;
 let cronPopup = null;
+let subworkerPopup = null;
 let welcomePopup = null;
 let proxyPopup = null;
 let welcomeShown = false;
 
 const EliaAIRoot = path.join(__dirname, '..', '..');
 const contextPath = path.join(EliaAIRoot, 'context');
+const subworkersRoot = path.join(EliaAIRoot, 'subworkers');
 
 function loadContextFiles() {
   const context = { memory: '', tools: '', business: '' };
@@ -255,6 +257,135 @@ function startAgentStatusPolling() {
   agentStatusInterval = setInterval(send, 2000);
 }
 
+// ── Subworker status ─────────────────────────────────────────
+function parsePlistSchedule(plistPath) {
+  try {
+    if (!fs.existsSync(plistPath)) return null;
+    const { execSync } = require('child_process');
+    const json = execSync(`plutil -convert json -o - "${plistPath}" 2>/dev/null`, { encoding: 'utf8', timeout: 5000 }).trim();
+    const plist = JSON.parse(json);
+
+    // StartInterval (seconds-based, e.g. 1800 = every 30 min)
+    if (plist.StartInterval) {
+      const secs = plist.StartInterval;
+      let label;
+      if (secs >= 3600 && secs % 3600 === 0) label = `every ${secs / 3600}h`;
+      else if (secs >= 60 && secs % 60 === 0) label = `every ${secs / 60}min`;
+      else label = `every ${secs}s`;
+      return {
+        type: 'interval',
+        description: label,
+        intervalSeconds: secs,
+        intervals: null,
+        startHour: null,
+        endHour: null,
+        minutePattern: null
+      };
+    }
+
+    // StartCalendarInterval (list of Hour+Minute dicts)
+    const entries = plist.StartCalendarInterval;
+    if (!entries || !Array.isArray(entries) || entries.length === 0) return null;
+
+    const intervals = entries.map(e => ({ hour: e.Hour, minute: e.Minute }));
+    intervals.sort((a, b) => a.hour - b.hour || a.minute - b.minute);
+
+    const hours = [...new Set(intervals.map(i => i.hour))].sort((a, b) => a - b);
+    const minutes = [...new Set(intervals.map(i => i.minute))].sort((a, b) => a - b);
+
+    // Detect pattern
+    let description;
+    if (intervals.length === 1) {
+      const e = intervals[0];
+      description = `${String(e.hour).padStart(2, '0')}:${String(e.minute).padStart(2, '0')} daily`;
+    } else if (minutes.length === 1 && hours.length > 1) {
+      // Same minute every hour: hourly pattern
+      const minStr = String(minutes[0]).padStart(2, '0');
+      description = `${String(hours[0]).padStart(2, '0')}h→${String(hours[hours.length - 1]).padStart(2, '0')}h hourly at :${minStr}`;
+    } else if (minutes.length === 2 && minutes[0] === 0 && minutes[1] === 30 && hours.length > 1) {
+      // :00 and :30 → every 30 min
+      description = `${String(hours[0]).padStart(2, '0')}h→${String(hours[hours.length - 1]).padStart(2, '0')}h every 30min`;
+    } else {
+      // Generic list
+      description = intervals.map(e => `${String(e.hour).padStart(2, '0')}:${String(e.minute).padStart(2, '0')}`).join(', ');
+    }
+
+    return {
+      type: 'calendar',
+      description,
+      intervalSeconds: null,
+      intervals,
+      startHour: hours[0],
+      endHour: hours[hours.length - 1],
+      minutePattern: minutes
+    };
+  } catch (e) {
+    console.error('parsePlistSchedule error:', e.message);
+    return null;
+  }
+}
+
+function getSubworkerStatus() {
+  const results = [];
+  try {
+    const items = fs.readdirSync(subworkersRoot, { withFileTypes: true });
+    const skipDirs = new Set(['logs', 'plists', 'scripts']);
+    for (const item of items) {
+      if (!item.isDirectory()) continue;
+      if (skipDirs.has(item.name)) continue;
+
+      const dirPath = path.join(subworkersRoot, item.name);
+      const promptPath = path.join(dirPath, 'PROMPT.md');
+      const enabledPath = path.join(dirPath, '.enabled');
+      const plistName = `com.elia.${item.name}`;
+      const plistPath = path.join(subworkersRoot, 'plists', `${plistName}.plist`);
+
+      // Read description from PROMPT.md first line
+      let description = '';
+      try {
+        const firstLine = fs.readFileSync(promptPath, 'utf8').split('\n')[0] || '';
+        description = firstLine.replace(/^#\s*/, '').trim();
+      } catch (e) {
+        description = '';
+      }
+
+      // Check .enabled flag
+      const enabled = fs.existsSync(enabledPath);
+
+      // Check launchd status
+      let running = false;
+      try {
+        const out = require('child_process').execSync(
+          `launchctl list ${plistName} 2>/dev/null || true`,
+          { encoding: 'utf8' }
+        ).trim();
+        if (out && !out.includes('Could not find')) {
+          const lastField = out.split('\t').pop() || '';
+          running = lastField !== ''; // non-empty = process is running
+        }
+      } catch (e) {}
+
+      // Parse schedule from plist
+      const schedule = parsePlistSchedule(plistPath);
+
+      results.push({
+        name: item.name,
+        label: item.name.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
+        description,
+        path: dirPath,
+        enabled,
+        running,
+        plistExists: fs.existsSync(plistPath),
+        schedule
+      });
+    }
+    results.sort((a, b) => a.name.localeCompare(b.name));
+  } catch (e) {
+    console.error('getSubworkerStatus error:', e.message);
+  }
+  return results;
+}
+
 // ── ntfy SSE Stream ──────────────────────────────────────────
 function startNtfyStream() {
   if (!config.ntfy?.topic) return;
@@ -423,6 +554,62 @@ ipcMain.on('show-cron-popup', () => {
   showCronConfirmation();
 });
 
+// Subworker popup
+ipcMain.on('show-subworker-popup', () => {
+  showSubworkerPopupWindow();
+});
+
+// Get subworker list
+ipcMain.on('get-subworkers', (event) => {
+  const workers = getSubworkerStatus();
+  event.reply('subworkers-list', workers);
+});
+
+// Toggle subworker enabled state
+ipcMain.on('toggle-subworker', (event, name) => {
+  if (!name) return;
+  const subworkerDir = path.join(subworkersRoot, name);
+  const plistName = `com.elia.${name}`;
+  const plistPath = path.join(subworkersRoot, 'plists', `${plistName}.plist`);
+  const enabledPath = path.join(subworkerDir, '.enabled');
+
+  let enabled = false;
+  try {
+    if (fs.existsSync(enabledPath)) {
+      fs.unlinkSync(enabledPath);
+      enabled = false;
+      // Unload from launchd if plist exists
+      if (fs.existsSync(plistPath)) {
+        require('child_process').execSync(`launchctl bootout gui/$(id -u) ${plistPath} 2>/dev/null || true`);
+      }
+    } else {
+      fs.writeFileSync(enabledPath, 'enabled\n', 'utf8');
+      enabled = true;
+      // Load into launchd if plist exists
+      if (fs.existsSync(plistPath)) {
+        require('child_process').execSync(`launchctl bootstrap gui/$(id -u) ${plistPath} 2>/dev/null || true`);
+      }
+    }
+  } catch (e) {
+    console.error(`toggle-subworker ${name}:`, e.message);
+  }
+
+  // Check running state after toggle
+  let running = false;
+  try {
+    const out = require('child_process').execSync(
+      `launchctl list ${plistName} 2>/dev/null || true`,
+      { encoding: 'utf8' }
+    ).trim();
+    if (out && !out.includes('Could not find')) {
+      const lastField = out.split('\t').pop() || '';
+      running = lastField !== '';
+    }
+  } catch (e) {}
+
+  event.reply('subworker-toggled', { name, enabled, running });
+});
+
 // Run Morning Routine
 ipcMain.on('run-morning-routine', () => {
   const { exec } = require('child_process');
@@ -445,13 +632,16 @@ ipcMain.on('run-morning-speak', () => {
   runMorningSpeak();
 });
 
-// Close Morning Popup
+// Close all popups
 ipcMain.on('close-popup', () => {
   if (morningPopup && !morningPopup.isDestroyed()) {
     morningPopup.close();
   }
   if (cronPopup && !cronPopup.isDestroyed()) {
     cronPopup.close();
+  }
+  if (subworkerPopup && !subworkerPopup.isDestroyed()) {
+    subworkerPopup.close();
   }
   if (welcomePopup && !welcomePopup.isDestroyed()) {
     welcomePopup.close();
@@ -518,6 +708,85 @@ ipcMain.on('open-logs-terminal', () => {
   ].map(s => '-e ' + JSON.stringify(s)).join(' ');
   exec('osascript ' + script, (error) => {
     if (error) console.error('Logs terminal error:', error.message);
+  });
+});
+
+ipcMain.on('open-subworker-logs', (_event, name) => {
+  if (!name) return;
+  const { exec } = require('child_process');
+  // Try to open the LATEST per-run log file first, fallback to aggregate
+  const runsDir = path.join(subworkersRoot, 'logs', 'runs', name.replace(/-/g, '_'));
+  let logFile = path.join(subworkersRoot, 'logs', name.replace(/-/g, '_') + '.log');
+  try {
+    if (fs.existsSync(runsDir)) {
+      const files = fs.readdirSync(runsDir)
+        .filter(f => f.endsWith('.log'))
+        .sort()
+        .reverse();
+      if (files.length > 0) {
+        logFile = path.join(runsDir, files[0]);
+      }
+    }
+  } catch (_) {}
+  if (!fs.existsSync(logFile)) {
+    const { dialog } = require('electron');
+    dialog.showMessageBox({
+      type: 'info',
+      title: 'No logs',
+      message: `No run logs yet for ${name}.`,
+      detail: 'Run the trigger script once to generate the first log file.'
+    });
+    return;
+  }
+  const cmd = 'tail -n 5000 -f ' + logFile;
+  const script = [
+    'tell application "Terminal" to activate',
+    'tell application "Terminal" to do script ' + JSON.stringify(cmd),
+    'delay 0.3',
+    'tell application "Terminal" to set bounds of front window to {20, 50, 900, 500}'
+  ].map(s => '-e ' + JSON.stringify(s)).join(' ');
+  exec('osascript ' + script, (error) => {
+    if (error) console.error('open-subworker-logs error:', error.message);
+  });
+});
+
+// List per-run log files for a subworker (last 100, sorted newest first)
+ipcMain.on('get-subworker-runs', (event, name) => {
+  if (!name) return;
+  const runsDir = path.join(subworkersRoot, 'logs', 'runs', name.replace(/-/g, '_'));
+  const runs = [];
+  try {
+    if (fs.existsSync(runsDir)) {
+      const files = fs.readdirSync(runsDir)
+        .filter(f => f.endsWith('.log'))
+        .sort()
+        .reverse()
+        .slice(0, 100);
+      for (const file of files) {
+        const filePath = path.join(runsDir, file);
+        try {
+          const stats = fs.statSync(filePath);
+          runs.push({ filename: file, path: filePath, mtime: stats.mtimeMs, size: stats.size });
+        } catch (_) {}
+      }
+    }
+  } catch (_) {}
+  event.reply('subworker-runs', { name, runs });
+});
+
+// Open a specific log file in Terminal
+ipcMain.on('open-subworker-log-file', (_event, logFilePath) => {
+  if (!logFilePath) return;
+  const { exec } = require('child_process');
+  const cmd = 'tail -n 5000 -f ' + logFilePath;
+  const script = [
+    'tell application "Terminal" to activate',
+    'tell application "Terminal" to do script ' + JSON.stringify(cmd),
+    'delay 0.3',
+    'tell application "Terminal" to set bounds of front window to {20, 50, 900, 500}'
+  ].map(s => '-e ' + JSON.stringify(s)).join(' ');
+  exec('osascript ' + script, (error) => {
+    if (error) console.error('open-subworker-log-file error:', error.message);
   });
 });
 
@@ -1164,6 +1433,46 @@ function showCronConfirmation() {
   
   cronPopup.on('closed', () => {
     cronPopup = null;
+  });
+}
+
+// Subworker Manager Popup
+function showSubworkerPopupWindow() {
+  if (subworkerPopup && !subworkerPopup.isDestroyed()) {
+    subworkerPopup.focus();
+    return;
+  }
+
+  const display = screen.getPrimaryDisplay();
+  const { width: screenWidth, height: screenHeight } = display.workAreaSize;
+
+  const popupW = 950;
+  const popupH = 680;
+  const x = Math.round((screenWidth - popupW) / 2);
+  const y = Math.round((screenHeight - popupH) / 2);
+
+  subworkerPopup = new BrowserWindow({
+    width: popupW,
+    height: popupH,
+    x,
+    y,
+    frame: false,
+    transparent: true,
+    resizable: false,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    backgroundColor: '#00000000',
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      preload: path.join(__dirname, 'preload.js')
+    }
+  });
+
+  subworkerPopup.loadFile(path.join(__dirname, '..', 'subworker-popup.html'));
+
+  subworkerPopup.on('closed', () => {
+    subworkerPopup = null;
   });
 }
 

@@ -7,17 +7,21 @@ set -euo pipefail
 # Configuration - dynamic path detection
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 AGENT_DIR="$(dirname "$SCRIPT_DIR")"
-TRIGGER_SCRIPT="${AGENT_DIR}/scripts/trigger_opencode_interactive.sh"
-PROMPT_FILE="${AGENT_DIR}/PROMPT.md"
-AGENT_PAYLOADS_DIR="${AGENT_DIR}/.agent_payloads"
-DISABLED_FLAG="${AGENT_DIR}/.scheduler_disabled"
 
-# If scheduler is disabled, exit immediately — don't start the agent
-if [[ -f "$DISABLED_FLAG" ]]; then
-    echo "[$(date)] start_agents.sh: Scheduler DISABLED (.scheduler_disabled exists) — exiting"
+# ============================================================
+# SCHEDULER DISABLE GUARD
+# If .scheduler_disabled exists, exit immediately without running.
+# Create this file to permanently disable all scheduled/interactive agent runs:
+#   touch ~/EliaAI/.scheduler_disabled
+# ============================================================
+if [[ -f "${AGENT_DIR}/.scheduler_disabled" ]]; then
+    echo "[GUARD] .scheduler_disabled found — agent disabled. Exiting."
     exit 0
 fi
 
+TRIGGER_SCRIPT="${AGENT_DIR}/scripts/trigger_opencode_interactive.sh"
+PROMPT_FILE="${AGENT_DIR}/PROMPT.md"
+AGENT_PAYLOADS_DIR="${AGENT_DIR}/.agent_payloads"
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'

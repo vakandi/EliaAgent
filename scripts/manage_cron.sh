@@ -337,7 +337,11 @@ EOF
     launchctl load "$LAUNCHD_PLIST"
 
     success "Scheduler installed (every ${interval})"
-    log "Schedule: runs at :00 and :30 every hour (fixed times)"
+    case "$interval" in
+        20min) log "Schedule: runs at :00, :20, :40 every hour within range" ;;
+        30min|30minute) log "Schedule: runs at :00 and :30 every hour within range" ;;
+        *) log "Schedule: runs at :00 every interval within range" ;;
+    esac
     log "Hours: ${start_hour}:00 - ${end_hour}:00"
     
     # Save state
@@ -465,6 +469,10 @@ disable_scheduler() {
     pkill -f "trigger_morning.sh" 2>/dev/null || true
     pkill -f "start_agents.sh" 2>/dev/null || true
     pkill -f "cron_wrapper.sh" 2>/dev/null || true
+    pkill -f "oh-my-opencode.*run" 2>/dev/null || true
+    pkill -f "ralph-loop" 2>/dev/null || true
+    # Kill any Elia agent sessions started outside the scheduler
+    pkill -f "opencode run.*elia" 2>/dev/null || true
     sleep 1
     touch "$DISABLED_FLAG"
     log "Disabled flag created: ${DISABLED_FLAG}"

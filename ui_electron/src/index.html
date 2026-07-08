@@ -74,6 +74,7 @@
     position: relative;
     pointer-events: none;
     width: fit-content;
+    margin-top: -30px;
   }
 
   #orb-close-row .mini-orb,
@@ -93,7 +94,7 @@
   #right-controls {
     position: absolute;
     right: -90px;
-    top: 50%;
+    top: 40%;
     transform: translateY(-60%);
     display: flex;
     flex-direction: column;
@@ -1147,6 +1148,49 @@
     text-shadow: 0 0 8px rgba(224, 64, 251, 0.8);
   }
 
+  /* SUBWORKER Toggle - Cyan/Teal theme (between close and cron) */
+  .subworker-toggle {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding: 1px 3px;
+    border-radius: 3px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    font-family: 'Orbitron', monospace;
+    font-size: 6px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    user-select: none;
+    margin: 0;
+    -webkit-app-region: no-drag;
+    position: relative;
+    z-index: 300;
+    background: rgba(0, 188, 212, 0.15);
+    border: 1px solid #00bcd4;
+    color: #00bcd4;
+    margin-bottom: 3px;
+  }
+  .subworker-toggle:hover {
+    background: rgba(0, 188, 212, 0.25);
+    box-shadow: 0 0 8px rgba(0, 188, 212, 0.4);
+  }
+  #subworker-toggle {
+    margin-bottom: 2px;
+    z-index: 350;
+  }
+
+  .subworker-toggle .label-text {
+    transition: all 0.2s ease;
+    cursor: pointer;
+    padding: 2px 4px;
+    border-radius: 3px;
+  }
+  .subworker-toggle .label-text:hover {
+    background: rgba(0, 188, 212, 0.3);
+    text-shadow: 0 0 8px rgba(0, 188, 212, 0.8);
+  }
+
   /* Period Badges (in STATUS card) */
   .period-badge {
     font-family: 'Orbitron', monospace;
@@ -1233,10 +1277,12 @@
   
   <div id="right-controls">
     <div id="btn-close" title="Fermer"></div>
-    <!-- CRON Toggle - First toggle (above OMO) -->
     <div class="cron-toggle" id="cron-toggle" onclick="toggleCron()">
       <span class="toggle-switch"></span>
       <span class="label-text cron-label" onclick="event.stopPropagation(); showCronManual()" title="Lancer manuellement">CRON</span>
+    </div>
+    <div class="subworker-toggle" id="subworker-toggle" onclick="showSubworkerPopup()">
+      <span class="label-text" title="Gérer les subworkers">AGENTS</span>
     </div>
     <div class="omo-toggle" id="omo-toggle" onclick="toggleOmo()">
       <span class="toggle-switch"></span>
@@ -1456,6 +1502,10 @@ function showCronManual() {
 
 function openLogsTerminal() {
   window.electronAPI?.send('open-logs-terminal');
+}
+
+function showSubworkerPopup() {
+  window.electronAPI?.send('show-subworker-popup');
 }
 
 function toggleSpeak() {

@@ -102,13 +102,47 @@ WHERE m.active=1 GROUP BY 1,2 ORDER BY n DESC LIMIT 20;"
 
 ---
 
+## 🚀 Version: v2.1.0 — 🔧 SCRIPT HARDENING + SUBWORKER MANAGER (Jul 8, 2026)
+
+### 🔒 Tmux Safety Guards
+
+**Problem**: Running `elia-ui.sh`, `kill_elia.sh`, `run-tmux.sh` from inside an existing tmux session (e.g., OpenCode's terminal pane) would kill the parent session or replace the calling shell — destroying the agent's workspace.
+
+**Fix**: Added tmux-inside-tmux detection to all entry-point scripts:
+
+| Script | Guard Added |
+|--------|-------------|
+| `elia-ui.sh` | Early exit if `$TMUX` is set |
+| `elia-ui-4win.sh` | Deprecation warning + exit |
+| `kill_elia.sh` | Client-aware kill (only kills if no active tmux clients) |
+| `run-tmux.sh` | Early exit if `$TMUX` is set |
+
+### 🛡️ Scheduler Disable Improvements
+
+- `trigger_opencode_interactive.sh` / `start_agents.sh` — Added `.scheduler_disabled` guard: immediate exit if scheduler is disabled
+- `start_agents.bat` — Same guard for Windows
+- `manage_cron.sh` — Better interval logging (shows `:00, :20, :40` for 20min, `:00, :30` for 30min)
+- `manage_cron.sh` — Added `pkill` cleanup for `oh-my-opencode run` and `ralph-loop` processes on disable
+- `manage_cron.sh` — Kill Elia agent sessions started outside the scheduler
+
+### 🧩 Script Improvements
+
+- **`manage_subworkers.sh`** (NEW — public release) — Script to enable/disable/install/uninstall subworkers via launchd plists. Template with example format for users to customize.
+- `elia-ui.sh` — Added `is_already_opencode_server()` to detect existing healthy servers and avoid unnecessary restarts
+
+### 📚 Documentation
+
+- **`subworkers/SUBWORKERS_SYSTEM.md`** — New comprehensive section on trigger bash scripts: why bash, architecture diagram, production-grade pattern (`.enabled` flag, per-run logs, personality injection), integration examples (launchd, cron, systemd, Docker, CI/CD, HTTP webhooks), and forensic debugging with per-run log history.
+
 ### 📋 Changelog Summary
 
 | Version | Date | Changes |
 |---------|------|---------|
+| **v2.1.0** | **Jul 8, 2026** | **🔧 Script hardening + subworker manager** |
 | **v2.0.0** | **May 16, 2026** | **🧠 Agent differentiation — per-agent memory system** |
 | v1.2.0 | May 14, 2026 | Scheduler fix: real enable/disable system |
 | v1.1.0 | May 13, 2026 | codemem integration |
+| v1.0.3 | May 22, 2026 | Proxy fix: curl health check + NO_PROXY + validation |
 | v1.0.2 | May 3, 2026 | Proxy system update (HTTP_PROXY) |
 | v1.0.1 | April 27, 2026 | Desktop shortcuts, Discord bot, subworkers |
 | Public | April 2026 | Initial public release |
@@ -237,6 +271,31 @@ alias elia='~/EliaAI/setup/opencode-proxy.sh'
 ### Documentation Updated
 
 - `setup/README.md` - Proxy Switcher section completely rewritten with new HTTP_PROXY approach
+
+---
+
+## Version: v1.0.3 (May 22, 2026)
+
+### Proxy Fixes & Hardening
+
+**Issue (May 22, 2026)**: `switch-proxy.sh` used `wget` for proxy health checks, which is not installed on macOS by default. Users without Homebrew `wget` got "❌ All proxies dead" even with valid proxies. Additionally, `opencode-proxy.sh` had no validation for missing/broken config and was missing localhost exclusions.
+
+### Fixes
+
+| Fix | File |
+|-----|------|
+| **wget → curl** — `curl` is available on ALL macOS by default | `setup/switch-proxy.sh` |
+| **time_ago() cascading echo bug** — was printing multiple time strings instead of one | `setup/switch-proxy.sh` |
+| **NO_PROXY env vars** — prevents proxying localhost/127.0.0.1 traffic | `setup/opencode-proxy.sh` |
+| **Config validation** — graceful error if `~/.proxychains.conf` is missing or malformed | `setup/opencode-proxy.sh` |
+
+### Migration
+
+```bash
+# Re-sync from EliaAgent or manually copy:
+cp path/to/EliaAgent/setup/switch-proxy.sh ~/EliaAI/setup/
+cp path/to/EliaAgent/setup/opencode-proxy.sh ~/EliaAI/setup/
+```
 
 ---
 

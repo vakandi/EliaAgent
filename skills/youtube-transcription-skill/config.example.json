@@ -1,0 +1,39 @@
+{
+  "whisper_model": "base",
+  "output_dir": "skills_output",
+  "max_concurrent_downloads": 3,
+  "transcription_settings": {
+    "language": "en",
+    "temperature": 0.0,
+    "best_of": 5,
+    "beam_size": 5
+  },
+  "api_keys": {
+    "openai": "YOUR_OPENAI_API_KEY_HERE",
+    "youtube": "YOUR_YOUTUBE_API_KEY_HERE"
+  },
+  "sales_keywords": [
+    "sale", "sell", "pitch", "close", "deal", "negotiate", "prospecting",
+    "lead", "conversion", "revenue", "commission", "customer", "prospect",
+    "value", "price", "objection", "handling", "presentation", "framework",
+    "technique", "strategy", "method", "approach", "process", "system"
+  ],
+  "framework_patterns": {
+    "SPIN Selling": ["situation", "problem", "implication", "need-payoff"],
+    "MEDDIC": ["metrics", "economic buyer", "decision criteria", "decision process"],
+    "NEAT Selling": ["need", "economic, authority, timeline"],
+    "Challenger Sale": ["teach", "tailor", "take control"],
+    "Value Selling": ["value", "benefit", "return", "investment"],
+    "Consultative Selling": ["question", "understand", "recommend", "confirm"]
+  },
+  "output_formats": [
+    "json",
+    "markdown",
+    "pdf"
+  ],
+  "cleanup_settings": {
+    "delete_downloaded_videos": true,
+    "delete_transcription_files": false,
+    "keep_skills_only": true
+  }
+}

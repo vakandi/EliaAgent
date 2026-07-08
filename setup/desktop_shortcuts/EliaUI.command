@@ -34,9 +34,11 @@ fi
 
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 
-# Kill any existing session
-tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
-sleep 0.5
+# If session already exists, just attach — don't kill and recreate
+if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    log "Session '$SESSION_NAME' already exists — attaching"
+    exec tmux attach -t "$SESSION_NAME"
+fi
 
 log "Creating new tmux session: $SESSION_NAME"
 

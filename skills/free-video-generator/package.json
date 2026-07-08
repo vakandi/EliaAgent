@@ -1,0 +1,37 @@
+{
+  "name": "free-video-generator",
+  "version": "1.0.0",
+  "description": "Leverage unlimited Google accounts for free AI video generation",
+  "author": "Eurus IA",
+  "license": "MIT",
+  "main": "index.js",
+  "scripts": {
+    "test": "node test.js",
+    "start": "node server.js",
+    "monitor": "node monitor.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "cheerio": "^1.0.0",
+    "puppeteer": "^21.0.0",
+    "node-schedule": "^2.1.1",
+    "crypto-js": "^4.2.0",
+    "lodash": "^4.17.21",
+    "moment": "^2.29.4"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "nodemon": "^3.0.0"
+  },
+  "keywords": [
+    "video-generation",
+    "ai",
+    "free-content",
+    "google-accounts",
+    "automation",
+    "content-creation"
+  ],
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}

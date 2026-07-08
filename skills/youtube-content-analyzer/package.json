@@ -1,0 +1,95 @@
+{
+  "name": "youtube-content-analyzer",
+  "version": "1.0.0",
+  "description": "YouTube Content Analyzer - Analyse marketing et vente des vidéos YouTube",
+  "author": "Mycroft IA",
+  "category": "content-analysis",
+  "tags": [
+    "youtube",
+    "analysis",
+    "marketing",
+    "sales",
+    "nlp",
+    "content"
+  ],
+  "dependencies": [
+    "nltk",
+    "spacy",
+    "transformers",
+    "torch",
+    "pandas",
+    "numpy",
+    "requests",
+    "youtube-transcript-api"
+  ],
+  "commands": [
+    {
+      "name": "analyze-youtube",
+      "description": "Analyser une vidéo YouTube",
+      "usage": "python analyzer.py --url \"URL_VIDEO\" --output \"analysis.json\"",
+      "example": "python analyzer.py --url \"https://youtube.com/watch?v=abc123\" --output \"hormozi_analysis.json\""
+    },
+    {
+      "name": "analyze-playlist",
+      "description": "Analyser une playlist YouTube",
+      "usage": "python analyzer.py --playlist \"PLAYLIST_URL\" --batch --output \"batch_analysis/\"",
+      "example": "python analyzer.py --playlist \"https://youtube.com/playlist?list=xyz\" --batch"
+    },
+    {
+      "name": "generate-skills",
+      "description": "Générer des skills à partir des analyses",
+      "usage": "python analyzer.py --input \"analysis.json\" --generate-skills --output \"skills/\"",
+      "example": "python analyzer.py --input \"hormozi_analysis.json\" --generate-skills"
+    }
+  ],
+  "config": {
+    "nlp_settings": {
+      "model": "en_core_web_lg",
+      "sentiment_analysis": true,
+      "entity_recognition": true,
+      "topic_extraction": true
+    },
+    "marketing_analysis": {
+      "target_audience_keywords": ["entrepreneur", "business", "revenue", "growth"],
+      "value_proposition_indicators": ["results", "proven", "systematic", "framework"],
+      "messaging_patterns": ["direct", "confident", "data-driven", "practical"]
+    },
+    "sales_analysis": {
+      "technique_keywords": {
+        "objection_handling": ["objection", "concern", "pushback", "resistance"],
+        "closing": ["close", "deal", "commitment", "decision"],
+        "prospecting": ["lead", "prospect", "cold", "outreach"]
+      }
+    }
+  },
+  "installation": {
+    "windows": "install.bat",
+    "linux": "install.sh",
+    "macos": "install.sh"
+  },
+  "input_formats": [
+    "youtube_url",
+    "playlist_url",
+    "transcription_json"
+  ],
+  "output_formats": [
+    "analysis_json",
+    "skill_json",
+    "markdown_report",
+    "pdf_report"
+  ],
+  "features": [
+    "Analyse marketing profonde",
+    "Extraction de frameworks de vente",
+    "Analyse NLP avancée",
+    "Génération de skills",
+    "Support playlists",
+    "Export multiple formats"
+  ],
+  "target_audience": [
+    "Marketeurs",
+    "Formateurs vente",
+    "Consultants",
+    "Entrepreneurs"
+  ]
+}

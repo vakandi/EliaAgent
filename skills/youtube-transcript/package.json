@@ -1,0 +1,33 @@
+{
+  "name": "youtube-transcript",
+  "version": "1.0.0",
+  "description": "Extract and analyze YouTube video transcripts",
+  "author": "Eurus IA",
+  "repository": "https://github.com/badlogic/pi-skills",
+  "license": "MIT",
+  "main": "index.js",
+  "scripts": {
+    "test": "node test.js",
+    "build": "webpack --mode production"
+  },
+  "dependencies": {
+    "youtube-transcript-api": "^1.0.2",
+    "axios": "^1.6.0",
+    "natural": "^6.12.0"
+  },
+  "devDependencies": {
+    "webpack": "^5.88.0",
+    "webpack-cli": "^5.1.4"
+  },
+  "keywords": [
+    "youtube",
+    "transcript",
+    "video",
+    "content-analysis",
+    "research",
+    "ai"
+  ],
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}

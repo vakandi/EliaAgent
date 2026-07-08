@@ -14,6 +14,29 @@
 # Kept only for reference. Delete when no one remembers this existed.
 # =============================================================================
 
+# ============================================================
+# TMUX INSIDE TMUX GUARD
+# If already inside a tmux session, do NOT kill-session or
+# attach — that would destroy the parent tmux session.
+# ============================================================
+if [[ -n "$TMUX" ]]; then
+    echo "[GUARD] Already inside tmux session ($TMUX) — skipping elia-ui-4win.sh (deprecated)."
+    echo "[GUARD] To attach manually: tmux attach -t elia"
+    exit 0
+fi
+
+# ============================================================
+# STRONG EARLY EXIT — Ce script est deprecated et DANGEREUX.
+# Il utilise tmux kill-session qui détruit la session en cours.
+# Les seuls launchers autorisés sont:
+#   - EliaUI.command (safe, check-then-attach)
+#   - elia-ui.sh (safe, client-check avant kill)
+# ============================================================
+echo "⛔ [DEPRECATED] elia-ui-4win.sh est deprecated et dangereux."
+echo "    Utilise EliaUI.command (3 panes) à la place."
+echo "    Pour attacher à une session existante: tmux attach -t elia"
+exit 1
+
 # Window 1: OpenCode server (opencode-serve.sh)
 # Window 2: CodeMem Viewer (codemem-viewer.sh)
 # Window 3: Agents (start_agents.sh)  ← WRONG, should not be here
