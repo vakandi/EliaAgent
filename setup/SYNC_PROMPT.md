@@ -14,7 +14,7 @@ Your task is to SYNC the private repo to the public repo, cleaning all sensitive
 
 ---
 
-## CRITICAL: Lessons Learned (May 2026)
+## CRITICAL: Lessons Learned (May 2026 / July 8 2026)
 
 **⚠️ This sync process has a history of breaking things. Follow these rules strictly.**
 
@@ -45,6 +45,8 @@ GitHub has **automatic secret scanning**. It will BLOCK pushes containing:
 - Email addresses, phone numbers
 - Server credentials, database URLs
 
+**⚠️ CRITICAL LESSON (July 8, 2026)**: I failed to check for Atlassian API tokens (`ATATT3...`) and Discord bot tokens before pushing. GitHub auto-detected them and revoked the PAT. ALWAYS run ALL checks below before any commit.
+
 **Pre-push verification checklist:**
 ```bash
 # 1. Check staged changes for sensitive patterns
@@ -59,6 +61,21 @@ git diff --cached | grep -E '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b'
 
 # 4. Check for real email addresses
 git diff --cached | grep -E '\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'
+
+# 5. ⚠️ Check for Atlassian tokens (ATATT prefix - GitHub auto-detects these)
+git diff --cached | grep 'ATATT'
+
+# 6. ⚠️ Check for Discord bot tokens (base64-encoded snowflake format)
+git diff --cached | grep -E 'DISCORD_BOT_TOKEN|ND[A-Za-z0-9]+\.'
+
+# 7. ⚠️ Check for hardcoded Telegram credentials
+git diff --cached | grep -E 'TELEGRAM_API_[A-Z]+=|TG_BOT_TOKEN|TG_CHAT_ID|TG_USER_ID='
+
+# 8. ⚠️ Check for any hardcoded JIRA/CONFLUENCE tokens
+git diff --cached | grep -E 'JIRA_API_TOKEN|CONFLUENCE_API_TOKEN|JIRA_USERNAME|CONFLUENCE_USERNAME='
+
+# 9. ⚠️ Check for Node.js Discord bot tokens (often start with MT or Nt)
+git diff --cached | grep -E '"[A-Za-z0-9]{20,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{27,}"'
 ```
 
 **If ANY of these find matches, DO NOT COMMIT. Fix the files first.**
@@ -174,7 +191,9 @@ Or use explore agent for deeper analysis.
 **Typically NEW in EliaAI (copy to EliaAgent):**
 - `setup/desktop_shortcuts/` - Desktop shortcuts
 - `integrations/elia-discord-bot/` - Discord bot
-- `subworkers/` - Subworker agents
+- `subworkers/SUBWORKERS_SYSTEM.md` and `subworkers/SETUP_TOOLS.md` — Generic HOW-TO docs only (NOT subworker agent dirs)
+- NEW: `skills/elia-subworker-creator/` — Skill for creating subworkers (users need this to create their own)
+- NEW: `skills/blog-photo-yourapp/` — Blog image skill
 - New scripts in `scripts/`
 - Updated `ui_electron/` (without node_modules)
 
@@ -197,6 +216,10 @@ Or use explore agent for deeper analysis.
 - `integrations/elia-discord-bot/logs/` - Bot runtime logs
 - `integrations/elia-discord-bot/sessions.json` - Active sessions
 - `.scheduler_state` - Scheduler state files
+- **`subworkers/*/`** — All subworker agent dirs (yourbrand-suppliers, yourapp-*, yourapp-*, tiktok-content, reddit-saas-scraper, etc.). Subworkers contain private business prompts, anchor memory, and workspace data. **NEVER COPY.**
+  - Exception: `subworkers/SUBWORKERS_SYSTEM.md` and `subworkers/SETUP_TOOLS.md` are generic HOW-TO docs that CAN be synced.
+  - Exception: `subworkers/plists/` and `subworkers/scripts/` can contain EXAMPLE templates (not business-specific).
+- **EliaAI PROMPT.md** — Contains personal info, real business context, team members. Use a CLEANED version for public (or don't copy at all).
 
 ### Step 3: Clean Sensitive Data (NEVER modify source)
 
@@ -237,8 +260,10 @@ rsync -a /path/to/EliaAI/ui_electron/ /path/to/EliaAgent/ui_electron/ \
 rsync -a /path/to/EliaAI/scripts/ /path/to/EliaAgent/scripts/ \
   --exclude='logs'
 
-# Copy subworkers
-rsync -a /path/to/EliaAI/subworkers/ /path/to/EliaAgent/subworkers/
+# Copy subworkers — ONLY generic docs, NEVER agent dirs
+rsync -a /path/to/EliaAI/subworkers/SUBWORKERS_SYSTEM.md /path/to/EliaAgent/subworkers/SUBWORKERS_SYSTEM.md
+rsync -a /path/to/EliaAI/subworkers/SETUP_TOOLS.md /path/to/EliaAgent/subworkers/SETUP_TOOLS.md
+# ⚠️ DO NOT copy subworkers/<name>/ agent directories — they contain private business prompts
 ```
 
 ### Step 5: VERIFY No Sensitive Data Leaked (CRITICAL)
@@ -355,7 +380,13 @@ Use /path/to/EliaAI as source, /path/to/EliaAgent as target.
 | `setup/desktop_shortcuts/*` | YES | Desktop shortcuts |
 | `integrations/elia-discord-bot/` | YES | Discord bot (clean .env, logs, sessions.json first) |
 | `ui_electron/*` | YES | UI (exclude node_modules, .sisyphus, store) |
-| `subworkers/*` | YES | Subworker agents |
+| `subworkers/SUBWORKERS_SYSTEM.md` | YES (cleaned) | Generic HOW-TO doc only — no business-specific content |
+| `subworkers/SETUP_TOOLS.md` | YES (cleaned) | Tools installation guide only |
+| `subworkers/<name>/` (agent dirs) | **NO** | **PRIVATE** — contains business prompts, memory, workspace data |
+| `subworkers/plists/` | YES (templates only) | Example plist templates (not business-specific) |
+| `subworkers/scripts/` | YES (templates only) | Example trigger script templates (not business-specific) |
+| `skills/elia-subworker-creator/` | YES | Skill for users to create their own subworkers |
+| `skills/blog-photo-yourapp/` | YES | Blog image generation skill |
 | `context/TOOLS.md` | YES (cleaned) | Remove real tokens, IPs, business names |
 | `context/business.md` | YES (cleaned) | Replace with placeholders |
 | `PROMPT.md` | YES | Main prompt (scrub personal names) |
@@ -372,6 +403,29 @@ Use /path/to/EliaAI as source, /path/to/EliaAgent as target.
 ---
 
 ## Troubleshooting Sync Issues
+
+### Problem: `gh` auth fails but you have no browser for device flow
+
+If `gh auth login` fails (revoked PAT, no browser available, etc.), check if a token is cached in git credentials:
+
+```bash
+# Check git credential store
+cat ~/.git-credentials
+# Example: https://username:ghp_TOKEN@github.com
+
+# Use it directly for push operations (read-only operations work without auth)
+git push origin main --force   # Uses the credential helper automatically
+git push origin --delete refs/tags/v2.1.0
+
+# Delete a GitHub release via API using the stored token
+RELEASE_ID=$(curl -s -H "Authorization: Bearer $(cat ~/.git-credentials | sed 's/.*://;s/@.*//')" \
+  https://api.github.com/repos/user/EliaAgent/releases | \
+  python3 -c "import sys,json; rs=json.load(sys.stdin); [print(r['id'],r['tag_name']) for r in rs]")
+curl -X DELETE -H "Authorization: Bearer $(cat ~/.git-credentials | sed 's/.*://;s/@.*//')" \
+  https://api.github.com/repos/user/EliaAgent/releases/$RELEASE_ID
+```
+
+**⚠️ Important**: If the PAT was revoked by GitHub secret scanning, it won't work. Generate a new classic PAT (scope `repo`) at https://github.com/settings/tokens and update `~/.git-credentials`.
 
 ### Problem: "remote rejected due to secret scanning"
 
@@ -420,8 +474,12 @@ If you accidentally pushed private data:
 [ ] No server IP addresses in clean files
 [ ] No API keys or tokens in clean files
 [ ] No personal names in clean files
+[ ] No Atlassian tokens (ATATT3...) in clean files
+[ ] No Discord bot tokens in clean files
+[ ] No Telegram bot tokens/hash/ids in clean files
+[ ] No JIRA/CONFLUENCE usernames or tokens in clean files
 [ ] Template literals (${...}) are intact after copy
-[ ] `git diff --cached` reviewed for sensitive data
+[ ] `git diff --cached` reviewed for sensitive data (RUN ALL 9 CHECKS)
 [ ] NEVER `git rm` on source repo — only `--cached` (keeps files on disk)
 [ ] Integration `.env` files restored to disk after cleanup
 [ ] Incremental push working (not batching all commits)
@@ -430,4 +488,4 @@ If you accidentally pushed private data:
 
 ---
 
-**Last updated**: May 14, 2026
+**Last updated**: July 8, 2026
