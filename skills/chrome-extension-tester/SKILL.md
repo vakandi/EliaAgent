@@ -1,6 +1,6 @@
 ---
 name: chrome-extension-tester
-description: "Testing workflow for Chrome extensions with yourbrand backend integration. Use when: (1) Testing Snapchat Auto Add extension features, (2) Registering devices with the yourbrand backend, (3) Debugging extension behavior, (4) Accessing popup and service worker logs, (5) Running automation tests against the extension."
+description: "Testing workflow for Chrome extensions with YourBrand backend integration. Use when: (1) Testing Snapchat Auto Add extension features, (2) Registering devices with the YourBrand backend, (3) Debugging extension behavior, (4) Accessing popup and service worker logs, (5) Running automation tests against the extension."
 ---
 
 # Chrome Extension Tester
@@ -11,7 +11,7 @@ description: "Testing workflow for Chrome extensions with yourbrand backend inte
 
 ```bash
 agent-browser --profile ~/.agent-browser-profile \
-  --extension "/path/to/Documents/MultiSaasDeploy/snapchat_army/snapchat_ecommerce_chrome_extension" \
+  --extension "/path/to/chrome-extension" \
   open about:blank
 ```
 
@@ -33,13 +33,13 @@ agent-browser open "chrome-extension://{EXTENSION_ID}/popup.html"
 
 1. Load extension → Open popup
 2. Fill Master Key: `agent-browser fill "ref=e10" "MASTER_KEY"`
-3. Fill Snapchat Account: `agent-browser fill "ref=e11" "yourco.dev"`
+3. Fill Snapchat Account: `agent-browser fill "ref=e11" "youragency.dev"`
 4. Click Register: `agent-browser click "ref=e12"`
 5. Wait 3s → Check logs: `agent-browser click "ref=e7"`
 
 ### Get Master Key
 
-1. Go to `https://yourbrand.com/admin?section=channels`
+1. Go to `https://[your-store].com/admin?section=channels`
 2. Click **Master Key** → **Régénérer**
 3. Copy the key
 
@@ -76,7 +76,7 @@ Open popup → Click **📋 Logs** button → View log section
 ## API Testing
 
 ```bash
-curl -X POST "https://yourbrand.com/api/snapchat-ext/register" \
+curl -X POST "https://[your-store].com/api/snapchat-ext/register" \
   -H "Content-Type: application/json" \
   -H "X-Snapchat-Extension-Key: YOUR_KEY" \
   -d '{"device_id":"UUID","device_name":"Test","extension_version":"1.0.0","browser":"chrome","os":"MacIntel"}'
@@ -87,7 +87,7 @@ Note: `device_id` must be a valid UUID v4.
 ## Extension Path
 
 ```
-/path/to/Documents/MultiSaasDeploy/snapchat_army/snapchat_ecommerce_chrome_extension/
+/path/to/chrome-extension/
 ```
 
 ## Key Files

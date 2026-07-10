@@ -8,8 +8,8 @@
 
 ```
 skill(name="mcp-cli")
-read /path/to/EliaAI/context/TOOLS.md
-read /path/to/EliaAI/memory/MEMORY.md
+read ~/EliaAI/context/TOOLS.md
+read ~/EliaAI/memory/MEMORY.md
 ```
 
 ---
@@ -33,7 +33,7 @@ Elia's job is to **keep the team moving forward**:
 # Quick inbox sweep (5 min)
 mcp-cli call whatsapp list_chats '{}'
 mcp-cli call telegram get_default_group_messages '{"limit":15}'
-mcp-cli call discord-server-mcp discord_execute '{"operation":"messages.list_range","params":{"channel_id":"1489244810777727046","hours":6,"limit":20}}'
+mcp-cli call discord-server-mcp discord_execute '{"operation":"messages.list_range","params":{"channel_id":"[channel-id]","hours":6,"limit":20}}'
 ```
 
 ### Reply (MUST)
@@ -55,10 +55,10 @@ Every run, post to at least ONE group:
 # YOURBRAND BUSINESS
 "Salut! Je passe check si tout va bien. Ali, les commandes du jour?"
 
-# YOURCO PowerRangers
+# [Your Team] PowerRangers
 "Checking in! Thomas, besoin d'aide sur un projet?"
 
-# YOURVENTURES
+# [YOUR PARTNER]
 "Marco, des nouvelles réservations?"
 ```
 
@@ -80,7 +80,7 @@ Check for stuck items → Unblock:
 
 ### Check MEMORY.md for "en attente"
 ```
-grep -i "en attente" /path/to/EliaAI/memory/MEMORY.md
+grep -i "en attente" ~/EliaAI/memory/MEMORY.md
 ```
 
 ### For each stuck item >24h:
@@ -89,7 +89,7 @@ grep -i "en attente" /path/to/EliaAI/memory/MEMORY.md
 
 | Stuck Item | Action |
 |------------|--------|
-| Stripe → YourName | Telegram: "Hey, deadline April 20, besoin d'aide?" |
+| Stripe → [YOUR NAME] | Telegram: "Hey, deadline April 20, besoin d'aide?" |
 | Shopify → Thomas | WhatsApp: "Le token Shopify, ça gaze?" |
 | Orders → Ali | WhatsApp: "Ali, tu as temps de traiter?" |
 
@@ -97,14 +97,14 @@ grep -i "en attente" /path/to/EliaAI/memory/MEMORY.md
 
 ## 📊 PHASE 4: QUICK BUSINESS CHECKS
 
-### YourBrand (2 min)
+### [Your Brand] (2 min)
 ```bash
 # Check for new orders in WhatsApp
 # Check Shopify if accessible
 # Post status to #orders
 ```
 
-### YourTool (1 min)
+### [Your SaaS] (1 min)
 ```bash
 # Quick ticket count check (if API available)
 # Post status to #panel
@@ -146,12 +146,12 @@ Before ending run, verify:
 
 ### Discord Channel IDs
 ```
-health-checks: 1489247935807099020
-orders:        1489244862871244950
-products:      1489244857250615416
-clients:       1489244868235755580
-panel:         1489244946673176618
-reports:       1489244810777727046
+health-checks: [channel-id]
+orders:        [channel-id]
+products:      [channel-id]
+clients:       [channel-id]
+panel:         [channel-id]
+reports:       [channel-id]
 ```
 
 ### Send Message

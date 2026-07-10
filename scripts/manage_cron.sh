@@ -304,11 +304,11 @@ ${calendar_entries}
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/path/to/opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/home/user/.local/bin:/home/user/.npm-global/bin:/home/user/.nvm/versions/node/v20.20.2/bin</string>
+        <string>~/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:~/.local/bin:~/.npm-global/bin:~/.nvm/versions/node/v20.20.2/bin</string>
         <key>HOME</key>
-        <string>/home/user</string>
+        <string>~</string>
         <key>USER</key>
-        <string>user</string>
+        <string>yourusername</string>
         <key>NO_PROXY</key>
         <string>127.0.0.1,localhost,::1</string>
         <key>no_proxy</key>
@@ -410,11 +410,11 @@ install_morning_scheduler() {
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/path/to/opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/home/user/.local/bin:/home/user/.npm-global/bin:/home/user/.nvm/versions/node/v20.20.2/bin</string>
+        <string>~/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:~/.local/bin:~/.npm-global/bin:~/.nvm/versions/node/v20.20.2/bin</string>
         <key>HOME</key>
-        <string>/home/user</string>
+        <string>~</string>
         <key>USER</key>
-        <string>user</string>
+        <string>yourusername</string>
         <key>NO_PROXY</key>
         <string>127.0.0.1,localhost,::1</string>
         <key>no_proxy</key>

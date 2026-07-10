@@ -18,32 +18,32 @@ PRE-REPORT CHECKLIST:
 For each business area, decide: DOES THIS APPLY THIS RUN?
 
 ☐ Server Health / MCP Status:
-  If YES → Send to #health-checks (1489247935807099020)
-  Command: mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"1489247935807099020","content":"YOUR MESSAGE"}'
+  If YES → Send to #health-checks ([channel-id])
+  Command: mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"YOUR MESSAGE"}'
 
 ☐ YourBrand Orders / Sales:
-  If YES → Send to #orders (1489244862871244950)
-  Command: mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"1489244862871244950","content":"YOUR MESSAGE"}'
+  If YES → Send to #orders ([channel-id])
+  Command: mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"YOUR MESSAGE"}'
 
 ☐ YourBrand Products:
-  If YES → Send to #products (1489244857250615416)
-  Command: mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"1489244857250615416","content":"YOUR MESSAGE"}'
+  If YES → Send to #products ([channel-id])
+  Command: mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"YOUR MESSAGE"}'
 
 ☐ YourBrand Clients:
-  If YES → Send to #clients (1489244868235755580)
-  Command: mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"1489244868235755580","content":"YOUR MESSAGE"}'
+  If YES → Send to #clients ([channel-id])
+  Command: mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"YOUR MESSAGE"}'
 
 ☐ YourTool Panel:
-  If YES → Send to #panel (1489244946673176618)
-  Command: mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"1489244946673176618","content":"YOUR MESSAGE"}'
+  If YES → Send to #panel ([channel-id])
+  Command: mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"YOUR MESSAGE"}'
 
 ☐ TikTok/YouTube Content:
-  If YES → Send to #content (1489244954646679662)
-  Command: mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"1489244954646679662","content":"YOUR MESSAGE"}'
+  If YES → Send to #content ([channel-id])
+  Command: mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"YOUR MESSAGE"}'
 
 ☐ TikTok/YouTube Analytics:
-  If YES → Send to #analytics (1489244965337956514)
-  Command: mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"1489244965337956514","content":"YOUR MESSAGE"}'
+  If YES → Send to #analytics ([channel-id])
+  Command: mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"YOUR MESSAGE"}'
 ```
 
 **⚠️ IF UNSURE WHERE TO SEND → VERIFY CHANNELS FIRST:**
@@ -53,7 +53,7 @@ mcp-cli call discord-server-mcp discord_execute '{"operation":"channels.list","p
 Check current channel structure and match your content to the most appropriate channel.
 
 **THEN and ONLY THEN:**
-- Send brief summary (3-5 bullets MAX) to #reports (1489244810777727046)
+- Send brief summary (3-5 bullets MAX) to #reports ([channel-id])
 - DO NOT repeat details already sent to other channels
 
 **❌ IF YOU SKIP THIS CHECKLIST → REPORT IS INVALID**
@@ -67,13 +67,13 @@ Check current channel structure and match your content to the most appropriate c
 ### ✅ CORRECT - Send file directly (NEW!):
 ```bash
 # Send file directly to Discord channel
-mcp-cli call discord-server-mcp discord_send_file '{"channel_id":"1489244810777727046","file_path":"/path/to/EliaAI/docs/2026-04-08/report.md","content":"📋 Rapport détaillé"}'
+mcp-cli call discord-server-mcp discord_send_file '{"channel_id":"[channel-id]","file_path":"/path/to/EliaAI/docs/2026-04-08/report.md","content":"📋 Rapport détaillé"}'
 ```
 
 ### ❌ WRONG - Never send file path as text:
 ```bash
 # DON'T do this - sends just a path, not the file
-mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"1489244810777727046","content":"📄 Report: /path/to/EliaAI/docs/2026-04-08/report.md"}'
+mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"📄 Report: /path/to/EliaAI/docs/2026-04-08/report.md"}'
 ```
 
 ### Fallback - If direct upload fails, use tmpfiles.org:
@@ -112,7 +112,7 @@ read /path/to/EliaAI/context/TOOLS.md
 
 # 3. Load memory
 read /path/to/EliaAI/memory/MEMORY.md
-read /path/to/EliaAI/memory/GLOBAL-*-WAEL-BOUSFIRA.md
+read /path/to/EliaAI/memory/GLOBAL-*-YOUR-NAME.md
 read /path/to/EliaAI/memory/MEMORY-TOOLS-AND-AUTOMATION-WORKFLOWS.md
 
 # 4. Check Google Calendar & Tasks (URGENT reminders)
@@ -150,15 +150,15 @@ mcp-cli call discord-mcp discord_get_dms '{"limit":20}'
 mcp-cli call discord-server-mcp discord_execute '{"operation":"channels.list","params":{}}'
 
 # Read messages from last 12 hours (DEFAULT - use this for inbox check)
-mcp-cli call discord-server-mcp discord_execute '{"operation":"messages.list_range","params":{"channel_id":"1489244810777727046","hours":12,"limit":50}}'
+mcp-cli call discord-server-mcp discord_execute '{"operation":"messages.list_range","params":{"channel_id":"[channel-id]","hours":12,"limit":50}}'
 
 # Read messages from key channels (last 12h default):
-# #reports: 1489244810777727046
-# #urgent: 1489244806310793216
-# #activity-logs: 1489244812107317402
-# #health-checks: 1489247935807099020
-# #projects (YourCo): 1489244906013593642
-# #orders (B2L): 1489244862871244950
+# #reports: [channel-id]
+# #urgent: [channel-id]
+# #activity-logs: [channel-id]
+# #health-checks: [channel-id]
+# #projects (YourCo): [channel-id]
+# #orders (B2L): [channel-id]
 ```
 
 ### Check emails (ProtonMail + IONOS)
@@ -182,7 +182,7 @@ Run these every cycle. Act on any anomaly.
 - Open tickets, overdue payments
 - → Reply to tickets if non-sensitive
 
-### MayaVanta (Marco's project)
+### [Your Partner] (Marco's project)
 - New bookings, messages in YOURVENTURES WhatsApp group
 - → Coordinate with Marco
 
@@ -196,7 +196,7 @@ Run these every cycle. Act on any anomaly.
 
 - Analyze work progress and advancements
 - Identify completed vs. pending tasks
-- Categorize by business (Bene2luxe, YourCo, YOURVENTURES, etc.)
+- Categorize by business (Your Brand, YourCo, YOURVENTURES, etc.)
 - Generate tasks for YourName, Rida, Thomas, Ali
 - Prioritize all tasks (most to least important)
 
@@ -304,12 +304,12 @@ mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"CHANNEL_ID"
 - **YourName**: Owner, management, logistics, development, ads, banking
 - **Rida**: Your Company co-founder, social media, WhatsApp, client acquisition
 - **Thomas Cogné**: Your Company co-founder, technical, logistics, deals, SnapchatArmy
-- **Ali**: Bene2luxe key associate, stocks, customer relations, product sourcing
+- **Ali**: Your Brand key associate, stocks, customer relations, product sourcing
 - **Anass**: YourBrand2, client acquisition US/UK, frontend
 
 **Business Relationships**:
 - **YOURVENTURES**: YourCo agency's partner - treat all YOURVENTURES tasks as YourCo agency business
-- **Bene2luxe**: Clothing business, Ali is key associate
+- **Your Brand**: Clothing business, Ali is key associate
 - **AccForge**: YourCo agency client project
 
 **Error Handling**:

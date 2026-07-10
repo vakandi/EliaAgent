@@ -8,8 +8,8 @@
 
 ```
 skill(name="mcp-cli")
-read /path/to/EliaAI/context/TOOLS.md
-read /path/to/EliaAI/memory/MEMORY.md
+read ~/EliaAI/context/TOOLS.md
+read ~/EliaAI/memory/MEMORY.md
 ```
 
 ---
@@ -40,7 +40,7 @@ mcp-cli call discord-server-mcp discord_execute '{"operation":"messages.list_ran
 | From | To | Action |
 |------|-----|--------|
 | Customer | Ali/Team | Forward order request |
-| YourName | Team | Relay task |
+| [YOUR NAME] | Team | Relay task |
 | Team | Team | Connect them |
 | Question | Answer | Reply directly |
 
@@ -58,10 +58,10 @@ Send connection messages:
 # To YOURBRAND BUSINESS
 "Ali, t'as vu la commande de ce matin? besoin de shipping?"
 
-# To YOURCO
-"Thomas, Rida demande si le projet X avance?"
+# To [YOUR TEAM]
+"Thomas, [Team Member] demande si le projet X avance?"
 
-# To YOURVENTURES
+# To [YOUR PARTNER]
 "Marco, t'as eu des nouvelles reservations?"
 ```
 
@@ -71,10 +71,10 @@ Post to keep everyone informed:
 
 ```bash
 # Orders update
-mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"1489244862871244950","content":"📦 Commandes du jour: X traitées"}'
+mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"📦 Commandes du jour: X traitées"}'
 
 # Team update  
-mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"1489244810777727046","content":"🔄 Relayed: X → Y"}'
+mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"🔄 Relayed: X → Y"}'
 ```
 
 ---
@@ -83,17 +83,17 @@ mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"14892448107
 
 ### Find Stuck Items
 ```
-grep -i "en attente\|waiting\|blocked" /path/to/EliaAI/memory/MEMORY.md
+grep -i "en attente\|waiting\|blocked" ~/EliaAI/memory/MEMORY.md
 ```
 
 ### Relay to Unblock
 
 | Stuck | Relay To | Message |
 |-------|----------|---------|
-| Stripe | → YourName | "Hey, deadline proche, on est bons?" |
+| Stripe | → [YOUR NAME] | "Hey, deadline proche, on est bons?" |
 | Shopify | → Thomas | "Le token, besoin d'aide?" |
 | Orders | → Ali | "Commandes en attente, dispo?" |
-| Content | → Rida | "Le contenu, on est prêts!" |
+| Content | → [Team Member] | "Le contenu, on est prêts!" |
 
 **Send the message. Don't just note it.**
 
@@ -103,17 +103,17 @@ grep -i "en attente\|waiting\|blocked" /path/to/EliaAI/memory/MEMORY.md
 
 ### Quick Sync Each Business
 
-#### YourBrand
+#### [Your Brand]
 - Orders today?
 - Shipments needed?
 - → Relay to Ali
 
-#### YourTool
+#### [Your SaaS]
 - Tickets count?
 - Issues?
 - → Post #panel
 
-#### MayaVanta
+#### [Your Partner]
 - Bookings?
 - → Relay to Marco
 
@@ -163,10 +163,10 @@ If inbox is empty → CREATE activity:
 
 | Channel | ID |
 |---------|-----|
-| #health-checks | 1489247935807099020 |
-| #orders | 1489244862871244950 |
-| #panel | 1489244946673176618 |
-| #reports | 1489244810777727046 |
+| #health-checks | [channel-id] |
+| #orders | [channel-id] |
+| #panel | [channel-id] |
+| #reports | [channel-id] |
 
 ---
 

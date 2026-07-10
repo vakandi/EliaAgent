@@ -97,14 +97,14 @@ URL: https://higgsfield.ai/lipsync-studio?ugc-studio=true
 
 **Mascot Image Path:**
 ```
-/path/to/Documents/HiggsField.ai-API-Wraper/mascott_yourbrand.png
+/path/to/mascot.png
 ```
 
 **⚠️ ERROR HANDLING:**
 
 If user asks to use the mascot in UGC generation, you will see:
 ```
-Cannot read "mascott_yourbrand.png" (this model does not support image input)
+Cannot read "mascot.png" (this model does not support image input)
 ```
 
 **Solution:** Use text prompts to describe mascot lipsync/animation scenes.

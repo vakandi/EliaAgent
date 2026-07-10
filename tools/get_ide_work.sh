@@ -46,7 +46,7 @@ HOURS=$(( ($(date +%s) - SINCE_EPOCH) / 3600 ))
 {
     echo "# IDE Work Summary"
     echo ""
-    echo '> **📎 See also**: [[../wiki/businesses/YourCo-Agency|Your Company]] | [[../wiki/topics/YourCo-Agency-Timeline|YourCo Timeline]] | [[../wiki/businesses/YourBrand|YourBrand]] | [[../wiki/businesses/YourTool|YourTool]] | [[../wiki/topics/Infrastructure-Timeline|Infrastructure]] | [[../wiki/tools/MCP-Tools|MCP Tools]]'
+    echo '> **📎 See also**: [[../wiki/businesses/your-agency|Your Agency]] | [[../wiki/topics/your-agency-Timeline|Agency Timeline]] | [[../wiki/businesses/Your Brand|Your Brand]] | [[../wiki/businesses/Your SaaS|Your SaaS]] | [[../wiki/topics/infrastructure-timeline|Infrastructure]] | [[../wiki/tools/MCP-Tools|MCP Tools]]'
     echo ""
     echo "**Generated:** $(date '+%Y-%m-%d %H:%M:%S') | **Since:** $SINCE_DATE (${HOURS}h) | **User:** $(whoami)"
     echo ""

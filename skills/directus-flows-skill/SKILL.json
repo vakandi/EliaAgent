@@ -1,0 +1,6 @@
+{
+  "name": "directus-flows",
+  "description": "Complete Directus Flows management skill. Create, read, update, delete flows and operations via REST API. All trigger types (event, webhook, schedule, operation, manual), all operation types (request, transform, condition, log, mail, notification, item CRUD, sleep, throw-error, exec, trigger, JWT), operation chaining with resolve/reject, grid positioning for visual layout, and debugging/troubleshooting. Use when working with Directus automation flows, webhooks, event hooks, or schedule triggers.",
+  "version": "1.0.0",
+  "author": "Gilfoyle"
+}

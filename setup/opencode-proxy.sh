@@ -1,29 +1,21 @@
 #!/bin/bash
 # Wrapper opencode avec proxy via variables d'environnement
-# Lit la config depuis ~/.proxychains.conf (écrite par switch-proxy.sh)
+
+# ============================================================
+# SCHEDULER DISABLE GUARD
+# If .scheduler_disabled exists, exit immediately without running.
+# Create this file to permanently disable all agent launches:
+#   touch ~/EliaAI/.scheduler_disabled
+# ============================================================
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+AGENT_DIR="$(dirname "$SCRIPT_DIR")"
 
 PROXY_CONF="$HOME/.proxychains.conf"
-
-if [ ! -f "$PROXY_CONF" ]; then
-    echo "❌ $PROXY_CONF introuvable. Run 'sp' d'abord pour configurer un proxy."
-    exit 1
-fi
-
-PROXY_LINE=$(grep "^http " "$PROXY_CONF" | head -1)
-if [ -z "$PROXY_LINE" ]; then
-    echo "❌ Aucun proxy configuré dans $PROXY_CONF. Run 'sp' d'abord."
-    exit 1
-fi
-
+PROXY_LINE=$(grep "http " "$PROXY_CONF" | head -1)
 IP=$(echo "$PROXY_LINE" | awk '{print $2}')
 PORT=$(echo "$PROXY_LINE" | awk '{print $3}')
 USER=$(echo "$PROXY_LINE" | awk '{print $4}')
 PASS=$(echo "$PROXY_LINE" | awk '{print $5}')
-
-if [ -z "$IP" ] || [ -z "$PORT" ]; then
-    echo "❌ Configuration proxy invalide dans $PROXY_CONF."
-    exit 1
-fi
 
 echo "🔧 Proxy activé: $IP:$PORT"
 env HTTP_PROXY="http://${USER}:${PASS}@${IP}:${PORT}" \

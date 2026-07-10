@@ -287,26 +287,28 @@ function parsePlistSchedule(plistPath) {
     const entries = plist.StartCalendarInterval;
     if (!entries || !Array.isArray(entries) || entries.length === 0) return null;
 
-    const intervals = entries.map(e => ({ hour: e.Hour, minute: e.Minute }));
+    const intervals = entries.map(e => ({ hour: e.Hour, minute: e.Minute, weekday: e.Weekday }));
     intervals.sort((a, b) => a.hour - b.hour || a.minute - b.minute);
 
     const hours = [...new Set(intervals.map(i => i.hour))].sort((a, b) => a - b);
     const minutes = [...new Set(intervals.map(i => i.minute))].sort((a, b) => a - b);
+    const weekdays = [...new Set(intervals.map(i => i.weekday).filter(w => w !== undefined))].sort((a, b) => a - b);
 
-    // Detect pattern
+    const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
     let description;
-    if (intervals.length === 1) {
+    if (intervals.length === 1 && weekdays.length === 1) {
+      const e = intervals[0];
+      description = `${DAY_NAMES[weekdays[0]]} ${String(e.hour).padStart(2, '0')}:${String(e.minute).padStart(2, '0')}`;
+    } else if (intervals.length === 1) {
       const e = intervals[0];
       description = `${String(e.hour).padStart(2, '0')}:${String(e.minute).padStart(2, '0')} daily`;
     } else if (minutes.length === 1 && hours.length > 1) {
-      // Same minute every hour: hourly pattern
       const minStr = String(minutes[0]).padStart(2, '0');
       description = `${String(hours[0]).padStart(2, '0')}h→${String(hours[hours.length - 1]).padStart(2, '0')}h hourly at :${minStr}`;
     } else if (minutes.length === 2 && minutes[0] === 0 && minutes[1] === 30 && hours.length > 1) {
-      // :00 and :30 → every 30 min
       description = `${String(hours[0]).padStart(2, '0')}h→${String(hours[hours.length - 1]).padStart(2, '0')}h every 30min`;
     } else {
-      // Generic list
       description = intervals.map(e => `${String(e.hour).padStart(2, '0')}:${String(e.minute).padStart(2, '0')}`).join(', ');
     }
 
@@ -559,6 +561,54 @@ ipcMain.on('show-subworker-popup', () => {
   showSubworkerPopupWindow();
 });
 
+let schedulePickerPopup = null;
+ipcMain.on('open-schedule-picker', (event, agentName, currentSchedule) => {
+  showSchedulePickerWindow(agentName, currentSchedule);
+});
+
+ipcMain.on('save-subworker-schedule', (event, { agentName, scheduleConfig }) => {
+  try {
+    const plistPath = path.join(subworkersRoot, 'plists', `com.elia.${agentName}.plist`);
+    if (!fs.existsSync(plistPath)) {
+      event.reply('schedule-saved', { success: false, error: 'Plist not found' });
+      return;
+    }
+
+    const json = execSync(`plutil -convert json -o - "${plistPath}"`, { encoding: 'utf8' });
+    const plist = JSON.parse(json);
+
+    delete plist.StartInterval;
+    delete plist.StartCalendarInterval;
+
+    if (scheduleConfig.type === 'interval') {
+      plist.StartInterval = scheduleConfig.seconds;
+    } else if (scheduleConfig.type === 'calendar') {
+      plist.StartCalendarInterval = scheduleConfig.entries;
+    }
+
+    const tmpJson = path.join('/tmp', `plist_${agentName}_${Date.now()}.json`);
+    fs.writeFileSync(tmpJson, JSON.stringify(plist), 'utf8');
+    execSync(`plutil -convert xml1 -o "${plistPath}" "${tmpJson}"`, { encoding: 'utf8' });
+    fs.unlinkSync(tmpJson);
+
+    try {
+      execSync(`launchctl bootout gui/$(id -u) "${plistPath}" 2>/dev/null || true`, { encoding: 'utf8' });
+    } catch (_) {}
+    try {
+      execSync(`launchctl bootstrap gui/$(id -u) "${plistPath}" 2>/dev/null || true`, { encoding: 'utf8' });
+    } catch (_) {}
+
+    if (subworkerPopup && !subworkerPopup.isDestroyed()) {
+      subworkerPopup.webContents.send('subworkers-list', getSubworkerStatus());
+    }
+
+    event.reply('schedule-saved', { success: true, agentName });
+  } catch (e) {
+    console.error('save-subworker-schedule error:', e.message);
+    event.reply('schedule-saved', { success: false, error: e.message });
+  }
+});
+
 // Get subworker list
 ipcMain.on('get-subworkers', (event) => {
   const workers = getSubworkerStatus();
@@ -646,6 +696,9 @@ ipcMain.on('close-popup', () => {
   if (welcomePopup && !welcomePopup.isDestroyed()) {
     welcomePopup.close();
   }
+  if (schedulePickerPopup && !schedulePickerPopup.isDestroyed()) {
+    schedulePickerPopup.close();
+  }
 });
 
 // Run Manual Cron (from cron popup)
@@ -677,7 +730,7 @@ ipcMain.on('open-logs-terminal', () => {
   const path = require('path');
   
   // Find latest opencode_interactive log file
-  const logsDir = '/path/to/EliaAI/logs';
+  const logsDir = 'process.env.HOME + '/EliaAI'/logs';
   let latestLog = null;
   let latestTime = 0;
   
@@ -696,7 +749,7 @@ ipcMain.on('open-logs-terminal', () => {
   } catch (e) {}
   
   // Fallback to cron.log if no opencode log found
-  const logFile = latestLog || '/path/to/EliaAI/logs/cron.log';
+  const logFile = latestLog || 'process.env.HOME + '/EliaAI'/logs/cron.log';
   // Show whole file + follow in realtime
   const cmd = 'tail -n 5000 -f ' + logFile;
   
@@ -750,6 +803,38 @@ ipcMain.on('open-subworker-logs', (_event, name) => {
   });
 });
 
+// ── Helpers for run log timestamp parsing ──────────────────────────
+function parseLocalTimestamp(str) {
+  const parts = str.match(/\d+/g);
+  if (!parts || parts.length < 6) return null;
+  return new Date(+parts[0], +parts[1] - 1, +parts[2], +parts[3], +parts[4], +parts[5]);
+}
+
+function timeAgo(date) {
+  if (!date) return null;
+  const diffMs = Date.now() - date.getTime();
+  if (diffMs < 60000) return 'just now';
+  if (diffMs < 3600000) return Math.floor(diffMs / 60000) + 'm ago';
+  if (diffMs < 86400000) {
+    const h = Math.floor(diffMs / 3600000);
+    const m = Math.floor((diffMs % 3600000) / 60000);
+    return h + 'h ' + m + 'm ago';
+  }
+  return Math.floor(diffMs / 86400000) + 'd ago';
+}
+
+function formatDuration(ms) {
+  if (ms == null || ms <= 0) return null;
+  const totalSec = Math.round(ms / 1000);
+  if (totalSec < 60) return totalSec + 's';
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  if (m < 60) return m + 'm ' + s + 's';
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  return h + 'h ' + rm + 'm';
+}
+
 // List per-run log files for a subworker (last 100, sorted newest first)
 ipcMain.on('get-subworker-runs', (event, name) => {
   if (!name) return;
@@ -766,7 +851,47 @@ ipcMain.on('get-subworker-runs', (event, name) => {
         const filePath = path.join(runsDir, file);
         try {
           const stats = fs.statSync(filePath);
-          runs.push({ filename: file, path: filePath, mtime: stats.mtimeMs, size: stats.size });
+          const run = { filename: file, path: filePath, mtime: stats.mtimeMs, size: stats.size, status: 'unknown' };
+
+          // Parse log content for timeAgo and duration
+          try {
+            const fd = fs.openSync(filePath, 'r');
+            const headBuf = Buffer.alloc(300);
+            const headBytes = fs.readSync(fd, headBuf, 0, 300, 0);
+            const head = headBuf.toString('utf8', 0, headBytes);
+            const startMatch = head.match(/^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]/);
+            if (startMatch) {
+              const startDate = parseLocalTimestamp(startMatch[1]);
+              run.timeAgo = timeAgo(startDate);
+
+              // Read tail to find status marker
+              // trigger_template.sh writes: [timestamp] EOF_SUBWORKER_EXIT:<code>
+              // This is a unique string the AI can never produce.
+              const tailLen = Math.min(stats.size, 300);
+              const tailBuf = Buffer.alloc(tailLen);
+              const tailBytes = fs.readSync(fd, tailBuf, 0, tailLen, Math.max(0, stats.size - tailLen));
+              const tail = tailBuf.toString('utf8', 0, tailBytes);
+              const exitMatch = tail.match(/\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s+EOF_SUBWORKER_EXIT:(\d+)/);
+              if (exitMatch) {
+                const endDate = parseLocalTimestamp(exitMatch[1]);
+                const exitCode = parseInt(exitMatch[2], 10);
+                run.duration = formatDuration(endDate - startDate);
+                if (exitCode !== 0) run.status = 'crashed';
+                else run.status = 'success';
+              } else {
+                // No EOF marker — old log or pre-marker run. Try partial
+                // duration from last [timestamp] line, status stays unknown.
+                const allTs = [...tail.matchAll(/\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]/g)];
+                if (allTs.length > 0) {
+                  const lastDate = parseLocalTimestamp(allTs[allTs.length - 1][1]);
+                  run.duration = formatDuration(lastDate - startDate);
+                }
+              }
+            }
+            fs.closeSync(fd);
+          } catch (_) {}
+
+          runs.push(run);
         } catch (_) {}
       }
     }
@@ -842,7 +967,7 @@ ipcMain.on('execute-elia-command', () => {
               const user = parts[3];
               const pass = parts[4];
               const proxyUrl = `http://${user}:${pass}@${ip}:${port}`;
-              cmd = `cd /path/to/EliaAI && env HTTP_PROXY="${proxyUrl}" HTTPS_PROXY="${proxyUrl}" http_proxy="${proxyUrl}" https_proxy="${proxyUrl}" ELIA_MODEL=${modelValue} /path/to/Documents/dictate.command`;
+              cmd = `cd process.env.HOME + '/EliaAI' && env HTTP_PROXY="${proxyUrl}" HTTPS_PROXY="${proxyUrl}" http_proxy="${proxyUrl}" https_proxy="${proxyUrl}" ELIA_MODEL=${modelValue} process.env.HOME + '/Documents'/dictate.command`;
             }
           }
         } catch (e) {
@@ -851,7 +976,7 @@ ipcMain.on('execute-elia-command', () => {
       }
 
       if (!cmd) {
-        cmd = `cd /path/to/EliaAI && ELIA_MODEL=${modelValue} /path/to/Documents/dictate.command`;
+        cmd = `cd process.env.HOME + '/EliaAI' && ELIA_MODEL=${modelValue} process.env.HOME + '/Documents'/dictate.command`;
       }
 
       const script = [
@@ -888,7 +1013,7 @@ ipcMain.on('execute-mini-orb', () => {
           const user = parts[3];
           const pass = parts[4];
           const proxyUrl = `http://${user}:${pass}@${ip}:${port}`;
-          cmd = `env HTTP_PROXY="${proxyUrl}" HTTPS_PROXY="${proxyUrl}" http_proxy="${proxyUrl}" https_proxy="${proxyUrl}" /path/to/EliaAI/scripts/voice-command-only.sh`;
+          cmd = `env HTTP_PROXY="${proxyUrl}" HTTPS_PROXY="${proxyUrl}" http_proxy="${proxyUrl}" https_proxy="${proxyUrl}" process.env.HOME + '/EliaAI'/scripts/voice-command-only.sh`;
         }
       }
     } catch (e) {
@@ -897,7 +1022,7 @@ ipcMain.on('execute-mini-orb', () => {
   }
   
   if (!cmd) {
-    cmd = '/path/to/EliaAI/scripts/voice-command-only.sh';
+    cmd = 'process.env.HOME + '/EliaAI'/scripts/voice-command-only.sh';
   }
   
   const script = [
@@ -990,7 +1115,7 @@ function loadCurrentModel() {
 // Get current scheduler settings — standardEnabled follows the real LaunchAgent plist (not stale .scheduler_state).
 function getCurrentCronSettings() {
   const stateFile = path.join(EliaAIRoot, '.scheduler_state');
-  const home = process.env.HOME || '/home/user';
+  const home = process.env.HOME || 'process.env.HOME';
   const launchdPlist = path.join(home, 'Library/LaunchAgents/com.elia.elia-agent.plist');
   const morningPlist = path.join(home, 'Library/LaunchAgents/com.elia.elia-agent-morning.plist');
   const plistInstalled = fs.existsSync(launchdPlist);
@@ -1284,7 +1409,7 @@ function saveTraySettings() {
 }
 
 function createTray() {
-  const iconPath = '/path/to/EliaAI/ui_electron/imgs/electronui.png';
+  const iconPath = 'process.env.HOME + '/EliaAI'/ui_electron/imgs/electronui.png';
   let trayIcon = nativeImage.createFromPath(iconPath);
   if (trayIcon.isEmpty()) {
     trayIcon = nativeImage.createEmpty();
@@ -1347,33 +1472,33 @@ function runMorningSpeak() {
   const fs = require('fs');
   const path = require('path');
   
-  const eliaAI = '/path/to/EliaAI';
+  const eliaAI = 'process.env.HOME + '/EliaAI'';
   const promptFile = path.join(eliaAI, '.morning_briefing_prompt.txt');
   
   const morningPrompt = `MORNING BRIEFING - COMPREHENSIVE DAILY UPDATE:
 
-You are Elia's morning briefing assistant. Your task is to gather ALL relevant information and provide a complete spoken briefing to YourName.
+You are Elia's morning briefing assistant. Your task is to gather ALL relevant information and provide a complete spoken briefing to User.
 
-CRITICAL: You must SPEAK to YourName during the ENTIRE process, not just at the end. Use elia-voxtral-speak throughout.
+CRITICAL: You must SPEAK to the user during the ENTIRE process, not just at the end. Use elia-voxtral-speak throughout.
 
 SPEAK AT THESE MOMENTS:
-1. AT THE START: "Salut YourName, je démarre le briefing matinal. Je check tout ça."
+1. AT THE START: "Salut User, je démarre le briefing matinal. Je check tout ça."
 2. AFTER EACH CHECK: "Je finishes de checker [Google Calendar / WhatsApp / Telegram / Jira], je te donne le point."
 3. BEFORE SENDING TASKS: "Je t'ajoute [X] tâches sur ton téléphone."
-4. AT THE END: "C'est bon YourName, voici le résumé complet de la matinée."
+4. AT THE END: "C'est bon User, voici le résumé complet de la matinée."
 
 MUST DO:
 1. CHECK GOOGLE CALENDAR: Use gws-workspace list-events to get today's meetings and events
 2. CHECK TELEGRAM: Read recent messages from Watson IA group (chat ID: -5148361692)
 3. CHECK WHATSAPP: Read YOURBRAND BUSINESS (000000000000000000@g.us) and YOURCO PowerRangers (000000000000000000@g.us)
-4. CHECK JIRA: Get pending tickets for BEN, YOURCOAGENC, ZOVAPANEL, TIKYT
-5. CHECK MEMORY FILES: Read /path/to/EliaAI/memory/*.md for important context
+4. CHECK JIRA: Get pending tickets for [YOUR-PROJECTS]
+5. CHECK MEMORY FILES: Read process.env.HOME + '/EliaAI'/memory/*.md for important context
 6. GATHER BUSINESS UPDATES: Status of all 8 businesses
-7. IDENTIFY ACTION ITEMS: What needs YourName's attention today?
+7. IDENTIFY ACTION ITEMS: What needs the user's attention today?
 8. IDENTIFY WAITING ON: What are team members waiting for?
 
 AFTER GATHERING ALL INFO:
-- Use gws-workspace create-task to add any important tasks to YourName's phone
+- Use gws-workspace create-task to add any important tasks to the user's phone
 - Use gws-workspace create-event to add any meetings to calendar if missing
 
 IMPORTANT: Speak at EACH step using elia-voxtral-speak (fast, French) → fallback: elia-speak`;
@@ -1473,6 +1598,52 @@ function showSubworkerPopupWindow() {
 
   subworkerPopup.on('closed', () => {
     subworkerPopup = null;
+  });
+}
+
+function showSchedulePickerWindow(agentName, currentSchedule) {
+  if (schedulePickerPopup && !schedulePickerPopup.isDestroyed()) {
+    schedulePickerPopup.focus();
+    return;
+  }
+
+  const display = screen.getPrimaryDisplay();
+  const { width: screenWidth, height: screenHeight } = display.workAreaSize;
+
+  const popupW = 420;
+  const popupH = 520;
+  const x = Math.round((screenWidth - popupW) / 2);
+  const y = Math.round((screenHeight - popupH) / 2);
+
+  schedulePickerPopup = new BrowserWindow({
+    width: popupW,
+    height: popupH,
+    x,
+    y,
+    frame: false,
+    transparent: false,
+    resizable: false,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    backgroundColor: '#0a0f1a',
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      preload: path.join(__dirname, 'preload.js')
+    }
+  });
+
+  schedulePickerPopup.loadFile(path.join(__dirname, '..', 'schedule-picker.html'));
+
+  schedulePickerPopup.webContents.on('did-finish-load', () => {
+    schedulePickerPopup.webContents.send('schedule-picker-init', {
+      agentName,
+      currentSchedule
+    });
+  });
+
+  schedulePickerPopup.on('closed', () => {
+    schedulePickerPopup = null;
   });
 }
 

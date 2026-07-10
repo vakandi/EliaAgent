@@ -31,7 +31,7 @@ yt-dlp -o "/tmp/instagram_videos/%(id)s.%(ext)s" "https://www.instagram.com/reel
 
 ```bash
 # ⚠️ CRITICAL: NEVER hardcode French!
-# YourName's saved videos are mostly ENGLISH
+# the user's saved videos are mostly ENGLISH
 
 # Auto-detect language (ALWAYS USE THIS)
 whisper /tmp/instagram_videos/XXXXX.mp4 \

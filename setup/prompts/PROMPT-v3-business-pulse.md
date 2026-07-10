@@ -8,7 +8,7 @@
 
 ```
 skill(name="mcp-cli")
-read /path/to/EliaAI/context/TOOLS.md
+read ~/EliaAI/context/TOOLS.md
 ```
 
 ---
@@ -31,7 +31,7 @@ Every run, you MUST post to 3+ places:
 # Quick read (3 min max)
 mcp-cli call whatsapp list_chats '{}'
 mcp-cli call telegram get_default_group_messages '{"limit":10}'
-mcp-cli call discord-server-mcp discord_execute '{"operation":"messages.list","params":{"channel_id":"1489244810777727046","limit":10}}'
+mcp-cli call discord-server-mcp discord_execute '{"operation":"messages.list","params":{"channel_id":"[channel-id]","limit":10}}'
 ```
 
 ### Action Matrix
@@ -49,16 +49,16 @@ mcp-cli call discord-server-mcp discord_execute '{"operation":"messages.list","p
 
 ### Check Each Business (5 min total)
 
-#### YourBrand
+#### [Your Brand]
 - Any new orders?
 - Stock alerts?
 - Customer messages?
 
-#### YourTool  
+#### [Your SaaS]  
 - Open tickets?
 - Payment issues?
 
-#### MayaVanta
+#### [Your Partner]
 - New bookings?
 - Marco messages?
 
@@ -102,7 +102,7 @@ Look for items marked "en attente" > 24h
 
 | Item | Who | Relance How |
 |------|-----|-------------|
-| Stripe | YourName | Telegram DM |
+| Stripe | [YOUR NAME] | Telegram DM |
 | Shopify | Thomas | WhatsApp |
 | Orders | Ali | WhatsApp B2L |
 

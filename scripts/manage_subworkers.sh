@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-AGENT_DIR="${AGENT_DIR:-$HOME/EliaAI}"
+AGENT_DIR="~/EliaAI"
 SW_DIR="${AGENT_DIR}/subworkers"
 PLISTS_DIR="${SW_DIR}/plists"
 SCRIPTS_DIR="${SW_DIR}/scripts"
@@ -27,12 +27,13 @@ error()  { echo -e "${RED}[ERROR]${NC} $1"; }
 
 # ── Subworker definitions ──────────────────────────────────────────
 # Format: "dir_name:plist_name:trigger_script:log_file:display_name"
-# Edit this array to match YOUR subworkers.
-# Example:
-#   "my-promoter:com.elia.my-promoter:trigger_my_promoter.sh:my_promoter.log:My Promoter"
 SUBWORKERS=(
-  # Add your subworkers here:
-  # "agent-name:com.elia.agent-name:trigger_agent_name.sh:agent_name.log:Agent Display Name"
+  "yourapp-telegram:com.elia.yourapp-telegram:trigger_yourapp_telegram.sh:yourapp_telegram.log:YourApp Telegram"
+  "yourbrand-promoter:com.elia.yourbrand-promoter:trigger_yourbrand_promoter.sh:promoter_yourbrand.log:Your Brand Promoter"
+  "youragency-promoter:com.elia.youragency-promoter:trigger_youragency_promoter.sh:promoter_youragency.log:Your Agency Promoter"
+  "yourbrand-suppliers:com.elia.yourbrand-suppliers:trigger_yourbrand_suppliers.sh:suppliers_yourbrand.log:Your Brand Suppliers"
+  "tempack-dev:com.elia.tempack-dev:trigger_tempack_dev.sh:tempack_dev.log:Tempack Dev"
+  "tiktok-content:com.elia.tiktok-content:trigger_tiktok_content.sh:tiktok_content.log:TikTok Content"
 )
 
 # ── Helpers ────────────────────────────────────────────────────────
@@ -326,13 +327,18 @@ Commands:
   uninstall <name>  Remove plist from ~/Library/LaunchAgents (keep .enabled)
 
 Subworkers:
-  (Edit the SUBWORKERS array at the top of this script to add yours)
+  yourapp-telegram   YourApp Telegram recruiter
+  yourbrand-promoter   Your Brand Promoter (IG, TikTok, FB)
+  youragency-promoter       Your Agency Promoter (LinkedIn, X, Reddit)
+  yourbrand-suppliers  Your Brand Supplier Finder
+  tempack-dev          Tempack SaaS Development
+  tiktok-content       TikTok Content Creator
 
 Examples:
   ./manage_subworkers.sh                          # show status table
-  ./manage_subworkers.sh enable my-agent          # enable and install
-  ./manage_subworkers.sh disable my-agent          # disable and unload
-  ./manage_subworkers.sh status my-agent           # detailed status
+  ./manage_subworkers.sh disable yourapp-telegram
+  ./manage_subworkers.sh enable youragency-promoter
+  ./manage_subworkers.sh status yourbrand-promoter
 EOF
 }
 

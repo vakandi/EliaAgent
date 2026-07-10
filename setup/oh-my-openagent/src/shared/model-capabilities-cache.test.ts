@@ -7,9 +7,9 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
   buildModelCapabilitiesSnapshotFromModelsDev,
-  createModelCapabilitiesCacheStore,
   MODELS_DEV_SOURCE_URL,
-} from "./model-capabilities-cache"
+} from "./model-capabilities-normalizer"
+import { createModelCapabilitiesCacheStore } from "./model-capabilities-cache"
 
 let fakeUserCacheRoot = ""
 let testCacheDir = ""

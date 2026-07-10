@@ -84,7 +84,7 @@ Your task: Analyze what work was accomplished and send a summary.
 
 ⚠️ IMPORTANT - Telegram vs Discord for reports:
 - Discord #reports (ELIA-HQ) = Regular reports (default)
-- Telegram send_msg_to_default_group = URGENT/blockers only (YourName needs to fix ASAP for next runs)
+- Telegram send_msg_to_default_group = URGENT/blockers only (the user needs to fix ASAP for next runs)
 EOF
                 
                 log_info "Spawning analyzer agent to summarize $((runtime/60)) minutes of work..."
@@ -665,15 +665,15 @@ start_mcp_manager() {
     local NODE_BIN=""
     if command -v node &>/dev/null; then
         NODE_BIN="$(command -v node)"
-    elif [[ -x "/home/user/.nvm/versions/node/v24.13.1/bin/node" ]]; then
-        NODE_BIN="/home/user/.nvm/versions/node/v24.13.1/bin/node"
+    elif [[ -x "~/.nvm/versions/node/v24.13.1/bin/node" ]]; then
+        NODE_BIN="~/.nvm/versions/node/v24.13.1/bin/node"
     elif [[ -x "/opt/homebrew/bin/node" ]]; then
         NODE_BIN="/opt/homebrew/bin/node"
     elif [[ -x "/usr/local/bin/node" ]]; then
         NODE_BIN="/usr/local/bin/node"
     else
         # Last resort - find it
-        NODE_BIN="$(find /home/user/.nvm -name node -type f 2>/dev/null | head -1)"
+        NODE_BIN="$(find ~/.nvm -name node -type f 2>/dev/null | head -1)"
     fi
     
     if [[ -z "$NODE_BIN" ]] || [[ ! -x "$NODE_BIN" ]]; then

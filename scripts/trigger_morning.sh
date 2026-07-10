@@ -16,7 +16,7 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOM
 # Configuration - dynamic path detection
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 AGENT_DIR="$(dirname "$SCRIPT_DIR")"
-OPENCODE_BIN="/path/to/opencode/bin/opencode"
+OPENCODE_BIN="~/.opencode/bin/opencode"
 LOG_DIR="${AGENT_DIR}/logs"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
@@ -75,7 +75,7 @@ export OPENCODE_MODEL="$MODEL_TO_USE"
 
 # Load ALL OpenCode plugins (Ralph loop + rate-limit fallback + codemem memory)
 # CRITICAL: Include codemem plugin path for memory system to work
-export OPENCODE_PLUGIN_PATH="/path/to/config/opencode/plugin:/path/to/EliaAI/integrations/codemem/packages/opencode-plugin"
+export OPENCODE_PLUGIN_PATH="~/.config/opencode/plugin:~/EliaAI/integrations/codemem/packages/opencode-plugin"
 
 # Check USE_PROXY flag - also check .proxy_enabled file as backup
 if [[ "${USE_PROXY:-0}" == "1" ]]; then
@@ -176,13 +176,13 @@ echo "Extra context: ${EXTRA_CONTEXT:-none}"
 echo ""
 
 if [[ "$RALPH_MODE" == "true" ]]; then
-    LOOP_PROMPT="You are EliaAI, an autonomous AI assistant for YourName YourSurname.
+    LOOP_PROMPT="You are EliaAI, an autonomous AI assistant for [YOUR NAME].
 
 YOUR BUSINESSES:
 - EliaIA: AI solutions and automation
-- YourTool: Digital marketing and growth  
-- Your Company: Creative and web agency
-- YourBrand: Luxury e-commerce platform
+- Your SaaS: Digital marketing and growth  
+- Your Agency: Creative and web agency
+- Your Brand: Luxury e-commerce platform
 
 YOUR TASK:
 Execute the Morning Routine as defined in MORNING_PROMPT.md below.
@@ -210,13 +210,13 @@ Output <promise>COMPLETE</promise> when you have genuinely finished all tasks an
     LOOP_ARGS="--completion-promise COMPLETE --max-iterations 50"
     echo "Using Ralph loop command (max 50 iterations)"
 else
-    LOOP_PROMPT="You are EliaAI, an autonomous AI assistant for YourName YourSurname.
+    LOOP_PROMPT="You are EliaAI, an autonomous AI assistant for [YOUR NAME].
 
 YOUR BUSINESSES:
 - EliaIA: AI solutions and automation
-- YourTool: Digital marketing and growth
-- Your Company: Creative and web agency
-- YourBrand: Luxury e-commerce platform
+- Your SaaS: Digital marketing and growth
+- Your Agency: Creative and web agency
+- Your Brand: Luxury e-commerce platform
 
 YOUR TASK:
 Execute the Morning Routine as defined in MORNING_PROMPT.md below.

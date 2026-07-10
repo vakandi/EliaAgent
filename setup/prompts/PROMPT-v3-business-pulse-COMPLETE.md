@@ -9,10 +9,10 @@
 
 ```bash
 skill(name="mcp-cli")
-read /path/to/EliaAI/context/TOOLS.md
-read /path/to/EliaAI/memory/MEMORY.md
+read ~/EliaAI/context/TOOLS.md
+read ~/EliaAI/memory/MEMORY.md
 
-CHECKPOINT_FILE="/path/to/EliaAI/.elia_checkpoint.json"
+CHECKPOINT_FILE="~/EliaAI/.elia_checkpoint.json"
 if [[ -f "$CHECKPOINT_FILE" ]]; then
     source /dev/stdin <<< "$(jq -r 'to_entries | .[] | tostring | "export \(.key)=\"\(.value)\""' "$CHECKPOINT_FILE" 2>/dev/null)"
 fi
@@ -42,16 +42,16 @@ fi
 # WhatsApp - rotate through groups
 mcp-cli call whatsapp list_chats '{}'
 mcp-cli call whatsapp list_messages '{"chat_jid":"YOURBRAND_JID","limit":20}'
-mcp-cli call whatsapp list_messages '{"chat_jid":"YOURCO_JID","limit":10}'
-mcp-cli call whatsapp list_messages '{"chat_jid":"YOURVENTURES_JID","limit":10}'
+mcp-cli call whatsapp list_messages '{"chat_jid":"[YOUR TEAM]_JID","limit":10}'
+mcp-cli call whatsapp list_messages '{"chat_jid":"[YOUR PARTNER]_JID","limit":10}'
 
 # Telegram
 mcp-cli call telegram get_default_group_messages '{"limit":15}'
 
 # Discord - multiple channels
-mcp-cli call discord-server-mcp discord_execute '{"operation":"messages.list_range","params":{"channel_id":"1489244810777727046","hours":6,"limit":20}}'
-mcp-cli call discord-server-mcp discord_execute '{"operation":"messages.list","params":{"channel_id":"1489247935807099020","limit":3}}'
-mcp-cli call discord-server-mcp discord_execute '{"operation":"messages.list","params":{"channel_id":"1489244862871244950","limit":3}}'
+mcp-cli call discord-server-mcp discord_execute '{"operation":"messages.list_range","params":{"channel_id":"[channel-id]","hours":6,"limit":20}}'
+mcp-cli call discord-server-mcp discord_execute '{"operation":"messages.list","params":{"channel_id":"[channel-id]","limit":3}}'
+mcp-cli call discord-server-mcp discord_execute '{"operation":"messages.list","params":{"channel_id":"[channel-id]","limit":3}}'
 ```
 
 ### 1.2 Process Decision Matrix
@@ -103,7 +103,7 @@ whisper /path/to/audio.ogg --model large-v3 --language French --task transcribe
 
 ## 📊 PHASE 2: BUSINESS METRICS (10 min)
 
-### 2.1 YourBrand Metrics
+### 2.1 [Your Brand] Metrics
 
 Check AND post for each:
 
@@ -126,7 +126,7 @@ Awaiting: [N]
 Clients active: [N]
 ```
 
-### 2.2 YourTool Metrics
+### 2.2 [Your SaaS] Metrics
 
 | Metric | Check Where | Post Where | Post When |
 |--------|------------|------------|----------|
@@ -138,14 +138,14 @@ Clients active: [N]
 **Post Templates:**
 
 ```
-📊 YourTool – [DATE]
+📊 [Your SaaS] – [DATE]
 Open tickets: [N]
 New today: [N]
 Closed: [N]
 Awaiting: [N]
 ```
 
-### 2.3 MayaVanta Metrics
+### 2.3 [Your Partner] Metrics
 
 | Metric | Check Where | Post Where | Post When |
 |--------|------------|------------|----------|
@@ -156,7 +156,7 @@ Awaiting: [N]
 **Post Templates:**
 
 ```
-🚗 MayaVanta – [DATE]
+🚗 [Your Partner] – [DATE]
 New bookings: [N]
 Active: [N]
 Issues: [N]
@@ -173,7 +173,7 @@ Issues: [N]
 **Check Script:**
 
 ```bash
-for site in yourbrand.com yourtool.com; do
+for site in [yourbrand].com [yoursaas].com; do
     curl -s -o /dev/null -w "%{http_code}" https://$site
 done
 ```
@@ -184,8 +184,8 @@ done
 🖥️ Server Status – [TIME]
 B2L: [200/FAIL]
 ZB: [200/FAIL]
-YourProject: [200/FAIL]
-YourBrand2: [200/FAIL]
+[Your Service]: [200/FAIL]
+[Your Business]: [200/FAIL]
 ```
 
 ---
@@ -210,13 +210,13 @@ YourBrand2: [200/FAIL]
 
 ```bash
 # 1. Health
-mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"1489247935807099020","content":"🖥️ Servers – B2L ✅ ZB ✅ MV ✅"}'
+mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"🖥️ Servers – B2L ✅ ZB ✅ MV ✅"}'
 
 # 2. Orders
-mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"1489244862871244950","content":"📦 Orders – 3 new (Evan, Salhiou, Andy)"}'
+mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"📦 Orders – 3 new (Evan, Salhiou, Andy)"}'
 
 # 3. Panel
-mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"1489244946673176618","content":"📊 ZB: 2 open, 1 closed today"}'
+mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"📊 ZB: 2 open, 1 closed today"}'
 ```
 
 ### 3.2 WhatsApp Engagement
@@ -236,7 +236,7 @@ mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"14892449466
 |--------|----------|
 | Thomas | "Thomas, le Shopify, ça avance?" |
 | Ali | "Ali, les commandes, c'est good?" |
-| Rida | "Rida, le contenu, on est prêts?" |
+| [Team Member] | "[Team Member], le contenu, on est prêts?" |
 | Marco | "Marco, des nouvelles?" |
 
 ---
@@ -247,7 +247,7 @@ mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"14892449466
 
 ```bash
 # Search all sources
-grep -i "en attente\|waiting\|blocked\|depuis\|48h" /path/to/EliaAI/memory/MEMORY.md | head -10
+grep -i "en attente\|waiting\|blocked\|depuis\|48h" ~/EliaAI/memory/MEMORY.md | head -10
 grep -i "URGENT\|BLOCKED" docs/2026-04-*/session*.md | head -5
 ```
 
@@ -255,10 +255,10 @@ grep -i "URGENT\|BLOCKED" docs/2026-04-*/session*.md | head -5
 
 | Stuck Item | Person | Channel | Reminder Template |
 |-----------|--------|---------|------------------|
-| Stripe verification | YourName | Telegram | "Stripe deadline proche. Besoin d'aide?" |
+| Stripe verification | [YOUR NAME] | Telegram | "Stripe deadline proche. Besoin d'aide?" |
 | Shopify token | Thomas | WhatsApp | "Thomas, token Shopify, c'est good?" |
 | Order processing | Ali | WhatsApp B2L | "Ali, commandes en attente" |
-| Content | Rida | WhatsApp | "Rida, contenu, où on en est?" |
+| Content | [Team Member] | WhatsApp | "[Team Member], contenu, où on en est?" |
 | SSL renewal | Thomas | WhatsApp | "Thomas, SSL, ça gaze?" |
 
 ### 4.3 Relance Rules
@@ -348,23 +348,23 @@ for channel, content in chunks:
 
 ### Channel IDs
 ```
-health-checks: 1489247935807099020
-orders:      1489244862871244950
-products:   1489244857250615416
-clients:    1489244868235755580
-panel:      1489244946673176618
-content:    1489244954646679662
-analytics: 1489244965337956514
-reports:    1489244810777727046
-urgent:     1489244806310793216
+health-checks: [channel-id]
+orders:      [channel-id]
+products:   [channel-id]
+clients:    [channel-id]
+panel:      [channel-id]
+content:    [channel-id]
+analytics: [channel-id]
+reports:    [channel-id]
+urgent:     [channel-id]
 ```
 
 ### Send All Channels
 ```bash
 # Health + Panel + Orders = 3 minimum
-mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"1489247935807099020","content":"..."}'
-mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"1489244946673176618","content":"..."}'
-mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"1489244862871244950","content":"..."}'
+mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"..."}'
+mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"..."}'
+mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"..."}'
 ```
 
 ---

@@ -5,14 +5,14 @@ describe("resolveSkillPathReferences", () => {
 	it("resolves @path references containing a slash to absolute paths", () => {
 		//#given
 		const content = "Run `python3 @scripts/search.py` to search"
-		const basePath = "/path/to/config/opencode/skills/frontend-ui-ux"
+		const basePath = "/home/user/.config/opencode/skills/frontend-ui-ux"
 
 		//#when
 		const result = resolveSkillPathReferences(content, basePath)
 
 		//#then
 		expect(result).toBe(
-			"Run `python3 /path/to/config/opencode/skills/frontend-ui-ux/scripts/search.py` to search"
+			"Run `python3 /home/user/.config/opencode/skills/frontend-ui-ux/scripts/search.py` to search"
 		)
 	})
 
