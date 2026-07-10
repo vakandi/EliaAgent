@@ -159,7 +159,7 @@ Object.keys(localStorage)
 
 ## YourBrand Mascot ⚠️
 
-**Path:** `/path/to/Documents/HiggsField.ai-API-Wraper/mascott_yourbrand.png`
+**Path:** `/path/to/mascot.png`
 
 **DO NOT use as image input.** Use text prompts only.
 

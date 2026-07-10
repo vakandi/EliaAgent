@@ -24,8 +24,8 @@
 ### What Are Subworkers?
 
 Subworkers are autonomous AI agents that run on a schedule or trigger. Each subworker has:
-- A **personality file** (`~/.config/opencode/agents/<agent-id>.md`) defining identity and behavior
-- A **PROMPT.md** with task-specific instructions
+- A **personality file** (`~/.config/opencode/agents/<agent-id>.md`) — loaded automatically by oh-my-opencode via the `-a` flag
+- A **PROMPT.md** with task-specific instructions — injected by the trigger
 - A **workspace folder** for isolated file I/O
 - A **trigger script** that launches via `oh-my-opencode run`
 - An optional **LaunchAgent plist** for scheduled execution
@@ -36,8 +36,9 @@ Subworkers are autonomous AI agents that run on a schedule or trigger. Each subw
 Trigger (launchd / manual)
   └─ trigger_template.sh
        ├── Creates workspace/ if missing
-       ├── Loads PROMPT.md + personality
+       ├── Loads PROMPT.md
        ├── oh-my-opencode run -d workspace/ -a <agent> "<task>"
+       │     └── oh-my-opencode loads personality from ~/.config/opencode/agents/<agent-id>.md
        └── OpenCode loads workspace/opencode.json (per-agent permissions)
 ```
 
@@ -57,7 +58,6 @@ EliaAI/subworkers/
 │       └── <agent_name>/         # Per-run logs
 └── <agent-id>/
     ├── PROMPT.md                 # Task-specific instructions
-    ├── personality.md            # Agent personality (optional)
     ├── .enabled                  # Gate file — presence = active
     ├── .loop_mode                # (Optional) Server-attach loop mode
     └── workspace/                # Runtime directory (auto-created)
@@ -71,8 +71,8 @@ EliaAI/subworkers/
 ### Creating a New Subworker
 
 ```bash
-mkdir -p /path/to/EliaAI/subworkers/<agent-id>/workspace
-touch /path/to/EliaAI/subworkers/<agent-id>/.enabled
+mkdir -p ~/EliaAI/subworkers/<agent-id>/workspace
+touch ~/EliaAI/subworkers/<agent-id>/.enabled
 ```
 
 ---
@@ -86,14 +86,14 @@ Every subworker agent runs in its own `workspace/` folder:
 1. **Isolates file I/O** — agents only write inside their workspace, never outside. The `opencode.json` local config blocks access to all other folders on the system.
 2. **Enables per-agent permissions** — place an `opencode.json` in the workspace folder to restrict tools per agent (OpenCode loads local config over global)
 3. **Prevents cross-contamination** — log files, state, and generated content stay in one place
-4. **Daily docs folders** — the trigger creates `workspace/docs/YYYY-MM-DD/` every run. `mkdir -p` is idempotent: 50 runs on the same day = 1 folder. Agents can see all previous days' work.
+4. **Daily folders** — the trigger creates `workspace/YYYY-MM-DD/` every run. `mkdir -p` is idempotent: 50 runs on the same day = 1 folder. Agents can see all previous days' work.
 
 ### 3.2 How It Works
 
 The trigger template (`trigger_template.sh`) automatically:
 
 1. Creates `workspace/` on every run (`mkdir -p "$WORKSPACE_DIR"`)
-2. Creates `workspace/docs/YYYY-MM-DD/` every run (idempotent — only one folder per day regardless of run count)
+2. Creates `workspace/YYYY-MM-DD/` every run (idempotent — only one folder per day regardless of run count)
 3. Passes `-d "$WORKSPACE_DIR"` (a.k.a. `--directory`) to `oh-my-opencode run`
 4. OpenCode loads `workspace/opencode.json` (if present) as the local config, **overriding** the global `~/.config/opencode/opencode.json`
 5. The agent sees only the tools/skills/MCPs defined in its local config
@@ -119,11 +119,11 @@ Create `subworkers/<agent-id>/workspace/opencode.json`:
   },
   "permissions": {
     "read": {
-      "allow": ["/path/to/EliaAI/subworkers/<agent-id>/workspace/**"],
+      "allow": ["~/EliaAI/subworkers/<agent-id>/workspace/**"],
       "deny": ["**"]
     },
     "write": {
-      "allow": ["/path/to/EliaAI/subworkers/<agent-id>/workspace/**"],
+      "allow": ["~/EliaAI/subworkers/<agent-id>/workspace/**"],
       "deny": ["**"]
     },
     "execute": {
@@ -151,20 +151,20 @@ Every subworker's PROMPT.md **MUST** include these instructions:
 ```
 ## Workspace Constraint
 You MUST only read and write files inside your `workspace/` folder:
-`/path/to/EliaAI/subworkers/<agent-id>/workspace/`
+`~/EliaAI/subworkers/<agent-id>/workspace/`
 Never write files outside this folder. All system paths outside workspace/ are blocked.
 
-## Daily Docs
-Each run creates a daily docs folder: `workspace/docs/YYYY-MM-DD/`.
+## Daily Folders
+Each run creates a daily folder directly in workspace: `workspace/YYYY-MM-DD/`.
 Write your work logs, research, and outputs into today's folder.
 The folder is idempotent — only one per day regardless of how many times the trigger runs.
 You can read all previous days' folders to understand context and history.
 
 ## Mempalace
 To orient yourself on every run:
-1. Check `workspace/docs/` for the latest day folder — read today's work-in-progress
+1. Check `workspace/` for the latest day folder to read today's work-in-progress
 2. Scan previous days' docs for relevant context: decisions made, blockers, next steps
-3. If you need to revisit something from days ago, navigate by date: `workspace/docs/2026-04-01/`
+3. If you need to revisit something from days ago, navigate by date: `workspace/2026-04-01/`
 4. Write a summary of what you did today into the current day's folder before finishing
 ```
 
@@ -223,9 +223,11 @@ Add to the `"agent"` section:
   "mode": "primary",
   "color": "#hexcolor",
   "model": "opencode/big-pickle",
-  "prompt_append": "**FIRST: Read `~/.config/opencode/agents/<agent-id>.md` for your full workflow and rules.**\n\nTu es <agent-id> - Description here."
+  "prompt_append": "**FIRST: Read ~/.config/opencode/agents/<agent-id>.md for your full personality and workflow.**\n\n**THEN: Read subworkers/<agent-id>/PROMPT.md for your complete task instructions.**\n\nYou are <agent-id> - Description here. Execute your assigned task."
 }
 ```
+
+> ⚠️ **prompt_append MUST always tell the agent to read its own personality file.** oh-my-opencode loads personality via `-a`, but the prompt_append reinforces it. The trigger injects PROMPT.md, but the prompt_append should also reference it.
 
 Note: `"mode": "primary"` here is fine even when the frontmatter uses `"mode": "all"`. The frontmatter `mode` controls the opencode TUI behavior; the `opencode.json` mode is used for configuration loading.
 
@@ -248,9 +250,11 @@ Note: `"mode": "primary"` here is fine even when the frontmatter uses `"mode": "
 "<agent-id>": {
   "model": "opencode/big-pickle",
   "description": "Short description",
-  "prompt_append": "**FIRST: Read /path/to/EliaAI/subworkers/<agent-id>/PROMPT.md for your full instructions.**\n\nYou are <agent-id>. Execute your assigned task. Always respect your workspace constraint."
+  "prompt_append": "**FIRST: Read ~/.config/opencode/agents/<agent-id>.md for your full personality and workflow.**\n\nYou are <agent-id>. Execute your assigned task. Always respect your workspace constraint."
 }
 ```
+
+> ⚠️ **Same rule: prompt_append MUST always tell the agent to read its own personality file.** The trigger injects PROMPT.md automatically, but personality should be referenced in prompt_append.
 
 #### Add to `"agent_display_names"`:
 
@@ -267,7 +271,7 @@ Every new subworker **MUST** complete ALL of these steps. Missing any one step =
 | 1 | YAML frontmatter with `mode: all` | `~/.config/opencode/agents/<agent-id>.md` | Agent appears in agent switcher, `/agents` menu, AND `@mention` in chat. Without this, agent won't surface anywhere. |
 | 2 | `"mode": "primary"` | `opencode.json` → `"agent"` section | Makes agent visible in `/agents` list and loads configuration |
 | 3 | `"mode": "primary"` | `oh-my-openagent.json` → `"agents"` section | Makes agent callable via `oh-my-opencode run -a <agent>` |
-| 4 | Add to `"categories"` | `oh-my-openagent.json` → `"categories"` | Adds `prompt_append` with pointer to PROMPT.md |
+| 4 | Add to `"categories"` | `oh-my-openagent.json` → `"categories"` | Adds `prompt_append` with personality reference + identity context |
 | 5 | Add display name | `oh-my-openagent.json` → `"agent_display_names"` | Shows readable name in `/agents` menu |
 
 > ⚠️ **Frontmatter with `mode: all` is the critical piece. Without it, registering in JSON configs alone is not enough — the agent will be invisible in the opencode TUI and unmentionalble.**
@@ -322,8 +326,8 @@ Save as `scripts/trigger_<name>.sh` and `chmod +x`.
 | **PATH resolution** | Finds `oh-my-opencode` for launchd (which lacks `~/.bun/bin`) |
 | **`.enabled` gate** | Skips if `subworkers/<agent-id>/.enabled` doesn't exist |
 | **PROMPT.md loading** | Reads from `subworkers/<agent-id>/PROMPT.md` |
-| **Personality loading** | Reads from `~/.config/opencode/agents/<agent-id>.md` (optional) |
-| **Workspace auto-creation** | Creates `workspace/` + `workspace/docs/YYYY-MM-DD/` every run |
+| **Personality** | Loaded automatically by oh-my-opencode from `~/.config/opencode/agents/<agent-id>.md` via `-a` flag |
+| **Workspace auto-creation** | Creates `workspace/` + `workspace/YYYY-MM-DD/` (date folder at root) every run |
 | **`-d` flag** | Passes `--directory workspace/` to `oh-my-opencode run` for per-agent config |
 | **Mode detection** | `task` (single-shot) vs `loop` (server-attach with `/ulw-loop`) |
 | **Per-run logging** | Each run logged individually + aggregate log |
@@ -337,7 +341,7 @@ Save as `scripts/trigger_<name>.sh` and `chmod +x`.
 
 ```bash
 # Enable loop mode for an agent
-touch /path/to/EliaAI/subworkers/<agent-id>/.loop_mode
+touch ~/EliaAI/subworkers/<agent-id>/.loop_mode
 ```
 
 ### 5.4 Creating a Trigger Wrapper
@@ -348,6 +352,30 @@ touch /path/to/EliaAI/subworkers/<agent-id>/.loop_mode
 4. Create `subworkers/<agent-id>/.enabled` to activate
 5. `chmod +x scripts/trigger_<name>.sh`
 6. Register in `opencode.json` + `oh-my-openagent.json` (see §4.3)
+7. Create personality file at `~/.config/opencode/agents/<agent-id>.md` with YAML frontmatter (see §4.1)
+
+### 5.5 Exit/Completion Marker
+
+Every run log ends with a unique marker line written by `trigger_template.sh`:
+
+```
+[YYYY-MM-DD HH:MM:SS] EOF_SUBWORKER_EXIT:<code>
+```
+
+This marker is always written after `oh-my-opencode run` exits, regardless of success or failure. The `set +e` / `set -e` wrapping prevents the shell's `euo pipefail` from terminating the script before the marker is written.
+
+**Why a unique marker instead of parsing "completed" in AI output:**
+- The AI agent's stdout is redirected into the same run log file (`>> "$RUN_LOG" 2>&1`)
+- The AI might output text like "All tasks completed" or "I've completed the task" — parsing for "completed" would false-match
+- `EOF_SUBWORKER_EXIT:` is a string the AI can never produce: it's only written by the shell script's `log()` function after the opencode process fully exits
+
+**How the Electron UI (subworker-popup.html) uses it:**
+1. Opens the run log file and reads the last 300 bytes
+2. Regex-searches for `EOF_SUBWORKER_EXIT:(\d+)`
+3. If found: extracts exit code, calculates duration from start timestamp → marker timestamp
+4. `exit 0` → green duration badge (success)
+5. `exit non-zero` → orange "crashed" badge with duration (agent failed mid-run)
+6. If marker not found: yellow "● RUNNING" badge (agent still executing or trigger script crashed before reaching the marker)
 
 ---
 
@@ -420,7 +448,7 @@ mcp-cli list
 ### 7.1 Template Plist
 
 ```bash
-cat > /path/to/EliaAI/subworkers/plists/com.elia.<agent-id>.plist << 'EOF'
+cat > ~/EliaAI/subworkers/plists/com.elia.<agent-id>.plist << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -431,7 +459,7 @@ cat > /path/to/EliaAI/subworkers/plists/com.elia.<agent-id>.plist << 'EOF'
     <key>ProgramArguments</key>
     <array>
         <string>/bin/zsh</string>
-        <string>/path/to/EliaAI/subworkers/scripts/trigger_<name>.sh</string>
+        <string>~/EliaAI/subworkers/scripts/trigger_<name>.sh</string>
     </array>
 
     <key>RunAtLoad</key>
@@ -447,19 +475,19 @@ cat > /path/to/EliaAI/subworkers/plists/com.elia.<agent-id>.plist << 'EOF'
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/path/to/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>~/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>HOME</key>
-        <string>/path/to/home</string>
+        <string>~</string>
     </dict>
 
     <key>WorkingDirectory</key>
-    <string>/path/to/EliaAI</string>
+    <string>~/EliaAI</string>
 
     <key>StandardOutPath</key>
-    <string>/path/to/EliaAI/subworkers/logs/<agent_name>.log</string>
+    <string>~/EliaAI/subworkers/logs/<agent_name>.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/path/to/EliaAI/subworkers/logs/<agent_name>.log</string>
+    <string>~/EliaAI/subworkers/logs/<agent_name>.log</string>
 </dict>
 </plist>
 EOF
@@ -468,7 +496,7 @@ EOF
 ### 7.2 Load & Verify
 
 ```bash
-launchctl load /path/to/EliaAI/subworkers/plists/com.elia.<agent-id>.plist
+launchctl load ~/EliaAI/subworkers/plists/com.elia.<agent-id>.plist
 launchctl list | grep "com.elia"
 ```
 

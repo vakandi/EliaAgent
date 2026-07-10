@@ -1,8 +1,0 @@
-1
-00:00:00,800 --> 00:00:05,440
-Ouais t'as raison, je m'en occupe là aujourd'hui, sinon dans la semaine s'il y a d'autres problèmes, mais voilà.
-
-2
-00:00:05,540 --> 00:00:09,720
-Moi je pensais même pas qu'il y avait des clients qui voulaient regarder le site, parce que bon, vu qu'il n'y a pas le système de paiement qui est déjà là.
-

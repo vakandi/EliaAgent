@@ -68,7 +68,7 @@
   ],
   "ntfy": {
     "server": "https://ntfy.sh",
-    "topic": "jaruser",
+    "topic": "yourusername",
     "token": ""
   },
   "display": {

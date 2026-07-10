@@ -8,7 +8,7 @@
 
 You are working with TWO GitHub repos:
 - **Private**: `/path/to/EliaAI` (your working repo with all your changes)
-- **Public**: `/path/to/EliaAgent` (cleaned repo for public release)
+- **Public**: `~/user/EliaAgent` (cleaned repo for public release)
 
 Your task is to SYNC the private repo to the public repo, cleaning all sensitive data (credentials, logs, personal info) while preserving all functionality.
 
@@ -18,26 +18,6 @@ Your task is to SYNC the private repo to the public repo, cleaning all sensitive
 
 **⚠️ This sync process has a history of breaking things. Follow these rules strictly.**
 
-### ⚠️ CATASTROPHIC LEAK (July 8, 2026): brain/, docs/, memory/, wiki/, hidden dirs EXPOSED
-
-**The ENTIRE private data was pushed to a public GitHub repo for 12+ commits.** Including:
-- `brain/` (raw/cleaned/obsidian — LLM training data, private notes)
-- `docs/`, `logs/`, `memory/`, `research/`, `downloads/`
-- `wiki/` (wikis for ALL businesses: strategy, team, pricing)
-- `context/` (real TOOLS.md with server IPs, real business info)
-- Hidden files: `.backups/`, `.prompt_backup/`, `.sisyphus/`, `.morning_briefing_prompt.txt`
-- All real names, emails, server IPs, API keys in git history
-
-**Root cause**: Copying too broadly without checking WHAT was already in the target. The target repo accumulated sensitive data over many syncs.
-
-**Fix**: 9 passes of `git filter-repo` to surgically remove dirs, paths, and text replacements. 3178 → 3030 files. All names, IPs, emails, business names → placeholders.
-
-**NEW RULES**:
-- Verify the ENTIRE target filesystem (not just `git diff --cached`)
-- Remove business-specific dirs (`wiki/`, `context/`) from public repo entirely
-- Remove ALL hidden files/dirs before push
-- Run `git filter-repo` on the TARGET, not the source (source stays intact)
-
 ### 1. NEVER let shell eat `${}` template literals
 
 Files in EliaAI contain JavaScript/TypeScript template literals like `` `Hello ${name}` `` and bash `${VARIABLE}` references. During `cp -R`, `echo`, or `cat` operations, the shell interprets `${...}` and can silently mangle file contents.
@@ -45,7 +25,7 @@ Files in EliaAI contain JavaScript/TypeScript template literals like `` `Hello $
 **Check for this before committing:**
 ```bash
 # After copying, verify no template literals were eaten
-cd /path/to/EliaAgent
+cd ~/user/EliaAgent
 grep -rn '\${[A-Za-z]' --include='*.md' --include='*.sh' --include='*.js' --include='*.ts' --include='*.html' --include='*.json' . 2>/dev/null | grep -v 'node_modules/' | head -30
 ```
 
@@ -67,43 +47,14 @@ GitHub has **automatic secret scanning**. It will BLOCK pushes containing:
 
 **⚠️ CRITICAL LESSON (July 8, 2026)**: I failed to check for Atlassian API tokens (`ATATT3...`) and Discord bot tokens before pushing. GitHub auto-detected them and revoked the PAT. ALWAYS run ALL checks below before any commit.
 
-**⚠️ CRITICAL — Verify the TARGET filesystem, NOT just git diff:**
-
-`git diff --cached` only shows what changed in the NEXT commit. It does NOT detect files that were ALREADY committed with private data. You MUST scan the ENTIRE working tree of the TARGET repo.
-
-**Pre-push verification checklist (TWO-STEP):**
-
-**Step A — Scan the ENTIRE target repo (catch already-committed leaks):**
+**Pre-push verification checklist:**
 ```bash
-cd /path/to/EliaAgent
+# 1. Check staged changes for sensitive patterns
+cd ~/user/EliaAgent
+git diff --cached | grep -iE 'api.?key|secret|token|password|credential|\.env|proxy|vakandi|discord|doe|co.?bou|bene.?luxe|157\.180|login|ssh-'
 
-echo "=== Scan for real names (customize for YOUR name) ==="
-grep -rni '\[YOUR-NAME\]\|\[YOUR-SURNAME\]' --include='*.md' --include='*.sh' --include='*.js' --include='*.ts' . 2>/dev/null | grep -v '.git/' | grep -v 'SYNC_PROMPT.md'
-
-echo "=== Scan for real business names (update with YOUR businesses) ==="
-grep -rni '\[YOUR-BUSINESS-1\]\|\[YOUR-BUSINESS-2\]' --include='*.md' --include='*.sh' --include='*.js' --include='*.ts' . 2>/dev/null | grep -v '.git/'
-
-echo "=== Scan for real IPs ==="
-grep -rnE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' --include='*.md' --include='*.sh' --include='*.js' --include='*.ts' --include='*.json' --include='*.plist' . 2>/dev/null | grep -v '.git/' | grep -v '127.0.0.1\|0.0.0.0\|255\|8.8.8.8\|1.1.1.1\|192\.168\.'
-
-echo "=== Scan for real emails ==="
-grep -rnE '\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b' --include='*.md' --include='*.sh' --include='*.js' --include='*.ts' . 2>/dev/null | grep -v '.git/' | grep -v 'example.com\|@g.us\|account[0-9]\|fonts\.google\|sil\.org\|youtube.com\|OFL\.txt'
-
-echo "=== Scan for API keys ==="
-grep -rn 'api_key\|api-key\|API_KEY\|ATATT' --include='*.md' --include='*.sh' --include='*.js' --include='*.ts' --include='*.py' . 2>/dev/null | grep -v '.git/' | grep -v 'node_modules/'
-
-echo "=== Scan for hidden files with personal data ==="
-find . -maxdepth 2 -name '.*' -type f 2>/dev/null | grep -v '.git/' | grep -v '.gitignore' | grep -v '.DS_Store'
-```
-
-**Step B — Check staged changes (for incremental commits):**
-```bash
-# 1. Check staged changes for sensitive patterns (update with YOUR patterns)
-cd /path/to/EliaAgent
-git diff --cached | grep -iE 'api.?key|secret|token|password|credential|\.env|proxy|login|ssh-'
-
-# 2. Check for any private business names (update with YOUR names)
-git diff --cached | grep -iE '\[YOUR-NAME\]|\[YOUR-BUSINESS\]'
+# 2. Check for any private business names
+git diff --cached | grep -iE 'john|doe|real.?name|yourbrand|yourbrand|youragency'
 
 # 3. Check for server IPs
 git diff --cached | grep -E '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b'
@@ -114,20 +65,20 @@ git diff --cached | grep -E '\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'
 # 5. ⚠️ Check for Atlassian tokens (ATATT prefix - GitHub auto-detects these)
 git diff --cached | grep 'ATATT'
 
-# 6. ⚠️ Check for Discord bot tokens
+# 6. ⚠️ Check for Discord bot tokens (base64-encoded snowflake format)
 git diff --cached | grep -E 'DISCORD_BOT_TOKEN|ND[A-Za-z0-9]+\.'
 
-# 7. ⚠️ Check for Telegram credentials
+# 7. ⚠️ Check for hardcoded Telegram credentials
 git diff --cached | grep -E 'TELEGRAM_API_[A-Z]+=|TG_BOT_TOKEN|TG_CHAT_ID|TG_USER_ID='
 
-# 8. ⚠️ Check for JIRA/CONFLUENCE tokens
+# 8. ⚠️ Check for any hardcoded JIRA/CONFLUENCE tokens
 git diff --cached | grep -E 'JIRA_API_TOKEN|CONFLUENCE_API_TOKEN|JIRA_USERNAME|CONFLUENCE_USERNAME='
 
-# 9. ⚠️ Check for Node.js Discord bot tokens
+# 9. ⚠️ Check for Node.js Discord bot tokens (often start with MT or Nt)
 git diff --cached | grep -E '"[A-Za-z0-9]{20,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{27,}"'
 ```
 
-**If Step A finds ANYTHING, STOP. Run `git filter-repo` on the target repo before adding new commits. The target must be spotless FIRST.**
+**If ANY of these find matches, DO NOT COMMIT. Fix the files first.**
 
 ### 3. NEVER `git rm` without `--cached` on the private repo — breaks credentials on disk
 
@@ -154,11 +105,11 @@ If GitHub rejects your push due to secret scanning, OR if you realize secrets ar
 brew install git-filter-repo
 
 # Step 2: Strip sensitive strings from history
-cd /path/to/EliaAgent
+cd ~/user/EliaAgent
 git filter-repo --replace-text <(echo "SENSITIVE_STRING==>REPLACEMENT")
 
 # Step 3: Force push the cleaned history
-git remote add origin https://github.com/user/EliaAgent.git
+git remote add origin https://github.com/vakandi/EliaAgent.git
 git push origin main --force
 ```
 
@@ -190,9 +141,9 @@ git commit --amend   # Add more changes or fix message
 
 After push, check the GitHub web UI to verify:
 ```bash
-gh repo view user/EliaAgent --json description,url
+gh repo view vakandi/EliaAgent --json description,url
 # Or open in browser:
-open https://github.com/user/EliaAgent
+open https://github.com/vakandi/EliaAgent
 ```
 
 ---
@@ -230,7 +181,7 @@ open https://github.com/user/EliaAgent
 
 Run this to find differences:
 ```bash
-diff -rq /path/to/EliaAI /path/to/EliaAgent --exclude=".git" --exclude="*.log" --exclude="node_modules" 2>/dev/null | head -100
+diff -rq /path/to/EliaAI ~/user/EliaAgent --exclude=".git" --exclude="*.log" --exclude="node_modules" 2>/dev/null | head -100
 ```
 
 Or use explore agent for deeper analysis.
@@ -252,14 +203,12 @@ Or use explore agent for deeper analysis.
 - `context/TOOLS.md` - Tools reference
 - `context/business.md` - Business info
 
-**NEVER Copy (Source):**
+**NEVER Copy:**
 - `.env` - Real credentials
 - `logs/` - Runtime logs
 - `docs/YYYY-MM-DD/` - Daily logs
-- `brain/` — ALL of brain/ (raw, cleaned, obsidian) — personal data, LLM training data, private notes
+- `brain/obsidian/` - Private wiki
 - `memory/*-CREDENTIALS.md` - Secrets
-- `research/` - Market research data
-- `downloads/` - Downloaded content
 - `node_modules/` - NPM packages
 - `venv/`, `__pycache__/` - Python caches
 - `setup/proxies.txt` - Proxy list with real IP:PORT:USER:PASS
@@ -267,21 +216,7 @@ Or use explore agent for deeper analysis.
 - `integrations/elia-discord-bot/logs/` - Bot runtime logs
 - `integrations/elia-discord-bot/sessions.json` - Active sessions
 - `.scheduler_state` - Scheduler state files
-- `store/` - Electron user data
-
-**REMOVE from Target (after copy) — business-specific dirs:**
-- `context/` — Contains YOUR real business info (TOOLS.md with server IPs, business.md, jira-projects.md). Remove entirely. Users set up their own.
-- `wiki/` — Contains YOUR business wikis. Remove entirely. Users create their own.
-- `.backups/` — Personal prompt backups. Remove.
-- `.prompt_backup/` — Personal prompt backups. Remove.
-- `.sisyphus/` — Runtime state with personal paths. Remove.
-- `.opencode/` — Configuration with personal paths. Keep only if generic.
-- `.morning_briefing_prompt.txt` — Personal info. Remove.
-
-**⚠️ The action of filtering is on the TARGET, not the source.** Source keeps ALL data intact. Target gets filtered.
-
-**NEVER Copy (Subworkers):**
-- **`subworkers/*/`** — All subworker agent dirs. Subworkers contain private business prompts, anchor memory, workspace data. **NEVER COPY.**
+- **`subworkers/*/`** — All subworker agent dirs (YourBrand-suppliers, yourapp-*, yourapp-*, tiktok-content, reddit-saas-scraper, etc.). Subworkers contain private business prompts, anchor memory, and workspace data. **NEVER COPY.**
   - Exception: `subworkers/SUBWORKERS_SYSTEM.md` and `subworkers/SETUP_TOOLS.md` are generic HOW-TO docs that CAN be synced.
   - Exception: `subworkers/plists/` and `subworkers/scripts/` can contain EXAMPLE templates (not business-specific).
 - **EliaAI PROMPT.md** — Contains personal info, real business context, team members. Use a CLEANED version for public (or don't copy at all).
@@ -310,25 +245,29 @@ Use `rsync` for safe copying (handles special characters better than `cp`):
 
 ```bash
 # Copy desktop shortcuts
-rsync -a /path/to/EliaAI/setup/desktop_shortcuts/ /path/to/EliaAgent/setup/desktop_shortcuts/
+rsync -a /path/to/EliaAI/setup/desktop_shortcuts/ ~/user/EliaAgent/setup/desktop_shortcuts/
 
 # Copy discord bot (clean)
-rsync -a /path/to/EliaAI/integrations/elia-discord-bot/ /path/to/EliaAgent/integrations/elia-discord-bot/ \
+rsync -a /path/to/EliaAI/integrations/elia-discord-bot/ ~/user/EliaAgent/integrations/elia-discord-bot/ \
   --exclude='.env' --exclude='__pycache__' --exclude='venv' --exclude='logs' --exclude='sessions.json'
 
 # Copy ui_electron (without node_modules)
-rm -rf /path/to/EliaAgent/ui_electron
-rsync -a /path/to/EliaAI/ui_electron/ /path/to/EliaAgent/ui_electron/ \
+rm -rf ~/user/EliaAgent/ui_electron
+rsync -a /path/to/EliaAI/ui_electron/ ~/user/EliaAgent/ui_electron/ \
   --exclude='node_modules' --exclude='.sisyphus' --exclude='store' --exclude='.jarvis-position.json'
 
 # Copy scripts (excluding logs)
-rsync -a /path/to/EliaAI/scripts/ /path/to/EliaAgent/scripts/ \
+rsync -a /path/to/EliaAI/scripts/ ~/user/EliaAgent/scripts/ \
   --exclude='logs'
 
-# Copy subworkers — ONLY generic docs, NEVER agent dirs
-rsync -a /path/to/EliaAI/subworkers/SUBWORKERS_SYSTEM.md /path/to/EliaAgent/subworkers/SUBWORKERS_SYSTEM.md
-rsync -a /path/to/EliaAI/subworkers/SETUP_TOOLS.md /path/to/EliaAgent/subworkers/SETUP_TOOLS.md
+# Copy subworkers — ONLY generic docs and trigger TEMPLATE, NEVER agent dirs
+rsync -a /path/to/subworkers/SUBWORKERS_SYSTEM.md ~/user/EliaAgent/subworkers/SUBWORKERS_SYSTEM.md
+rsync -a /path/to/subworkers/SETUP_TOOLS.md ~/user/EliaAgent/subworkers/SETUP_TOOLS.md
+# Copy trigger TEMPLATE and example ONLY (NOT business-specific triggers)
+rsync -a /path/to/subworkers/scripts/trigger_template.sh ~/user/EliaAgent/subworkers/scripts/trigger_template.sh
+rsync -a /path/to/subworkers/scripts/README.md ~/user/EliaAgent/subworkers/scripts/ 2>/dev/null || true
 # ⚠️ DO NOT copy subworkers/<name>/ agent directories — they contain private business prompts
+# ⚠️ DO NOT copy subworkers/scripts/trigger_<name>.sh — business-specific triggers
 ```
 
 ### Step 5: VERIFY No Sensitive Data Leaked (CRITICAL)
@@ -336,28 +275,21 @@ rsync -a /path/to/EliaAI/subworkers/SETUP_TOOLS.md /path/to/EliaAgent/subworkers
 Run these checks BEFORE staging files:
 
 ```bash
-cd /path/to/EliaAgent
+cd ~/user/EliaAgent
 
-echo "=== Checking for personal names (customize for YOUR name) ==="
-grep -rni '\[YOUR-NAME\]\|\[YOUR-SURNAME\]' \
-  --include='*.md' --include='*.sh' --include='*.js' --include='*.ts' --include='*.json' \
-  . 2>/dev/null | grep -v '.git/' | grep -v 'SYNC_PROMPT.md'
-
-echo "=== Checking for business names (update with YOUR businesses) ==="
-grep -rni '\[YOUR-BUSINESS-1\]\|\[YOUR-BUSINESS-2\]' \
-  --include='*.md' --include='*.sh' --include='*.js' --include='*.ts' --include='*.json' \
-  . 2>/dev/null | grep -v '.git/'
+echo "=== Checking for business names ==="
+grep -rni 'john\|doe\|real.?name\|yourbrand\|youragency\|yourapp' \\
+  --include='*.md' --include='*.sh' --include='*.js' --include='*.ts' --include='*.json' --include='*.html' \
+  . 2>/dev/null | grep -v '.git/' | grep -v 'SYNC_PROMPT.md' | grep -v 'SYNC_REVERSE'
 
 echo "=== Checking for server IPs ==="
 grep -rnE '([0-9]{1,3}\.){3}[0-9]{1,3}' \
-  --include='*.md' --include='*.sh' --include='*.js' --include='*.ts' --include='*.json' \
-  . 2>/dev/null | grep -v '.git/' | grep -v '127.0.0.1\|0.0.0.0\|255\|8.8.8.8\|1.1.1.1'
-
-echo "=== Checking for hidden files ==="
-find . -maxdepth 2 -name '.*' -type f 2>/dev/null | grep -v '.git/' | grep -v '.gitignore' | grep -v '.DS_Store'
+  --include='*.md' --include='*.sh' --include='*.js' --include='*.ts' --include='*.json' --include='*.html' \
+  . 2>/dev/null | grep -v '.git/' | grep -v 'node_modules/' | grep -v '127.0.0.1\|0.0.0.0\|255\|8.8.8.8\|1.1.1.1'
 
 echo "=== Checking for template literal integrity ==="
-diff <(grep -c '\${' /path/to/EliaAI/setup/README.md) <(grep -c '\${' /path/to/EliaAgent/setup/README.md) || echo "⚠️  Template literal count mismatch!"
+# Compare a known file with template literals between source and target
+diff <(grep -c '\${' /path/to/EliaAI/setup/README.md) <(grep -c '\${' ~/user/EliaAgent/setup/README.md) || echo "⚠️  Template literal count mismatch!"
 ```
 
 **If ANY sensitive data is found, DO NOT PROCEED.** Fix files before staging.
@@ -381,7 +313,7 @@ Update `setup/README.md` if needed with new sections.
 ### Step 7: Commit (Small, Incremental)
 
 ```bash
-cd /path/to/EliaAgent
+cd ~/user/EliaAgent
 
 # Commit individually - push after each to verify
 git add setup/desktop_shortcuts/
@@ -402,7 +334,7 @@ git push origin main
 git push origin main
 
 # Verify on GitHub
-gh repo view user/EliaAgent --web
+gh repo view vakandi/EliaAgent --web
 ```
 
 ### Step 9: Update GitHub Release (Optional)
@@ -419,7 +351,7 @@ gh release create "vX.X.X" --title "EliaAI vX.X.X" --notes-file RELEASENOTES.md 
 
 ### For Explore Agent:
 ```
-Compare /path/to/EliaAI vs /path/to/EliaAgent
+Compare /path/to/EliaAI vs ~/user/EliaAgent
 
 List ALL differences:
 - New files in EliaAI (need copy)
@@ -440,7 +372,7 @@ Sync EliaAI to EliaAgent:
 6. Commit and push incrementally
 7. Update GitHub release
 
-Use /path/to/EliaAI as source, /path/to/EliaAgent as target.
+Use /path/to/EliaAI as source, ~/user/EliaAgent as target.
 ```
 
 ---
@@ -491,10 +423,10 @@ git push origin --delete refs/tags/v2.1.0
 
 # Delete a GitHub release via API using the stored token
 RELEASE_ID=$(curl -s -H "Authorization: Bearer $(cat ~/.git-credentials | sed 's/.*://;s/@.*//')" \
-  https://api.github.com/repos/user/EliaAgent/releases | \
+  https://api.github.com/repos/vakandi/EliaAgent/releases | \
   python3 -c "import sys,json; rs=json.load(sys.stdin); [print(r['id'],r['tag_name']) for r in rs]")
 curl -X DELETE -H "Authorization: Bearer $(cat ~/.git-credentials | sed 's/.*://;s/@.*//')" \
-  https://api.github.com/repos/user/EliaAgent/releases/$RELEASE_ID
+  https://api.github.com/repos/vakandi/EliaAgent/releases/$RELEASE_ID
 ```
 
 **⚠️ Important**: If the PAT was revoked by GitHub secret scanning, it won't work. Generate a new classic PAT (scope `repo`) at https://github.com/settings/tokens and update `~/.git-credentials`.
@@ -505,16 +437,16 @@ If GitHub blocks your push:
 ```bash
 # 1. Find what secret triggered it
 # Check the email from GitHub or:
-gh api repos/user/EliaAgent/secret-scanning/alerts 2>/dev/null | head -20
+gh api repos/vakandi/EliaAgent/secret-scanning/alerts 2>/dev/null | head -20
 
 # 2. Remove the secret from the file
 # Edit the file to remove/replace the sensitive string
 
 # 3. If secret is in git history (not just latest commit):
 brew install git-filter-repo
-cd /path/to/EliaAgent
+cd ~/user/EliaAgent
 git filter-repo --replace-text <(echo "THE_SENSITIVE_STRING==>REPLACEMENT")
-git remote add origin https://github.com/user/EliaAgent.git
+git remote add origin https://github.com/vakandi/EliaAgent.git
 git push origin main --force
 ```
 
@@ -523,10 +455,10 @@ git push origin main --force
 If `${...}` patterns were eaten by shell:
 ```bash
 # Re-copy the affected files using rsync
-rsync -a /path/to/EliaAI/path/to/file /path/to/EliaAgent/path/to/file
+rsync -a /path/to/EliaAI/path/to/file ~/user/EliaAgent/path/to/file
 
 # Verify integrity
-diff /path/to/EliaAI/path/to/file /path/to/EliaAgent/path/to/file
+diff /path/to/EliaAI/path/to/file ~/user/EliaAgent/path/to/file
 ```
 
 ### Problem: Wrong content pushed to public repo
@@ -541,33 +473,21 @@ If you accidentally pushed private data:
 ## Safety Checklist (Run Before Each Commit)
 
 ```
-=== STEP A: FULL TARGET REPO SCAN (CATCH ALREADY-COMMITTED LEAKS) ===
-[ ] grep -rni '[YOUR-NAME]' entire target repo → only in SYNC_PROMPT.md
-[ ] grep -rni '[YOUR-BUSINESS-1]' entire target → only in SYNC_PROMPT.md
-[ ] grep -rnE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' target → only localhost/rfc1918
-[ ] grep -rnE '\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b' → only example.com
-[ ] grep -rn 'ATATT\|api_key' target → 0 matches
-[ ] find . -name '.*' -type f → only .gitignore, .DS_Store
-[ ] No brain/, docs/, logs/, memory/, research/, downloads/ in target
-[ ] No wiki/ or context/ in target (users set up their own)
-
-=== STEP B: STAGED CHANGES CHECK ===
-[ ] Sensitive files excluded (.env, logs, proxies, etc.)
-[ ] No business names in staged files
-[ ] No server IP addresses in staged files
-[ ] No API keys or tokens in staged files
-[ ] No personal names in staged files
-[ ] No tokens (ATATT, DISCORD, TELEGRAM, JIRA) in staged files
-[ ] `git diff --cached` reviewed for sensitive data (run all 9 checks)
-
-=== STEP C: GENERAL ===
+[ ] Sensitive files excluded (.env, logs, proxies.txt, etc.)
+[ ] No business names in clean files
+[ ] No server IP addresses in clean files
+[ ] No API keys or tokens in clean files
+[ ] No personal names in clean files
+[ ] No Atlassian tokens (ATATT3...) in clean files
+[ ] No Discord bot tokens in clean files
+[ ] No Telegram bot tokens/hash/ids in clean files
+[ ] No JIRA/CONFLUENCE usernames or tokens in clean files
 [ ] Template literals (${...}) are intact after copy
-[ ] NEVER `git rm` on source repo — only `--cached`
+[ ] `git diff --cached` reviewed for sensitive data (RUN ALL 9 CHECKS)
+[ ] NEVER `git rm` on source repo — only `--cached` (keeps files on disk)
 [ ] Integration `.env` files restored to disk after cleanup
 [ ] Incremental push working (not batching all commits)
 [ ] GitHub web UI shows correct content
-
-=== IF ANY STEP A CHECK FAILS: STOP. RUN FILTER-REPO ON TARGET FIRST. ===
 ```
 
 ---

@@ -130,7 +130,7 @@ mcp-cli call vision-mcp analyze_image '{"image_url": "https://..."}'
 
 ## 7. Capabilities Requises par Agent
 
-### yourco-promoter:
+### youragency-promoter:
 - ✅ LinkedIn: Post, comment, connect, message
 - ✅ X: Post, like, retweet, reply, search
 - ✅ Reddit: Comment, post (via browser)

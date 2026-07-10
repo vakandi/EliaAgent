@@ -46,6 +46,7 @@ contextBridge.exposeInMainWorld('popupAPI', {
   openSubworkerLogs: (name) => ipcRenderer.send('open-subworker-logs', name),
   openSubworkerLogFile: (path) => ipcRenderer.send('open-subworker-log-file', path),
   getSubworkerRuns: (name) => ipcRenderer.send('get-subworker-runs', name),
+  openSchedulePicker: (name, currentSchedule) => ipcRenderer.send('open-schedule-picker', name, currentSchedule),
 });
 
 // Extend electronAPI with subworker runs reply
@@ -53,4 +54,17 @@ contextBridge.exposeInMainWorld('subworkerRunsAPI', {
   onSubworkerRuns: (callback) => {
     ipcRenderer.on('subworker-runs', (_event, data) => callback(data));
   },
+});
+
+contextBridge.exposeInMainWorld('schedulePickerAPI', {
+  onInit: (callback) => {
+    ipcRenderer.on('schedule-picker-init', (_event, data) => callback(data));
+  },
+  saveSchedule: (agentName, scheduleConfig) => {
+    ipcRenderer.send('save-subworker-schedule', { agentName, scheduleConfig });
+  },
+  onSaved: (callback) => {
+    ipcRenderer.on('schedule-saved', (_event, result) => callback(result));
+  },
+  close: () => ipcRenderer.send('close-popup'),
 });

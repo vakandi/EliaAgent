@@ -25,8 +25,8 @@ fi
 
 echo "[SERVER] Starting on port $PORT..."
 if [[ -n "$PROXY_HTTP" ]]; then
-    env HTTP_PROXY="$PROXY_HTTP" HTTPS_PROXY="$PROXY_HTTPS" http_proxy="$PROXY_HTTP" https_proxy="$PROXY_HTTPS" /path/to/opencode/bin/opencode serve --port $PORT &
+    env HTTP_PROXY="$PROXY_HTTP" HTTPS_PROXY="$PROXY_HTTPS" http_proxy="$PROXY_HTTP" https_proxy="$PROXY_HTTPS" ~/.opencode/bin/opencode serve --port $PORT &
 else
-    /path/to/opencode/bin/opencode serve --port $PORT &
+    ~/.opencode/bin/opencode serve --port $PORT &
 fi
 echo "Server started"

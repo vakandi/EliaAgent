@@ -86,14 +86,14 @@ curl -F "file=@/path/to/video.mp4" https://tmpfiles.org/api/v1/upload
 
 **Mascot Image Path:**
 ```
-/path/to/Documents/HiggsField.ai-API-Wraper/mascott_yourbrand.png
+/path/to/mascot.png
 ```
 
 **⚠️ ERROR HANDLING:**
 
 If user asks to use the mascot, you will see:
 ```
-Cannot read "mascott_yourbrand.png" (this model does not support image input)
+Cannot read "mascot.png" (this model does not support image input)
 ```
 
 **Solution:** Use text prompts to describe mascot scenes instead.

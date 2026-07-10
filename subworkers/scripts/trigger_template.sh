@@ -4,7 +4,7 @@
 # ============================================================
 # Usage:
 #   1. Copy this file → scripts/trigger_<name>.sh
-#   2. Change AGENT_NAME (underscore convention, e.g. my_agent)
+#   2. Change AGENT_NAME (underscore convention, e.g. your_agency_promoter)
 #   3. Create subworkers/<agent-id>/PROMPT.md
 #   4. Create subworkers/<agent-id>/.enabled to activate
 #   5. (Optional) Create .loop_mode for server-attach loop mode
@@ -22,7 +22,7 @@ set -euo pipefail
 AGENT_ID="${AGENT_NAME//_/-}"
 
 # ── Paths ─────────────────────────────────────────────────
-AGENT_DIR="/path/to/EliaAI"
+AGENT_DIR="~/EliaAI"
 SUBWORKER_DIR="$AGENT_DIR/subworkers/$AGENT_ID"
 WORKSPACE_DIR="$SUBWORKER_DIR/workspace"
 LOG_DIR="$AGENT_DIR/subworkers/logs"
@@ -41,7 +41,7 @@ log() {
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$AGGREGATE_LOG" >> "$RUN_LOG"
 }
 
-# ── PATH Resolution (launchd lacks ~/.bun/bin) ────────────
+# ── PATH Resolution (launchd lacks ~/.bun/bin and nvm node bins) ──
 if ! command -v oh-my-opencode &>/dev/null; then
   for dir in "$HOME/.bun/bin" "$HOME/.opencode/bin" /opt/homebrew/bin /usr/local/bin; do
     if [[ -x "$dir/oh-my-opencode" ]]; then
@@ -52,6 +52,20 @@ if ! command -v oh-my-opencode &>/dev/null; then
 fi
 if ! command -v oh-my-opencode &>/dev/null; then
   log "FATAL: oh-my-opencode not found"
+  exit 1
+fi
+
+# Resolve opencode binary too (oh-my-opencode needs it, and it's often in nvm)
+if ! command -v opencode &>/dev/null; then
+  for dir in "$HOME/.nvm/versions/node/"*"/bin" "$HOME/.bun/bin" "$HOME/.opencode/bin" /opt/homebrew/bin /usr/local/bin; do
+    if [[ -x "$dir/opencode" ]]; then
+      export PATH="$dir:$PATH"
+      break
+    fi
+  done
+fi
+if ! command -v opencode &>/dev/null; then
+  log "FATAL: opencode not found (required by oh-my-opencode)"
   exit 1
 fi
 
@@ -89,9 +103,8 @@ if [[ ! -f "$PROMPT_FILE" ]]; then
 fi
 PROMPT=$(cat "$PROMPT_FILE")
 
-# ── Load personality (optional) ───────────────────────────
-PERSONALITY_FILE="$HOME/.config/opencode/agents/${AGENT_ID}.md"
-PERSONALITY=$(cat "$PERSONALITY_FILE" 2>/dev/null || echo "")
+# ── Personality loaded by oh-my-opencode via -a flag ──────
+# oh-my-opencode reads ~/.config/opencode/agents/<agent-id>.md automatically.
 
 # ── Detect mode: task vs loop ─────────────────────────────
 LOOP_FLAG="$SUBWORKER_DIR/.loop_mode"
@@ -118,6 +131,7 @@ fi
 # ═══════════════════════════════════════════════════════════
 cd "$AGENT_DIR"
 
+EXIT_CODE=0
 if [[ "$MODE" == "loop" ]]; then
     # ── Loop mode: server-attach (promoters, persistent agents) ──
     OPENCODE_PORT=4096
@@ -160,22 +174,20 @@ if [[ "$MODE" == "loop" ]]; then
     fi
     log "Loop: $LOOP_CMD"
 
+    set +e
     oh-my-opencode run --attach "http://127.0.0.1:$OPENCODE_PORT" \
         -d "$WORKSPACE_DIR" -a "$AGENT_ID" "$LOOP_CMD" >> "$RUN_LOG" 2>&1
+    EXIT_CODE=$?
+    set -e
 else
-    # ── Task mode: single-shot (SEO, blog, one-off tasks) ──
-    PERSONALITY_BLOCK=""
-    if [[ -n "$PERSONALITY" ]]; then
-        PERSONALITY_BLOCK="PERSONALITY:
-$PERSONALITY"
-    fi
-
+    set +e
     oh-my-opencode run -d "$WORKSPACE_DIR" -a "$AGENT_ID" "Execute ONE task now:
-
-$PERSONALITY_BLOCK
 
 PROMPT:
 $PROMPT" >> "$RUN_LOG" 2>&1
+    EXIT_CODE=$?
+    set -e
 fi
 
-log "$AGENT_ID completed"
+log "EOF_SUBWORKER_EXIT:${EXIT_CODE}"
+exit $EXIT_CODE

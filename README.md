@@ -189,7 +189,7 @@ EliaAI orchestrates **13 specialized subagents**, each with a unique personality
 |----------|:----:|------|-----------------|
 | **Backend** | 🛠️ Oliver | APIs, databases, Docker, CI/CD | *"The solution is straightforward."* |
 | **Frontend** | 🎨 James | React, UI/UX, animations | *"It should make you want to click."* |
-| **Finance** | 💰 William | Invoicing, payments, MayaVanta | *"Money follows when work is done well."* |
+| **Finance** | 💰 William | Invoicing, payments, [Your Partner] | *"Money follows when work is done well."* |
 | **Marketing** | 📢 Victoria | TikTok, YouTube, Snapchat campaigns | *"The best marketing doesn't feel like marketing."* |
 | **Sales** | 🤝 Charles | Lead generation, conversion, closing | *"The deal isn't closed until it's signed."* |
 | **HR** | 👥 Elizabeth | Hiring, recruitment, employee management | *"The best hires are the ones where you don't hesitate."* |

@@ -8,8 +8,8 @@
 
 ```
 skill(name="mcp-cli")
-read /path/to/EliaAI/context/TOOLS.md
-read /path/to/EliaAI/memory/MEMORY.md
+read ~/EliaAI/context/TOOLS.md
+read ~/EliaAI/memory/MEMORY.md
 ```
 
 ---
@@ -37,7 +37,7 @@ mcp-cli call whatsapp list_chats '{}'
 mcp-cli call telegram get_default_group_messages '{"limit":10}'
 
 # Discord - #reports channel
-mcp-cli call discord-server-mcp discord_execute '{"operation":"messages.list_range","params":{"channel_id":"1489244810777727046","hours":6,"limit":20}}'
+mcp-cli call discord-server-mcp discord_execute '{"operation":"messages.list_range","params":{"channel_id":"[channel-id]","hours":6,"limit":20}}'
 ```
 
 ### FOR EACH MESSAGE → DECIDE NOW:
@@ -59,7 +59,7 @@ Send to at least ONE business group:
 "Salut! Je check le status..."
 "Thomas, ça avance le Shopify?"
 "Ali, les commandes?"
-"Rida, le contenu?"
+"[Team Member], le contenu?"
 ```
 
 ### B. Discord Engagement
@@ -73,7 +73,7 @@ POST to channels (don't just read):
 
 ```bash
 # Example: Server status to #health-checks
-mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"1489247935807099020","content":"🖥️ Servers: B2L ✅ ZB ✅"}'
+mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"🖥️ Servers: B2L ✅ ZB ✅"}'
 ```
 
 ---
@@ -82,15 +82,15 @@ mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"14892479358
 
 Quick checks per business:
 
-### YourBrand
+### [Your Brand]
 - New orders? → Post to #orders
 - Messages in YOURBRAND BUSINESS group? → Reply
 
-### YourTool
+### [Your SaaS]
 - Open tickets? → Reply if simple
 - Post status to #panel
 
-### MayaVanta
+### [Your Partner]
 - New bookings? → Check with Marco
 
 ---
@@ -103,7 +103,7 @@ If something "en attente" >24h:
 
 | Blocked | Relance Who | Channel |
 |----------|---------|---------|
-| Stripe verification | YourName | Telegram DM |
+| Stripe verification | [YOUR NAME] | Telegram DM |
 | Shopify token | Thomas | WhatsApp |
 | Orders | Ali | WhatsApp B2L |
 

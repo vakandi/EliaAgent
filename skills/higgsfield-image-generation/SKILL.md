@@ -252,7 +252,7 @@ localStorage.removeItem('hf:image-form-upd')
 
 ## YourBrand Mascot ⚠️
 
-**Path:** `/path/to/Documents/HiggsField.ai-API-Wraper/mascott_yourbrand.png`
+**Path:** `/path/to/mascot.png`
 
 **DO NOT use as image input.** Use text prompts only.
 
@@ -260,11 +260,11 @@ localStorage.removeItem('hf:image-form-upd')
 
 ## 📂 WHERE IMAGES ARE SAVED
 
-**Images are saved to the "YourNameTest" folder by default!**
+**Images are saved to the "TestFolder" folder by default!**
 
 To view generated images:
 1. Go to: `https://higgsfield.ai/assets`
-2. **Click on "YourNameTest"** folder in the left sidebar (NOT "All Assets" at root)
+2. **Click on "TestFolder"** folder in the left sidebar (NOT "All Assets" at root)
 3. Your generated images will appear there
 
 **Note:** The main "All Assets" view shows ROOT-level files only (empty by default). 
@@ -275,7 +275,7 @@ Your images are in the folder, not at root level.
 ## DOWNLOADING
 
 1. Go to: `https://higgsfield.ai/assets`
-2. **Click on "YourNameTest"** folder in the left sidebar
+2. **Click on "TestFolder"** folder in the left sidebar
 3. Select images with checkboxes
 4. Click "Download"
 5. Files in: `~/Downloads/`

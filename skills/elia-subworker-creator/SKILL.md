@@ -2,11 +2,9 @@
 name: elia-subworker-creator
 description: >-
   Create a new autonomous subworker in the EliaAI system. A subworker is an AI agent with its own personality
-  (stored in ~/.config/opencode/agents/), its own detailed prompt (in subworkers/<agent-id>/PROMPT.md), a trigger
-  script sourcing trigger_template.sh, an isolated workspace with per-agent permissions, and an optional
-  LaunchAgent plist for scheduling. This skill handles the FULL pipeline:
-  opencode.json + oh-my-openagent.json registration → agent personality → PROMPT.md with workspace constraint →
-  trigger script → workspace isolation + per-agent opencode.json → plist → SUBWORKERS_SYSTEM.md update.
+  (stored in ~/.config/opencode/agents/), its own detailed prompt (in subworkers/<name>/PROMPT.md), a trigger
+  script, and an optional LaunchAgent plist for scheduling. This skill handles the FULL pipeline:
+  opencode.json registration → agent personality file → PROMPT.md → trigger script → plist → SUBWORKERS_SYSTEM.md update.
   Use this whenever the user says "create a subworker", "add a new agent", "make a promoter", "new sub-worker",
   "add subworker", or any request to create a scheduled autonomous agent for the EliaAI ecosystem.
   DO NOT attempt to create subworkers without this skill — the procedure has many interdependencies and
@@ -17,22 +15,21 @@ description: >-
 
 ## Why This Skill Exists
 
-This session, multiple mistakes were made creating a subworker because the full procedure has 8 interdependent
-steps across 5 different locations (opencode.json, oh-my-openagent.json, subworkers directory, scripts, plists).
-Forgetting even one step (like registering in `oh-my-openagent.json`) silently breaks the subworker.
-This skill enforces the complete, verified pipeline.
+This session, multiple mistakes were made creating a subworker because the full procedure has 7 interdependent
+steps across 4 different locations. Forgetting even one step (like registering in `opencode.json`) silently
+breaks the subworker. This skill enforces the complete, verified pipeline.
 
 ## Overview — The 8-Step Pipeline
 
 ```
-opencode.json + oh-my-openagent.json (register agent in TWO files)
-  → ~/.config/opencode/agents/<agent-id>.md (personality + YAML frontmatter)
-    → subworkers/<agent-id>/PROMPT.md (detailed workflow + workspace constraint)
-      → subworkers/scripts/trigger_<agent_name>.sh (sources trigger_template.sh — 4 lines)
-        → subworkers/<agent-id>/workspace/ + opencode.json (isolation + permissions)
-          → subworkers/plists/com.elia.<agent-id>.plist (LaunchAgent)
-            → SUBWORKERS_SYSTEM.md (register in master doc)
-              → subworkers/<agent-id>/.enabled (disabled by default)
+opencode.json (register agent)
+  → ~/.config/opencode/agents/<name>.md (personality + YAML frontmatter)
+    → subworkers/<name>/PROMPT.md (detailed workflow prompt)
+      → subworkers/scripts/trigger_<name>.sh → sources trigger_template.sh
+        → subworkers/plists/com.elia.<name>.plist (LaunchAgent)
+          → SUBWORKERS_SYSTEM.md (register in master doc)
+            → subworkers/<name>/.enabled (disabled by default)
+              → workspace/ dir auto-created with -d isolation
 ```
 
 Each step references files from previous steps. Doing them in order is critical.
@@ -45,100 +42,61 @@ Each step references files from previous steps. Doing them in order is critical.
 
 ```bash
 cat /path/to/subworkers/SUBWORKERS_SYSTEM.md
-cat /path/to/subworkers/scripts/trigger_template.sh
-cat /path/to/opencode.json | python3 -c "import sys,json; d=json.load(sys.stdin); print(json.dumps(d.get('agent',{}), indent=2))"
-ls /path/to/opencode/agents/
+cat /path/to/opencode-config/opencode.json | python3 -c "import sys,json; d=json.load(sys.stdin); print(json.dumps(d.get('agent',{}), indent=2))"
+ls /path/to/agents/
 ls /path/to/subworkers/scripts/
 ls /path/to/subworkers/plists/
 ```
 
-Also read the newest subworker (`my-agent`) — it follows the current system with workspace isolation:
+Also read 1-2 existing subworkers to match the style:
 ```bash
-cat /path/to/subworkers/my-agent/PROMPT.md
-cat /path/to/subworkers/scripts/trigger_my_agent.sh
-ls -la /path/to/subworkers/my-agent/workspace/
+cat /path/to/subworkers/youragency-promoter/PROMPT.md
+cat /path/to/subworkers/yourapp-telegram/PROMPT.md
 ```
 
 ---
 
-## Step 1: Register agent — TWO files required
+## Step 1: Register agent in opencode.json
 
-Every new subworker MUST be registered in both `opencode.json` AND `oh-my-openagent.json`.
+Add the agent entry to `opencode.json`. The `name` MUST match what you use everywhere else.
 
-### Conventions
-- **Agent ID**: kebab-case, descriptive (e.g., `my-custom-agent`, `scheduler-bot`)
-- **Agent name** (for trigger scripts): underscore version of Agent ID (`my_custom_agent`, `scheduler_bot`)
-- **Mode**: always `"primary"` for scheduled autonomous agents
-
-### File 1: `~/.config/opencode/opencode.json`
-
-Add to the `"agent"` section:
+**Conventions:**
+- `name`: kebab-case, descriptive (e.g., `YourBrand-suppliers`, `yourapp-telegram`)
+- `mode`: `primary` for scheduled autonomous agents, `subagent` for agents called by other agents
+- `color`: hex color for terminal display
+- `model`: `opencode/big-pickle` (default)
+- `prompt_append`: ALWAYS start with `"**FIRST: Read /path/to/subworkers/<name>/PROMPT.md pour ton workflow complet.**"`
 
 ```python
 import json
 
-with open('/path/to/opencode.json') as f:
+with open('/path/to/opencode-config/opencode.json') as f:
     data = json.load(f)
 
-data['agent']['<agent-id>'] = {
+data['agent']['<name>'] = {
     "description": "<short description, 50-80 chars>",
-    "mode": "primary"
+    "mode": "primary",
+    "color": "#<hex-color>",
+    "model": "opencode/big-pickle",
+    "prompt_append": "**FIRST: Read /path/to/subworkers/<name>/PROMPT.md pour ton workflow complet.**\n\nTu es <name>, <role description>."
 }
 
-with open('/path/to/opencode.json', 'w') as f:
+with open('/path/to/opencode-config/opencode.json', 'w') as f:
     json.dump(data, f, indent=2)
     f.write('\n')
 ```
 
-### File 2: `~/.config/opencode/oh-my-openagent.json`
-
-Add entries to THREE sections:
-
-#### 2a. `"agents"` section:
-```python
-data['agents']['<agent-id>'] = {
-    "model": "opencode/big-pickle",
-    "mode": "primary",
-    "fallback_models": []
-}
-```
-
-#### 2b. `"categories"` section — add `prompt_append` pointing to PROMPT.md:
-```python
-data['categories']['<agent-id>'] = {
-    "model": "opencode/big-pickle",
-    "description": "<short description>",
-    "prompt_append": "**FIRST: Read /path/to/subworkers/<agent-id>/PROMPT.md for your full instructions.**\n\nYou are <agent-id>. Execute your assigned task. Always respect your workspace constraint."
-}
-```
-
-#### 2c. `"agent_display_names"` section:
-```python
-data['agent_display_names']['<agent-id>'] = "Readable Name"
-```
-
-**⚠️ Critical:** The `prompt_append` references the PROMPT.md path — make sure this path uses the EXACT same `<agent-id>`. The workspace constraint reminder is mandatory.
-
-### Registration Summary
-
-| # | What | Where | Why |
-|---|------|-------|-----|
-| 1 | `"mode": "primary"` | `opencode.json` → `"agent"` section | Makes agent visible in `/agents` list |
-| 2 | `"mode": "primary"` | `oh-my-openagent.json` → `"agents"` section | Makes agent callable via `oh-my-opencode run -a <agent>` |
-| 3 | Add to `"categories"` | `oh-my-openagent.json` → `"categories"` | Adds `prompt_append` with pointer to PROMPT.md |
-| 4 | Add display name | `oh-my-openagent.json` → `"agent_display_names"` | Shows readable name in `/agents` menu |
-
-> ⚠️ **Failure to register in both files = agent invisible/invokable.**
+**⚠️ Critical:** The `prompt_append` references the PROMPT.md path — make sure this path uses the EXACT same `<name>`.
 
 ---
 
-## Step 2: Create agent personality file (~/.config/opencode/agents/<agent-id>.md)
+## Step 2: Create agent personality file (~/.config/opencode/agents/<name>.md)
 
 The agent personality file in `~/.config/opencode/agents/` serves as the agent's identity and is loaded
 when the subworker triggers. ALWAYS include YAML frontmatter.
 
 **YAML frontmatter fields:**
-- `name`: Must match agent ID (e.g., `my-custom-agent`)
+- `name`: Must match the name in opencode.json
 - `slug`: Same as name
 - `description`: Short description
 - `model`: `opencode/big-pickle`
@@ -155,15 +113,15 @@ when the subworker triggers. ALWAYS include YAML frontmatter.
 **Example:**
 ```markdown
 ---
-name: <agent-id>
-slug: <agent-id>
+name: <name>
+slug: <name>
 description: Short description
 model: opencode/big-pickle
 temperature: 0.3
 mode: primary
 ---
 
-# <Agent Name> — Identity
+# <Name> — Identity
 
 Tu es un [role] spécialisé en [domain]. [1-2 sentence identity].
 
@@ -178,28 +136,24 @@ Tu es un [role] spécialisé en [domain]. [1-2 sentence identity].
 - ❌ [What to avoid]
 ```
 
-**Path:** `/path/to/opencode/agents/<agent-id>.md`
+**Path:** `/path/to/agents/<name>.md`
 
 ---
 
-## Step 3: Create PROMPT.md (subworkers/<agent-id>/PROMPT.md)
+## Step 3: Create PROMPT.md (subworkers/<name>/PROMPT.md)
 
 Create the detailed workflow document. This is the MAIN file the agent reads at runtime.
 
-**Location:** `/path/to/subworkers/<agent-id>/PROMPT.md`
+**Location:** `/path/to/subworkers/<name>/PROMPT.md`
 
 **Required sections:**
 1. **SOURCE DE VÉRITÉ** — List all personality files to read first (from `~/.config/opencode/agents/`)
 2. **MISSION** — What this subworker does
 3. **RUN CYCLE** — How long each run takes (max duration)
-4. **WORKSPACE CONSTRAINT** — MUST include these exact instructions (copy from §3.4 of SUBWORKERS_SYSTEM.md):
-   - Only read/write inside `workspace/` folder
-   - Daily docs pattern (`workspace/docs/YYYY-MM-DD/`)
-   - Mempalace: check previous days' docs for context, write summary to today's folder
-5. **WORKFLOW** — Step-by-step instructions
-6. **OUTILS** — What tools they can use (Discord channels, Jira, etc.)
-7. **REPORTING** — How to report results (Discord format)
-8. **LIMITATIONS** — What they must NOT do
+4. **WORKFLOW** — Step-by-step instructions
+5. **OUTILS** — What tools they can use (Discord channels, Jira, etc.)
+6. **REPORTING** — How to report results (Discord format)
+7. **LIMITATIONS** — What they must NOT do
 
 **⚠️ NEVER include a personality.md in the subworker folder.** Personalities go in
 `~/.config/opencode/agents/` only. The PROMPT.md references those files in SOURCE DE VÉRITÉ.
@@ -210,111 +164,49 @@ Create the detailed workflow document. This is the MAIN file the agent reads at 
 
 ---
 
-## Step 4: Create trigger script (subworkers/scripts/trigger_<agent_name>.sh)
+## Step 4: Create trigger script (subworkers/scripts/trigger_<name>.sh)
 
-The trigger script is the wrapper that launchd calls. **Do NOT write it from scratch** — use
-the universal `trigger_template.sh` which handles all launch logic: PATH resolution, `.enabled`
-gate, PROMPT.md loading, workspace creation, daily docs folders, mode detection, and logging.
+The trigger script sources `trigger_template.sh`, which handles logging, PATH, .enabled gating,
+PROMPT.md loading, workspace isolation, loop mode, and proxy detection. You just set `AGENT_NAME`.
 
-**Create the wrapper (4 lines):**
-
+**Template:**
 ```bash
 #!/bin/zsh
-# <Readable Name> — Trigger (template wrapper)
-AGENT_NAME="<underscore_agent_name>"
-source "$(dirname "$0")/trigger_template.sh"
+AGENT_NAME="<underscore_name>"
+source /path/to/subworkers/scripts/trigger_template.sh
 ```
 
-The only configuration variable is `AGENT_NAME` (underscore convention, e.g., `my_custom_agent`).
-The template derives the agent ID as `AGENT_ID="${AGENT_NAME//_/-}"` (e.g., `my-custom-agent`).
+Replace `<underscore_name>` with the agent name in underscore format (e.g., `yourapp_seo`, `YourBrand_suppliers`).
+The template derives the directory name and agent ID from this value (underscore → hyphen).
 
-**Make it executable:**
-```bash
-chmod +x /path/to/subworkers/scripts/trigger_<agent_name>.sh
-```
+**Workspace isolation:** The template sets `WORKSPACE_DIR="$SUBWORKER_DIR/workspace"` and passes
+`-d "$WORKSPACE_DIR"` to `oh-my-opencode run`. This constrains the agent's working directory.
 
-### What the template handles for you
-
-| Feature | Detail |
-|---------|--------|
-| **PATH resolution** | Finds `oh-my-opencode` in launchd context |
-| **`.enabled` gate** | Skips if no `.enabled` file |
-| **PROMPT.md + personality loading** | Reads from subworker directory |
-| **Workspace auto-creation** | Creates `workspace/` + `workspace/docs/YYYY-MM-DD/` |
-| **`-d` flag** | Passes `--directory workspace/` for per-agent config |
-| **Mode detection** | `task` (single-shot) vs `loop` (server-attach) |
-| **Per-run logging** | Individual + aggregate logs |
-| **Proxy support** | Via `.proxy_enabled` file |
-
----
-
-## Step 5: Create workspace + per-agent permissions (subworkers/<agent-id>/workspace/)
-
-The trigger template auto-creates `workspace/` and `workspace/docs/YYYY-MM-DD/`, but you
-MUST also create the per-agent `opencode.json` to restrict file access.
-
-### 5.1 Create workspace directory
-
-```bash
-mkdir -p /path/to/subworkers/<agent-id>/workspace
-```
-
-### 5.2 Create per-agent `workspace/opencode.json`
-
-This file blocks ALL folders on the system except the agent's own workspace. The agent keeps
-full MCP/API access but cannot read/write files outside `workspace/`.
-
+**Optional `workspace/opencode.json`:** A per-agent config override. Useful for model overrides.
+Create it only if needed:
 ```json
 {
   "agent": {
     "<agent-id>": {
-      "description": "Description of this agent",
+      "description": "Per-agent config for <agent-id>",
       "mode": "primary"
     }
-  },
-  "tools": {
-    "enabled": ["discord-server-mcp", "whatsapp-mcp", "telegram", "gmail"]
-  },
-  "permissions": {
-    "read": {
-      "allow": ["/path/to/subworkers/<agent-id>/workspace/**"],
-      "deny": ["**"]
-    },
-    "write": {
-      "allow": ["/path/to/subworkers/<agent-id>/workspace/**"],
-      "deny": ["**"]
-    },
-    "execute": {
-      "deny": ["**"]
-    }
-  },
-  "mcpServers": {
-    "discord-server-mcp": { ... },
-    "whatsapp-mcp": { ... }
   }
 }
 ```
+Do NOT use `permissions` (plural) — the OpenCode schema only supports `permission` (singular, tool-level
+allow/deny/ask, no path-level globs). The workspace dir + PROMPT.md instruction are the isolation mechanism.
 
-**Key rules:**
-- `permissions.read/write.deny: ["**"]` — blocks ALL paths by default
-- `permissions.read/write.allow` — only the agent's own workspace
-- `mcpServers` — agent still has full MCP access for API calls
-- `permissions.execute.deny: ["**"]` — blocks arbitrary command execution
-
-If no `workspace/opencode.json` exists, the agent falls back to global config (no restrictions).
-
-**⚠️ The `-d` flag in `trigger_template.sh` (Step 4) is what makes this work.** Without `-d workspace/`,
-OpenCode won't load the per-agent config. The template handles this automatically.
+**Make the script executable:**
+```bash
+chmod +x /path/to/subworkers/scripts/trigger_<name>.sh
+```
 
 ---
 
-## Step 6: Create LaunchAgent plist (subworkers/plists/com.elia.<agent-id>.plist)
+## Step 5: Create LaunchAgent plist (subworkers/plists/com.elia.<name>.plist)
 
 Creates a scheduled LaunchAgent. The plist runs the trigger script at the specified interval.
-
-**Naming conventions in the plist:**
-- `<agent-id>` = hyphenated (e.g., `my-custom-agent`) — used in Label and folder paths
-- `<agent_name>` = underscored (e.g., `my_custom_agent`) — used in trigger script filename and log file
 
 **Template:**
 ```xml
@@ -324,12 +216,12 @@ Creates a scheduled LaunchAgent. The plist runs the trigger script at the specif
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.elia.<agent-id></string>
+    <string>com.elia.<name></string>
 
     <key>ProgramArguments</key>
     <array>
         <string>/bin/zsh</string>
-        <string>/path/to/subworkers/scripts/trigger_<agent_name>.sh</string>
+        <string>/path/to/subworkers/scripts/trigger_<name>.sh</string>
     </array>
 
     <key>RunAtLoad</key>
@@ -337,59 +229,55 @@ Creates a scheduled LaunchAgent. The plist runs the trigger script at the specif
 
     <key>StartCalendarInterval</key>
     <array>
-        <!-- Customize schedule — example: hourly 9am-6pm -->
-        <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>0</integer></dict>
+        <dict>
+            <key>Hour</key>
+            <integer>8</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
     </array>
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/path/to/opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>HOME</key>
-        <string>/path/to/home</string>
+        <string>~/user</string>
     </dict>
 
     <key>WorkingDirectory</key>
     <string>/path/to/EliaAI</string>
 
     <key>StandardOutPath</key>
-    <string>/path/to/subworkers/logs/<agent_name>.log</string>
+    <string>/path/to/subworkers/logs/<name>.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/path/to/subworkers/logs/<agent_name>.log</string>
+    <string>/path/to/subworkers/logs/<name>.log</string>
 </dict>
 </plist>
 ```
 
-**Schedule examples:**
-- Single daily: `<dict><key>Hour</key><integer>8</integer><key>Minute</key><integer>0</integer></dict>`
-- Hourly 8h-23h: one dict per hour
-- Every 30 min: use `StartInterval` with `<integer>1800</integer>` instead of `StartCalendarInterval`
-
 ---
 
-## Step 7: Update SUBWORKERS_SYSTEM.md
+## Step 6: Update SUBWORKERS_SYSTEM.md
 
 Edit `/path/to/subworkers/SUBWORKERS_SYSTEM.md` to register the new subworker:
 
-1. **Directory Structure** (§2) — Add the new folder, script, plist, and log entries to the tree
-2. **Creating a New Subworker** (§2.1) — Add `mkdir -p` and `.enabled` commands for the new agent
-3. **Tools & MCP Servers** (§6) — If the agent needs new tools, add them to the tables
+1. **Key Differences table** — Add a new column for the subworker with: Business, Focus, Platforms, Interval, Hours, Max output
+2. **Directory Structure** — Add the new folder, script, plist, and log entries
 
 **⚠️ NEVER overwrite SUBWORKERS_SYSTEM.md — always edit it in place.** Use the `edit` tool
-to add insertions to the existing sections. The doc is a generic system architecture reference
-(no per-agent Key Differences table).
+to add insertions to the existing sections.
 
 ---
 
-## Step 8: Create .enabled flag (disabled by default)
+## Step 7: Create .enabled flag (disabled by default)
 
 The subworker is disabled by default. To enable it later, create the `.enabled` flag:
 
 ```bash
 # Disabled by default (skip this in the initial creation)
-# touch /path/to/subworkers/<agent-id>/.enabled
+# touch /path/to/subworkers/<name>/.enabled
 ```
 
 Only create `.enabled` if the user explicitly asks to activate the subworker. By default,
@@ -401,29 +289,43 @@ the trigger script checks for `.enabled` and skips if absent.
 
 | Mistake | Consequence | Correct |
 |---------|-------------|---------|
-| Writing trigger script from scratch instead of sourcing template | Misses workspace isolation, mode detection, logging | Use `source trigger_template.sh` (4 lines) |
-| Forgetting to register in `oh-my-openagent.json` | `oh-my-opencode run -a <agent>` fails silently | Register in BOTH `opencode.json` AND `oh-my-openagent.json` |
-| No workspace `opencode.json` with path restrictions | Agent can read/write anywhere on the system | Create per-agent `workspace/opencode.json` with `deny: ["**"]` |
-| Missing workspace constraint in PROMPT.md | Agent writes files outside workspace | Include §3.4 sections: constraint, daily docs, mempalace |
-| Not using `-d` flag in trigger | Per-agent opencode.json is never loaded | Already handled by `trigger_template.sh` — don't remove it |
+| Creating `personality.md` in subworker/ folder | Wrong location, agent won't find it | Put in `~/.config/opencode/agents/<name>.md` |
+| Forgetting to register in `opencode.json` | `oh-my-opencode run -a <name>` fails silently | Register BEFORE creating other files |
 | Overwriting `SUBWORKERS_SYSTEM.md` | Destroys existing subworker docs | Use `edit` tool to modify in place |
-| Wrong agent ID in `prompt_append` or paths | Agent reads wrong PROMPT.md | Verify name matches exactly across all references |
+| Wrong agent name in `prompt_append` | Agent reads wrong PROMPT.md | Verify name matches exactly |
 | Not making trigger script executable | Plist runs but script fails silently | `chmod +x` the script |
-| Skipping any of the 8 steps | Subworker silently broken | Run through all 8 steps in order |
+| Referencing personality.md in PROMPT.md | File doesn't exist at that path | Reference `~/.config/opencode/agents/<name>.md` |
+| Skipping any of the 7 steps | Subworker silently broken | Run through all 7 steps in order |
+| Creating agent file in subworkers/ | Not registered in opencode.json | Agent files go in `~/.config/opencode/agents/` |
+| Using `permissions` (plural) in workspace/opencode.json | ConfigInvalidError, agent won't launch | Use `permission` (singular, tool-level) or omit entirely |
+| Forgetting workspace/opencode.json has no path-level security | Agent CAN read/write outside workspace | Workspace isolation = `-d` flag + PROMPT.md instruction, not config |
 
 ## Verification Checklist
 
 Before saying the subworker is ready, verify ALL of these:
 
 ```
-[x] Step 1: opencode.json + oh-my-openagent.json registered (agents, categories, agent_display_names)
-[x] Step 2: ~/.config/opencode/agents/<agent-id>.md exists with YAML frontmatter
-[x] Step 3: subworkers/<agent-id>/PROMPT.md exists with workspace constraint + daily docs + mempalace
-[x] Step 4: subworkers/scripts/trigger_<agent_name>.sh exists (sources trigger_template.sh) and is executable
-[x] Step 5: subworkers/<agent-id>/workspace/ exists with per-agent opencode.json (deny: ["**"])
-[x] Step 6: subworkers/plists/com.elia.<agent-id>.plist exists with correct PATH
-[x] Step 7: SUBWORKERS_SYSTEM.md updated with new subworker
-[x] Step 8: No .enabled flag (disabled by default — user enables manually)
+[x] Step 1: opencode.json has agent entry with prompt_append
+[x] Step 2: ~/.config/opencode/agents/<name>.md exists with YAML frontmatter
+[x] Step 3: subworkers/<name>/PROMPT.md exists
+[x] Step 4: subworkers/scripts/trigger_<name>.sh exists, is executable, sources trigger_template.sh
+[x] Step 5: subworkers/plists/com.elia.<name>.plist exists
+[x] Step 6: SUBWORKERS_SYSTEM.md updated with new subworker
+[x] Step 7: No .enabled flag (disabled by default — user enables manually)
+[x] Step 8: subworkers/<name>/workspace/ dir exists (auto-created by trigger_template.sh)
+```
+
+**Config validation:** Before declaring a subworker ready, run a dry trigger to confirm the
+`workspace/opencode.json` (if present) has no invalid keys. The `permission` key (singular) is
+tool-level only (allow/deny/ask per tool) — path-level globs are not supported.
+
+```bash
+# Dry test (set .enabled first, then remove it)
+touch /path/to/subworkers/<name>/.enabled
+bash /path/to/subworkers/scripts/trigger_<name>.sh 2>&1 &
+sleep 5 && kill %1 2>/dev/null
+# Check the run log for ConfigInvalidError
+cat /path/to/subworkers/logs/runs/<underscore_name>/$(ls -t /path/to/subworkers/logs/runs/<underscore_name>/ | head -1)
 ```
 
 Use this checklist in your response to confirm completion.

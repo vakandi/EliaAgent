@@ -12,7 +12,7 @@ The Elia Brain uses Obsidian wiki-style links (`[[...]]`) to connect raw session
 ## Directory Structure
 
 ```
-/path/to/EliaAI/
+~/EliaAI/
 ├── brain/                    # Main brain vault
 │   ├── raw/                 # Raw session data
 │   │   ├── logs/           # .log files (OpenCode sessions)
@@ -46,8 +46,8 @@ Files in `brain/raw/**` use this path pattern:
 
 Example:
 ```
-[[../../../wiki/people/YourName|YourName]]
-[[../../../wiki/businesses/YourBrand|YourBrand]]
+[[../../../wiki/people/User|User]]
+[[../../../wiki/businesses/[Your Brand]|[Your Brand]]]
 ```
 
 ### Why ../../../wiki/ ?
@@ -68,7 +68,7 @@ Links all `.md` files in `brain/raw/`.
 
 **Usage:**
 ```bash
-cd /path/to/EliaAI/brain/linkers
+cd ~/EliaAI/brain/linkers
 python3 master_bulk_linker.py           # Run
 python3 master_bulk_linker.py --dry-run   # Preview
 ```
@@ -86,7 +86,7 @@ Links all `.log` files in `brain/raw/`.
 
 **Usage:**
 ```bash
-cd /path/to/EliaAI/brain/linkers
+cd ~/EliaAI/brain/linkers
 python3 log_linker.py
 ```
 
@@ -127,7 +127,7 @@ python3 comprehensive_linker.py
 
 ### People
 ```python
-"YourName": ("../../../wiki/people/YourName", "YourName")
+"User": ("../../../wiki/people/User", "User")
 "Thomas": ("../../../wiki/people/Thomas-Cogne", "Thomas")
 "Ali": ("../../../wiki/people/Ali", "Ali")
 "Rida": ("../../../wiki/people/Rida", "Rida")
@@ -137,13 +137,13 @@ python3 comprehensive_linker.py
 
 ### Businesses
 ```python
-"YourBrand": ("../../../wiki/businesses/YourBrand", "YourBrand")
+"[Your Brand]": ("../../../wiki/businesses/[Your Brand]", "[Your Brand]")
 "YOURBRAND": ("../../../wiki/businesses/YOURBRAND-BUSINESS", "YOURBRAND")
-"YourTool": ("../../../wiki/businesses/YourTool", "YourTool")
-"YourCo": ("../../../wiki/businesses/YourCo-Agency", "YourCo")
-"YOURVENTURES": ("../../../wiki/businesses/YourVentures", "YOURVENTURES")
-"YourBrand2": ("../../../wiki/businesses/YourBrand2", "YourBrand2")
-"YourProject": ("../../../wiki/businesses/YourProject", "YourProject")
+"[Your SaaS]": ("../../../wiki/businesses/[Your SaaS]", "[Your SaaS]")
+"[Your Agency]": ("../../../wiki/businesses/[Your Agency]-Agency", "[Your Agency]")
+"[YOUR PARTNER]": ("../../../wiki/businesses/[Your Partner]", "[YOUR PARTNER]")
+"[Your Business]": ("../../../wiki/businesses/[Your Business]", "[Your Business]")
+"[Your Service]": ("../../../wiki/businesses/[Your Service]", "[Your Service]")
 ```
 
 ### Channels
@@ -159,8 +159,8 @@ python3 comprehensive_linker.py
 "SSH": ("../../../wiki/systems/SSH-Servers", "SSH")
 "Jira": ("../../../wiki/systems/Jira-Tickets-Index", "Jira")
 "MCP": ("../../../wiki/tools/MCP-Tools", "MCP")
-"Stripe": ("../../../wiki/businesses/YourBrand#stripe", "Stripe")
-"Shopify": ("../../../wiki/businesses/YourBrand#shopify", "Shopify")
+"Stripe": ("../../../wiki/businesses/[Your Brand]#stripe", "Stripe")
+"Shopify": ("../../../wiki/businesses/[Your Brand]#shopify", "Shopify")
 ```
 
 ### AI & Tools
@@ -226,7 +226,7 @@ grep -o '\[\[../../../wiki/[^]]*\]\]' file.log | wc -l
 ### Find unlinked files
 ```python
 from pathlib import Path
-base = Path('/path/to/EliaAI/brain/raw')
+base = Path('~/EliaAI/brain/raw')
 unlinked = [f for f in base.glob('**/*.log') 
             if f.read_text(errors='ignore').count('../../../wiki/') == 0 
             and len(f.read_text(errors='ignore').split()) > 50]
@@ -257,7 +257,7 @@ python3 log_linker.py
 Add to crontab for automatic linking:
 ```bash
 # Run every day at 3am
-0 3 * * * cd /path/to/EliaAI/brain/linkers && python3 comprehensive_linker.py >> /path/to/EliaAI/brain/raw/logs/linker_cron.log 2>&1
+0 3 * * * cd ~/EliaAI/brain/linkers && python3 comprehensive_linker.py >> ~/EliaAI/brain/raw/logs/linker_cron.log 2>&1
 ```
 
 ## Summary
@@ -271,4 +271,4 @@ The linking system transforms raw session data into a navigable knowledge graph:
 
 ---
 *Generated: 2026-04-12*
-*Scripts: `/path/to/EliaAI/brain/linkers/`*
+*Scripts: `~/EliaAI/brain/linkers/`*

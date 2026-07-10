@@ -12,10 +12,10 @@ echo "=== Health Check - $(date) ===" | tee -a "$LOG_FILE"
 
 
 declare -A servers=(
-    ["yourbrand.com"]="https"
-    ["yourtool.com"]="https"
-    ["yourproject.com"]="http"
-    ["yourbrand2.com"]="http"
+    ["[yourbrand].com"]="https"
+    ["[yoursaas].com"]="https"
+    ["[yourservice].com"]="http"
+    ["[yourbusiness].com"]="http"
 )
 
 ALL_OK=true
@@ -38,7 +38,7 @@ done
 echo "" | tee -a "$LOG_FILE"
 echo "=== API Health ===" | tee -a "$LOG_FILE"
 
-for api in "yourbrand.com" "yourtool.com"; do
+for api in "[yourbrand].com" "[yoursaas].com"; do
     health=$(curl -s --connect-timeout 5 "https://${api}/api/health" 2>/dev/null || echo "{}")
     if echo "$health" | grep -q "ok"; then
         db_status=$(echo "$health" | grep -o '"db":[^,}]*' | cut -d: -f2)

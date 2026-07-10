@@ -9,11 +9,11 @@
 
 ```bash
 skill(name="mcp-cli")
-read /path/to/EliaAI/context/TOOLS.md
-read /path/to/EliaAI/memory/MEMORY.md
+read ~/EliaAI/context/TOOLS.md
+read ~/EliaAI/memory/MEMORY.md
 
 # Load checkpoint
-CHECKPOINT_FILE="/path/to/EliaAI/.elia_checkpoint.json"
+CHECKPOINT_FILE="~/EliaAI/.elia_checkpoint.json"
 if [[ -f "$CHECKPOINT_FILE" ]]; then
     source /dev/stdin <<< "$(jq -r 'to_entries | .[] | tostring | "export \(.key)=\"\(.value)\""' "$CHECKPOINT_FILE" 2>/dev/null)"
 fi
@@ -48,19 +48,19 @@ mcp-cli call whatsapp list_messages '{"chat_jid":"GROUP_JID","limit":20}'
 mcp-cli call telegram get_default_group_messages '{"limit":15}'
 
 # Discord - key channels
-mcp-cli call discord-server-mcp discord_execute '{"operation":"messages.list_range","params":{"channel_id":"1489244810777727046","hours":6,"limit":20}}'
+mcp-cli call discord-server-mcp discord_execute '{"operation":"messages.list_range","params":{"channel_id":"[channel-id]","hours":6,"limit":20}}'
 # #health-checks
-mcp-cli call discord-server-mcp discord_execute '{"operation":"messages.list","params":{"channel_id":"1489247935807099020","limit":5}}'
+mcp-cli call discord-server-mcp discord_execute '{"operation":"messages.list","params":{"channel_id":"[channel-id]","limit":5}}'
 # #orders  
-mcp-cli call discord-server-mcp discord_execute '{"operation":"messages.list","params":{"channel_id":"1489244862871244950","limit":5}}'
+mcp-cli call discord-server-mcp discord_execute '{"operation":"messages.list","params":{"channel_id":"[channel-id]","limit":5}}'
 ```
 
 ### 1.2 Priority Processing
 
 | Priority | Who | Response Time | Action |
 |----------|-----|---------------|--------|
-| P1 | @user (YourName) | IMMEDIATE | Reply & act within run |
-| P2 | Thomas, Rida | Within run | Reply & move forward |
+| P1 | @[your-username] ([YOUR NAME]) | IMMEDIATE | Reply & act within run |
+| P2 | Thomas, [Team Member] | Within run | Reply & move forward |
 | P3 | Ali, Marco | Within run | Acknowledge & track |
 | P4 | Others | When possible | Process when free |
 
@@ -146,7 +146,7 @@ INBOX HAD MESSAGES?
 ```
 "Thomas, ça avance le Shopify? Besoin d'aide?"
 "Ali, les commandes du jour, c'est good?"
-"Rida, le contenu pour aujourd'hui, on est prêts?"
+"[Team Member], le contenu pour aujourd'hui, on est prêts?"
 "Marco, t'as eu des bookings?"
 ```
 
@@ -168,7 +168,7 @@ INBOX HAD MESSAGES?
 | Channel | Content | Frequency |
 |---------|---------|-----------|
 | #health-checks | Server status | Every run |
-| #panel | YourTool status | Every run |
+| #panel | [Your SaaS] status | Every run |
 
 #### Post When Relevant
 | Channel | Content | Trigger |
@@ -184,8 +184,8 @@ INBOX HAD MESSAGES?
 "🖥️ Servers – [TIME]
 B2L: ✅ 
 ZB: ✅ 
-YourProject: ✅ 
-YourBrand2: ⚠️ SSL"
+[Your Service]: ✅ 
+[Your Business]: ⚠️ SSL"
 ```
 
 **Status Update:**
@@ -214,14 +214,14 @@ Awaiting: [N]"
 
 ```bash
 # Search memory
-grep -i "en attente\|waiting\|blocked\|depuis" /path/to/EliaAI/memory/MEMORY.md | head -10
+grep -i "en attente\|waiting\|blocked\|depuis" ~/EliaAI/memory/MEMORY.md | head -10
 
 # Check recent session docs
 ls -lt docs/2026-04-*/session*.md | head -3
 cat docs/2026-04-*/session_LATEST.md
 
 # Search Discord #urgent
-mcp-cli call discord-server-mcp discord_execute '{"operation":"messages.list","params":{"channel_id":"1489244806310793216","limit":5}}'
+mcp-cli call discord-server-mcp discord_execute '{"operation":"messages.list","params":{"channel_id":"[channel-id]","limit":5}}'
 ```
 
 ### 3.2 Unblock Decision Tree
@@ -235,10 +235,10 @@ FIND STUCK ITEM
 │   └── < 24h → Note, check next run
 │
 ├── Who can help?
-│   ├── YourName (Stripe) → Telegram DM
+│   ├── [YOUR NAME] (Stripe) → Telegram DM
 │   ├── Thomas (Shopify) → WhatsApp to Thomas
 │   ├── Ali (Orders) → WhatsApp to Ali
-│   └── Rida (Content) → WhatsApp to Rida
+│   └── [Team Member] (Content) → WhatsApp to [Team Member]
 │
 └── Still blocked after 2 relances?
     ├── YES → Escalate to team
@@ -268,16 +268,16 @@ FIND STUCK ITEM
 
 ### 4.1 Check Each Business
 
-#### YourBrand
+#### [Your Brand]
 - New orders in WhatsApp?
 - Stock levels OK?
 - Customer messages pending?
 
-#### YourTool  
+#### [Your SaaS]  
 - Open tickets count?
 - Payment issues?
 
-#### MayaVanta
+#### [Your Partner]
 - New bookings?
 - Marco messages?
 
@@ -340,16 +340,16 @@ FOUND ANOMALY?
 
 ```bash
 # Health
-mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"1489247935807099020","content":"🖥️ Status: OK"}'
+mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"🖥️ Status: OK"}'
 
 # Orders (if relevant)
-mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"1489244862871244950","content":"📦 Orders: [count]"}'
+mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"📦 Orders: [count]"}'
 
 # Panel (if relevant)
-mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"1489244946673176618","content":"ZB: [status]"}'
+mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"ZB: [status]"}'
 
 # Summary (brief)
-mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"1489244810777727046","content":"📋 Elia – [HH:MM]
+mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"📋 Elia – [HH:MM]
 ✅ Done: [X] replies, [Y] posts, [Z] relances"}'
 ```
 
@@ -406,11 +406,11 @@ If run produces NO inbox messages → AUTO:
 
 ### Channel IDs
 ```
-health-checks: 1489247935807099020
-orders:        1489244862871244950
-panel:        1489244946673176618
-reports:      1489244810777727046
-urgent:       1489244806310793216
+health-checks: [channel-id]
+orders:        [channel-id]
+panel:        [channel-id]
+reports:      [channel-id]
+urgent:       [channel-id]
 ```
 
 ### Send Template

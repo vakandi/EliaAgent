@@ -14,7 +14,7 @@ export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
 export PATH="$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.nvm/versions/node/v20.20.2/bin:$PATH"
 
-source /home/user/.zshrc 2>/dev/null || true
+source ~/.zshrc 2>/dev/null || true
 
 # Read model from .opencode_model if set
 MODEL_FILE="${AGENT_DIR}/.opencode_model"

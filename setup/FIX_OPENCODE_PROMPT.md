@@ -6,7 +6,7 @@ You are a debugging specialist tasked with fixing OpenCode TUI that stopped work
 
 ## Problem
 
-OpenCode TUI (Terminal UI) stopped opening after the user modified the codemem memory system at `/path/to/EliaAI/integrations/codemem`. 
+OpenCode TUI (Terminal UI) stopped opening after the user modified the codemem memory system at `~/EliaAI/integrations/codemem`. 
 
 **Symptoms:**
 - TUI tries to open but doesn't display
@@ -16,7 +16,7 @@ OpenCode TUI (Terminal UI) stopped opening after the user modified the codemem m
 
 ## What Was Changed
 
-1. User modified files in `/path/to/EliaAI/integrations/codemem` (memory system)
+1. User modified files in `~/EliaAI/integrations/codemem` (memory system)
 2. After modifications, OpenCode stopped working
 
 ## Current State
@@ -25,14 +25,14 @@ OpenCode TUI (Terminal UI) stopped opening after the user modified the codemem m
 ```json
 {
   "plugin": [
-    "file:///path/to/config/opencode/plugins/open-island.js",
-    "file:///path/to/config/opencode/plugins/codemem.js"
+    "file://~/.config/opencode/plugins/open-island.js",
+    "file://~/.config/opencode/plugins/codemem.js"
   ]
 }
 ```
 
 **Codemem Plugin:**
-- Symlink: `~/.config/opencode/plugins/codemem.js` → `/path/to/EliaAI/integrations/codemem/packages/opencode-plugin/.opencode/plugins/codemem.js`
+- Symlink: `~/.config/opencode/plugins/codemem.js` → `~/EliaAI/integrations/codemem/packages/opencode-plugin/.opencode/plugins/codemem.js`
 - File exists and is valid
 - Last modified: May 5, 23:26
 
@@ -43,7 +43,7 @@ OpenCode TUI (Terminal UI) stopped opening after the user modified the codemem m
 - `~/.config/opencode/opencode.json`
 - `~/.config/opencode/settings.json`
 - `~/.config/opencode/plugins/codemem.js`
-- `/path/to/EliaAI/integrations/codemem/packages/opencode-plugin/.opencode/plugins/codemem.js`
+- `~/EliaAI/integrations/codemem/packages/opencode-plugin/.opencode/plugins/codemem.js`
 
 ## Your Mission
 

@@ -12,12 +12,12 @@
 skill(name="mcp-cli")
 
 # 2. Load context files
-read /path/to/EliaAI/context/TOOLS.md
-read /path/to/EliaAI/memory/MEMORY.md
-read /path/to/EliaAI/memory/GLOBAL-*-WAEL-BOUSFIRA.md
+read ~/EliaAI/context/TOOLS.md
+read ~/EliaAI/memory/MEMORY.md
+read ~/EliaAI/memory/GLOBAL-*-YOUR-NAME.md
 
 # 3. Load checkpoint
-CHECKPOINT_FILE="/path/to/EliaAI/.elia_checkpoint.json"
+CHECKPOINT_FILE="~/EliaAI/.elia_checkpoint.json"
 if [[ -f "$CHECKPOINT_FILE" ]]; then
     source /dev/stdin <<< "$(jq -r 'to_entries | .[] | tostring | "export \(.key)=\"\(.value)\""' "$CHECKPOINT_FILE" 2>/dev/null)"
     echo "Last run: $last_run"
@@ -52,13 +52,13 @@ fi
 mcp-cli call whatsapp list_chats '{}'
 # Then for each group ID:
 mcp-cli call whatsapp list_messages '{"chat_jid":"GROUP_JID","limit":20}'
-# Key groups: YOURBRAND BUSINESS, YOURCO PowerRangers, YOURVENTURES
+# Key groups: YOURBRAND BUSINESS, [Your Team] PowerRangers, [YOUR PARTNER]
 
 # B. Telegram - default group
 mcp-cli call telegram get_default_group_messages '{"limit":15}'
 
 # C. Discord - #reports channel (last 6 hours)
-mcp-cli call discord-server-mcp discord_execute '{"operation":"messages.list_range","params":{"channel_id":"1489244810777727046","hours":6,"limit":25}}'
+mcp-cli call discord-server-mcp discord_execute '{"operation":"messages.list_range","params":{"channel_id":"[channel-id]","hours":6,"limit":25}}'
 
 # D. Discord DMs
 mcp-cli call discord-mcp discord_get_dms '{"limit":10}'
@@ -68,15 +68,15 @@ mcp-cli call discord-mcp discord_get_dms '{"limit":10}'
 
 | Priority | Who | Action |
 |----------|-----|--------|
-| **P1** | @user (YourName) | If ANY message/audio → IMMEDIATE reply |
-| **P2** | Thomas or Rida | If ANY message → IMMEDIATE process |
+| **P1** | @[your-username] ([YOUR NAME]) | If ANY message/audio → IMMEDIATE reply |
+| **P2** | Thomas or [Team Member] | If ANY message → IMMEDIATE process |
 | **P3** | Team (Ali, Marco) | Reply within run |
 | **P4** | Others | Reply when possible |
 
 ### 1.3 Voice Messages (CRITICAL - MUST transcribe)
 
 If ANY audio file found:
-1. **FIRST**: Transcribe YourName's voice messages (they contain tasks)
+1. **FIRST**: Transcribe [YOUR NAME]'s voice messages (they contain tasks)
 2. **THEN**: Transcribe others
 
 ```bash
@@ -94,7 +94,7 @@ For **EVERY** message, decide IMMEDIATELY:
 │
 ├── Is it a REQUEST (non-sensitive)?
 │   ├── YES → DO IT or acknowledge + create ticket
-│   └── NO → Send approval request to YourName
+│   └── NO → Send approval request to [YOUR NAME]
 │
 ├── Is it an ORDER?
 │   ├── YES → Process → Forward to Ali → Confirm in #orders
@@ -145,20 +145,20 @@ For **EVERY** message, decide IMMEDIATELY:
 
 | Channel ID | Channel | When to Post | Example |
 |-----------|--------|--------------|---------|
-| 1489247935807099020 | #health-checks | Every run | "🖥️ B2L:200 ZB:200" |
-| 1489244862871244950 | #orders | New orders | "📦 3 commandes aujourd'hui" |
-| 1489244857250615416 | #products | Changes | "Nouveaux produits ajoutés" |
-| 1489244868235755580 | #clients | Updates | "Nouveau client: [name]" |
-| 1489244946673176618 | #panel | Every run | "ZB: 0 tickets" |
-| 1489244954646679662 | #content | Done | "TikTok posté" |
+| [channel-id] | #health-checks | Every run | "🖥️ B2L:200 ZB:200" |
+| [channel-id] | #orders | New orders | "📦 3 commandes aujourd'hui" |
+| [channel-id] | #products | Changes | "Nouveaux produits ajoutés" |
+| [channel-id] | #clients | Updates | "Nouveau client: [name]" |
+| [channel-id] | #panel | Every run | "ZB: 0 tickets" |
+| [channel-id] | #content | Done | "TikTok posté" |
 
 ```bash
 # Template - POST to channel
 mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"CHANNEL_ID","content":"MESSAGE"}'
 
 # Examples:
-mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"1489247935807099020","content":"🖥️ Servers: B2L ✅ ZB ✅ YourProject ⚠️"}'
-mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"1489244862871244950","content":"📦 Commandes: 3 nouvelles - Evan, Salhiou, Andy"}'
+mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"🖥️ Servers: B2L ✅ ZB ✅ [Service] ⚠️"}'
+mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"📦 Commandes: 3 nouvelles - Evan, Salhiou, Andy"}'
 ```
 
 ### 2.2 WhatsApp - TEAM ENGAGEMENT (MANDATORY)
@@ -173,7 +173,7 @@ mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"14892448628
 # Specific check-in
 "Thomas, ça avance le projet Shopify?"
 "Ali, les commandes du jour sont traitées?"
-"Rida, le contenu est prêt?"
+"[Team Member], le contenu est prêt?"
 
 # Relay (after inbox)
 "J'ai transmis la demande de [person] à [person]. On attend?"
@@ -183,8 +183,8 @@ mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"14892448628
 | Group | When to Post |
 |-------|-------------|
 | YOURBRAND BUSINESS | Every run - orders, clients |
-| YOURCO PowerRangers | Projects, dev work |
-| YOURVENTURES | Bookings, Marco |
+| [Your Team] PowerRangers | Projects, dev work |
+| [YOUR PARTNER] | Bookings, Marco |
 
 ### 2.3 Minimum Engagement Rules
 
@@ -200,11 +200,11 @@ mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"14892448628
 
 Quick check each business for anomalies.
 
-### 3.1 YourBrand
+### 3.1 [Your Brand]
 
 ```bash
 # Check WhatsApp for order keywords
-mcp-cli call whatsapp list_messages '{"chat_jid":"YOURBRAND_BUSINESS_JID","limit":15}'
+mcp-cli call whatsapp list_messages '{"chat_jid":"YOURBRAND_JID","limit":15}'
 ```
 
 **What to look for:**
@@ -215,7 +215,7 @@ mcp-cli call whatsapp list_messages '{"chat_jid":"YOURBRAND_BUSINESS_JID","limit
 
 **If found:** Process → Post to #orders → Reply to customer
 
-### 3.2 YourTool
+### 3.2 [Your SaaS]
 
 **What to look for:**
 - New tickets
@@ -224,7 +224,7 @@ mcp-cli call whatsapp list_messages '{"chat_jid":"YOURBRAND_BUSINESS_JID","limit
 
 **If found:** Reply if simple → Create ticket if complex → Post to #panel
 
-### 3.3 MayaVanta
+### 3.3 [Your Partner]
 
 **What to look for:**
 - New bookings
@@ -242,7 +242,7 @@ mcp-cli call whatsapp list_messages '{"chat_jid":"YOURBRAND_BUSINESS_JID","limit
 
 ```bash
 # Search MEMORY for waiting items
-grep -i "en attente\|waiting\|blocked\|depuis" /path/to/EliaAI/memory/MEMORY.md | head -10
+grep -i "en attente\|waiting\|blocked\|depuis" ~/EliaAI/memory/MEMORY.md | head -10
 
 # Check session docs for pending
 ls -lt docs/2026-04-*/session*.md | head -5
@@ -253,10 +253,10 @@ ls -lt docs/2026-04-*/session*.md | head -5
 ```
 ├── Item waiting > 24h?
 │   ├── YES → Send reminder NOW
-│   │   ├── Stripe verification → Telegram to YourName
+│   │   ├── Stripe verification → Telegram to [YOUR NAME]
 │   │   ├── Shopify token → WhatsApp to Thomas
 │   │   ├── Order → WhatsApp to Ali
-│   │   └── Content → WhatsApp to Rida
+│   │   └── Content → WhatsApp to [Team Member]
 │   │
 │   └── NO → Note for next run
 │
@@ -284,7 +284,7 @@ ls -lt docs/2026-04-*/session*.md | head -5
 
 **Content (WhatsApp):**
 ```
-"Rida, on est prêts pour le contenu. Tu as besoin de quelque chose?"
+"[Team Member], on est prêts pour le contenu. Tu as besoin de quelque chose?"
 ```
 
 ---
@@ -333,7 +333,7 @@ ls -lt docs/2026-04-*/session*.md | head -5
 
 ```bash
 # To #reports (summary only)
-mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"1489244810777727046","content":"📋 Elia – [DATE HH:MM]
+mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"📋 Elia – [DATE HH:MM]
 
 ✅ Done: [3] replies, [2] posts, [1] relance
 📬 Inbox: [X] messages processed
@@ -347,7 +347,7 @@ mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"14892448107
 **BEFORE sending reports → Check what's already been postedrecently:**
 
 ```bash
-mcp-cli call discord-server-mcp discord_execute '{"operation":"messages.list","params":{"channel_id":"1489247935807099020","limit":5}}'
+mcp-cli call discord-server-mcp discord_execute '{"operation":"messages.list","params":{"channel_id":"[channel-id]","limit":5}}'
 ```
 
 If status already posted this hour → Skip posting same.
@@ -394,7 +394,7 @@ If status already posted this hour → Skip posting same.
 |----------|----------|
 | Read messages → "done" | Read → **REPLY** → done |
 | Check servers → stop | Check → **POST** status |
-| "En attente Stripe" | **RELANCE YourName** |
+| "En attente Stripe" | **RELANCE [YOUR NAME]** |
 | "Nothing in inbox" | **INITIATE WhatsApp** |
 | Send all to #reports | **Split** to right channels |
 | Null run → "OK" | Null run → **AUTO-EXECUTE** |
@@ -407,7 +407,7 @@ If status already posted this hour → Skip posting same.
 ### Save Checkpoint (BEFORE EXIT)
 
 ```bash
-CHECKPOINT_FILE="/path/to/EliaAI/.elia_checkpoint.json"
+CHECKPOINT_FILE="~/EliaAI/.elia_checkpoint.json"
 NEXT=$(date -u -d "+30 minutes" "+%Y-%m-%dT%H:%M:%SZ")
 NOW=$(date -u "+%Y-%m-%dT%H:%M:%SZ")
 echo "{\"last_run\":\"$NOW\",\"next_run\":\"$NEXT\"}" > "$CHECKPOINT_FILE"
@@ -452,15 +452,15 @@ mcp-cli call discord-server-mcp discord_execute '{"operation":"guild.get","param
 
 ### Channel IDs
 ```
-health-checks: 1489247935807099020
-orders:        1489244862871244950
-products:      1489244857250615416
-clients:       1489244868235755580
-panel:        1489244946673176618
-content:      1489244954646679662
-analytics:    1489244965337956514
-reports:      1489244810777727046
-urgent:       1489244806310793216
+health-checks: [channel-id]
+orders:        [channel-id]
+products:      [channel-id]
+clients:       [channel-id]
+panel:        [channel-id]
+content:      [channel-id]
+analytics:    [channel-id]
+reports:      [channel-id]
+urgent:       [channel-id]
 ```
 
 ### Send Command Template

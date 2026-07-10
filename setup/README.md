@@ -215,13 +215,13 @@ IP:PORT:USERNAME:PASSWORD
 
 Example:
 ```
-[redacted-proxy]
-[redacted-proxy]
+[proxy-ip:port:user:pass]
+[proxy-ip:port:user:pass]
 ```
 
 After use, history is appended:
 ```
-[redacted-proxy] |last:2026-03-24 01:17:42 |dur:0h 5m
+[proxy-ip:port:user:pass] |last:2026-03-24 01:17:42 |dur:0h 5m
 ```
 
 ### Setup
@@ -230,8 +230,8 @@ After use, history is appended:
 
 ```bash
 # Add to ~/.zshrc
-alias sp='bash /path/to/EliaAI/setup/switch-proxy.sh'
-alias spm='bash /path/to/EliaAI/setup/switch-proxy.sh --manual'
+alias sp='bash ~/EliaAI/setup/switch-proxy.sh'
+alias spm='bash ~/EliaAI/setup/switch-proxy.sh --manual'
 
 # Proxychains aliases (for curl testing)
 alias pcurl='proxychains4 -f ~/.proxychains.conf /opt/homebrew/opt/curl/bin/curl'
@@ -322,7 +322,7 @@ To clear all history and start fresh:
 ```bash
 # Clear proxies.txt (keeps proxy list, removes history)
 cat > ~/EliaAI/setup/proxies.txt << 'EOF'
-[redacted-proxy]
+[proxy-ip:port:user:pass]
 YOUR_OTHER_PROXY:PORT:USER:PASS
 EOF
 
@@ -368,7 +368,7 @@ Debug: from the repo root, `./ui_electron/run-debug.sh` then attach DevTools to 
 **User crontab (default):**
 
 ```bash
-cd /path/to/EliaAI
+cd ~/EliaAI
 
 # Every 2 hours, 10:00–22:00
 ./manage_cron.sh install --interval 2h --start 10 --end 22
@@ -512,7 +512,7 @@ Each subagent has TWO configuration sources that work together:
 
 **The prompt_append tells each agent:**
 ```
-**FIRST: Read your personality file at `/path/to/config/opencode/agents/[name].md` for your full workflow and rules.**
+**FIRST: Read your personality file at `~/.config/opencode/agents/[name].md` for your full workflow and rules.**
 ```
 
 This ensures agents always load their complete personality from the `.md` files for best results.
@@ -544,13 +544,13 @@ task(category="ecommerce-luxury", load_skills=["luxury-fashion-marketing-genius"
 |----------|------|--------|-----------------|
 | `backend-dev` | Oliver | APIs, databases, Docker, CI/CD | "The solution is straightforward." |
 | `frontend-dev` | James | React, UI/UX, animations | "It should make you want to click." |
-| `finance-ops` | William | Invoicing, payments, MayaVanta | "Money follows when work is done well." |
+| `finance-ops` | William | Invoicing, payments, [Your Partner] | "Money follows when work is done well." |
 | `marketing-social` | Victoria | TikTok, YouTube, Snapchat campaigns | "The best marketing doesn't feel like marketing." |
 | `sales-closing` | Charles | Lead generation, conversion, closing | "The deal isn't closed until it's signed." |
 | `hr-recruitment` | Elizabeth | Hiring, recruitment, employee management | "The best hires are the ones where you don't hesitate." |
 | `content-creation` | Marcus | Videos, thumbnails, scheduling, FFmpeg | "Content is king, but distribution is queen." |
-| `ecommerce-luxury` | Charlotte | YourBrand luxury fashion resale | "Luxury is in the details. And in authenticity." |
-| `partnership-yourventures` | Alexander | MayaKech coordination, relationship management | "Strong partnership, strong business." |
+| `ecommerce-luxury` | Charlotte | [Your Brand] luxury fashion resale | "Luxury is in the details. And in authenticity." |
+| `partnership-yourpartner` | Alexander | [Partner Social] coordination, relationship management | "Strong partnership, strong business." |
 | `operations-workflow` | Sebastian | Jira, workflows, multi-SaaS deployment | "A good system runs itself. A great system improves itself." |
 | `dm-customer-comms` | Catherine | WhatsApp, Telegram, Discord support | "Every message is an impression. Make it count." |
 | `snapchat-growth` | Ethan | Bot farms, account creation, ad campaigns | "In growth, speed beats perfection." |
@@ -563,8 +563,8 @@ Each subagent can be equipped with relevant skills for enhanced performance:
 | Skill | Best For |
 |-------|----------|
 | `coding-agent` | General coding tasks |
-| `master-sales` | Sales copywriting, campaigns for YourBrand |
-| `luxury-fashion-marketing-genius` | Luxury fashion marketing (YourBrand) |
+| `master-sales` | Sales copywriting, campaigns for [Your Brand] |
+| `luxury-fashion-marketing-genius` | Luxury fashion marketing ([Your Brand]) |
 | `frontend-ui-ux` | Design decisions, UI components |
 | `git-master` | Git operations, atomic commits |
 | `dev-browser` | Browser automation, web testing |
@@ -645,7 +645,7 @@ Add category in `~/.config/opencode/oh-my-openagent.json` → `categories` secti
   "[name]": {
     "model": "opencode/big-pickle",
     "description": "Agent description",
-    "prompt_append": "**FIRST: Read your personality file at `/path/to/config/opencode/agents/[name].md` for your full workflow and rules.**
+    "prompt_append": "**FIRST: Read your personality file at `~/.config/opencode/agents/[name].md` for your full workflow and rules.**
 
 [Short intro + key rules]"
   }
@@ -710,7 +710,7 @@ You are [Name], [Role description].
       "color": "#EC4899"
     },
     "yourbrand": {
-      "description": "YourBrand - Luxury fashion resale",
+      "description": "[Your Brand] - Luxury fashion resale",
       "mode": "primary"
     },
     "setbon": {
@@ -807,9 +807,9 @@ oh-my-opencode run -a <agent> "<task/message>"
 
 # Available Subagents
 oh-my-opencode run -a setbon "Message pour Setbon"           # Marketing
-oh-my-opencode run -a yourbrand "Message pour YourBrand"      # Luxury e-commerce
-oh-my-opencode run -a yourco-agency "Message pour YourCo"      # B2B digital
-oh-my-opencode run -a yourtool "Message pour YourTool"    # SMMPanel
+oh-my-opencode run -a yourbrand "Message pour [Your Brand]"      # Luxury e-commerce
+oh-my-opencode run -a your-agency "Message pour Your Agency"      # B2B digital
+oh-my-opencode run -a your-saas "Message pour Your SaaS"    # SMMPanel
 oh-my-opencode run -a gilfoyle "Message pour Gilfoyle"       # Backend dev
 oh-my-opencode run -a picasso "Message pour Picasso"         # Frontend/UI
 oh-my-opencode run -a tiktok-youtube-auto "Message"          # TikTok/YouTube
@@ -882,7 +882,7 @@ EliaAI/
 
 - **Scheduled job uses wrong model**  
   Ensure Elia has the desired model selected (so `.opencode_model` is updated). Check:  
-  `cat /path/to/EliaAI/.opencode_model`  
+  `cat ~/EliaAI/.opencode_model`  
   **IMPORTANT**: Use ONLY free OpenCode models (big-pickle, minimax-m2.5-free). Do NOT use Claude/GPT/paid models.  
   Cron/LaunchAgent do not need to be reinstalled when you change the model.
 
@@ -935,7 +935,7 @@ Elia peut être intégrée à Discord comme bot conversationnel. Chaque channel 
 **3. Configurer le bot:**
 
 ```bash
-cd /path/to/EliaAI/integrations/elia-discord-bot
+cd ~/EliaAI/integrations/elia-discord-bot
 
 # Copier .env.example vers .env
 cp .env.example .env
@@ -1206,7 +1206,7 @@ Please:
      * Set "fallbackModel": "opencode/big-pickle"
    - This ensures NO paid models (Claude, GPT, etc.) are ever used - only free OpenCode models
 
-2. Update context/business.md - Replace all references to "YourName", "YourName YourSurname", "Your Company", "YourBrand", "MayaVanta", etc. with MY information:
+2. Update context/business.md - Replace all references to "[YOUR NAME]", "[YOUR NAME]", "[Your Agency]", "[Your Brand]", "[Your Partner]", etc. with MY information:
    - My name and profile
    - MY businesses (replace the examples with yours)
    - MY team members and partners
@@ -1238,15 +1238,15 @@ Please:
    - MY growth plans
 
 6. Update PROMPT.md:
-   - Replace "YourName" with MY name
-   - Replace "Surname" with MY surname
+   - Replace "[YOUR NAME]" with MY name
+   - Replace "[YOUR NAME]" with MY surname
    - Update business references to MY businesses
    - Update team members to MY team
    - Update communication channels to MY channels
    - Adjust personality to match MY preferences
 
 7. Update MORNING_PROMPT.md:
-   - Replace "YourName", "Rida", "Thomas", "Ali" team references with MY people
+   - Replace "[YOUR NAME]", "Rida", "Thomas", "Ali" team references with MY people
    - Update business tasks to MY businesses
    - Adjust the morning routine to match MY workflow
 
@@ -1268,7 +1268,7 @@ Please:
 9. Update the prompt_append in oh-my-opencode.json for EACH agent:
    - Find each category in the "categories" section
    - Update the prompt_append to say "**FIRST: Read your personality file at `/path/to/agents/[name].md`..."
-   - Replace "YourName", "Surname" with MY name in prompt_append text
+   - Replace "[YOUR NAME]", "[YOUR NAME]" with MY name in prompt_append text
    - Update business/tool references
    - ALSO ensure each agent in "agents" section has: "model": "opencode/big-pickle" AND "fallback_models": []
 
@@ -1331,7 +1331,7 @@ Key sections to update:
 
 ```
 Key sections to update:
-- MCP-CLI servers (YOUR servers, not YourName's)
+- MCP-CLI servers (YOUR servers, not [YOUR NAME]'s)
 - SSH hosts (YOUR actual servers)
 - Business Group JIDs (YOUR actual WhatsApp groups)
 - Individual Contacts (YOUR actual contacts)
@@ -1376,7 +1376,7 @@ Key sections to update:
 - Business references: YOUR businesses
 - Communication channels: YOUR actual groups
 - Team roles: YOUR team structure
-- All names: YourName, Rida, Thomas, Ali → YOUR people
+- All names: [YOUR NAME], Rida, Thomas, Ali → YOUR people
 ```
 
 #### 8. Update Global OpenCode AGENTS.md
@@ -1388,7 +1388,7 @@ This file sets the global personality for OpenCode. Find it at `~/.config/openco
 - Update personality description:
   - "You ARE Elia" - The ultimate assistant with master marketing skills, 
     master dev knowledge, and SaaS building expertise
-  - "Owner: YourName YourSurname" → "Owner: [YOUR NAME]"
+  - "Owner: [YOUR NAME]" → "Owner: [YOUR NAME]"
   - Update all business references to YOUR businesses
   - Update team references to YOUR team
   - Update communication channels to YOUR channels
@@ -1445,7 +1445,7 @@ For Elia to run tools independently, add these aliases to your shell profile (`~
 
 ```bash
 # Add this alias for WhatsApp Bridge management
-alias wabridge='/path/to/Documents/mcps_server/whatsapp-mcp/whatsapp-bridge/restart-whatsapp-bridge.sh'
+alias wabridge='~/Documents/mcps_server/whatsapp-mcp/whatsapp-bridge/restart-whatsapp-bridge.sh'
 
 # Usage:
 # wabridge start   - Start bridge (fails if already running)
@@ -1459,7 +1459,7 @@ alias wabridge='/path/to/Documents/mcps_server/whatsapp-mcp/whatsapp-bridge/rest
 
 ```bash
 # Add this alias for Playwright MCP server management
-alias playwright-restart='/path/to/Documents/mcps_server/restart_clean_mcp_playwright.sh'
+alias playwright-restart='~/Documents/mcps_server/restart_clean_mcp_playwright.sh'
 
 # Usage:
 # playwright-restart    # Restart Playwright MCP on port 8931
@@ -1498,17 +1498,17 @@ alias agent-browser='agent-browser --profile ~/.agent-browser-profile'
 whisper /path/to/audio.ogg --model large-v3 --language French --task transcribe
 
 # Elia TTS - Voice Output (installed via script)
-# Run: sudo bash /path/to/EliaAI/tools/install_elia_tts.sh
+# Run: sudo bash ~/EliaAI/tools/install_elia_tts.sh
 elia-voxtral-speak "Message" -j    # happy tone
 elia-voxtral-speak "Message" -d      # sad tone
 elia-speak -x "Message"             # sexy (fallback)
 
 # If elia-voxtral-speak/elia-speak not found in OpenCode: use scripts directly
-# python3 /path/to/Documents/mcps_server/dia_voice/mistral-speak.py "Message" -j
-# python3 /path/to/EliaAI/setup/speak.py "Message" -x
+# python3 ~/Documents/mcps_server/dia_voice/mistral-speak.py "Message" -j
+# python3 ~/EliaAI/setup/speak.py "Message" -x
 
 # MCP Servers - Source code available at:
-# https://github.com/user/McpServers/settings/access
+# https://github.com/yourusername/McpServers/settings/access
 ```
 
 ---
@@ -1560,7 +1560,7 @@ Each SSH server has a `--blacklist` argument:
     "-y",
     "@fangjunjie/ssh-mcp-server",
     "--host",
-    "203.0.113.1",
+    "[server-ip]",
     ...
     "--blacklist",
     "^docker\\s+(exec|run.*postgres|...),..."

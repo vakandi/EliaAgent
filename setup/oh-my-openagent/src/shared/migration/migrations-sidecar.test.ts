@@ -17,8 +17,8 @@ describe("migrations sidecar", () => {
 
   describe("getSidecarPath", () => {
     test("appends .migrations.json to the config path", () => {
-      expect(getSidecarPath("/path/to/config/opencode/oh-my-openagent.json")).toBe(
-        "/path/to/config/opencode/oh-my-openagent.json.migrations.json",
+      expect(getSidecarPath("/home/user/.config/opencode/oh-my-openagent.json")).toBe(
+        "/home/user/.config/opencode/oh-my-openagent.json.migrations.json",
       )
     })
 

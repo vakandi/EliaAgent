@@ -272,6 +272,26 @@
       color: #00e5ff;
       box-shadow: 0 0 8px rgba(0,229,255,0.3);
     }
+    .schedule-btn-small {
+      font-family: 'Orbitron', monospace;
+      font-size: 7px;
+      font-weight: 600;
+      letter-spacing: 1px;
+      padding: 3px 6px;
+      border-radius: 3px;
+      border: 1px solid rgba(255,152,0,0.3);
+      background: rgba(255,152,0,0.08);
+      color: rgba(255,152,0,0.7);
+      cursor: pointer;
+      transition: all 0.2s ease;
+      flex-shrink: 0;
+    }
+    .schedule-btn-small:hover {
+      background: rgba(255,152,0,0.2);
+      border-color: rgba(255,152,0,0.6);
+      color: #ff9800;
+      box-shadow: 0 0 8px rgba(255,152,0,0.3);
+    }
     .chevron-btn {
       font-family: 'Share Tech Mono', monospace;
       font-size: 10px;
@@ -336,6 +356,30 @@
       padding: 6px 14px;
       border-bottom: 1px solid rgba(0,229,255,0.08);
     }
+    .runs-columns {
+      font-family: 'Orbitron', monospace;
+      font-size: 7px;
+      color: rgba(0,229,255,0.3);
+      letter-spacing: 1.5px;
+      padding: 4px 14px 3px;
+      border-bottom: 1px solid rgba(0,229,255,0.12);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      background: rgba(0,229,255,0.03);
+    }
+    .runs-columns .col-file { flex: 1; min-width: 0; }
+    .runs-columns .col-badges {
+      display: flex;
+      gap: 6px;
+      flex-shrink: 0;
+      margin-left: auto;
+    }
+    .runs-columns .col-badges span {
+      min-width: 36px;
+      text-align: right;
+    }
     .run-item {
       font-family: 'Share Tech Mono', monospace;
       font-size: 11px;
@@ -361,6 +405,46 @@
       font-size: 9px;
       color: rgba(0,229,255,0.3);
       flex-shrink: 0;
+    }
+    .run-item .run-badges {
+      display: flex;
+      gap: 6px;
+      flex-shrink: 0;
+      align-items: center;
+      margin-left: auto;
+    }
+    .run-badge {
+      font-family: 'Orbitron', monospace;
+      font-size: 8px;
+      padding: 2px 8px;
+      border-radius: 10px;
+      letter-spacing: 0.5px;
+      white-space: nowrap;
+    }
+    .run-badge-time {
+      background: rgba(0,230,118,0.12);
+      border: 1px solid rgba(0,230,118,0.3);
+      color: #00e676;
+    }
+    .run-badge-duration {
+      background: rgba(0,230,118,0.08);
+      border: 1px solid rgba(0,230,118,0.2);
+      color: rgba(0,230,118,0.8);
+    }
+    .run-badge-running {
+      background: rgba(255,255,0,0.08);
+      border: 1px solid rgba(255,255,0,0.2);
+      color: rgba(255,255,0,0.7);
+    }
+    .run-badge-crashed {
+      background: rgba(255,152,0,0.12);
+      border: 1px solid rgba(255,152,0,0.3);
+      color: #ff9800;
+    }
+    .run-badge-unknown {
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.12);
+      color: rgba(255,255,255,0.35);
     }
     .runs-loading {
       font-family: 'Share Tech Mono', monospace;
@@ -481,6 +565,7 @@
           <span class="nextrun-badge${enabledCls}" title="Next scheduled run">
             <span class="nextrun-label">NEXT</span>${escHtml(nextRun)}
           </span>
+          <button class="schedule-btn-small" data-name="${w.name}" title="Change schedule">⏰</button>
           <button class="logs-btn-small" data-name="${w.name}" title="Open latest log in terminal">LOGS</button>
           <button class="chevron-btn" data-name="${w.name}" title="Browse per-run logs">▼</button>
           <span class="status-badge ${runningCls}">${runningText}</span>
@@ -504,6 +589,20 @@
         btn.addEventListener('click', function(e) {
           e.stopPropagation();
           window.popupAPI.openSubworkerLogs(this.dataset.name);
+        });
+      });
+
+      // Schedule button: opens schedule picker popup
+      document.querySelectorAll('.schedule-btn-small').forEach(btn => {
+        btn.addEventListener('click', function(e) {
+          e.stopPropagation();
+          const name = this.dataset.name;
+          // Find current schedule from the card's data attribute
+          const card = this.closest('.subworker-card');
+          const schedStr = card ? card.dataset.schedule : '';
+          let currentSchedule = null;
+          try { currentSchedule = schedStr ? JSON.parse(schedStr) : null; } catch(_) {}
+          window.popupAPI.openSchedulePicker(name, currentSchedule);
         });
       });
 
@@ -570,12 +669,28 @@
       const displayCount = Math.min(runs.length, 10);
       const hasMore = runs.length > 10;
       let html = `<div class="runs-header">LAST ${runs.length} RUNS</div>`;
+      html += `<div class="runs-columns"><span class="col-file">FILE</span><span class="col-badges"><span>SIZE</span><span>WHEN</span><span>DURATION</span></span></div>`;
       for (let i = 0; i < displayCount; i++) {
         const r = runs[i];
         const sizeStr = r.size > 1024 ? (r.size / 1024).toFixed(0) + 'KB' : r.size + 'B';
+        const timeBadge = r.timeAgo ? `<span class="run-badge run-badge-time">${escHtml(r.timeAgo)}</span>` : '';
+        let durBadge;
+        switch (r.status) {
+          case 'success':
+            durBadge = `<span class="run-badge run-badge-duration">${escHtml(r.duration)}</span>`;
+            break;
+          case 'crashed':
+            durBadge = `<span class="run-badge run-badge-crashed">${escHtml(r.duration)} (crashed)</span>`;
+            break;
+          case 'unknown':
+            durBadge = `<span class="run-badge run-badge-unknown">${r.duration ? escHtml(r.duration) + ' ???' : '???'}</span>`;
+            break;
+          default:
+            durBadge = '<span class="run-badge run-badge-running">● RUNNING</span>';
+        }
         html += `<div class="run-item" data-path="${escHtml(r.path)}">
           <span class="run-filename">${escHtml(r.filename)}</span>
-          <span class="run-meta">${sizeStr}</span>
+          <span class="run-badges"><span class="run-meta">${sizeStr}</span>${timeBadge}${durBadge}</span>
         </div>`;
       }
       if (hasMore) {
@@ -634,18 +749,33 @@
     function getNextRun(schedule) {
       if (!schedule || !schedule.intervals || schedule.intervals.length === 0) return '--:--';
       const now = new Date();
-      const y = now.getFullYear();
-      const m = String(now.getMonth() + 1).padStart(2, '0');
-      const d = String(now.getDate()).padStart(2, '0');
-      const today = `${y}-${m}-${d}`;
-      // Find next interval today
+      const currentDay = now.getDay();
+      const currentHour = now.getHours();
+      const currentMin = now.getMinutes();
+
       for (const intv of schedule.intervals) {
-        const t = new Date(`${today}T${String(intv.hour).padStart(2, '0')}:${String(intv.minute).padStart(2, '0')}:00`);
-        if (t > now) return `${String(intv.hour).padStart(2, '0')}:${String(intv.minute).padStart(2, '0')}`;
+        if (intv.weekday !== undefined) {
+          if (intv.weekday === currentDay) {
+            if (intv.hour > currentHour || (intv.hour === currentHour && intv.minute > currentMin)) {
+              const DAY_ABBR = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+              return `${DAY_ABBR[intv.weekday]} ${String(intv.hour).padStart(2, '0')}:${String(intv.minute).padStart(2, '0')}`;
+            }
+          } else if (intv.weekday > currentDay || (intv.weekday < currentDay && intv.hour > currentHour)) {
+            const DAY_ABBR = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+            return `${DAY_ABBR[intv.weekday]} ${String(intv.hour).padStart(2, '0')}:${String(intv.minute).padStart(2, '0')}`;
+          }
+        } else {
+          if (intv.hour > currentHour || (intv.hour === currentHour && intv.minute > currentMin)) {
+            return `${String(intv.hour).padStart(2, '0')}:${String(intv.minute).padStart(2, '0')}`;
+          }
+        }
       }
-      // First interval tomorrow
       if (schedule.intervals.length > 0) {
         const first = schedule.intervals[0];
+        if (first.weekday !== undefined) {
+          const DAY_ABBR = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+          return `${DAY_ABBR[first.weekday]} ${String(first.hour).padStart(2, '0')}:${String(first.minute).padStart(2, '0')}`;
+        }
         return `${String(first.hour).padStart(2, '0')}:${String(first.minute).padStart(2, '0')}`;
       }
       return '--:--';

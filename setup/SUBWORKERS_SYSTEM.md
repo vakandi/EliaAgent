@@ -903,18 +903,18 @@ Generate B2B leads for Your Company (web development, software, AI implementatio
 
 | Priority | Channel | When |
 |----------|---------|------|
-| **EMERGENCY** | WhatsApp - YOURCO PowerRangers (`000000000000000000@g.us`) | Blockers, urgent issues, client emergencies |
-| **REGULAR** | Discord - **YOURCO AGENCY** category (`1489244768235028633`) | Leads contacted, negotiations, progress |
-| **FALLBACK** | Discord - #reports (`1489244810777727046`) | Only if Discord fails |
+| **EMERGENCY** | WhatsApp - YOURCO PowerRangers (`000000000000001@g.us`) | Blockers, urgent issues, client emergencies |
+| **REGULAR** | Discord - **YOUR TEAM** category (`[channel-id]`) | Leads contacted, negotiations, progress |
+| **FALLBACK** | Discord - #reports (`[channel-id]`) | Only if Discord fails |
 
-#### Discord Channel IDs (YOURCO AGENCY)
+#### Discord Channel IDs (YOUR TEAM)
 
 | Channel | ID | Purpose |
 |---------|-----|---------|
-| 🚀-projects | `1489244906013593642` | Active projects |
-| 👥-clients | `1489244911449538680` | Client leads & negotiations |
-| 💻-dev-work | `1489244916352684045` | Dev tasks |
-| 💰-invoices | `1489244921180455035` | Invoices |
+| 🚀-projects | `[channel-id]` | Active projects |
+| 👥-clients | `[channel-id]` | Client leads & negotiations |
+| 💻-dev-work | `[channel-id]` | Dev tasks |
+| 💰-invoices | `[channel-id]` | Invoices |
 
 #### Workflow Steps
 
@@ -996,19 +996,19 @@ Engage with luxury fashion community, find buyers, promote YourBrand resale.
 
 | Priority | Channel | When |
 |----------|---------|------|
-| **EMERGENCY** | WhatsApp - YOURBRAND BUSINESS (`000000000000000000@g.us`) | Client wants product we don't have, supplier issue |
-| **REGULAR** | Discord - **BEN2LUXE** category (`1489244764808417320`) | Engagement data, leads found, products talked about |
-| **FALLBACK** | Discord - #reports (`1489244810777727046`) | Only if Discord fails |
+| **EMERGENCY** | WhatsApp - YOURBRAND BUSINESS (`000000000000000@g.us`) | Client wants product we don't have, supplier issue |
+| **REGULAR** | Discord - **YOUR BRAND** category (`[channel-id]`) | Engagement data, leads found, products talked about |
+| **FALLBACK** | Discord - #reports (`[channel-id]`) | Only if Discord fails |
 
-#### Discord Channel IDs (BEN2LUXE)
+#### Discord Channel IDs (YOUR BRAND)
 
 | Channel | ID | Purpose |
 |---------|-----|---------|
-| 🛍️-products | `1489244857250615416` | Product updates |
-| 📦-orders | `1489244862871244950` | Orders |
-| 👥-clients | `1489244868235755580` | Client leads |
-| 📱-social-media | `1489244873847734292` | Social engagement |
-| 📤-marketing | `1489244878431846523` | Marketing campaigns |
+| 🛍️-products | `[channel-id]` | Product updates |
+| 📦-orders | `[channel-id]` | Orders |
+| 👥-clients | `[channel-id]` | Client leads |
+| 📱-social-media | `[channel-id]` | Social engagement |
+| 📤-marketing | `[channel-id]` | Marketing campaigns |
 
 #### Workflow Steps
 
@@ -1092,20 +1092,20 @@ ACTION REQUIRED: Can we source this?
 
 ```bash
 # COBU AGENCY - clients channel
-mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"1489244911449538680","content":"# YourCo Promoter Report - {DATE}\n\n[Your report content]"}'
+mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"# YourCo Promoter Report - {DATE}\n\n[Your report content]"}'
 
-# BEN2LUXE - clients channel  
-mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"1489244868235755580","content":"# YourBrand Promoter Report - {DATE}\n\n[Your report content]"}'
+# YOUR BRAND - clients channel  
+mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"# YourBrand Promoter Report - {DATE}\n\n[Your report content]"}'
 ```
 
 #### Send to WhatsApp (Emergency Only)
 
 ```bash
 # YourCo PowerRangers (emergency)
-mcp-cli call whatsapp send_message '{"chat_jid":"000000000000000000@g.us","message":"[Report]"}'
+mcp-cli call whatsapp send_message '{"chat_jid":"000000000000001@g.us","message":"[Report]"}'
 
 # YOURBRAND BUSINESS (emergency)
-mcp-cli call whatsapp send_message '{"chat_jid":"000000000000000000@g.us","message":"[Report]"}'
+mcp-cli call whatsapp send_message '{"chat_jid":"000000000000000@g.us","message":"[Report]"}'
 ```
 
 ---
@@ -1189,8 +1189,8 @@ Mission: Générer des leads B2B pour services web dev/AI/logiciels.
 ## Canaux de Reporting
 | Canal | ID | Usage |
 |-------|-----|-------|
-| Discord #clients YOURCO | 1489244911449538680 | Rapports réguliers |
-| WhatsApp YOURCO PowerRangers | 000000000000000000@g.us | URGENT uniquement |
+| Discord #clients YOURCO | [channel-id] | Rapports réguliers |
+| WhatsApp YOURCO PowerRangers | 000000000000001@g.us | URGENT uniquement |
 
 ## Workflow (Section 8.1 référence)
 ```
@@ -1252,10 +1252,10 @@ DISCOVERY (10min) → QUALIFICATION (10min) → ENGAGEMENT (15min) → NURTURE (
 ## Commandes Reporting (depuis TOOLS.md)
 ```bash
 # Discord
-mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"1489244911449538680","content":"[REPORT]"}'
+mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"[REPORT]"}'
 
 # WhatsApp URGENT
-mcp-cli call whatsapp send_message '{"chat_jid":"000000000000000000@g.us","message":"[URGENT]"}'
+mcp-cli call whatsapp send_message '{"chat_jid":"000000000000001@g.us","message":"[URGENT]"}'
 ```
 
 CRÉER LE FICHIER MAINTENANT.
@@ -1315,8 +1315,8 @@ Mission: Engager avec la communauté mode luxe, trouver des acheteurs, promouvoi
 ## Canaux de Reporting
 | Canal | ID | Usage |
 |-------|-----|-------|
-| Discord #clients BEN2LUXE | 1489244868235755580 | Rapports réguliers |
-| WhatsApp YOURBRAND BUSINESS | 000000000000000000@g.us | URGENT - produits manquants |
+| Discord #clients YOUR BRAND | [channel-id] | Rapports réguliers |
+| WhatsApp YOURBRAND BUSINESS | 000000000000000@g.us | URGENT - produits manquants |
 
 ## Workflow (Section 8.2 référence)
 ```
@@ -1378,10 +1378,10 @@ Quand un client veut un produit QUE NOUS N'AVONS PAS:
 ## Commandes Reporting
 ```bash
 # Discord
-mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"1489244868235755580","content":"[REPORT]"}'
+mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"[REPORT]"}'
 
 # WhatsApp URGENT
-mcp-cli call whatsapp send_message '{"chat_jid":"000000000000000000@g.us","message":"[SUPPLIER ISSUE]"}'
+mcp-cli call whatsapp send_message '{"chat_jid":"000000000000000@g.us","message":"[SUPPLIER ISSUE]"}'
 ```
 
 CRÉER LE FICHIER MAINTENANT.

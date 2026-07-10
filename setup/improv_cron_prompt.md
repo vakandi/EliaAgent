@@ -22,7 +22,7 @@ You have access to:
 https://cloud.langfuse.com/project/cmngbcydq009oad07dahaikmz/traces
 
 ### 2. Local logs
-/path/to/EliaAI/logs/
+~/EliaAI/logs/
 
 Files:
 logs/opencode_interactive_YYYYMMDD_HHMMSS.log

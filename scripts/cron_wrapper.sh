@@ -16,7 +16,7 @@ export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
 export PATH="$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.nvm/versions/node/v20.20.2/bin:$PATH"
 
-source /home/user/.zshrc 2>/dev/null || true
+source ~/.zshrc 2>/dev/null || true
 
 # Mark this as a cron run (used by trigger_opencode_interactive.sh for lock mechanism)
 export ELIA_CRON=1

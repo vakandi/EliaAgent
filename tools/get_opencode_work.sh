@@ -253,7 +253,7 @@ total_sessions=$((total_sessions + ${prompt_count:-0}))
 cat >> "$OUT" << 'ENDHEADER'
 # OpenCode Work Summary
 
-> **📎 See also**: [[../wiki/businesses/YourCo-Agency|Your Company]] | [[../wiki/topics/YourCo-Agency-Timeline|YourCo Timeline]] | [[../wiki/businesses/YourBrand|YourBrand]] | [[../wiki/businesses/YourTool|YourTool]] | [[../wiki/topics/Infrastructure-Timeline|Infrastructure]] | [[../wiki/tools/MCP-Tools|MCP Tools]]
+> **📎 See also**: [[../wiki/businesses/your-agency|Your Agency]] | [[../wiki/topics/your-agency-Timeline|Agency Timeline]] | [[../wiki/businesses/Your Brand|Your Brand]] | [[../wiki/businesses/Your SaaS|Your SaaS]] | [[../wiki/topics/infrastructure-timeline|Infrastructure]] | [[../wiki/tools/MCP-Tools|MCP Tools]]
 
 ENDHEADER
 
