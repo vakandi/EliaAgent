@@ -34,7 +34,7 @@ Subworkers are autonomous AI agents that run on a schedule or trigger. Each subw
 
 ```
 Trigger (launchd / manual)
-  └─ trigger_template.sh
+  └─ trigger_template.js (Node.js, child_process.spawn)
        ├── Creates workspace/ if missing
        ├── Loads PROMPT.md
        ├── oh-my-opencode run -d workspace/ -a <agent> "<task>"
@@ -50,8 +50,7 @@ Trigger (launchd / manual)
 EliaAI/subworkers/
 ├── SUBWORKERS_SYSTEM.md          # This file
 ├── scripts/
-│   ├── trigger_template.sh       # UNIVERSAL TEMPLATE
-│   └── trigger_<name>.sh         # Per-agent wrappers (1 line change)
+│   └── trigger_template.js       # UNIVERSAL TEMPLATE (Node.js, no per-agent wrappers needed)
 ├── logs/
 │   ├── <agent_name>.log          # Aggregate logs
 │   └── runs/
@@ -72,7 +71,7 @@ EliaAI/subworkers/
 
 ```bash
 mkdir -p ~/EliaAI/subworkers/<agent-id>/workspace
-touch ~/EliaAI/subworkers/<agent-id>/.enabled
+touch ~/EliaAI/subworkers/<agent-id>/.enabled  # or use --force to skip
 ```
 
 ---
@@ -90,7 +89,7 @@ Every subworker agent runs in its own `workspace/` folder:
 
 ### 3.2 How It Works
 
-The trigger template (`trigger_template.sh`) automatically:
+The trigger template (`trigger_template.js`) automatically:
 
 1. Creates `workspace/` on every run (`mkdir -p "$WORKSPACE_DIR"`)
 2. Creates `workspace/YYYY-MM-DD/` every run (idempotent — only one folder per day regardless of run count)
@@ -306,25 +305,29 @@ Existing running opencode instances cache the agent list at startup — config c
 
 ## 5. Trigger Template
 
-### 5.1 Template File: `scripts/trigger_template.sh`
+### 5.1 Template File: `scripts/trigger_template.js`
 
-The universal trigger template handles all subworker launch logic. To create a new agent trigger:
+The universal trigger template (Node.js) handles all subworker launch logic. No per-agent wrapper scripts needed — the launchd plist passes `--agent <name>` directly:
 
-```bash
-#!/bin/zsh
-# <Agent Name> — Trigger (template wrapper)
-AGENT_NAME="<underscore_agent_name>"
-source "$(dirname "$0")/trigger_template.sh"
+```xml
+<string>node</string>
+<string>~/EliaAI/subworkers/scripts/trigger_template.js</string>
+<string>--agent</string>
+<string>my_agent</string>
 ```
 
-Save as `scripts/trigger_<name>.sh` and `chmod +x`.
+For manual terminal runs:
+```bash
+node scripts/trigger_template.js --agent my_agent --force
+```
 
 ### 5.2 What the Template Handles
 
 | Feature | Detail |
 |---------|--------|
 | **PATH resolution** | Finds `oh-my-opencode` for launchd (which lacks `~/.bun/bin`) |
-| **`.enabled` gate** | Skips if `subworkers/<agent-id>/.enabled` doesn't exist |
+| **`.enabled` gate** | Skips if `subworkers/<agent-id>/.enabled` doesn't exist. Use `--force` flag to bypass for manual terminal runs |
+| **`--force` flag** | `--agent <name> --force` skips the `.enabled` check. Launchd never passes this flag, so scheduled runs still respect `.enabled` |
 | **PROMPT.md loading** | Reads from `subworkers/<agent-id>/PROMPT.md` |
 | **Personality** | Loaded automatically by oh-my-opencode from `~/.config/opencode/agents/<agent-id>.md` via `-a` flag |
 | **Workspace auto-creation** | Creates `workspace/` + `workspace/YYYY-MM-DD/` (date folder at root) every run |
@@ -344,25 +347,23 @@ Save as `scripts/trigger_<name>.sh` and `chmod +x`.
 touch ~/EliaAI/subworkers/<agent-id>/.loop_mode
 ```
 
-### 5.4 Creating a Trigger Wrapper
+### 5.4 Creating a New Subworker
 
-1. Copy `trigger_template.sh` → `scripts/trigger_<name>.sh`
-2. Change `AGENT_NAME` only (underscore convention, e.g. `my_agent` becomes agent ID `my-agent`)
-3. Create `subworkers/<agent-id>/PROMPT.md`
-4. Create `subworkers/<agent-id>/.enabled` to activate
-5. `chmod +x scripts/trigger_<name>.sh`
-6. Register in `opencode.json` + `oh-my-openagent.json` (see §4.3)
-7. Create personality file at `~/.config/opencode/agents/<agent-id>.md` with YAML frontmatter (see §4.1)
+1. Create `subworkers/<agent-id>/PROMPT.md`
+2. Create `subworkers/<agent-id>/.enabled` to activate (or use `--force` to bypass for manual runs)
+3. Register in `opencode.json` + `oh-my-openagent.json` (see §4.3)
+4. Create personality file at `~/.config/opencode/agents/<agent-id>.md` with YAML frontmatter (see §4.1)
+5. Add a plist entry in `plists/com.elia.<agent-id>.plist` pointing to `trigger_template.js --agent <agent_id>`
 
 ### 5.5 Exit/Completion Marker
 
-Every run log ends with a unique marker line written by `trigger_template.sh`:
+Every run log ends with a unique marker line written by `trigger_template.js`:
 
 ```
 [YYYY-MM-DD HH:MM:SS] EOF_SUBWORKER_EXIT:<code>
 ```
 
-This marker is always written after `oh-my-opencode run` exits, regardless of success or failure. The `set +e` / `set -e` wrapping prevents the shell's `euo pipefail` from terminating the script before the marker is written.
+This marker is always written after `oh-my-opencode run` exits, regardless of success or failure.
 
 **Why a unique marker instead of parsing "completed" in AI output:**
 - The AI agent's stdout is redirected into the same run log file (`>> "$RUN_LOG" 2>&1`)
@@ -447,8 +448,7 @@ mcp-cli list
 
 ### 7.1 Template Plist
 
-```bash
-cat > ~/EliaAI/subworkers/plists/com.elia.<agent-id>.plist << 'EOF'
+```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -458,8 +458,10 @@ cat > ~/EliaAI/subworkers/plists/com.elia.<agent-id>.plist << 'EOF'
 
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/zsh</string>
-        <string>~/EliaAI/subworkers/scripts/trigger_<name>.sh</string>
+        <string>node</string>
+        <string>~/EliaAI/subworkers/scripts/trigger_template.js</string>
+        <string>--agent</string>
+        <string><agent_id_with_underscores></string>
     </array>
 
     <key>RunAtLoad</key>
@@ -475,7 +477,7 @@ cat > ~/EliaAI/subworkers/plists/com.elia.<agent-id>.plist << 'EOF'
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>~/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>HOME</key>
         <string>~</string>
     </dict>
@@ -490,7 +492,6 @@ cat > ~/EliaAI/subworkers/plists/com.elia.<agent-id>.plist << 'EOF'
     <string>~/EliaAI/subworkers/logs/<agent_name>.log</string>
 </dict>
 </plist>
-EOF
 ```
 
 ### 7.2 Load & Verify
@@ -507,6 +508,7 @@ launchctl list | grep "com.elia"
 | Issue | Solution |
 |-------|----------|
 | Agent not responding | Check `launchctl list \| grep com.elia` |
+| Trigger skips with ".enabled not found" | Create `subworkers/<agent-id>/.enabled` or run with `--force` flag for manual terminal runs |
 | `EPERM: operation not permitted` on `oh-my-opencode` | Bun global package is a symlink to a local source checkout. Fix: `rm -rf ~/.bun/install/global/node_modules/oh-my-opencode && bun install -g oh-my-opencode` |
 | MCP not connecting | `mcp-cli list` + restart if needed |
 | Rate limited | Wait 1h + reduce frequency |
@@ -532,7 +534,7 @@ rm -rf ~/.bun/install/global/node_modules/oh-my-opencode
 bun install -g oh-my-opencode
 ```
 
-**Prevention**: The trigger template (`trigger_template.sh`) now includes an automated check for this exact condition. If the bun global package is a symlink, the trigger fails immediately with a clear error message and fix instructions instead of a cryptic EPERM stack trace.
+**Prevention**: The Node.js trigger (`trigger_template.js`) handles binary resolution via a `which()` function that checks `~/.bun/bin`, `~/.opencode/bin`, `/opt/homebrew/bin`, and `/usr/local/bin`. If `oh-my-opencode` is not found, the trigger fails immediately with a clear error message instead of a cryptic EPERM stack trace.
 
 **Why it only affects `oh-my-opencode run` and not `oh-my-opencode --version`**: The `--version` flag reads `package.json` directly from the wrapper script location and exits before loading the platform-specific binary. The `run` command (and most other commands) trigger the full module loading chain, which traverses the symlink and hits macOS security restrictions.
 
