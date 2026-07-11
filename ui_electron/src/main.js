@@ -730,7 +730,7 @@ ipcMain.on('open-logs-terminal', () => {
   const path = require('path');
   
   // Find latest opencode_interactive log file
-  const logsDir = 'process.env.HOME + '/EliaAI'/logs';
+  const logsDir = path.join(EliaAIRoot, 'logs');
   let latestLog = null;
   let latestTime = 0;
   
@@ -749,7 +749,7 @@ ipcMain.on('open-logs-terminal', () => {
   } catch (e) {}
   
   // Fallback to cron.log if no opencode log found
-  const logFile = latestLog || 'process.env.HOME + '/EliaAI'/logs/cron.log';
+  const logFile = latestLog || path.join(EliaAIRoot, 'logs', 'cron.log');
   // Show whole file + follow in realtime
   const cmd = 'tail -n 5000 -f ' + logFile;
   
@@ -801,6 +801,56 @@ ipcMain.on('open-subworker-logs', (_event, name) => {
   exec('osascript ' + script, (error) => {
     if (error) console.error('open-subworker-logs error:', error.message);
   });
+});
+
+ipcMain.on('run-subworker-now', (_event, name, model) => {
+  if (!name) return;
+  const { exec } = require('child_process');
+  const triggerScript = path.join(subworkersRoot, 'scripts', 'trigger_template.js');
+  if (!fs.existsSync(triggerScript)) {
+    const { dialog } = require('electron');
+    dialog.showMessageBox({ type: 'error', title: 'Trigger not found', message: `No trigger script: ${triggerScript}` });
+    return;
+  }
+  const agentName = name.replace(/-/g, '_');
+  const modelFlag = model ? ` --model ${model}` : '';
+  const termCmd = `node "${triggerScript}" --agent ${agentName}${modelFlag} --force 2>&1 | tee /tmp/subworker_run_${name}.log; echo "EXIT:$?"`;
+  const script = [
+    'tell application "Terminal" to activate',
+    'tell application "Terminal" to do script ' + JSON.stringify(termCmd),
+    'delay 0.3',
+    'tell application "Terminal" to set bounds of front window to {20, 50, 900, 500}'
+  ].map(s => '-e ' + JSON.stringify(s)).join(' ');
+  exec('osascript ' + script, (error) => {
+    if (error) console.error('run-subworker-now error:', error.message);
+  });
+});
+
+// ── Model selection persistence ──────────────────────────────
+const modelSelectionsPath = path.join(__dirname, '..', 'model-selections.json');
+
+ipcMain.handle('get-model-selections', () => {
+  try {
+    if (fs.existsSync(modelSelectionsPath)) {
+      return JSON.parse(fs.readFileSync(modelSelectionsPath, 'utf-8'));
+    }
+  } catch (e) {
+    console.error('get-model-selections error:', e.message);
+  }
+  return {};
+});
+
+ipcMain.on('save-model-selection', (_event, name, model) => {
+  try {
+    let data = {};
+    if (fs.existsSync(modelSelectionsPath)) {
+      data = JSON.parse(fs.readFileSync(modelSelectionsPath, 'utf-8'));
+    }
+    data[name] = model;
+    fs.writeFileSync(modelSelectionsPath, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.error('save-model-selection error:', e.message);
+  }
 });
 
 // ── Helpers for run log timestamp parsing ──────────────────────────
@@ -967,7 +1017,7 @@ ipcMain.on('execute-elia-command', () => {
               const user = parts[3];
               const pass = parts[4];
               const proxyUrl = `http://${user}:${pass}@${ip}:${port}`;
-              cmd = `cd process.env.HOME + '/EliaAI' && env HTTP_PROXY="${proxyUrl}" HTTPS_PROXY="${proxyUrl}" http_proxy="${proxyUrl}" https_proxy="${proxyUrl}" ELIA_MODEL=${modelValue} process.env.HOME + '/Documents'/dictate.command`;
+              cmd = `cd ${EliaAIRoot} && env HTTP_PROXY="${proxyUrl}" HTTPS_PROXY="${proxyUrl}" http_proxy="${proxyUrl}" https_proxy="${proxyUrl}" ELIA_MODEL=${modelValue} ~/Documents/dictate.command`;
             }
           }
         } catch (e) {
@@ -976,7 +1026,7 @@ ipcMain.on('execute-elia-command', () => {
       }
 
       if (!cmd) {
-        cmd = `cd process.env.HOME + '/EliaAI' && ELIA_MODEL=${modelValue} process.env.HOME + '/Documents'/dictate.command`;
+        cmd = `cd ${EliaAIRoot} && ELIA_MODEL=${modelValue} ~/Documents/dictate.command`;
       }
 
       const script = [
@@ -1013,7 +1063,7 @@ ipcMain.on('execute-mini-orb', () => {
           const user = parts[3];
           const pass = parts[4];
           const proxyUrl = `http://${user}:${pass}@${ip}:${port}`;
-          cmd = `env HTTP_PROXY="${proxyUrl}" HTTPS_PROXY="${proxyUrl}" http_proxy="${proxyUrl}" https_proxy="${proxyUrl}" process.env.HOME + '/EliaAI'/scripts/voice-command-only.sh`;
+          cmd = `env HTTP_PROXY="${proxyUrl}" HTTPS_PROXY="${proxyUrl}" http_proxy="${proxyUrl}" https_proxy="${proxyUrl}" ${EliaAIRoot}/scripts/voice-command-only.sh`;
         }
       }
     } catch (e) {
@@ -1022,7 +1072,7 @@ ipcMain.on('execute-mini-orb', () => {
   }
   
   if (!cmd) {
-    cmd = 'process.env.HOME + '/EliaAI'/scripts/voice-command-only.sh';
+    cmd = `${EliaAIRoot}/scripts/voice-command-only.sh`;
   }
   
   const script = [
@@ -1115,7 +1165,7 @@ function loadCurrentModel() {
 // Get current scheduler settings — standardEnabled follows the real LaunchAgent plist (not stale .scheduler_state).
 function getCurrentCronSettings() {
   const stateFile = path.join(EliaAIRoot, '.scheduler_state');
-  const home = process.env.HOME || 'process.env.HOME';
+  const home = process.env.HOME;
   const launchdPlist = path.join(home, 'Library/LaunchAgents/com.elia.elia-agent.plist');
   const morningPlist = path.join(home, 'Library/LaunchAgents/com.elia.elia-agent-morning.plist');
   const plistInstalled = fs.existsSync(launchdPlist);
@@ -1409,7 +1459,7 @@ function saveTraySettings() {
 }
 
 function createTray() {
-  const iconPath = 'process.env.HOME + '/EliaAI'/ui_electron/imgs/electronui.png';
+  const iconPath = path.join(EliaAIRoot, 'ui_electron', 'imgs', 'electronui.png');
   let trayIcon = nativeImage.createFromPath(iconPath);
   if (trayIcon.isEmpty()) {
     trayIcon = nativeImage.createEmpty();
@@ -1472,33 +1522,33 @@ function runMorningSpeak() {
   const fs = require('fs');
   const path = require('path');
   
-  const eliaAI = 'process.env.HOME + '/EliaAI'';
+  const eliaAI = EliaAIRoot;
   const promptFile = path.join(eliaAI, '.morning_briefing_prompt.txt');
   
   const morningPrompt = `MORNING BRIEFING - COMPREHENSIVE DAILY UPDATE:
 
-You are Elia's morning briefing assistant. Your task is to gather ALL relevant information and provide a complete spoken briefing to User.
+You are Elia's morning briefing assistant. Your task is to gather ALL relevant information and provide a complete spoken briefing to Wael.
 
-CRITICAL: You must SPEAK to the user during the ENTIRE process, not just at the end. Use elia-voxtral-speak throughout.
+CRITICAL: You must SPEAK to Wael during the ENTIRE process, not just at the end. Use elia-voxtral-speak throughout.
 
 SPEAK AT THESE MOMENTS:
-1. AT THE START: "Salut User, je démarre le briefing matinal. Je check tout ça."
+1. AT THE START: "Salut Wael, je démarre le briefing matinal. Je check tout ça."
 2. AFTER EACH CHECK: "Je finishes de checker [Google Calendar / WhatsApp / Telegram / Jira], je te donne le point."
 3. BEFORE SENDING TASKS: "Je t'ajoute [X] tâches sur ton téléphone."
-4. AT THE END: "C'est bon User, voici le résumé complet de la matinée."
+4. AT THE END: "C'est bon Wael, voici le résumé complet de la matinée."
 
 MUST DO:
 1. CHECK GOOGLE CALENDAR: Use gws-workspace list-events to get today's meetings and events
 2. CHECK TELEGRAM: Read recent messages from Watson IA group (chat ID: -5148361692)
-3. CHECK WHATSAPP: Read YOURBRAND BUSINESS (000000000000000000@g.us) and YOURCO PowerRangers (000000000000000000@g.us)
-4. CHECK JIRA: Get pending tickets for [YOUR-PROJECTS]
-5. CHECK MEMORY FILES: Read process.env.HOME + '/EliaAI'/memory/*.md for important context
+3. CHECK WHATSAPP: Read B2LUXE BUSINESS (120363408208578679@g.us) and COBOU PowerRangers (120363420711538035@g.us)
+4. CHECK JIRA: Get pending tickets for BEN, COBOUAGENC, ZOVAPANEL, TIKYT
+5. CHECK MEMORY FILES: Read ~/EliaAI/memory/*.md for important context
 6. GATHER BUSINESS UPDATES: Status of all 8 businesses
-7. IDENTIFY ACTION ITEMS: What needs the user's attention today?
+7. IDENTIFY ACTION ITEMS: What needs Wael's attention today?
 8. IDENTIFY WAITING ON: What are team members waiting for?
 
 AFTER GATHERING ALL INFO:
-- Use gws-workspace create-task to add any important tasks to the user's phone
+- Use gws-workspace create-task to add any important tasks to Wael's phone
 - Use gws-workspace create-event to add any meetings to calendar if missing
 
 IMPORTANT: Speak at EACH step using elia-voxtral-speak (fast, French) → fallback: elia-speak`;

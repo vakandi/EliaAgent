@@ -47,6 +47,9 @@ contextBridge.exposeInMainWorld('popupAPI', {
   openSubworkerLogFile: (path) => ipcRenderer.send('open-subworker-log-file', path),
   getSubworkerRuns: (name) => ipcRenderer.send('get-subworker-runs', name),
   openSchedulePicker: (name, currentSchedule) => ipcRenderer.send('open-schedule-picker', name, currentSchedule),
+  runSubworkerNow: (name, model) => ipcRenderer.send('run-subworker-now', name, model),
+  getModelSelections: () => ipcRenderer.invoke('get-model-selections'),
+  saveModelSelection: (name, model) => ipcRenderer.send('save-model-selection', name, model),
 });
 
 // Extend electronAPI with subworker runs reply
