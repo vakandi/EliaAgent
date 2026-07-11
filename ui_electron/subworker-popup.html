@@ -114,6 +114,107 @@
     .subworker-card.enabled:hover {
       border-color: rgba(0,230,118,0.45);
     }
+    .subworker-name-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 2px;
+    }
+    .start-btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 20px;
+      height: 20px;
+      border-radius: 4px;
+      border: 1px solid rgba(0,229,255,0.25);
+      background: rgba(0,229,255,0.08);
+      color: rgba(0,229,255,0.6);
+      cursor: pointer;
+      transition: all 0.2s ease;
+      flex-shrink: 0;
+      padding: 0;
+    }
+    .start-btn:hover {
+      background: rgba(0,229,255,0.2);
+      border-color: rgba(0,229,255,0.6);
+      color: #00e5ff;
+      box-shadow: 0 0 10px rgba(0,229,255,0.4);
+      transform: scale(1.1);
+    }
+    .start-btn:active {
+      transform: scale(0.95);
+    }
+    .model-select-wrap {
+      position: relative;
+      flex-shrink: 0;
+    }
+    .model-badge {
+      font-family: 'Share Tech Mono', monospace;
+      font-size: 9px;
+      padding: 2px 6px;
+      border-radius: 3px;
+      border: 1px solid rgba(156,39,176,0.4);
+      background: rgba(156,39,176,0.1);
+      color: rgba(156,39,176,0.8);
+      cursor: pointer;
+      transition: all 0.2s ease;
+      letter-spacing: 0.5px;
+      white-space: nowrap;
+      user-select: none;
+    }
+    .model-badge:hover {
+      background: rgba(156,39,176,0.25);
+      border-color: rgba(156,39,176,0.7);
+      color: #ce93d8;
+      box-shadow: 0 0 8px rgba(156,39,176,0.3);
+    }
+    .model-dropdown {
+      display: none;
+      position: absolute;
+      top: calc(100% + 4px);
+      left: 0;
+      z-index: 1000;
+      background: rgba(10,12,18,0.97);
+      border: 1px solid rgba(156,39,176,0.4);
+      border-radius: 4px;
+      padding: 4px 0;
+      min-width: 200px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.6), 0 0 10px rgba(156,39,176,0.15);
+      backdrop-filter: blur(10px);
+    }
+    .model-dropdown.open { display: block; }
+    .model-option {
+      font-family: 'Share Tech Mono', monospace;
+      font-size: 10px;
+      padding: 5px 10px;
+      color: rgba(0,229,255,0.6);
+      cursor: pointer;
+      transition: all 0.15s ease;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      letter-spacing: 0.3px;
+    }
+    .model-option:hover {
+      background: rgba(156,39,176,0.15);
+      color: #ce93d8;
+    }
+    .model-option.selected {
+      color: #ce93d8;
+      background: rgba(156,39,176,0.1);
+    }
+    .model-option .model-dot {
+      width: 5px;
+      height: 5px;
+      border-radius: 50%;
+      background: rgba(156,39,176,0.4);
+      flex-shrink: 0;
+    }
+    .model-option.selected .model-dot {
+      background: #ce93d8;
+      box-shadow: 0 0 4px rgba(206,147,216,0.6);
+    }
     .subworker-info {
       flex: 1;
       min-width: 0;
@@ -530,9 +631,34 @@
     let openDropdown = null;
     // Cache runs per agent: { agentName: { runs: [], loadedAt: timestamp } }
     const runsCache = {};
+    // Track selected model per agent: { agentName: modelSlug }
+    const modelSelections = {};
+
+    async function loadModelSelections() {
+      try {
+        const saved = await window.popupAPI.getModelSelections();
+        if (saved && typeof saved === 'object') {
+          Object.assign(modelSelections, saved);
+        }
+      } catch (_) {}
+    }
+
+    function saveModelSelection(name, model) {
+      modelSelections[name] = model;
+      window.popupAPI.saveModelSelection(name, model);
+    }
 
     function renderSubworkers(workers) {
       if (!workers || workers.length === 0) {
+        grid.innerHTML = '<div class="loading" style="font-size:13px;color:rgba(255,23,68,0.6);">no subworkers found</div>';
+        return;
+      }
+      // Filter out placeholder agents
+      workers = workers.filter(w => {
+        const n = (w.name || '').toLowerCase();
+        return !n.includes('change_me') && !n.includes('change-me');
+      });
+      if (workers.length === 0) {
         grid.innerHTML = '<div class="loading" style="font-size:13px;color:rgba(255,23,68,0.6);">no subworkers found</div>';
         return;
       }
@@ -557,7 +683,25 @@
 
         card.innerHTML = `
           <div class="subworker-info">
-            <div class="subworker-name">${escHtml(w.label)}</div>
+            <div class="subworker-name-row">
+              <div class="subworker-name">${escHtml(w.label)}</div>
+              <div class="model-select-wrap">
+                <div class="model-badge" data-name="${w.name}" title="Select model">⚡ ${(modelSelections[w.name] || 'opencode/big-pickle').split('/').pop()}</div>
+                <div class="model-dropdown" data-name="${w.name}">
+                  <div class="model-option${(!modelSelections[w.name] || modelSelections[w.name] === 'opencode/big-pickle') ? ' selected' : ''}" data-model="opencode/big-pickle"><span class="model-dot"></span>big-pickle</div>
+                  <div class="model-option${modelSelections[w.name] === 'opencode/deepseek-v4-flash-free' ? ' selected' : ''}" data-model="opencode/deepseek-v4-flash-free"><span class="model-dot"></span>deepseek-v4-flash (free)</div>
+                  <div class="model-option${modelSelections[w.name] === 'opencode/mimo-v2.5-free' ? ' selected' : ''}" data-model="opencode/mimo-v2.5-free"><span class="model-dot"></span>mimo-v2.5 (free)</div>
+                  <div class="model-option${modelSelections[w.name] === 'opencode/nemotron-3-ultra-free' ? ' selected' : ''}" data-model="opencode/nemotron-3-ultra-free"><span class="model-dot"></span>nemotron-3-ultra (free)</div>
+                </div>
+              </div>
+              <button class="start-btn" data-name="${w.name}" title="Start agent">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M4.5 20.5l4-4"/>
+                  <path d="M15.5 5.5l4 4"/>
+                  <path d="M10 2l1.5 3.5L15 7l-3.5 1.5L10 12l-1.5-3.5L5 7l3.5-1.5L10 2z"/>
+                </svg>
+              </button>
+            </div>
             <div class="subworker-desc">${escHtml(w.description)}</div>
             <div class="subworker-path">${escHtml(w.path)}</div>
           </div>
@@ -621,6 +765,56 @@
           e.stopPropagation();
           window.electronAPI.send('toggle-subworker', this.dataset.name);
         });
+      });
+
+      // Start (wand) buttons — run agent now + open logs
+      document.querySelectorAll('.start-btn').forEach(btn => {
+        btn.addEventListener('click', function(e) {
+          e.stopPropagation();
+          const name = this.dataset.name;
+          const model = modelSelections[name] || 'opencode/big-pickle';
+          window.popupAPI.runSubworkerNow(name, model);
+        });
+      });
+
+      // Model badge: toggle dropdown
+      document.querySelectorAll('.model-badge').forEach(badge => {
+        badge.addEventListener('click', function(e) {
+          e.stopPropagation();
+          const name = this.dataset.name;
+          const wrap = this.closest('.model-select-wrap');
+          const dropdown = wrap.querySelector('.model-dropdown');
+          // Close all other model dropdowns
+          document.querySelectorAll('.model-dropdown.open').forEach(dd => {
+            if (dd !== dropdown) dd.classList.remove('open');
+          });
+          dropdown.classList.toggle('open');
+        });
+      });
+
+      // Model option: select model
+      document.querySelectorAll('.model-option').forEach(opt => {
+        opt.addEventListener('click', function(e) {
+          e.stopPropagation();
+          const model = this.dataset.model;
+          const dropdown = this.closest('.model-dropdown');
+          const name = dropdown.dataset.name;
+          const badge = dropdown.previousElementSibling;
+          // Update selection visuals
+          dropdown.querySelectorAll('.model-option').forEach(o => o.classList.remove('selected'));
+          this.classList.add('selected');
+          // Update badge text
+          badge.textContent = '⚡ ' + model.split('/').pop();
+          // Store selection
+          saveModelSelection(name, model);
+          // Close dropdown
+          dropdown.classList.remove('open');
+        });
+      });
+
+      // Close model dropdown when clicking elsewhere
+      document.addEventListener('click', () => {
+        document.querySelectorAll('.model-dropdown.open').forEach(dd => dd.classList.remove('open'));
       });
     }
 
@@ -807,7 +1001,8 @@
     });
 
     // Request subworker list on load
-    document.addEventListener('DOMContentLoaded', () => {
+    document.addEventListener('DOMContentLoaded', async () => {
+      await loadModelSelections();
       window.electronAPI.send('get-subworkers');
     });
 

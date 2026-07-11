@@ -68,7 +68,7 @@
   ],
   "ntfy": {
     "server": "https://ntfy.sh",
-    "topic": "yourusername",
+    "topic": "your-ntfy-topic",
     "token": ""
   },
   "display": {
