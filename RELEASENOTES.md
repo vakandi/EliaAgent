@@ -1,5 +1,31 @@
 # EliaAgent Release Notes
 
+## Version: v5.0.1 (July 12, 2026)
+
+### 🛡️ Subworker Premature Completion Fix — 10 Critical Bugfixes
+
+**Subworkers no longer die mid-task.** All 10 root causes of the "All tasks completed" false-positive and silent SSE stream death have been fixed in the oh-my-opencode CLI runner. Subworkers now survive long-running tasks with proper timeout handling, session-scoped event filtering, and continuous progress reporting.
+
+**What changed:**
+- **Fix #1** — `EVENT_PROCESSOR_SHUTDOWN_TIMEOUT_MS` raised from 2s → 10s to survive heavy event bursts
+- **Fix #2** — Telemetry `capture()` failures caught and logged instead of crashing the runner
+- **Fix #3** — Completion diagnostics (verbose mode) wrapped in try/catch — never crashes runner
+- **Fix #4** — Unknown completion status no longer treated as idle — requires explicit `completed` or `failed`
+- **Fix #5** — Null todo list guard — avoids crash when todo list hasn't been populated yet
+- **Fix #6** — `requiredConsecutive` raised from 1 → 3 before declaring idle — prevents false positives during stalls
+- **Fix #7** — `eventProcessorDied` flag — detects when the event processor crashes and stops poll loop
+- **Fix #8** — Watchdog timer scoped to session — multi-session CLI no longer triggers false idle
+- **Fix #9** — Toast notifications filtered by session ID — cross-session toasts no longer corrupt state
+- **Fix #10** — `eventProcessorDied` field added to event state — wired through completion detection
+
+**Impact:** Subworkers that previously died after 5-10 minutes of heavy tool use now survive indefinitely. The trigger template, launchd plists, and personality injection are unchanged — only the CLI runner internals were fixed.
+
+**Files modified:** `runner.ts`, `completion.ts`, `poll-for-completion.ts`, `event-stream-processor.ts`, `event-toast-handlers.ts`, `event-state.ts`
+
+**Docs:** See `setup/OH-MY-OPENCODE-CHANGES.md` for the full technical breakdown.
+
+---
+
 ## Version: v4.1.0 (July 10, 2026)
 
 ### 🚀 Unified Subworker Lifecycle Manager + Security Hardening

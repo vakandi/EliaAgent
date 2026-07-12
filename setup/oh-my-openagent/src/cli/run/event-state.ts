@@ -1,5 +1,6 @@
 export interface EventState {
   mainSessionIdle: boolean
+  mainSessionStarted: boolean
   mainSessionError: boolean
   lastError: string | null
   lastOutput: string
@@ -43,11 +44,14 @@ export interface EventState {
   messageStartedAtById: Record<string, number>
   /** Prevent duplicate completion metadata lines per message */
   completionMetaPrintedByMessageId: Record<string, boolean>
+  /** Set to true when the SSE event processor dies (connection lost) */
+  eventProcessorDied: boolean
 }
 
 export function createEventState(): EventState {
   return {
     mainSessionIdle: false,
+    mainSessionStarted: false,
     mainSessionError: false,
     lastError: null,
     lastOutput: "",
@@ -73,5 +77,6 @@ export function createEventState(): EventState {
     currentMessageId: null,
     messageStartedAtById: {},
     completionMetaPrintedByMessageId: {},
+    eventProcessorDied: false,
   }
 }

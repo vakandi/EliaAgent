@@ -9,14 +9,18 @@ import { executeOnCompleteHook } from "./on-complete-hook"
 import { resolveRunAgent } from "./agent-resolver"
 import { resolveRunModel } from "./model-resolver"
 import { pollForCompletion } from "./poll-for-completion"
+import { waitForPromptStart } from "./prompt-start"
 import { loadAgentProfileColors } from "./agent-profile-colors"
 import { suppressRunInput } from "./stdin-suppression"
 import { createTimestampedStdoutController } from "./timestamp-output"
 import { createCliPostHog, getPostHogDistinctId } from "../../shared/posthog"
+import { dispatchInternalPrompt, isInternalPromptDispatchAccepted } from "../../shared/prompt-async-gate"
+import { isAmbiguousPostDispatchPromptFailure } from "../../shared/prompt-failure-classifier"
+import { resolveRunnableRunAgent } from "./runnable-agent-resolver"
 
 export { resolveRunAgent }
 
-const EVENT_PROCESSOR_SHUTDOWN_TIMEOUT_MS = 2_000
+const EVENT_PROCESSOR_SHUTDOWN_TIMEOUT_MS = 10_000
 
 export async function waitForEventProcessorShutdown(
   eventProcessor: Promise<void>,
@@ -51,26 +55,14 @@ export async function run(options: RunOptions): Promise<number> {
   const resolvedAgent = resolveRunAgent(options, pluginConfig)
   const abortController = new AbortController()
 
-  const posthog = createCliPostHog()
+  const posthog = createCliPostHog({ configEnabled: pluginConfig.telemetry })
   const distinctId = getPostHogDistinctId()
   try {
     posthog.trackActive(distinctId, "run_started")
-  } catch {
-    // telemetry failure is non-fatal, silently ignore
-  }
-  try {
-    posthog.capture({
-      distinctId,
-      event: "run_started",
-      properties: {
-        command: "run",
-        agent: resolvedAgent,
-        has_model: !!options.model,
-        has_session_id: !!options.sessionId,
-      },
-    })
-  } catch {
-    // telemetry failure is non-fatal, silently ignore
+  } catch (error) {
+    if (!(error instanceof Error)) {
+      void error
+    }
   }
 
   try {
@@ -102,11 +94,16 @@ export async function run(options: RunOptions): Promise<number> {
         sessionId: options.sessionId,
         directory,
       })
+      const runnableAgent = await resolveRunnableRunAgent(client, resolvedAgent, pluginConfig)
 
       console.log(pc.dim(`Session: ${sessionID}`))
 
       if (resolvedModel) {
         console.log(pc.dim(`Model: ${resolvedModel.providerID}/${resolvedModel.modelID}`))
+      }
+
+      if (options.verbose) {
+        console.log(pc.dim(`Event watchdog: ${((options as any).eventWatchdogMs ?? 30000) / 1000}s, consecutive checks: 3`))
       }
 
       const ctx: RunContext = {
@@ -120,22 +117,52 @@ export async function run(options: RunOptions): Promise<number> {
       const eventState = createEventState()
       eventState.agentColorsByName = await loadAgentProfileColors(client)
       const eventProcessor = processEvents(ctx, events.stream, eventState).catch(
-        () => {},
+        (err: unknown) => {
+          eventState.eventProcessorDied = true
+          if (options.verbose) {
+            console.error(pc.red(`[event-processor] SSE stream error: ${err instanceof Error ? err.message : String(err)}`))
+          }
+        },
       )
 
-      await client.session.promptAsync({
-        path: { id: sessionID },
-        body: {
-          agent: resolvedAgent,
-          ...(resolvedModel ? { model: resolvedModel } : {}),
-          tools: {
-            question: false,
+      const promptResult = await dispatchInternalPrompt({
+        mode: "async",
+        client,
+        sessionID,
+        source: "cli-run",
+        settleMs: 0,
+        queueBehavior: "defer",
+        input: {
+          path: { id: sessionID },
+          body: {
+            agent: runnableAgent,
+            ...(resolvedModel ? { model: resolvedModel } : {}),
+            tools: {
+              question: false,
+            },
+            parts: [{ type: "text", text: message }],
           },
-          parts: [{ type: "text", text: message }],
+          query: { directory },
         },
-        query: { directory },
       })
-      const exitCode = await pollForCompletion(ctx, eventState, abortController)
+      const promptMayHaveBeenAccepted = promptResult.status === "failed"
+        && isAmbiguousPostDispatchPromptFailure(promptResult)
+      if (promptResult.status === "failed") {
+        if (promptMayHaveBeenAccepted) {
+          if (options.verbose) {
+            console.error(pc.dim("promptAsync returned an ambiguous error after dispatch; continuing to poll session"))
+          }
+        } else {
+          throw promptResult.error
+        }
+      }
+      if (!promptMayHaveBeenAccepted && !isInternalPromptDispatchAccepted(promptResult)) {
+        throw new Error(`Session ${sessionID} is not idle; promptAsync skipped by gate: ${promptResult.status}`)
+      }
+      await waitForPromptStart(ctx, eventState, abortController)
+      const exitCode = await pollForCompletion(ctx, eventState, abortController, {
+        requireMeaningfulWork: true,
+      })
 
       abortController.abort()
 
@@ -164,38 +191,6 @@ export async function run(options: RunOptions): Promise<number> {
         })
       }
 
-      if (exitCode === 0) {
-        try {
-          posthog.capture({
-            distinctId,
-            event: "run_completed",
-            properties: {
-              command: "run",
-              agent: resolvedAgent,
-              duration_ms: durationMs,
-              message_count: eventState.messageCount,
-            },
-          })
-        } catch {
-          // telemetry failure is non-fatal, silently ignore
-        }
-      } else if (exitCode === 1) {
-        try {
-          posthog.capture({
-            distinctId,
-            event: "run_failed",
-            properties: {
-              command: "run",
-              agent: resolvedAgent,
-              exit_code: exitCode,
-              duration_ms: durationMs,
-            },
-          })
-        } catch {
-          // telemetry failure is non-fatal, silently ignore
-        }
-      }
-
       return exitCode
     } catch (err) {
       cleanup()
@@ -210,32 +205,15 @@ export async function run(options: RunOptions): Promise<number> {
     if (err instanceof Error && err.name === "AbortError") {
       return 130
     }
-    try {
-      posthog.captureException(err, distinctId)
-    } catch {
-      // telemetry failure is non-fatal, silently ignore
-    }
-    try {
-      posthog.capture({
-        distinctId,
-        event: "run_failed",
-        properties: {
-          command: "run",
-          agent: resolvedAgent,
-          error: serializeError(err),
-          duration_ms: Date.now() - startTime,
-        },
-      })
-    } catch {
-      // telemetry failure is non-fatal, silently ignore
-    }
     console.error(pc.red(`Error: ${serializeError(err)}`))
     return 1
   } finally {
     try {
       await posthog.shutdown()
-    } catch {
-      // telemetry failure is non-fatal, silently ignore
+    } catch (error) {
+      if (!(error instanceof Error)) {
+        void error
+      }
     }
     timestampOutput?.restore()
   }
