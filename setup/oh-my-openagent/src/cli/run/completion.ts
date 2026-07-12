@@ -20,6 +20,11 @@ export async function checkCompletionConditions(ctx: RunContext): Promise<boolea
       return false
     }
 
+    if (continuationState.hasActiveBackgroundTaskMarker) {
+      logWaiting(ctx, continuationState.activeHookMarkerReason ?? "background tasks are active")
+      return false
+    }
+
     if (!await areAllChildrenIdle(ctx)) {
       return false
     }
@@ -57,7 +62,13 @@ async function areAllTodosComplete(ctx: RunContext): Promise<boolean> {
     path: { id: ctx.sessionID },
     query: { directory: ctx.directory },
   })
-  const todos = normalizeSDKResponse(todosRes, [] as Todo[])
+  const todos = normalizeSDKResponse(todosRes, null as Todo[] | null)
+  if (todos === null) {
+    if (ctx.verbose) {
+      console.error(pc.dim("[completion] todo API returned invalid response — cannot verify completion"))
+    }
+    return false
+  }
 
   const incompleteTodos = todos.filter(
     (t) => t.status !== "completed" && t.status !== "cancelled"
@@ -98,8 +109,8 @@ async function areAllDescendantsIdle(
 
   for (const child of children) {
     const status = allStatuses[child.id]
-    if (status && status.type !== "idle") {
-      logWaiting(ctx, `session ${child.id.slice(0, 8)}... is ${status.type}`)
+    if (!status || status.type !== "idle") {
+      logWaiting(ctx, `session ${child.id.slice(0, 8)}... is ${status ? status.type : "unknown"}`)
       return false
     }
 

@@ -2,14 +2,25 @@ import pc from "picocolors"
 import type { RunContext } from "./types"
 import type { EventState } from "./events"
 import { checkCompletionConditions } from "./completion"
-import { normalizeSDKResponse } from "../../shared"
+import { isRecord, normalizeSDKResponse } from "../../shared"
 
 const DEFAULT_POLL_INTERVAL_MS = 500
-const DEFAULT_REQUIRED_CONSECUTIVE = 1
+const DEFAULT_REQUIRED_CONSECUTIVE = 3
 const ERROR_GRACE_CYCLES = 3
 const MIN_STABILIZATION_MS = 1_000
 const DEFAULT_EVENT_WATCHDOG_MS = 30_000 // 30 seconds
 const DEFAULT_SECONDARY_MEANINGFUL_WORK_TIMEOUT_MS = 60_000 // 60 seconds
+
+type SessionStatusMap = Record<string, { type?: string }>
+
+function isIncompleteTodo(value: unknown): boolean {
+  if (!isRecord(value)) {
+    return true
+  }
+
+  const status = value.status
+  return status !== "completed" && status !== "cancelled"
+}
 
 export interface PollOptions {
   pollIntervalMs?: number
@@ -17,6 +28,11 @@ export interface PollOptions {
   minStabilizationMs?: number
   eventWatchdogMs?: number
   secondaryMeaningfulWorkTimeoutMs?: number
+  requireMeaningfulWork?: boolean
+  /** Injectable clock (default Date.now). Tests drive a virtual clock to assert timing causality deterministically. */
+  now?: () => number
+  /** Injectable poll delay (default real setTimeout). Tests advance the virtual clock here instead of sleeping. */
+  sleep?: (ms: number) => Promise<void>
 }
 
 export async function pollForCompletion(
@@ -37,20 +53,33 @@ export async function pollForCompletion(
   const secondaryMeaningfulWorkTimeoutMs =
     options.secondaryMeaningfulWorkTimeoutMs ??
     DEFAULT_SECONDARY_MEANINGFUL_WORK_TIMEOUT_MS
+  const requireMeaningfulWork = options.requireMeaningfulWork ?? false
+  const now = options.now ?? Date.now
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
   let consecutiveCompleteChecks = 0
   let errorCycleCount = 0
   let firstWorkTimestamp: number | null = null
   let secondaryTimeoutChecked = false
-  const pollStartTimestamp = Date.now()
+  const pollStartTimestamp = now()
 
   while (!abortController.signal.aborted) {
-    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs))
+    await sleep(pollIntervalMs)
 
     if (abortController.signal.aborted) {
       return 130
     }
 
     if (eventState.mainSessionError) {
+      // A session.error is only terminal while the session stays idle:
+      // runtime fallback rearms the session (status "busy"/"retry") after
+      // retryable errors, so a live recovery clears the latch (#3745).
+      const statusDuringError = await getMainSessionStatus(ctx)
+      if (statusDuringError === "busy" || statusDuringError === "retry") {
+        eventState.mainSessionError = false
+        eventState.mainSessionIdle = false
+        errorCycleCount = 0
+        continue
+      }
       errorCycleCount++
       if (errorCycleCount >= ERROR_GRACE_CYCLES) {
         console.error(
@@ -66,9 +95,15 @@ export async function pollForCompletion(
       errorCycleCount = 0
     }
 
+    // If the SSE event processor died (connection lost), mark session as failed
+    if (eventState.eventProcessorDied) {
+      console.error(pc.red("\n\nSSE event processor died — connection to opencode server lost."))
+      return 1
+    }
+
     let mainSessionStatus: "idle" | "busy" | "retry" | null = null
     if (eventState.lastEventTimestamp !== null) {
-      const timeSinceLastEvent = Date.now() - eventState.lastEventTimestamp
+      const timeSinceLastEvent = now() - eventState.lastEventTimestamp
       if (timeSinceLastEvent > eventWatchdogMs) {
         console.log(
           pc.yellow(
@@ -79,13 +114,8 @@ export async function pollForCompletion(
         )
 
         mainSessionStatus = await getMainSessionStatus(ctx)
-        if (mainSessionStatus === "idle") {
-          eventState.mainSessionIdle = true
-        } else if (mainSessionStatus === "busy" || mainSessionStatus === "retry") {
-          eventState.mainSessionIdle = false
-        }
 
-        eventState.lastEventTimestamp = Date.now()
+        eventState.lastEventTimestamp = now()
       }
     }
 
@@ -109,37 +139,32 @@ export async function pollForCompletion(
     }
 
     if (!eventState.hasReceivedMeaningfulWork) {
-      if (Date.now() - pollStartTimestamp < minStabilizationMs) {
+      if (now() - pollStartTimestamp < minStabilizationMs) {
         consecutiveCompleteChecks = 0
         continue
       }
 
-      if (
-        Date.now() - pollStartTimestamp > secondaryMeaningfulWorkTimeoutMs &&
-        !secondaryTimeoutChecked
-      ) {
-        secondaryTimeoutChecked = true
-        const childrenRes = await ctx.client.session.children({
-          path: { id: ctx.sessionID },
-          query: { directory: ctx.directory },
-        })
-        const children = normalizeSDKResponse(childrenRes, [] as unknown[])
-        const todosRes = await ctx.client.session.todo({
-          path: { id: ctx.sessionID },
-          query: { directory: ctx.directory },
-        })
-        const todos = normalizeSDKResponse(todosRes, [] as unknown[])
+      if (requireMeaningfulWork) {
+        if (now() - pollStartTimestamp <= secondaryMeaningfulWorkTimeoutMs) {
+          consecutiveCompleteChecks = 0
+          continue
+        }
 
-        const hasActiveChildren =
-          Array.isArray(children) && children.length > 0
-        const hasActiveTodos =
-          Array.isArray(todos) &&
-          todos.some(
-            (t: unknown) =>
-              (t as { status?: string })?.status !== "completed" &&
-              (t as { status?: string })?.status !== "cancelled"
-          )
-        const hasActiveWork = hasActiveChildren || hasActiveTodos
+        const hasActiveWork = await hasActiveSessionWork(ctx)
+        if (hasActiveWork) {
+          consecutiveCompleteChecks = 0
+          continue
+        }
+
+        console.error(
+          pc.red("\n\nSession never produced assistant output, tool activity, or reasoning after the prompt started.")
+        )
+        return 1
+      }
+
+      if (now() - pollStartTimestamp > secondaryMeaningfulWorkTimeoutMs && !secondaryTimeoutChecked) {
+        secondaryTimeoutChecked = true
+        const hasActiveWork = await hasActiveSessionWork(ctx)
 
         if (hasActiveWork) {
           eventState.hasReceivedMeaningfulWork = true
@@ -154,10 +179,10 @@ export async function pollForCompletion(
       }
     } else {
       if (firstWorkTimestamp === null) {
-        firstWorkTimestamp = Date.now()
+        firstWorkTimestamp = now()
       }
 
-      if (Date.now() - firstWorkTimestamp < minStabilizationMs) {
+      if (now() - firstWorkTimestamp < minStabilizationMs) {
         consecutiveCompleteChecks = 0
         continue
       }
@@ -182,6 +207,23 @@ export async function pollForCompletion(
   return 130
 }
 
+async function hasActiveSessionWork(ctx: RunContext): Promise<boolean> {
+  const childrenRes = await ctx.client.session.children({
+    path: { id: ctx.sessionID },
+    query: { directory: ctx.directory },
+  })
+  const children = normalizeSDKResponse<unknown[]>(childrenRes, [])
+  const todosRes = await ctx.client.session.todo({
+    path: { id: ctx.sessionID },
+    query: { directory: ctx.directory },
+  })
+  const todos = normalizeSDKResponse<unknown[]>(todosRes, [])
+
+  const hasActiveChildren = Array.isArray(children) && children.length > 0
+  const hasActiveTodos = Array.isArray(todos) && todos.some(isIncompleteTodo)
+  return hasActiveChildren || hasActiveTodos
+}
+
 async function getMainSessionStatus(
   ctx: RunContext
 ): Promise<"idle" | "busy" | "retry" | null> {
@@ -189,10 +231,7 @@ async function getMainSessionStatus(
     const statusesRes = await ctx.client.session.status({
       query: { directory: ctx.directory },
     })
-    const statuses = normalizeSDKResponse(
-      statusesRes,
-      {} as Record<string, { type?: string }>
-    )
+    const statuses = normalizeSDKResponse<SessionStatusMap>(statusesRes, {})
     if (!(ctx.sessionID in statuses)) {
       return "idle"
     }
@@ -201,7 +240,10 @@ async function getMainSessionStatus(
       return status
     }
     return null
-  } catch {
+  } catch (error) {
+    if (!(error instanceof Error)) {
+      throw error
+    }
     return null
   }
 }
