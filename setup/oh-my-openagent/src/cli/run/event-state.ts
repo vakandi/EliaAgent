@@ -46,6 +46,8 @@ export interface EventState {
   completionMetaPrintedByMessageId: Record<string, boolean>
   /** Set to true when the SSE event processor dies (connection lost) */
   eventProcessorDied: boolean
+  /** Count of idle wake-up "continue" messages injected by the poll loop */
+  idleWakeCount: number
 }
 
 export function createEventState(): EventState {
@@ -78,5 +80,6 @@ export function createEventState(): EventState {
     messageStartedAtById: {},
     completionMetaPrintedByMessageId: {},
     eventProcessorDied: false,
+    idleWakeCount: 0,
   }
 }
