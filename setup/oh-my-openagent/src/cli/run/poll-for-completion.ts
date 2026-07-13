@@ -3,6 +3,7 @@ import type { RunContext } from "./types"
 import type { EventState } from "./events"
 import { checkCompletionConditions } from "./completion"
 import { isRecord, normalizeSDKResponse } from "../../shared"
+import { dispatchInternalPrompt } from "../../shared/prompt-async-gate"
 
 const DEFAULT_POLL_INTERVAL_MS = 500
 const DEFAULT_REQUIRED_CONSECUTIVE = 3
@@ -10,6 +11,7 @@ const ERROR_GRACE_CYCLES = 3
 const MIN_STABILIZATION_MS = 1_000
 const DEFAULT_EVENT_WATCHDOG_MS = 30_000 // 30 seconds
 const DEFAULT_SECONDARY_MEANINGFUL_WORK_TIMEOUT_MS = 60_000 // 60 seconds
+const DEFAULT_MAX_IDLE_WAKES = 3
 
 type SessionStatusMap = Record<string, { type?: string }>
 
@@ -29,6 +31,7 @@ export interface PollOptions {
   eventWatchdogMs?: number
   secondaryMeaningfulWorkTimeoutMs?: number
   requireMeaningfulWork?: boolean
+  maxIdleWakes?: number
   /** Injectable clock (default Date.now). Tests drive a virtual clock to assert timing causality deterministically. */
   now?: () => number
   /** Injectable poll delay (default real setTimeout). Tests advance the virtual clock here instead of sleeping. */
@@ -54,6 +57,7 @@ export async function pollForCompletion(
     options.secondaryMeaningfulWorkTimeoutMs ??
     DEFAULT_SECONDARY_MEANINGFUL_WORK_TIMEOUT_MS
   const requireMeaningfulWork = options.requireMeaningfulWork ?? false
+  const maxIdleWakes = options.maxIdleWakes ?? DEFAULT_MAX_IDLE_WAKES
   const now = options.now ?? Date.now
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
   let consecutiveCompleteChecks = 0
@@ -114,6 +118,30 @@ export async function pollForCompletion(
         )
 
         mainSessionStatus = await getMainSessionStatus(ctx)
+
+        if (mainSessionStatus === "idle" && eventState.hasReceivedMeaningfulWork && eventState.idleWakeCount < maxIdleWakes) {
+          eventState.idleWakeCount++
+          console.log(
+            pc.cyan(
+              `\n  Session idle after work — injecting continue (${eventState.idleWakeCount}/${maxIdleWakes})...`
+            )
+          )
+          await dispatchInternalPrompt({
+            mode: "async",
+            client: ctx.client,
+            sessionID: ctx.sessionID,
+            source: "idle-wake",
+            settleMs: 0,
+            queueBehavior: "defer",
+            input: {
+              path: { id: ctx.sessionID },
+              body: {
+                parts: [{ type: "text", text: "continue" }],
+              },
+              query: { directory: ctx.directory },
+            },
+          })
+        }
 
         eventState.lastEventTimestamp = now()
       }
