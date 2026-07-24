@@ -1,5 +1,13 @@
 #!/bin/zsh
+# =============================================================================
+# kill_elia.sh — Clean up EliaAI processes and tmux session
+#
+# Session name: elia-ui (matches EliaUI.command)
+# Previous bug: targeted "elia" which collided with opencode sessions
+# =============================================================================
+
 PORT="${1:-4096}"
+SESSION="elia-ui"
 
 is_already_opencode_server() {
     local pid
@@ -8,14 +16,11 @@ is_already_opencode_server() {
 
     local process_name
     process_name=$(ps -p "$pid" -o comm= 2>/dev/null || echo "")
-    [[ "$process_name" == *"opencode"* ]] || return 1
+    # Accept "opencode" binary OR "node" process (opencode runs on Node.js)
+    [[ "$process_name" == *"opencode"* ]] || [[ "$process_name" == "node" ]] || return 1
 
-    if nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
-        echo "[kill_elia] Found existing opencode server on port $PORT (PID: $pid) — skipping kill" >&2
-        return 0
-    fi
-
-    return 1
+    echo "[kill_elia] Found existing opencode server on port $PORT (PID: $pid) — skipping kill" >&2
+    return 0
 }
 
 # ============================================================
@@ -29,20 +34,25 @@ if [[ -n "$TMUX" ]]; then
 fi
 
 if ! is_already_opencode_server; then
+    echo "[kill_elia] No active opencode server on port $PORT — cleaning up." >&2
+
+    # Kill whatever is holding the port
     lsof -ti:"$PORT" | xargs kill -9 2>/dev/null || true
+
     # Only kill tmux session if it has NO active clients (nobody is using it)
-    if tmux has-session -t elia 2>/dev/null; then
-        if tmux list-clients -t elia 2>/dev/null | grep -q .; then
-            echo "[GUARD] Session 'elia' has active clients — not killing." >&2
+    if tmux has-session -t "$SESSION" 2>/dev/null; then
+        if tmux list-clients -t "$SESSION" 2>/dev/null | grep -q .; then
+            echo "[GUARD] Session '$SESSION' has active clients — not killing." >&2
         else
-            tmux kill-session -t elia 2>/dev/null || true
+            echo "[kill_elia] Killing idle tmux session '$SESSION'" >&2
+            tmux kill-session -t "$SESSION" 2>/dev/null || true
         fi
     fi
-fi
 
-pkill -f "npm.*start" 2>/dev/null || true
-pkill -f "electron" 2>/dev/null || true
-pkill -f "bot.py" 2>/dev/null || true
-pkill -f "telegram-opencode-bot" 2>/dev/null || true
-pkill -f "node.*EliaAI" 2>/dev/null || true
-sleep 1
+    # Kill EliaAI-specific child processes (scoped, not system-wide)
+    pkill -f "opencode-serve.sh" 2>/dev/null || true
+    pkill -f "start_elias_discord.sh" 2>/dev/null || true
+    sleep 1
+else
+    echo "[kill_elia] Active opencode server detected on port $PORT — preserving." >&2
+fi
