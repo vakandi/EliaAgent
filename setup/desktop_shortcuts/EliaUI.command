@@ -28,18 +28,18 @@ if ! tmux has-session -t "$SESSION" 2>/dev/null; then
     sleep 1
 
     # Start opencode serve in pane 0
-    tmux send-keys -t "$SESSION":0.0 "cd ~/EliaAI && ./scripts/opencode-serve.sh 4096" Enter
+    tmux send-keys -t "$SESSION":0.0 "cd ~/EliaAgent && ./scripts/opencode-serve.sh 4096" Enter
 
     # Small delay so the scripts don't clash on startup
     sleep 2
 
     # Start Discord bot in pane 1 (right top)
-    tmux send-keys -t "$SESSION":0.1 "cd ~/EliaAI && ./scripts/start_elias_discord.sh" Enter
+    tmux send-keys -t "$SESSION":0.1 "cd ~/EliaAgent && ./scripts/start_elias_discord.sh" Enter
 
     sleep 1
 
     # Start Electron UI in pane 2 (right bottom)
-    tmux send-keys -t "$SESSION":0.2 "cd ~/EliaAI/ui_electron && npm start" Enter
+    tmux send-keys -t "$SESSION":0.2 "cd ~/EliaAgent/ui_electron && npm start" Enter
 fi
 
 # Attach to the session

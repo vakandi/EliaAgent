@@ -7,11 +7,11 @@
 # ============================================================
 if [[ -n "$TMUX" ]]; then
     echo "[GUARD] Already inside tmux session ($TMUX) — skipping elia-ui.sh."
-    echo "[GUARD] To attach manually: tmux attach -t elia"
+    echo "[GUARD] To attach manually: tmux attach -t $SESSION"
     exit 0
 fi
 
-SESSION="elia"
+SESSION="elia-ui"
 
 is_already_opencode_server() {
     local port="${1:-4096}"
@@ -20,7 +20,7 @@ is_already_opencode_server() {
     [[ -z "$pid" ]] && return 1
     local process_name
     process_name=$(ps -p "$pid" -o comm= 2>/dev/null || echo "")
-    [[ "$process_name" == *"opencode"* ]] || return 1
+    [[ "$process_name" == *"opencode"* ]] || [[ "$process_name" == "node" ]] || return 1
     nc -z 127.0.0.1 "$port" 2>/dev/null
 }
 
@@ -47,18 +47,18 @@ if ! is_already_opencode_server 4096; then
 fi
 
 # Only create session if it doesn't already exist — preserves
-# an existing "elia" session that's running opencode, etc.
+# an existing "elia-ui" session that's running opencode, etc.
 if ! tmux has-session -t "$SESSION" 2>/dev/null; then
     tmux new-session -d -s "$SESSION"
     tmux split-window -h -t "$SESSION"
     tmux split-window -h -t "$SESSION"
     tmux select-layout -t "$SESSION" tiled
     sleep 1
-    tmux send-keys -t "$SESSION":0.0 "~/EliaAI/scripts/opencode-serve.sh 4096" $'\n'
+    tmux send-keys -t "$SESSION":0.0 "~/EliaAgent/scripts/opencode-serve.sh 4096" $'\n'
     sleep 1
-    tmux send-keys -t "$SESSION":0.1 "~/EliaAI/scripts/start_elias_discord.sh" $'\n'
+    tmux send-keys -t "$SESSION":0.1 "~/EliaAgent/scripts/start_elias_discord.sh" $'\n'
     sleep 1
-    tmux send-keys -t "$SESSION":0.2 "cd ~/EliaAI/ui_electron && npm start" $'\n'
+    tmux send-keys -t "$SESSION":0.2 "cd ~/EliaAgent/ui_electron && npm start" $'\n'
 fi
 
 tmux attach -t "$SESSION"
