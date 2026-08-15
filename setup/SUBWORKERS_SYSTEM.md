@@ -1,10 +1,31 @@
-# Subworkers Promotion Agent System
-## Complete Implementation Guide for YourCo & YourBrand Promoters
+# Subworkers System
 
 **Date:** April 2026  
-**Version:** 2.0 - Detailed Implementation Prompts
+**Version:** 3.0
 
-> ⚠️ **CRITICAL:** Cette version contient des prompts DÉTAILLÉS pour chaque étape. Utilise la Section 9 pour implémenter.
+> Technical documentation for the autonomous subworker agent system.
+
+---
+
+## 🚫 RÈGLE ABSOLUE N°1 — LES AGENTS NE SE MODIFIENT JAMAIS EUX-MÊMES
+
+> **CE PRÉFIXE EST TRANSMIS À TOUS LES SUBWORKERS, SANS EXCEPTION. AUCUN AGENT N'ÉDITE, NE CRÉE, NE SUPPRIME NI NE REMPLACE SA PROPRE INFRASTRUCTURE.**
+
+**Interdiction totale et permanente**, applicable à chaque run, quel que soit le contexte : run normal, run forcé (`--force`), mode setup, mode débug, tâche ambiguë, "PROMPT.md partagé par l'utilisateur", etc.
+
+**Fichiers VERROUILLÉS (lecture seule pour l'agent) :**
+- Son propre `PROMPT.md` (`subworkers/<agent>/PROMPT.md`)
+- Son fichier de personnalité (`~/.config/opencode/agents/<agent>.md`)
+- Ses scripts de trigger, `.enabled`, `.loop_mode`, plists (`subworkers/plists/`, `~/Library/LaunchAgents/`)
+- `SUBWORKERS_SYSTEM.md`, `opencode.json`, registres d'agents, `context/TOOLS.md`
+- Ses skills (`~/.config/opencode/skills/<agent>/`)
+- **TOUT fichier situé hors de son `workspace/`**
+
+**Territoire d'écriture :** chaque agent n'écrit QUE dans `subworkers/<agent>/workspace/`. Tout le reste du système est en lecture seule.
+
+**Comportement attendu si un fichier système semble cassé ou manquant :** signaler dans `HANDOFF_NEXT_SESSION.md` + rapport de fin de run. **NE JAMAIS corriger soi-même.** Seul Wael ou l'agent principal Elia modifie le système.
+
+> ⚠️ Un subworker qui se modifie lui-même = violation fatale. Ceci n'est pas une suggestion, c'est la règle n°1 du système.
 
 ---
 
@@ -12,26 +33,12 @@
 
 1. [Overview](#1-overview)
 2. [Directory Structure](#2-directory-structure)
-3. [OpenCode Agent Configuration](#3-opencode-agent-configuration)
-4. [System Prompts](#4-system-prompts)
-5. [LaunchAgent Setup](#5-launchagent-setup)
-6. [Tools & Libraries](#6-tools--libraries)
-7. [MCP Servers](#7-mcp-servers)
-8. [Workflows & Reporting](#8-workflows--reporting)
-   - [8.1 YourCo Promoter - B2B Workflow](#81-yourco-promoter---b2b-workflow)
-   - [8.2 YourBrand Promoter - B2C Workflow](#82-yourbrand-promoter---b2c-workflow)
-   - [8.3 Reporting Commands](#83-reporting-commands)
-9. [Implementation Detail - DO NOT SKIP](#9-implementation-detail---do-not-skip)
-   - [9.1 Step 1: Créer les dossiers](#91-créer-les-dossiers---step-1)
-   - [9.2 Step 2: Créer PROMPT YourCo](#92-créer-le-prompt-yourco-promoter---step-2)
-   - [9.3 Step 3: Créer PROMPT YourBrand](#93-créer-le-prompt-yourbrand-promoter---step-3)
-   - [9.4 Step 4: Configurer OpenCode](#94-configurer-opencode---step-4)
-   - [9.5 Step 5: Installer Python libs](#95-installer-les-librairies-python---step-5)
-   - [9.6 Step 6: Créer scripts](#96-créer-les-scripts-déclencheurs---step-6)
-   - [9.7 Step 7: Créer plists](#97-créer-les-launchagents---step-7)
-   - [9.8 Step 8: Charger](#98-charger-les-launchagents---step-8)
-   - [9.9 Step 9: Test](#99-test-final---step-9)
-10. [Checklist Final](#10-checklist-final)
+3. [Workspace Isolation & Per-Agent Permissions](#3-workspace-isolation--per-agent-permissions)
+4. [OpenCode Agent Registration](#4-opencode-agent-registration)
+5. [Trigger Template](#5-trigger-template)
+6. [Tools & MCP Servers](#6-tools--mcp-servers)
+7. [LaunchAgent Setup](#7-launchagent-setup)
+8. [Enable/Disable & Schedule Management](#8-enabledisable--schedule-management)
 
 ---
 
@@ -39,19 +46,24 @@
 
 ### What Are Subworkers?
 
-Subworkers are autonomous AI agents that run on a schedule to promote your businesses:
-- **yourco-promoter**: Promotes Your Company (B2B web development)
-- **yourbrand-promoter**: Promotes YourBrand (luxury resale)
+Subworkers are autonomous AI agents that run on a schedule or trigger. Each subworker has:
+- A **personality file** (`~/.config/opencode/agents/<agent-id>.md`) — loaded automatically by oh-my-opencode via the `-a` flag
+- A **PROMPT.md** with task-specific instructions — injected by the trigger
+- A **workspace folder** for isolated file I/O
+- A **trigger script** that launches via `oh-my-opencode run`
+- An optional **LaunchAgent plist** for scheduled execution
 
-### Key Differences
+### Architecture
 
-| Aspect | yourco-promoter | yourbrand-promoter |
-|---|---|---|
-| **Business** | Your Company | YourBrand |
-| **Focus** | B2B leads | Luxury resale |
-| **Platforms** | LinkedIn, X, Reddit | Instagram, TikTok, FB, Snapchat |
-| **Interval** | 30 min | 20 min |
-| **Hours** | 09:00-21:00 | 10:00-22:00 |
+```
+Trigger (launchd / manual)
+  └─ trigger_template.js (Node.js, child_process.spawn)
+       ├── Creates workspace/ if missing
+       ├── Loads PROMPT.md
+       ├── oh-my-opencode run -d workspace/ -a <agent> "<task>"
+       │     └── oh-my-opencode loads personality from ~/.config/opencode/agents/<agent-id>.md
+       └── OpenCode loads workspace/opencode.json (per-agent permissions)
+```
 
 ---
 
@@ -60,664 +72,518 @@ Subworkers are autonomous AI agents that run on a schedule to promote your busin
 ```
 EliaAI/subworkers/
 ├── SUBWORKERS_SYSTEM.md          # This file
-├── yourco-promoter/
-│   ├── PROMPT.md                 # Main agent prompt
-│   └── personality.md             # Agent personality
-├── yourbrand-promoter/
-│   ├── PROMPT.md                  # Main agent prompt
-│   └── personality.md             # Agent personality
 ├── scripts/
-│   ├── trigger_yourco_promoter.sh        # YourCo trigger script
-│   └── trigger_yourbrand_promoter.sh    # YourBrand trigger script
-├── plists/
-│   ├── com.elia.yourco-promoter.plist    # YourCo LaunchAgent
-│   └── com.elia.yourbrand-promoter.plist # YourBrand LaunchAgent
-└── logs/
-    ├── promoter_yourco.log               # YourCo logs
-    └── promoter_yourbrand.log           # YourBrand logs
+│   └── trigger_template.js       # UNIVERSAL TEMPLATE (Node.js, no per-agent wrappers needed)
+├── logs/
+│   ├── <agent_name>.log          # Aggregate logs
+│   └── runs/
+│       └── <agent_name>/         # Per-run logs
+├── vcam-community-organic/       # VcamAndroid Community Manager (social content, engagement)
+│   ├── PROMPT.md
+│   └── workspace/
+├── vcam-seo/                     # VcamAndroid SEO Strategist (blog, rankings, GEO)
+│   ├── PROMPT.md
+│   └── workspace/
+├── refund-hunter/                # RefundHunter (ecommerce refund policy & resale research, Google Doc daily)
+│   ├── PROMPT.md
+│   └── workspace/
+└── <agent-id>/                   # Template — replace with actual agent ID
+    ├── PROMPT.md                 # Task-specific instructions
+    ├── .enabled                  # Gate file — presence = active
+    ├── .loop_mode                # (Optional) Server-attach loop mode
+    └── workspace/                # Runtime directory (auto-created)
+        ├── opencode.json         # (Optional) Per-agent tool permissions
+        └── docs/                 # Daily work folders (auto-created)
+            ├── 2026-04-01/
+            ├── 2026-04-02/
+            └── ...               # idempotent — mkdir -p once per day
 ```
 
-### Create Directories
+### Creating a New Subworker
 
 ```bash
-mkdir -p /path/to/EliaAI/subworkers/yourco-promoter
-mkdir -p /path/to/EliaAI/subworkers/yourbrand-promoter
-mkdir -p /path/to/EliaAI/plists
+mkdir -p /Users/vakandi/EliaAI/subworkers/<agent-id>/workspace
+touch /Users/vakandi/EliaAI/subworkers/<agent-id>/.enabled  # or use --force to skip
 ```
 
 ---
 
-## 3. OpenCode Agent Configuration
+## 3. Workspace Isolation & Per-Agent Permissions
 
-### 3.1 Add to `opencode.json`
+### 3.1 Why Workspace Isolation
 
-File: `~/.config/opencode/opencode.json`
+Every subworker agent runs in its own `workspace/` folder:
+
+1. **Isolates file I/O** — agents only write inside their workspace, never outside. The `opencode.json` local config blocks access to all other folders on the system.
+2. **Enables per-agent permissions** — place an `opencode.json` in the workspace folder to restrict tools per agent (OpenCode loads local config over global)
+3. **Prevents cross-contamination** — log files, state, and generated content stay in one place
+4. **Daily folders** — the trigger creates `workspace/YYYY-MM-DD/` every run. `mkdir -p` is idempotent: 50 runs on the same day = 1 folder. Agents can see all previous days' work.
+
+### 3.2 How It Works
+
+The trigger template (`trigger_template.js`) automatically:
+
+1. Creates `workspace/` on every run (`mkdir -p "$WORKSPACE_DIR"`)
+2. Creates `workspace/YYYY-MM-DD/` every run (idempotent — only one folder per day regardless of run count)
+3. Passes `-d "$WORKSPACE_DIR"` (a.k.a. `--directory`) to `oh-my-opencode run`
+4. OpenCode loads `workspace/opencode.json` (if present) as the local config, **overriding** the global `~/.config/opencode/opencode.json`
+5. The agent sees only the tools/skills/MCPs defined in its local config
+
+The `-d` flag works with both `--attach` (loop mode) and direct (task mode).
+
+### 3.3 Per-Agent `opencode.json` Template
+
+The `opencode.json` in the workspace folder MUST block access to ALL folders on the system except the agent's own workspace. The agent keeps full access to all MCP servers but cannot read/write outside its `workspace/` directory.
+
+Create `subworkers/<agent-id>/workspace/opencode.json`:
+
+```json
+{
+  "agent": {
+    "<agent-id>": {
+      "description": "Description of this agent",
+      "mode": "primary"
+    }
+  },
+  "tools": {
+    "enabled": ["discord-server-mcp", "whatsapp-mcp", "telegram", "gmail"]
+  },
+  "permissions": {
+    "read": {
+      "allow": ["/Users/vakandi/EliaAI/subworkers/<agent-id>/workspace/**"],
+      "deny": ["**"]
+    },
+    "write": {
+      "allow": ["/Users/vakandi/EliaAI/subworkers/<agent-id>/workspace/**"],
+      "deny": ["**"]
+    },
+    "execute": {
+      "deny": ["**"]
+    }
+  },
+  "mcpServers": {
+    "discord-server-mcp": { ... },
+    "whatsapp-mcp": { ... }
+  }
+}
+```
+
+- **`permissions.read/write.deny: ["**"]`** — blocks all paths by default
+- **`permissions.read/write.allow`** — only the agent's own workspace is readable/writable
+- **`mcpServers`** — the agent still has full MCP access for API calls, reporting, etc.
+- **`permissions.execute.deny: ["**"]`** — prevents arbitrary command execution
+
+If no `workspace/opencode.json` exists, the agent falls back to the global config (no restrictions).
+
+### 3.4 PROMPT.md Workspace Constraint
+
+Every subworker's PROMPT.md **MUST** include these instructions:
+
+```
+## Workspace Constraint
+You MUST only read and write files inside your `workspace/` folder:
+`/Users/vakandi/EliaAI/subworkers/<agent-id>/workspace/`
+Never write files outside this folder. All system paths outside workspace/ are blocked.
+
+## Daily Folders
+Each run creates a daily folder directly in workspace: `workspace/YYYY-MM-DD/`.
+Write your work logs, research, and outputs into today's folder.
+The folder is idempotent — only one per day regardless of how many times the trigger runs.
+You can read all previous days' folders to understand context and history.
+
+## Handoff
+At the START of every run, read `workspace/HANDOFF_NEXT_SESSION.md` — it tells you exactly where the previous run left off, what's done, and what to do next.
+At the END of every run, overwrite `workspace/HANDOFF_NEXT_SESSION.md` with current state so the next session can pick up seamlessly. Never leave stale tasks in the "Next priorities" section.
+
+## Mempalace
+To orient yourself on every run:
+1. Read `workspace/HANDOFF_NEXT_SESSION.md` for the latest battle plan (completed, pending, next priorities)
+2. Check `workspace/` for the latest day folder to read today's work-in-progress
+3. Scan previous days' docs for relevant context: decisions made, blockers, next steps
+4. If you need to revisit something from days ago, navigate by date: `workspace/2026-04-01/`
+5. Before finishing, write a summary into the current day's folder AND update `HANDOFF_NEXT_SESSION.md`
+```
+
+### 3.5 Discord Channel Setup — Mandatory for Reporting
+
+Every subworker that reports via Discord **MUST** have a dedicated channel. Discord is the ONLY interaction point between subworkers and the user — there is no other way for agents to communicate results, ask questions, or escalate blockers.
+
+**When creating a new subworker, follow this procedure:**
+
+1. **List available Discord guilds:**
+```bash
+mcp-cli call discord-server-mcp list_guilds '{}'
+```
+
+2. **Ask the user which guild to use** — present the list of available guilds with their names and IDs. The user chooses the guild where the agent should report.
+
+3. **List categories in the chosen guild:**
+```bash
+mcp-cli call discord-server-mcp list_categories '{"guild_id":"<chosen_guild_id>"}'
+```
+
+4. **Ask the user which category** to place the agent's reporting channel under. Categories organize channels logically (e.g., "MIRORPAY", "BENE2LUXE", "REPORTS").
+
+5. **Create the channel in the right category:**
+```bash
+mcp-cli call discord-server-mcp create_channel '{
+  "guild_id": "<guild_id>",
+  "name": "<agent-name>-reports",
+  "type": 0,
+  "parent_id": "<category_id>"
+}'
+```
+
+6. **Save the channel ID** — the response returns the new channel's ID. Use this in the PROMPT.md reporting section:
+```markdown
+## 💬 REPORTING — Discord
+**Canal:** `<channel_id>` (<guild_name> / <category_name>)
+**Outil:** `mcp-cli call discord-server-mcp send_message`
+```
+
+**Why this matters:**
+- Agents cannot ask questions or escalate issues without a Discord channel
+- Each agent needs its own channel to avoid cross-talk between subworkers
+- The channel MUST be in the correct category for organization
+- The channel ID is what the agent uses to send reports via `mcp-cli call discord-server-mcp send_message`
+
+**⚠️ DO NOT hardcode Discord channel IDs in PROMPT.md without first creating the channel via this procedure.** Channel IDs are unique per guild — copying an ID from another agent's PROMPT.md will send messages to the wrong channel.
+
+---
+
+## 4. OpenCode Agent Registration
+
+### 4.1 File: `~/.config/opencode/agents/<agent-id>.md` (Personality File)
+
+The personality file **MUST** contain YAML frontmatter before the markdown content. Without frontmatter, the agent will not appear in the `/agents` menu and cannot be `@mentioned` in opencode.
+
+```yaml
+---
+name: <agent-id>
+slug: <agent-id>
+description: Short description of what this agent does
+mode: all             # "all" = visible in agent selector + delegatable via @mention
+model: opencode/big-pickle
+temperature: 0.3
+tools:
+  read: true
+  write: true
+  edit: true
+  bash: true
+  glob: true
+  grep: true
+  webfetch: true
+  task: true
+  websearch: true
+permissions:
+  bash:
+    "ls*": allow
+    "cat*": allow
+    "echo*": allow
+    "curl*": allow
+    "*": ask
+  edit:
+    "*.md": allow
+    "*": ask
+---
+```
+
+**Key rules:**
+- **`mode: all`** — This is the single most important field. `"all"` registers the agent in BOTH the TUI agent selector (`primary` mode) AND the delegation system (`subagent` mode). Using `"primary"` alone hides it from `@mention` in chat; `"subagent"` alone hides it from the agent switcher.
+- **`mode: all`** is what makes the agent appear everywhere: `/agents` menu, agent switcher, `@mention`, and `opencode run --agent`.
+- **`permissions`** — Restrict bash commands and file edits appropriately for the agent's role. Marketing agents don't need `"git commit*": allow`, code agents don't need `"curl*": allow`.
+- **`tools`** — Set to `true` for all tools the agent may need. At minimum: `read`, `write`, `edit`, `bash`, `grep`, `glob`.
+
+### 4.2 File: `~/.config/opencode/opencode.json`
 
 Add to the `"agent"` section:
 
 ```json
-"yourco-promoter": {
-  "description": "Your Company B2B promoter - LinkedIn, X, Reddit",
-  "mode": "primary"
-},
-"yourbrand-promoter": {
-  "description": "YourBrand luxury resale promoter - Instagram, TikTok, FB",
-  "mode": "primary"
+"<agent-id>": {
+  "description": "What this agent does",
+  "mode": "primary",
+  "color": "#hexcolor",
+  "model": "opencode/big-pickle",
+  "prompt_append": "**FIRST: Read ~/.config/opencode/agents/<agent-id>.md for your full personality and workflow.**\n\n**THEN: Read subworkers/<agent-id>/PROMPT.md for your complete task instructions.**\n\nYou are <agent-id> - Description here. Execute your assigned task."
 }
 ```
 
-### 3.2 Add to `oh-my-openagent.json`
+> ⚠️ **prompt_append MUST always tell the agent to read its own personality file.** oh-my-opencode loads personality via `-a`, but the prompt_append reinforces it. The trigger injects PROMPT.md, but the prompt_append should also reference it.
 
-File: `~/.config/opencode/oh-my-openagent.json`
+Note: `"mode": "primary"` here is fine even when the frontmatter uses `"mode": "all"`. The frontmatter `mode` controls the opencode TUI behavior; the `opencode.json` mode is used for configuration loading.
 
-#### Add to `"agents"` section:
+### 4.3 File: `~/.config/opencode/oh-my-openagent.json`
+
+#### Add to `"agents"`:
 
 ```json
-"yourco-promoter": {
+"<agent-id>": {
   "model": "opencode/big-pickle",
   "mode": "primary",
-  "fallback_models": []
-},
-"yourbrand-promoter": {
-  "model": "opencode/big-pickle",
-  "mode": "primary",
+  "variant": "max",
   "fallback_models": []
 }
 ```
 
-#### Add to `"categories"` section:
+#### Add to `"categories"`:
 
 ```json
-"yourco-promoter": {
+"<agent-id>": {
   "model": "opencode/big-pickle",
-  "description": "Your Company B2B promoter",
-  "prompt_append": "**FIRST: Read your personality file at `/path/to/EliaAI/subworkers/yourco-promoter/personality.md` for your full workflow and rules.**\n\nYou are yourco-promoter, specialized in B2B lead generation for Your Company. Your mission:\n- Find potential clients on LinkedIn, X, Reddit\n- Engage with relevant posts and comments\n- Generate leads for web development services\n- Use tools: linkedin-scraper, X API, Reddit API, mcp-cli\n\n**CRITICAL**: ALWAYS warm up accounts gradually. NEVER spam."
-},
-"yourbrand-promoter": {
-  "model": "opencode/big-pickle",
-  "description": "YourBrand luxury resale promoter",
-  "prompt_append": "**FIRST: Read your personality file at `/path/to/EliaAI/subworkers/yourbrand-promoter/personality.md` for your full workflow and rules.**\n\nYou are yourbrand-promoter, specialized in luxury fashion resale promotion. Your mission:\n- Find buyers on Instagram, TikTok, Facebook Marketplace\n- Engage with luxury fashion communities\n- Promote YourBrand brand\n- Use tools: instagrapi, agent-browser, marketplace-mcp\n\n**CRITICAL**: ALWAYS use human-like timing. NEVER sound like a bot."
+  "description": "Short description",
+  "prompt_append": "**FIRST: Read ~/.config/opencode/agents/<agent-id>.md for your full personality and workflow.**\n\nYou are <agent-id>. Execute your assigned task. Always respect your workspace constraint."
 }
 ```
 
-#### Add to `"agent_display_names"` section:
+> ⚠️ **Same rule: prompt_append MUST always tell the agent to read its own personality file.** The trigger injects PROMPT.md automatically, but personality should be referenced in prompt_append.
+
+#### Add to `"agent_display_names"`:
 
 ```json
-"yourco-promoter": "YourCo Promoter",
-"yourbrand-promoter": "YourBrand Promoter"
+"<agent-id>": "Readable Name"
 ```
 
-### 3.3 Restart OpenCode
+### 4.4 Mandatory Registration Pattern
+
+Every new subworker **MUST** complete ALL of these steps. Missing any one step = agent invisible or unusable:
+
+| # | What | Where | Why |
+|---|------|-------|-----|
+| 1 | YAML frontmatter with `mode: all` | `~/.config/opencode/agents/<agent-id>.md` | Agent appears in agent switcher, `/agents` menu, AND `@mention` in chat. Without this, agent won't surface anywhere. |
+| 2 | `"mode": "primary"` | `opencode.json` → `"agent"` section | Makes agent visible in `/agents` list and loads configuration |
+| 3 | `"mode": "primary"` | `oh-my-openagent.json` → `"agents"` section | Makes agent callable via `oh-my-opencode run -a <agent>` |
+| 4 | Add to `"categories"` | `oh-my-openagent.json` → `"categories"` | Adds `prompt_append` with personality reference + identity context |
+| 5 | Add display name | `oh-my-openagent.json` → `"agent_display_names"` | Shows readable name in `/agents` menu |
+
+> ⚠️ **Frontmatter with `mode: all` is the critical piece. Without it, registering in JSON configs alone is not enough — the agent will be invisible in the opencode TUI and unmentionalble.**
+
+### 4.5 Verify Registration
+
+After registering, confirm the agent shows up correctly:
 
 ```bash
-# Kill and restart your OpenCode process
-# The new agents will appear in /agents command
+# Check agent appears in the list
+opencode agent list 2>&1 | grep "<agent-id>"
+
+# Expected output: <agent-id> (all)
 ```
+
+If it shows `(subagent)` instead of `(all)`, the frontmatter `mode: all` is missing or incorrect. If it doesn't show at all, check `opencode.json` syntax and file paths.
+
+### 4.6 Model IDs Must Match `opencode models`
+
+The subworker UI and manual trigger must use the same model IDs that `opencode models` prints on this machine.
+
+- Treat `opencode models` as the source of truth for the current catalog.
+- Use the exact model string that the runtime accepts, not an old alias copied from a past popup.
+- If a saved UI selection points to a stale alias, normalize it once on load and resave the fixed value.
+- Do not invent provider prefixes or `:free` suffixes unless they are present in the current catalog and accepted by the trigger path.
+
+For the Electron popup, the model badge and the "Run now" button should always round-trip through the same normalized model ID.
+
+### 4.7 Restart OpenCode
+
+New agents only appear after restarting opencode TUI sessions:
+
+```bash
+# Kill opencode processes
+pkill -f "opencode$"
+
+# Or restart the terminal/TUI session manually
+```
+
+Existing running opencode instances cache the agent list at startup — config changes are not hot-reloaded.
 
 ---
 
-## 4. System Prompts
+## 5. Trigger Template
 
-### 4.1 YourCo Promoter - Personality
+### 5.1 Template File: `scripts/trigger_template.js`
 
-File: `subworkers/yourco-promoter/personality.md`
+The universal trigger template (Node.js) handles all subworker launch logic. No per-agent wrapper scripts needed — the launchd plist passes `--agent <name>` directly:
 
-```markdown
-# YourCo Promoter - Personality & Workflow
-
-**Agent:** yourco-promoter  
-**Business:** Your Company (B2B Web Development)  
-**Mission:** Generate B2B leads for web development services
-
-## Platforms
-
-| Priority | Platform | Actions |
-|----------|----------|---------|
-| HIGH | LinkedIn | Post comments, send messages, connect |
-| HIGH | X (Twitter) | Reply, retweet, engage |
-| MEDIUM | Reddit | Comment in r/webdev, r/freelance |
-
-## Tools Available
-
-### Primary Tools
-
-1. **linkedin-scraper** - Profile data, company info
-   ```bash
-   pip install linkedin-scraper
-   ```
-
-2. **X MCP Server** - Twitter actions
-   ```bash
-   npx -y @mcpware/x-mcp-server
-   ```
-
-3. **mcp-cli** - General automation
-   ```bash
-   mcp-cli call <server> <tool>
-   ```
-
-4. **agent-browser** - Browser automation for complex tasks
-
-## Engagement Rules
-
-### LinkedIn
-
-1. **Search for prospects:**
-   - Keywords: "web developer", "React developer", "need a website", "looking for dev"
-   - Companies hiring: Startup, scale-up, agency
-
-2. **Engagement strategy:**
-   - Comment with value-adding insights (not "great post!")
-   - Connect with personalized message
-   - Follow up within 48 hours
-
-3. **Rate limits:**
-   - 30-50 connection requests/day max
-   - 20-30 messages/day max
-   - Warm up over 1-2 weeks
-
-### X (Twitter)
-
-1. **Search hashtags:**
-   - #webdev #react #freelance #startup
-   - #javascript #typescript #nextjs
-
-2. **Engagement:**
-   - Reply with helpful comments
-   - Quote retweet with add-on
-   - Like to build visibility
-
-3. **Rate limits:**
-   - 100 actions/hour max
-   - Avoid bulk actions
-
-### Reddit
-
-1. **Target subreddits:**
-   - r/webdev
-   - r/freelance
-   - r/reactjs
-   - r/javascript
-
-2. **Engagement:**
-   - Answer questions with expertise
-   - Share relevant case studies
-   - No direct promotion
-
-3. **Rules:**
-   - Read subreddit rules first
-   - 1 comment per thread max
-   - No affiliate links
-
-## Prohibited Actions
-
-- ❌ Mass DM ("I can build your website")
-- ❌ Spam comments with "DM me"
-- ❌ Buying connections/followers
-- ❌ Automated posting without review
-- ❌ Promise timelines you can't keep
-
-## Success Metrics
-
-| Metric | Target |
-|--------|--------|
-| LinkedIn connections | +50/week |
-| Qualified conversations | 5/week |
-| Proposals sent | 2/week |
-
-## Warm-Up Protocol
-
-**Week 1:** 10 connections/day, 5 messages/day
-**Week 2:** 20 connections/day, 10 messages/day
-**Week 3+:** 30 connections/day, 20 messages/day
-
-## Human-like Behavior
-
-- ✅ Random delays (5-30 seconds) between actions
-- ✅ Different phrasings for similar messages
-- ✅ Engage with non-business content occasionally
-- ✅ Use proper grammar and spelling
-- ❌ Never use templates verbatim
-
----
-
-## Verification Checklist
-
-Before sending any message/comment:
-- [ ] Does this provide value?
-- [ ] Is this personalized?
-- [ ] Would I say this in real life?
-- [ ] Does this violate platform ToS?
-- [ ] Is this sustainable?
+```xml
+<string>/Users/vakandi/.bun/bin/node</string>
+<string>/Users/vakandi/EliaAI/subworkers/scripts/trigger_template.js</string>
+<string>--agent</string>
+<string>my_agent</string>
 ```
 
-### 4.2 YourBrand Promoter - Personality
+For manual terminal runs:
+```bash
+node scripts/trigger_template.js --agent my_agent --force
+```
 
-File: `subworkers/yourbrand-promoter/personality.md`
+### 5.2 What the Template Handles
 
-```markdown
-# YourBrand Promoter - Personality & Workflow
-
-**Agent:** yourbrand-promoter  
-**Business:** YourBrand (Luxury Fashion Resale)  
-**Mission:** Promote luxury fashion resale to French/Swiss market
-
-## Platforms
-
-| Priority | Platform | Actions |
-|----------|----------|---------|
-| HIGH | Instagram | Like, comment, DM, story |
-| HIGH | TikTok | Comment, engage |
-| HIGH | Facebook Marketplace | Browse, message sellers |
-| MEDIUM | Snapchat | Add users, stories |
-
-## Tools Available
-
-### Primary Tools
-
-1. **instagrapi** - Instagram automation
-   ```bash
-   pip install instagrapi
-   ```
-
-2. **agent-browser** - Browser automation for TikTok comments
-   ```bash
-   # Use with Kameleo or Multilogin
-   ```
-
-3. **facebook-marketplace-mcp** - FB Marketplace
-   ```bash
-   npx -y @jdcodes1/facebook-marketplace-mcp
-   ```
-
-4. **TikTokApi** - Read-only TikTok data
-   ```bash
-   pip install TikTokApi
-   ```
-
-## Engagement Rules
-
-### Instagram
-
-1. **Search targets:**
-   - Hashtags: #luxuryfashion #designerbags #hermes #chanel #louisvuitton #balenciaga
-   - Accounts: Luxury resellers, fashion influencers
-   - Locations: Paris, Geneva, Zurich, Lausanne
-
-2. **Engagement strategy:**
-   - Like and comment on relevant posts
-   - DM interested buyers who comment
-   - Story replies
-
-3. **Rate limits (instagrapi):**
-   - ~200 actions/hour for new accounts
-   - ~500 actions/hour for aged accounts
-   - USE DELAY: `Client(delay_range=[10, 30])`
-
-4. **Caption examples (French):**
-   - "Magnifique pièces ! 🎀" (Beautiful piece!)
-   - "SuperbeFindeswahl! Welches Farbe?" (Great choice! Which color?)
-   - "Encore dispo?" (Still available?)
-
-### TikTok
-
-⚠️ **CRITICAL:** No public API for commenting. Use browser automation only.
-
-1. **Target content:**
-   - #luxuryfashion #designer #handbag
-   - Luxury fashion review videos
-   - "Get ready with me" fashion videos
-
-2. **Browser automation:**
-   - Use agent-browser with anti-detect profile
-   - Manual comment typing (simulate human)
-   - Random timing (30-120 seconds between)
-
-3. **Rate limits:**
-   - 10-20 comments/day max
-   - Spread throughout the day
-
-### Facebook Marketplace
-
-⚠️ **CRITICAL:** No public API for posting. Read-only + messaging.
-
-1. **Search for:**
-   - Keywords: Hermès, Chanel, Louis Vuitton, Cartier
-   - Locations: Paris, Lyon, Genève
-   - Price range: €500-5000
-
-2. **Strategy:**
-   - Browse listings (no automated posting)
-   - Message sellers with interest
-   - Build relationships
-
-3. **Messaging template:**
-   - "Bonjour! Je suis intéressé(e) par cet article. Est-il toujours disponible?"
-   - (Hello! I'm interested in this item. Is it still available?)
-
-### Snapchat
-
-⚠️ **LIMITED:** No public API for adding users.
-
-1. **Strategy:**
-   - Use Snapchat Ads (Marketing API) for reach
-   - Manual user adding via device only
-   - Focus on Ad campaigns, not organic
-
-## Prohibited Actions
-
-- ❌ Selling counterfeit items
-- ❌ Posting fake luxury items
-- ❌ Spam DMs
-- ❌ Price deception
-- ❌ Buying fake followers
-
-## Success Metrics
-
-| Metric | Target |
-|--------|--------|
-| Instagram engagement | +100 likes/day |
-| DM conversations | 10/day |
-| Sales leads | 3/week |
-
-## Warm-Up Protocol
-
-**Week 1:** 20 likes/day, 5 comments/day
-**Week 2:** 40 likes/day, 10 comments/day
-**Week 3+:** 60 likes/day, 15 comments/day
-
-## Human-like Behavior (CRITICAL)
-
-- ✅ Use French in comments (the target market)
-- ✅ Varied, natural language
-- ✅ Mix of short and long comments
-- ✅ Respond to stories
-- ❌ NEVER USE EMOJIS EXCESSIVELY (1-2 max)
-- ❌ Don't sound like a bot
-
-## Language Guidelines (French Market)
-
-| English | French |
+| Feature | Detail |
 |---------|--------|
-| "Great bag!" | "Superbe sac !" |
-| "Love this" | "J'adore !" |
-| "What price?" | "Quel prix ?" |
-| "Is it available?" | "Encore dispo ?" |
-| "Beautiful" | "Magnifique" |
+| **PATH resolution** | Finds `oh-my-opencode` for launchd (which lacks `~/.bun/bin`) |
+| **`.enabled` gate** | Skips if `subworkers/<agent-id>/.enabled` doesn't exist. Use `--force` flag to bypass for manual terminal runs |
+| **`--force` flag** | `--agent <name> --force` skips the `.enabled` check. Launchd never passes this flag, so scheduled runs still respect `.enabled` |
+| **PROMPT.md loading** | Reads from `subworkers/<agent-id>/PROMPT.md` |
+| **Personality** | Loaded automatically by oh-my-opencode from `~/.config/opencode/agents/<agent-id>.md` via `-a` flag |
+| **Workspace auto-creation** | Creates `workspace/` + `workspace/YYYY-MM-DD/` (date folder at root) every run |
+| **`-d` flag** | Passes `--directory workspace/` to `oh-my-opencode run` for per-agent config |
+| **Mode detection** | `task` (single-shot) vs `loop` (server-attach with `/ulw-loop`) |
+| **Per-run logging** | Each run logged individually + aggregate log |
+| **OpenCode sandboxing** | Each trigger run creates a fresh temp XDG sandbox for OpenCode data/cache/state so parallel subworkers do not share `~/.local/share/opencode` or other host runtime files |
+| **Proxy support** | When `.proxy_enabled` is present, the trigger refreshes proxy state via `setup/switch-proxy.sh` before launching the agent |
+| **Recovery resume** | On retry, the trigger tries to recover the prior `Session:` line from the previous run log, waits 20s, and resends `continue the work` into the same session via `--session-id` before falling back to a fresh run |
+### 5.3 Mode Selection
+
+**Task mode** (default): Single-shot execution. Agent runs once and exits.
+
+**Loop mode** (`.loop_mode` file): Agent runs in a persistent server-attached loop using `/ulw-loop` or `/ralph-loop`. Used for continuous promotion/social agents.
+
+```bash
+# Enable loop mode for an agent
+touch /Users/vakandi/EliaAI/subworkers/<agent-id>/.loop_mode
 ```
+
+### 5.4 Creating a New Subworker
+
+1. Create `subworkers/<agent-id>/PROMPT.md`
+2. Create `subworkers/<agent-id>/.enabled` to activate (or use `--force` to bypass for manual runs)
+3. Register in `opencode.json` + `oh-my-openagent.json` (see §4.3)
+4. Create personality file at `~/.config/opencode/agents/<agent-id>.md` with YAML frontmatter (see §4.1)
+5. Add a plist entry in `plists/com.elia.<agent-id>.plist` pointing to `trigger_template.js --agent <agent_id>`
+
+### 5.5 Exit/Completion Marker
+
+Every run log ends with a unique marker line written by `trigger_template.js`:
+
+```
+[YYYY-MM-DD HH:MM:SS] EOF_SUBWORKER_EXIT:<code>
+```
+
+This marker is always written after `oh-my-opencode run` exits, regardless of success or failure.
+
+**Why a unique marker instead of parsing "completed" in AI output:**
+- The AI agent's stdout is redirected into the same run log file (`>> "$RUN_LOG" 2>&1`)
+- The AI might output text like "All tasks completed" or "I've completed the task" — parsing for "completed" would false-match
+- `EOF_SUBWORKER_EXIT:` is a string the AI can never produce: it's only written by the shell script's `log()` function after the opencode process fully exits
+
+**How the Electron UI (subworker-popup.html) uses it:**
+1. Opens the run log file and reads the last 300 bytes
+2. Regex-searches for `EOF_SUBWORKER_EXIT:(\d+)`
+3. If found: extracts exit code, calculates duration from start timestamp → marker timestamp
+4. `exit 0` → green duration badge (success)
+5. `exit non-zero` → orange "crashed" badge with duration (agent failed mid-run)
+6. If marker not found: yellow "● RUNNING" badge (agent still executing or trigger script crashed before reaching the marker)
+
+### 5.6 Retry & Session Recovery
+
+When a subworker run fails, the trigger now prefers to reuse the previous OpenCode session instead of starting over.
+
+Recovery flow:
+
+1. Read the previous run log and extract the last `Session:` / `Session ID:` value.
+2. Wait 20 seconds before the first recovery resend.
+3. Re-run `oh-my-opencode run` with `--session-id <recovered-session-id>`.
+4. Send the short continuation prompt `continue the work` into that same session.
+5. If the reuse path returns `promptAsync skipped by gate: active`, keep the same session and retry it again after another cooldown instead of immediately falling back.
+6. If the resume is killed or does not validate after the same-session retries are exhausted, log the reason and let the outer retry loop decide whether to try a fresh run.
+7. Between outer retry attempts, wait a random 20-40 seconds so parallel subworkers do not all restart on the same second.
+
+Why this exists:
+
+- It keeps continuity in the same session when the agent is still salvageable.
+- It gives the session time to settle before replaying the prompt.
+- It makes the retry logs explicit enough to diagnose whether the failure was reuse, validation, or an external kill.
+- If OpenCode itself fails before a session ever exists, that is handled as a bootstrap failure first: the server connection layer retries the timed-out start before the outer trigger falls back to a fresh run.
+- The trigger now also isolates OpenCode runtime state per run by exporting temp `XDG_DATA_HOME` / `XDG_CACHE_HOME` / `XDG_STATE_HOME` values, which prevents concurrent subworkers from fighting over the same OpenCode log/database files.
+- When proxy mode is enabled, the trigger refreshes the proxy first via `setup/switch-proxy.sh`, then injects the resulting proxy env into the actual agent run while keeping localhost traffic unproxied.
+
+Relevant log lines:
+
+- `[RECOVERY] Session lookup result: ...`
+- `[RECOVERY] Cooling down before reusing session ...`
+- `[RECOVERY] Dispatching continuation prompt to session ...`
+- `[RECOVERY] Continuation dispatch returned exit_code=...`
+- `[RECOVERY] Reuse result: blockedByActive=..., validated=...`
+- `[RECOVERY] Session ... is still active; keeping the same session and retrying after cooldown`
+- `[RECOVERY] Exhausted same-session retries ...`
+- `[RETRY] ...s remaining` heartbeat lines while waiting to restart
+- In task mode, cleanup is scoped to owned loop servers only; it does not kill unrelated ports used by sibling subworkers.
+- Retry backoff is randomized in the 20-40 second range to reduce startup collisions when several subworkers fail at once.
+
+### 5.7 Handoff File (`HANDOFF_NEXT_SESSION.md`)
+
+Every subworker run **MUST** end by writing or updating a handoff file at the workspace root:
+
+```
+workspace/HANDOFF_NEXT_SESSION.md
+```
+
+**Purpose:** This file is the bridge between runs. It tells the next session exactly where the previous one left off — what was done, what's pending, and what to do next. Without it, each run starts blind and risks duplicating work or repeating completed tasks.
+
+**What the agent MUST write before finishing:**
+
+```markdown
+# Handoff — <agent-id>
+
+**Last run:** YYYY-MM-DD HH:MM
+**Run status:** success | partial | failed
+
+## ✅ Completed this run
+- [Specific task 1 with detail]
+- [Specific task 2 with detail]
+
+## 🔄 In progress
+- [Task still being worked on — include exact file paths, line numbers, or state]
+
+## ⏳ Next priorities (in order)
+1. [Most important next action — be specific, not vague]
+2. [Second priority]
+3. [Third priority]
+
+## 🚫 Do NOT repeat
+- [Specific actions that were already attempted and completed]
+- [Dead ends or approaches that were tried and rejected]
+
+## 🔒 Blockers / Decisions needed
+- [Any blockers preventing progress]
+- [Decisions that need human input — include context so the next run can proceed or escalate]
+
+## 📂 Key files touched
+- path/to/file.py — [what was changed]
+- path/to/other.md — [what was done]
+```
+
+**Rules for the handoff file:**
+
+1. **Overwrite, don't append** — Each run replaces the entire file. The file reflects the LATEST state, not a history log.
+2. **Be specific** — "Worked on auth" is useless. "Fixed token refresh in `auth.py:45` — added 30s buffer before expiry" is actionable.
+3. **Name dead ends** — If a run tried something that failed, the next run must know NOT to retry it. Include "Do NOT repeat" entries.
+4. **Prioritize the next run** — The "Next priorities" section is the most important part. The agent reads this FIRST to know what to do.
+5. **No stale tasks** — If a task was completed, move it to "Completed" or delete it. Never leave finished work in "Next priorities."
+
+**How the agent uses it on startup:**
+
+When a subworker starts a new run, the Mempalace protocol (§3.4) should include reading this file:
+
+```
+## Startup Protocol
+1. Read workspace/HANDOFF_NEXT_SESSION.md — this tells you exactly what to do next
+2. Follow the "Next priorities" section in order
+3. Do NOT redo anything listed in "Do NOT repeat"
+4. At the end of your run, overwrite HANDOFF_NEXT_SESSION.md with the current state
+```
+
+**Why this matters:**
+
+- **Without handoff:** Each run re-reads all context from scratch, potentially redoing completed work, missing in-progress tasks, or retrying dead ends.
+- **With handoff:** Each run starts with a precise battle plan. The agent knows what's done, what's next, and what to avoid. Work advances every run instead of spinning.
 
 ---
 
-## 5. LaunchAgent Setup
+## 6. Tools & MCP Servers
 
-### 5.1 Install YourCo Promoter
-
-```bash
-cd /path/to/EliaAI
-
-# Create plist for YourCo Promoter (every 30 min, 09:00-21:00)
-cat > plists/com.elia.yourco-promoter.plist << 'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.elia.yourco-promoter</string>
-    
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/zsh</string>
-        <string>/path/to/EliaAI/scripts/trigger_yourco_promoter.sh</string>
-    </array>
-    
-    <key>RunAtLoad</key>
-    <false/>
-    
-    <key>StartCalendarInterval</key>
-    <array>
-        <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>30</integer></dict>
-        <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>30</integer></dict>
-        <dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>30</integer></dict>
-        <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>30</integer></dict>
-        <dict><key>Hour</key><integer>13</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>13</integer><key>Minute</key><integer>30</integer></dict>
-        <dict><key>Hour</key><integer>14</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>14</integer><key>Minute</key><integer>30</integer></dict>
-        <dict><key>Hour</key><integer>15</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>15</integer><key>Minute</key><integer>30</integer></dict>
-        <dict><key>Hour</key><integer>16</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>16</integer><key>Minute</key><integer>30</integer></dict>
-        <dict><key>Hour</key><integer>17</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>17</integer><key>Minute</key><integer>30</integer></dict>
-        <dict><key>Hour</key><integer>18</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>18</integer><key>Minute</key><integer>30</integer></dict>
-        <dict><key>Hour</key><integer>19</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>19</integer><key>Minute</key><integer>30</integer></dict>
-        <dict><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>20</integer><key>Minute</key><integer>30</integer></dict>
-    </array>
-    
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>/path/to/opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-        <key>HOME</key>
-        <string>/home/user</string>
-    </dict>
-    
-    <key>WorkingDirectory</key>
-    <string>/path/to/EliaAI</string>
-    
-    <key>StandardOutPath</key>
-    <string>/path/to/EliaAI/logs/promoter_yourco.log</string>
-    
-    <key>StandardErrorPath</key>
-    <string>/path/to/EliaAI/logs/promoter_yourco.log</string>
-</dict>
-</plist>
-EOF
-
-# Load the agent
-launchctl load plists/com.elia.yourco-promoter.plist
-
-echo "YourCo Promoter installed!"
-```
-
-### 5.2 Install YourBrand Promoter
+### 6.1 Python Libraries
 
 ```bash
-cd /path/to/EliaAI
-
-# Create plist for YourBrand Promoter (every 20 min, 10:00-22:00)
-cat > plists/com.elia.yourbrand-promoter.plist << 'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.elia.yourbrand-promoter</string>
-    
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/zsh</string>
-        <string>/path/to/EliaAI/scripts/trigger_yourbrand_promoter.sh</string>
-    </array>
-    
-    <key>RunAtLoad</key>
-    <false/>
-    
-    <key>StartCalendarInterval</key>
-    <array>
-        <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>20</integer></dict>
-        <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>40</integer></dict>
-        <dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>20</integer></dict>
-        <dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>40</integer></dict>
-        <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>20</integer></dict>
-        <dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>40</integer></dict>
-        <dict><key>Hour</key><integer>13</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>13</integer><key>Minute</key><integer>20</integer></dict>
-        <dict><key>Hour</key><integer>13</integer><key>Minute</key><integer>40</integer></dict>
-        <dict><key>Hour</key><integer>14</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>14</integer><key>Minute</key><integer>20</integer></dict>
-        <dict><key>Hour</key><integer>14</integer><key>Minute</key><integer>40</integer></dict>
-        <dict><key>Hour</key><integer>15</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>15</integer><key>Minute</key><integer>20</integer></dict>
-        <dict><key>Hour</key><integer>15</integer><key>Minute</key><integer>40</integer></dict>
-        <dict><key>Hour</key><integer>16</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>16</integer><key>Minute</key><integer>20</integer></dict>
-        <dict><key>Hour</key><integer>16</integer><key>Minute</key><integer>40</integer></dict>
-        <dict><key>Hour</key><integer>17</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>17</integer><key>Minute</key><integer>20</integer></dict>
-        <dict><key>Hour</key><integer>17</integer><key>Minute</key><integer>40</integer></dict>
-        <dict><key>Hour</key><integer>18</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>18</integer><key>Minute</key><integer>20</integer></dict>
-        <dict><key>Hour</key><integer>18</integer><key>Minute</key><integer>40</integer></dict>
-        <dict><key>Hour</key><integer>19</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>19</integer><key>Minute</key><integer>20</integer></dict>
-        <dict><key>Hour</key><integer>19</integer><key>Minute</key><integer>40</integer></dict>
-        <dict><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>20</integer><key>Minute</key><integer>20</integer></dict>
-        <dict><key>Hour</key><integer>20</integer><key>Minute</key><integer>40</integer></dict>
-        <dict><key>Hour</key><integer>21</integer><key>Minute</key><integer>0</integer></dict>
-        <dict><key>Hour</key><integer>21</integer><key>Minute</key><integer>20</integer></dict>
-        <dict><key>Hour</key><integer>21</integer><key>Minute</key><integer>40</integer></dict>
-    </array>
-    
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>/path/to/opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-        <key>HOME</key>
-        <string>/home/user</string>
-    </dict>
-    
-    <key>WorkingDirectory</key>
-    <string>/path/to/EliaAI</string>
-    
-    <key>StandardOutPath</key>
-    <string>/path/to/EliaAI/logs/promoter_yourbrand.log</string>
-    
-    <key>StandardErrorPath</key>
-    <string>/path/to/EliaAI/logs/promoter_yourbrand.log</string>
-</dict>
-</plist>
-EOF
-
-# Load the agent
-launchctl load plists/com.elia.yourbrand-promoter.plist
-
-echo "YourBrand Promoter installed!"
-```
-
-### 5.3 Trigger Scripts
-
-File: `scripts/trigger_yourco_promoter.sh`
-
-```bash
-#!/bin/zsh
-# YourCo Promoter - Trigger Script
-
-AGENT_DIR="/path/to/EliaAI"
-LOG_FILE="$AGENT_DIR/logs/promoter_yourco.log"
-
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting YourCo Promoter..." >> "$LOG_FILE"
-
-# Set model from .opencode_model or default
-if [[ -f "$AGENT_DIR/.opencode_model" ]]; then
-    MODEL=$(cat "$AGENT_DIR/.opencode_model")
-else
-    MODEL="big-pickle"
-fi
-
-# Build the prompt for yourco-promoter
-PROMPT="You are yourco-promoter. Run your promotion workflow for Your Company (B2B web dev).
-
-Execute ONE engagement action:
-- LinkedIn: Find 1 relevant post and comment OR send 1 connection request with message
-- X (Twitter): Find 1 relevant post and engage
-- Reddit: Find 1 relevant thread and provide value
-
-Focus on: web development, React, startups looking for developers.
-
-Remember:
-- ALWAYS be helpful, not salesy
-- NEVER spam
-- Use human-like language and timing
-
-Complete your task and report what you did."
-
-# Run with OpenCode
-cd "$AGENT_DIR"
-oh-my-opencode run -a yourco-promoter "$PROMPT"
-
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] YourCo Promoter completed" >> "$LOG_FILE"
-```
-
-File: `scripts/trigger_yourbrand_promoter.sh`
-
-```bash
-#!/bin/zsh
-# YourBrand Promoter - Trigger Script
-
-AGENT_DIR="/path/to/EliaAI"
-LOG_FILE="$AGENT_DIR/logs/promoter_yourbrand.log"
-
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting YourBrand Promoter..." >> "$LOG_FILE"
-
-# Set model from .opencode_model or default
-if [[ -f "$AGENT_DIR/.opencode_model" ]]; then
-    MODEL=$(cat "$AGENT_DIR/.opencode_model")
-else
-    MODEL="big-pickle"
-fi
-
-# Build the prompt for yourbrand-promoter
-PROMPT="You are yourbrand-promoter. Run your promotion workflow for YourBrand (luxury fashion resale).
-
-Execute ONE engagement action:
-- Instagram: Find 1 relevant post (luxury bags/fashion), like AND comment in French
-- TikTok: Browse and engage with luxury fashion content (if using browser)
-- Facebook Marketplace: Browse luxury listings and message 1 seller
-
-Focus on: Hermès, Chanel, Louis Vuitton, luxury fashion.
-
-Remember:
-- Use French language for comments
-- Be authentic, not salesy
-- NEVER use excessive emojis
-- Use natural, varied language
-
-Complete your task and report what you did."
-
-# Run with OpenCode
-cd "$AGENT_DIR"
-oh-my-opencode run -a yourbrand-promoter "$PROMPT"
-
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] YourBrand Promoter completed" >> "$LOG_FILE"
-```
-
-### 5.4 Make Scripts Executable
-
-```bash
-chmod +x /path/to/EliaAI/scripts/trigger_yourco_promoter.sh
-chmod +x /path/to/EliaAI/scripts/trigger_yourbrand_promoter.sh
-```
-
----
-
-## 6. Tools & Libraries
-
-### 6.1 Installation
-
-```bash
-# Install Python libraries
+# Install via pip
 pip install instagrapi
 pip install linkedin-scraper
 pip install TikTokApi
@@ -726,929 +592,40 @@ pip install TikTokApi
 uv pip install instagrapi linkedin-scraper TikTokApi
 ```
 
-### 6.2 Configuration for instagrapi
+### 6.2 Available MCP Servers
 
-```python
-# ~/.instagrapi_config.py
-from instagrapi import Client
-
-cl = Client(
-    delay_range=[10, 30],  # Random delay between actions
-    username="your_username",
-    password="your_password"
-)
-
-# Save session
-cl.dump_settings("session.json")
-
-# Load session (for reuse)
-cl.load_settings("session.json")
-```
-
-### 6.3 Configuration for linkedin-scraper
-
-```python
-# Using li_at cookie
-from linkedin_scraper import Linkedin
-
-# Requires LinkedIn session cookie (li_at)
-client = Linkedin(li_at="your_cookie_here")
-profile = client.get_profile("target_username")
-```
-
----
-
-## 7. MCP Servers
-
-### 7.1 Available MCP Servers
-
-#### Social Media MCP Servers
+#### Social Media
 
 | Server | NPM/GitHub | Platforms | Capabilities |
 |--------|-----------|----------|------------|
-| **@mcpware/instagram-mcp** | [npm](https://www.npmjs.com/package/@mcpware/instagram-mcp) | Instagram | 23 tools - posts, comments, DMs, stories, insights |
-| **facebook-marketplace-mcp** | [GitHub](https://github.com/jdcodes1/facebook-marketplace-mcp) | Facebook Marketplace | Search listings, browse (read-only) |
-| **x-mcp-server** | [GitHub](https://github.com/Lnxtanx/x-mcp-server) | X/Twitter | 54+ tools - post, delete, search, interact |
+| **@mcpware/instagram-mcp** | [npm](https://www.npmjs.com/package/@mcpware/instagram-mcp) | Instagram | 23 tools |
+| **facebook-marketplace-mcp** | [GitHub](https://github.com/jdcodes1/facebook-marketplace-mcp) | FB Marketplace | Browse, search |
+| **x-mcp-server** | [GitHub](https://github.com/Lnxtanx/x-mcp-server) | X/Twitter | 54+ tools |
 | **PostPulse** | [GitHub](https://github.com/PostPulse/mcp-server-postpulse) | Multi-platform | IG, FB, YouTube, TikTok, LinkedIn, X, Threads |
 | **Outstand** | [mcphub.io](https://mcphub.io/servers/outstand) | Multi-platform | 10 platforms, 25 tools |
-| **Publora** | [publora.com](https://publora.com) | Multi-platform | 10 platforms scheduling |
 
-#### Browser Automation MCP
+#### Browser Automation
 
 | Server | NPM/GitHub | Capabilities |
 |--------|-----------|------------|
-| **Playwright MCP** | `@playwright/mcp` | Navigation, clicking, forms, snapshots |
+| **Playwright MCP** | `@playwright/mcp` | Navigation, clicking, forms |
 | **agent-browser-mcp** | [GitHub](https://github.com/quantmew/agent-browser-mcp) | Full Playwright API + 44 tools |
 
-### 7.2 Installation Commands
+#### Communication (Reporting)
 
-```bash
-# Instagram MCP (requires Business account)
-npx -y @mcpware/instagram-mcp
+| Service | Command | Use |
+|---------|---------|-----|
+| WhatsApp | `mcp-cli call whatsapp send_message` | Emergency alerts |
+| Discord | `mcp-cli call discord-server-mcp discord_send_message` | Regular reports |
 
-# Facebook Marketplace MCP
-npx -y @jdcodes1/facebook-marketplace-mcp
-
-# X/Twitter MCP
-npx -y @mcpware/x-mcp-server
-
-# Playwright MCP (browser automation)
-npx -y @playwright/mcp@latest
-
-# agent-browser MCP (enhanced)
-npm install -g agent-browser-mcp-server
-```
-
-### 7.3 MCP Configuration
+### 6.3 MCP Configuration
 
 File: `~/.config/mcp/mcp_servers.json`
 
 ```json
 {
-  "instagram": {
-    "command": "npx",
-    "args": ["-y", "@mcpware/instagram-mcp"],
-    "env": {
-      "INSTAGRAM_ACCESS_TOKEN": "your_token"
-    }
-  },
-  "facebook-marketplace": {
-    "command": "npx",
-    "args": ["-y", "@jdcodes1/facebook-marketplace-mcp"]
-  },
-  "x-twitter": {
-    "command": "npx",
-    "args": ["-y", "@mcpware/x-mcp-server"],
-    "env": {
-      "X_API_KEY": "your_api_key"
-    }
-  },
-  "agent-browser": {
-    "command": "npx",
-    "args": ["-y", "agent-browser-mcp-server"],
-    "env": {
-      "BROWSER_PROFILE": "~/.agent-browser-profile"
-    }
-  },
-  "playwright": {
-    "command": "npx",
-    "args": ["-y", "@playwright/mcp"]
-  }
-}
-```
-
-### 7.4 Restart MCP CLI
-
-```bash
-# Kill existing MCP processes and restart
-pkill -f mcp
-mcp-cli &
-
-# Verify servers are running
-mcp-cli list
-```
-
-### 7.5 Using MCP Tools in Prompts
-
-```python
-# Example: Using mcp-cli to call Instagram MCP
-mcp-cli call instagram get_media_posts '{"username": "luxuryfashion", "count": 10}'
-
-# Example: Using Facebook Marketplace search
-mcp-cli call facebook-marketplace search_listings '{"query": "Hermes bag", "location": "Paris"}'
-
-# Example: Browser navigation
-mcp-cli call playwright browser_navigate '{"url": "https://instagram.com"}'
-```
-
-### 7.6 Remote MCP Servers (No Install)
-
-For MCP CLI with remote hosted servers:
-
-```json
-{
-  "mcpServers": {
-    "outstand": {
-      "url": "https://mcp.outstand.so/mcp",
-      "headers": {
-        "Authorization": "Bearer ost_your_key"
-      }
-    },
-    "postpulse": {
-      "url": "https://mcp.post-pulse.com"
-    }
-  }
-}
-```
-
-### 7.7 MCP Resources
-
-| Resource | URL |
-|----------|-----|
-| **Official MCP Servers** | [modelcontextprotocol/servers](https://github.com/modelcontextprotocol/servers) |
-| **MCP Repository** | [mcprepository.com](https://mcprepository.com) |
-| **Awesome MCP Servers** | [wong2/awesome-mcp](https://github.com/wong2/awesome-mcp) |
-| **MCP Hub** | [mcphub.io](https://mcphub.io) |
-
----
-
-## 8. Workflows & Reporting
-
-### 8.1 YourCo Promoter - B2B Workflow
-
-#### Objective
-Generate B2B leads for Your Company (web development, software, AI implementation services).
-
-#### Reporting Channels
-
-| Priority | Channel | When |
-|----------|---------|------|
-| **EMERGENCY** | WhatsApp - YOURCO PowerRangers (`000000000000001@g.us`) | Blockers, urgent issues, client emergencies |
-| **REGULAR** | Discord - **YOUR TEAM** category (`[channel-id]`) | Leads contacted, negotiations, progress |
-| **FALLBACK** | Discord - #reports (`[channel-id]`) | Only if Discord fails |
-
-#### Discord Channel IDs (YOUR TEAM)
-
-| Channel | ID | Purpose |
-|---------|-----|---------|
-| 🚀-projects | `[channel-id]` | Active projects |
-| 👥-clients | `[channel-id]` | Client leads & negotiations |
-| 💻-dev-work | `[channel-id]` | Dev tasks |
-| 💰-invoices | `[channel-id]` | Invoices |
-
-#### Workflow Steps
-
-```
-STEP 1: DISCOVERY (10 min)
-├── Search LinkedIn for: "web developer", "React", "need a website", "startup"
-├── Search X/Twitter for: #webdev #freelance #startup
-├── Search Reddit for: r/webdev, r/freelance, r/reactjs
-└── Identify potential client needs
-    → Record leads to memory/context
-
-STEP 2: QUALIFICATION (10 min)
-├── Analyze: Do they need a website/app/AI?
-├── Budget indicator: Startup stage, funding
-├── Timeline: Urgent or exploratory?
-├── Decision maker?
-└── Score: Hot/Warm/Cold
-
-STEP 3: ENGAGEMENT (15 min)
-├── LinkedIn: Comment with value + connect request
-├── X: Reply with helpful insight
-├── Reddit: Answer question with expertise
-└── Personalized message (NOT template)
-    → Use mcp-cli for LinkedIn/Telegram/Discord
-
-STEP 4: NURTURE (15 min)
-├── Follow up within 48h if no response
-├── Share relevant case study
-├── Ask about their project
-└── Propose consultation call
-```
-
-#### Report Format (Discord)
-
-```markdown
-# YourCo Promoter Report - {DATE}
-
-## Leads Contacted: {N}
-| Platform | Name | Company | Need | Status | Next Step |
-|---------|------|--------|------|--------|---------|
-| LinkedIn | [Name] | [Company] | [Need] | [Hot/Warm/Cold] | [Next Action] |
-
-## Pipeline Update
-- 🔥 Hot: {N}
-- 🔶 Warm: {N}
-- ❄️ Cold: {N}
-
-## Conversations Started: {N}
-[Brief summary of each conversation]
-
-## Blockers/Issues
-[Any issues needing attention]
-
-## Tomorrow's Focus
-[Priority targets for next run]
-```
-
-#### Client Needs Discovery Questions
-
-When engaging, ask to understand pain:
-
-| Question | Purpose |
-|----------|---------|
-| "What's your current process for X?" | Understand workflow |
-| "What's the biggest pain point?" | Find problem |
-| "How do you handle X today?" | Current solution |
-| "What's your timeline?" | Urgency |
-| "What's your budget range?" | Fit assessment |
-| "Who makes the decision?" | Decision maker |
-
----
-
-### 8.2 YourBrand Promoter - B2C Workflow
-
-#### Objective
-Engage with luxury fashion community, find buyers, promote YourBrand resale.
-
-#### Reporting Channels
-
-| Priority | Channel | When |
-|----------|---------|------|
-| **EMERGENCY** | WhatsApp - YOURBRAND BUSINESS (`000000000000000@g.us`) | Client wants product we don't have, supplier issue |
-| **REGULAR** | Discord - **YOUR BRAND** category (`[channel-id]`) | Engagement data, leads found, products talked about |
-| **FALLBACK** | Discord - #reports (`[channel-id]`) | Only if Discord fails |
-
-#### Discord Channel IDs (YOUR BRAND)
-
-| Channel | ID | Purpose |
-|---------|-----|---------|
-| 🛍️-products | `[channel-id]` | Product updates |
-| 📦-orders | `[channel-id]` | Orders |
-| 👥-clients | `[channel-id]` | Client leads |
-| 📱-social-media | `[channel-id]` | Social engagement |
-| 📤-marketing | `[channel-id]` | Marketing campaigns |
-
-#### Workflow Steps
-
-```
-STEP 1: COMMUNITY DISCOVERY (10 min)
-├── Search Instagram: #luxuryfashion #designerbags #hermes #chanel
-├── Search TikTok: luxury fashion, designer bags
-├── Search FB Marketplace: Hermès, Chanel, LV (browse only)
-└── Identify trending topics/products
-    → Note communities talking about what
-
-STEP 2: ENGAGEMENT (15 min)
-├── Instagram: Like + comment (in French!)
-├── TikTok: Comment on relevant videos (via browser)
-├── FB Marketplace: Browse, message sellers (no posting)
-└── Story replies
-    → Use instagrapi + agent-browser
-
-STEP 3: LEAD IDENTIFICATION (10 min)
-├── Who is asking about products we have?
-├── Who wants something we DON'T have?
-├── Who is looking for specific brand?
-└── Flag: "Wants X, we don't have" → URGENT report to WhatsApp
-    → Check supplier list (yupo store)
-
-STEP 4: OPPORTUNITY (10 min)
-├── DM interested buyers
-├── Share relevant inventory
-├── Offer to find specific items
-└── If can't find: Report to WhatsApp with margin inquiry
-    → "Client wants [ITEM] - margin potential [€X] - escalate?"
-```
-
-#### Supplier Flag (URGENT to WhatsApp)
-
-When a client wants a product we don't have:
-
-```
-Message to YOURBRAND BUSINESS (WhatsApp):
-⚠️ LEAD: [Client interest]
-- Product: [Item]
-- Brand: [Brand]
-- Budget: [Client's budget]
-- Our margin: [If known]
-- Supplier needed: YES - check yupo store + contacts
-ACTION REQUIRED: Can we source this?
-```
-
-#### Report Format (Discord)
-
-```markdown
-# YourBrand Promoter Report - {DATE}
-
-## Engagement: {N}
-| Platform | Type | Content | Result |
-|---------|------|--------|--------|
-| IG | Comment | [On post] | [Response?] |
-| TikTok | Comment | [On video] | [Response?] |
-| FB | Message | [To seller] | [Response?] |
-
-## Products in Demand: {N}
-| Brand | Item | Demand Level |
-|-------|------|------------|
-| [Brand] | [Item] | High/Medium |
-
-## Supplier Gaps: {N}
-[Items clients want but we don't have - escalate to team]
-
-## Leads to Follow: {N}
-[Names + what they want + contact]
-
-## Tomorrow's Focus
-[Priority hashtags, accounts, products]
-```
-
----
-
-### 8.3 Reporting Commands
-
-#### Send to Discord (via mcp-cli)
-
-```bash
-# COBU AGENCY - clients channel
-mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"# YourCo Promoter Report - {DATE}\n\n[Your report content]"}'
-
-# YOUR BRAND - clients channel  
-mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"# YourBrand Promoter Report - {DATE}\n\n[Your report content]"}'
-```
-
-#### Send to WhatsApp (Emergency Only)
-
-```bash
-# YourCo PowerRangers (emergency)
-mcp-cli call whatsapp send_message '{"chat_jid":"000000000000001@g.us","message":"[Report]"}'
-
-# YOURBRAND BUSINESS (emergency)
-mcp-cli call whatsapp send_message '{"chat_jid":"000000000000000@g.us","message":"[Report]"}'
-```
-
----
-
-## 9. Implementation Detail - DO NOT SKIP
-
-**CRITICAL: Avant de commencer l'implémentation, lis d'abord TOUTE cette section 9.**
-
-Cette section contient des prompts détaillés pour implémenter chaque partie du système. Chaque étape doit être exécutée dans l'ordre.
-
----
-
-### 9.1 CRÉER LES DOSSIERS - Step 1
-
-**Objectif:** Créer la structure de dossiers pour les subworkers.
-
-**Action à exécuter dans ton terminal:**
-
-```bash
-mkdir -p /path/to/EliaAI/subworkers/yourco-promoter
-mkdir -p /path/to/EliaAI/subworkers/yourbrand-promoter
-mkdir -p /path/to/EliaAI/subworkers/scripts
-mkdir -p /path/to/EliaAI/subworkers/plists
-mkdir -p /path/to/EliaAI/subworkers/logs
-```
-
-**Vérification:**
-```bash
-ls -la /path/to/EliaAI/subworkers/
-# Doit afficher:
-# - yourco-promoter/
-# - yourbrand-promoter/
-# - scripts/
-# - plists/
-# - logs/
-```
-
----
-
-### 9.2 CRÉER LE PROMPT YOURCO PROMOTER - Step 2
-
-**Objectif:** Générer le fichier PROMPT.md complet pour l'agent YourCo Promoter.
-
-**Contexte à lire d'abord:**
-- Lis la section 8.1 de CE document (workflow YourCo)
-- Lis la section 7 (Tools & Libraries) pour les outils disponibles
-- Lis TOOLS.md pour les commandes MCP
-
-**Prompt détaillé à copier dans OpenCode:**
-
-```
-/ulw-loop
-
-Tu dois créer le fichier /path/to/EliaAI/subworkers/yourco-promoter/PROMPT.md
-
-CONTEXTE À UTILISER:
-1. Lis d'abord /path/to/EliaAI/subworkers/SUBWORKERS_SYSTEM.md section 8.1 (workflow YourCo B2B)
-2. Lis /path/to/EliaAI/context/TOOLS.md sections MCP-CLI et Discord
-
-STRUCTURE DU FICHIERÀ CRÉER:
-
-# YourCo Promoter - PROMPT.md
-
-## Identity
-Tu es YOURCO PROMOTER, agent IA autonome pour Your Company.
-Mission: Générer des leads B2B pour services web dev/AI/logiciels.
-
-## Platforms Cibles
-| Priority | Platform | Actions |
-|----------|----------|---------|
-| HIGH | LinkedIn | Comment, Connect, Message |
-| HIGH | X (Twitter) | Reply, Engage |
-| MEDIUM | Reddit | Answer, Comment |
-
-## Outils Disponibles
-1. **linkedin-scraper** (pip install linkedin-scraper) - Profiles, companies
-2. **X MCP Server** - Twitter actions
-3. **mcp-cli** - WhatsApp, Discord, Telegram
-4. **agent-browser** - Browser automation
-
-## Canaux de Reporting
-| Canal | ID | Usage |
-|-------|-----|-------|
-| Discord #clients YOURCO | [channel-id] | Rapports réguliers |
-| WhatsApp YOURCO PowerRangers | 000000000000001@g.us | URGENT uniquement |
-
-## Workflow (Section 8.1 référence)
-```
-DISCOVERY (10min) → QUALIFICATION (10min) → ENGAGEMENT (15min) → NURTURE (15min)
-```
-
-## Questions Découverte Client
-| Question | Objectif |
-|----------|---------|
-| "Quel est votre process actuel pour X?" | Comprendre workflow |
-| "Quel est le plus gros problème?" | Trouver douleur |
-| "Comment gérez-vous X aujourd'hui?" | Solution actuelle |
-| "Quelle est votre timeline?" | Urgence |
-| "Quelle est votre budget?" | Évaluation fit |
-| "Qui décide?" | Decision maker |
-
-## Lead Scoring
-| Score | Criteria |
-|-------|----------|
-| 🔥 Hot | Budget + Timeline + Decision maker identifié |
-| 🔶 Warm | Besoin clair mais no timeline/budget |
-| ❄️ Cold | Exploratoire, pas de besoin clair |
-
-## Warm-Up Protocol
-- Semaine 1: 10 connexions/jour, 5 messages/jour
-- Semaine 2: 20 connexions/jour, 10 messages/jour
-- Semaine 3+: 30 connexions/jour, 20 messages/jour
-
-## Actions Interdites
-- ❌ Mass DM génériques
-- ❌ Templatescopiés-collés
-- ❌ Achat de connexions
-- ❌ Promesses de timeline impossibles
-
-## Format Report (Discord)
-```markdown
-# YourCo Promoter Report - {DATE}
-
-## Leads Contactés: {N}
-| Platform | Name | Company | Need | Status | Next Step |
-|---------|------|--------|------|--------|---------|
-| LinkedIn | [Name] | [Company] | [Need] | [Hot/Warm/Cold] | [Next Action] |
-
-## Pipeline
-- 🔥 Hot: {N}
-- 🔶 Warm: {N}
-- ❄️ Cold: {N}
-
-## Conversations: {N}
-[Résumé]
-
-## Blockers
-[Issues�� attention]
-
-## Demain
-[Priority]
-```
-
-## Commandes Reporting (depuis TOOLS.md)
-```bash
-# Discord
-mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"[REPORT]"}'
-
-# WhatsApp URGENT
-mcp-cli call whatsapp send_message '{"chat_jid":"000000000000001@g.us","message":"[URGENT]"}'
-```
-
-CRÉER LE FICHIER MAINTENANT.
---completion-promise DONE --max-iterations 0
-```
-
-**Vérification après création:**
-```bash
-cat /path/to/EliaAI/subworkers/yourco-promoter/PROMPT.md | head -50
-# Doit contenir: Identity, Platforms, Outils, Workflow, etc.
-```
-
----
-
-### 9.3 CRÉER LE PROMPT YOURBRAND PROMOTER - Step 3
-
-**Objectif:** Générer le fichier PROMPT.md complet pour l'agent YourBrand Promoter.
-
-**Contexte à lire d'abord:**
-- Lis la section 8.2 de CE document (workflow YourBrand B2C)
-- Lis section 7 (Tools & Libraries)
-- Lis TOOLS.md
-
-**Prompt détaillé à copier dans OpenCode:**
-
-```
-/ulw-loop
-
-Tu dois créer le fichier /path/to/EliaAI/subworkers/yourbrand-promoter/PROMPT.md
-
-CONTEXTE À UTILISER:
-1. Lis d'abord /path/to/EliaAI/subworkers/SUBWORKERS_SYSTEM.md section 8.2 (workflow YourBrand B2C)
-2. Lis /path/to/EliaAI/context/TOOLS.md sections MCP-CLI, WhatsApp, Discord
-
-STRUCTURE DU FICHIERÀ CRÉER:
-
-# YourBrand Promoter - PROMPT.md
-
-## Identity
-Tu es YOURBRAND PROMOTER, agent IA autonome pour YourBrand.
-Mission: Engager avec la communauté mode luxe, trouver des acheteurs, promouvoir revente.
-
-## Platforms Cibles
-| Priority | Platform | Actions |
-|----------|----------|---------|
-| HIGH | Instagram | Like, Comment, DM, Story |
-| HIGH | TikTok | Comment (browser only) |
-| HIGH | FB Marketplace | Browse, Message |
-| MEDIUM | Snapchat | Ads uniquement |
-
-## Outils Disponibles
-1. **instagrapi** (pip install instagrapi) - IG automation
-2. **TikTokApi** (pip install TikTokApi) - TikTok (read-only)
-3. **agent-browser** - Browser automation for TikTok comments
-4. **mcp-cli** - WhatsApp, Discord
-
-## Canaux de Reporting
-| Canal | ID | Usage |
-|-------|-----|-------|
-| Discord #clients YOUR BRAND | [channel-id] | Rapports réguliers |
-| WhatsApp YOURBRAND BUSINESS | 000000000000000@g.us | URGENT - produits manquants |
-
-## Workflow (Section 8.2 référence)
-```
-DISCOVERY (10min) → ENGAGEMENT (15min) → LEAD ID (10min) → OPPORTUNITY (10min)
-```
-
-## Langue Guidelines (Marché Français)
-| English | French |
-|---------|--------|
-| "Great bag!" | "Superbe sac !" |
-| "Love this" | "J'adore !" |
-| "What price?" | "Quel prix ?" |
-| "Still available?" | "Encore dispo ?" |
-
-## Warm-Up Protocol
-- Semaine 1: 20 likes/jour, 5 commentaires/jour
-- Semaine 2: 40 likes/jour, 10 commentaires/jour
-- Semaine 3+: 60 likes/jour, 15 commentaires/jour
-
-## PROTOCOLE SUPPLIER FLAG (CRITICAL)
-Quand un client veut un produit QUE NOUS N'AVONS PAS:
-1. NOTER: Produit, Marque, Budget client
-2. Envoyer URGENT à WhatsApp YOURBRAND BUSINESS:
-   "⚠️ LEAD: [produit] - [marque] - budget [€X]"
-3. Demander si on peut sourcer + marge
-
-## Actions Interdites
-- ❌ Vente de contrefaçon
-- ❌ Spam DMs
-- ❌ Trop d'emojis (1-2 max)
-- ❌ Sons robotiques
-
-## Format Report (Discord)
-```markdown
-# YourBrand Promoter Report - {DATE}
-
-## Engagement: {N}
-| Platform | Type | Content | Result |
-|---------|------|--------|--------|
-| IG | Comment | [Sur post] | [Réponse?] |
-| TikTok | Comment | [Sur video] | [Réponse?] |
-| FB | Message | [À vendeur] | [Réponse?] |
-
-## Produits en Demand: {N}
-| Marque | Item | Demande |
-|-------|------|---------|
-| [Marque] | [Item] | High/Medium |
-
-## Supplier Gaps: {N}
-[Items clients veulent mais on a pas - escalader]
-
-## Leads: {N}
-[Names + quoi ils veulent + contact]
-
-## Demain
-[Priority hashtags, comptes]
-```
-
-## Commandes Reporting
-```bash
-# Discord
-mcp-cli call discord-server-mcp discord_send_message '{"channel_id":"[channel-id]","content":"[REPORT]"}'
-
-# WhatsApp URGENT
-mcp-cli call whatsapp send_message '{"chat_jid":"000000000000000@g.us","message":"[SUPPLIER ISSUE]"}'
-```
-
-CRÉER LE FICHIER MAINTENANT.
---completion-promise DONE --max-iterations 0
-```
-
-**Vérification après création:**
-```bash
-cat /path/to/EliaAI/subworkers/yourbrand-promoter/PROMPT.md | head -50
-```
-
----
-
-### 9.4 CONFIGURER OPENCOD - Step 4
-
-**Objectif:** Ajouter les agents dans la configuration OpenCode.
-
-**Fichier 1:** `~/.config/opencode/opencode.json`
-
-Ajouter dans la section `"agent"`:
-
-```json
-"yourco-promoter": {
-  "description": "Your Company B2B promoter - LinkedIn, X, Reddit",
-  "mode": "primary"
-},
-"yourbrand-promoter": {
-  "description": "YourBrand luxury resale promoter - IG, TikTok, FB",
-  "mode": "primary"
-}
-```
-
-**Fichier 2:** `~/.config/opencode/oh-my-openagent.json`
-
-Ajouter dans `"agents"`:
-
-```json
-"yourco-promoter": {
-  "model": "opencode/big-pickle",
-  "mode": "primary",
-  "fallback_models": []
-},
-"yourbrand-promoter": {
-  "model": "opencode/big-pickle",
-  "mode": "primary",
-  "fallback_models": []
-}
-```
-
-Ajouter dans `"categories"`:
-
-```json
-"yourco-promoter": {
-  "model": "opencode/big-pickle",
-  "description": "Your Company B2B promoter",
-  "prompt_append": "**FIRST: Read /path/to/EliaAI/subworkers/yourco-promoter/PROMPT.md pour ton workflow complet.**
-\n\nTu es yourco-promoter. Utilise les outils de LinkedIn, X, Discord pour générer des leads B2B."
-},
-"yourbrand-promoter": {
-  "model": "opencode/big-pickle",
-  "description": "YourBrand luxury resale promoter",
-  "prompt_append": "**FIRST: Read /path/to/EliaAI/subworkers/yourbrand-promoter/PROMPT.md pour ton workflow complet.**
-\n\nTu es yourbrand-promoter. Utilise instagrapi, agent-browser pour promouvoir YourBrand."
-}
-```
-
-Ajouter dans `"agent_display_names"`:
-
-```json
-"yourco-promoter": "YourCo Promoter",
-"yourbrand-promoter": "YourBrand Promoter"
-```
-
-**Vérification:**
-```bash
-# Redémarrer OpenCode puis:
-# /agents
-# Doit afficher yourco-promoter et yourbrand-promoter
-```
-
----
-
-### 9.5 INSTALLER LES LIBRAIRIES PYTHON - Step 5
-
-```bash
-pip install instagrapi
-pip install linkedin-scraper
-pip install TikTokApi
-```
-
-**Alternative plus rapide:**
-```bash
-uv pip install instagrapi linkedin-scraper TikTokApi
-```
-
-**Vérification:**
-```bash
-python3 -c "from instagrapi import Client; print('instagrapi OK')"
-python3 -c "from linkedin_scraper import Linkedin; print('linkedin-scraper OK')"
-python3 -c "from TikTokApi import TikTokApi; print('TikTokApi OK')"
-```
-
----
-
-### 9.6 CRÉER LES SCRIPTS DÉCLENCHEURS - Step 6
-
-**Fichier:** `/path/to/EliaAI/subworkers/scripts/trigger_yourco_promoter.sh`
-
-```bash
-#!/bin/zsh
-# YourCo Promoter - Trigger Script
-
-AGENT_DIR="/path/to/EliaAI"
-LOG_FILE="$AGENT_DIR/subworkers/logs/promoter_yourco.log"
-
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting YourCo Promoter..." >> "$LOG_FILE"
-
-# Set model
-MODEL=$(cat "$AGENT_DIR/.opencode_model" 2>/dev/null || echo "big-pickle")
-
-# Load the prompt
-PROMPT=$(cat "$AGENT_DIR/subworkers/yourco-promoter/PROMPT.md")
-
-# Run with OpenCode - First read the prompt from file, then execute task
-cd "$AGENT_DIR"
-oh-my-opencode run -a yourco-promoter "Execute ONE promotion task now:
-- LinkedIn: Find 1 relevant post, comment + connect
-- X: Find 1 relevant post, engage
-- Reddit: Answer 1 relevant question
-
-Remember:
-- Use French language only when appropriate
-- Always be helpful, not salesy
-- Report to Discord #clients after
-
-$PROMPT"
-
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] YourCo Promoter completed" >> "$LOG_FILE"
-```
-
-**Fichier:** `/path/to/EliaAI/subworkers/scripts/trigger_yourbrand_promoter.sh`
-
-```bash
-#!/bin/zsh
-# YourBrand Promoter - Trigger Script
-
-AGENT_DIR="/path/to/EliaAI"
-LOG_FILE="$AGENT_DIR/subworkers/logs/promoter_yourbrand.log"
-
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting YourBrand Promoter..." >> "$LOG_FILE"
-
-# Set model
-MODEL=$(cat "$AGENT_DIR/.opencode_model" 2>/dev/null || echo "big-pickle")
-
-# Run
-cd "$AGENT_DIR"
-oh-my-opencode run -a yourbrand-promoter "Execute ONE promotion task now:
-- Instagram: Find 1 luxury post, like + comment in French
-- TikTok: Browse luxury fashion content (if browser available)
-- FB Marketplace: Browse 1 listing, message seller
-
-Remember:
-- Use French for comments
-- Use human-like language
-- Report to Discord #clients after"
-
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] YourBrand Promoter completed" >> "$LOG_FILE"
-```
-
-**Rendre exécutable:**
-```bash
-chmod +x /path/to/EliaAI/subworkers/scripts/trigger_yourco_promoter.sh
-chmod +x /path/to/EliaAI/subworkers/scripts/trigger_yourbrand_promoter.sh
-```
-
----
-
-### 9.7 CRÉER LES LAUNCHAGENTS - Step 7
-
-**Fichier plist pour YourCo (30 min, 09:00-21:00):**
-
-Voir Section 5.1 dans CE document pour le XML complet. Sauvegarder dans:
-`/path/to/EliaAI/subworkers/plists/com.elia.yourco-promoter.plist`
-
-**Fichier plist pour YourBrand (20 min, 10:00-22:00):**
-
-Voir Section 5.2 dans CE document pour le XML complet. Sauvegarder dans:
-`/path/to/EliaAI/subworkers/plists/com.elia.yourbrand-promoter.plist`
-
----
-
-### 9.8 CHARGER LES LAUNCHAGENTS - Step 8
-
-```bash
-cd /path/to/EliaAI/subworkers
-
-# Charger YourCo
-launchctl load plists/com.elia.yourco-promoter.plist
-
-# Charger YourBrand
-launchctl load plists/com.elia.yourbrand-promoter.plist
-
-# Vérifier
-launchctl list | grep -i promoter
-```
-
----
-
-### 9.9 TEST FINAL - Step 9
-
-```bash
-# Tester YourCo manuellement
-cd /path/to/EliaAI/subworkers
-./scripts/trigger_yourco_promoter.sh
-
-# Voir le log
-tail -f logs/promoter_yourco.log
-
-# Tester YourBrand
-./scripts/trigger_yourbrand_promoter.sh
-
-# Voir le log
-tail -f logs/promoter_yourbrand.log
-```
-
----
-
-## 10. Checklist Final
-
-- [ ] Step 1: Dossiers créés
-- [ ] Step 2: PROMPT.md YourCo créé
-- [ ] Step 3: PROMPT.md YourBrand créé
-- [ ] Step 4: OpenCode configuré
-- [ ] Step 5: Librairies Python installées
-- [ ] Step 6: Scripts trigger créés + exécutables
-- [ ] Step 7: LaunchAgent plists créés
-- [ ] Step 8: LaunchAgents chargés
-- [ ] Step 9: Test passé
-
----
-
-## 11. MCP Servers for Reporting (WhatsApp & Discord)
-
-### 11.1 Existing MCP Servers (Already Configured)
-
-From your TOOLS.md:
-
-| Service | Command | For |
-|---------|---------|-----|
-| WhatsApp | `mcp-cli call whatsapp send_message` | Emergency alerts |
-| Discord | `mcp-cli call discord-server-mcp discord_send_message` | Regular reports |
-
-### 11.2 Additional MCP Servers (Optional)
-
-| Server | Install | For |
-|--------|---------|-----|
-| `@pasympa/discord-mcp` | `npx -y @pasympa/discord-mcp` | 90+ Discord tools |
-| `whatsapp-mcp-extended` | Docker | 41 WhatsApp tools |
-
-### 11.3 Configuration
-
-Add to `~/.config/mcp/mcp_servers.json`:
-
-```json
-{
   "discord-report": {
-    "command": "npx", 
+    "command": "npx",
     "args": ["-y", "@pasympa/discord-mcp"],
     "env": {
       "DISCORD_TOKEN": "YOUR_BOT_TOKEN"
@@ -1657,138 +634,236 @@ Add to `~/.config/mcp/mcp_servers.json`:
 }
 ```
 
+Restart:
+```bash
+pkill -f mcp && mcp-cli &
+mcp-cli list
+```
+
 ---
 
-## 12. Verification & Testing
+## 7. LaunchAgent Setup
 
-### 12.1 Test YourCo Promoter Manually
+### 7.1 Template Plist
 
-```bash
-cd /path/to/EliaAI
-./scripts/trigger_yourco_promoter.sh
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.elia.<agent-id></string>
+
+    <key>ProgramArguments</key>
+    <array>
+<string>node</string>
+        <string>/Users/vakandi/EliaAI/subworkers/scripts/trigger_template.js</string>
+        <string>--agent</string>
+        <string><agent_id_with_underscores></string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <!-- Customize schedule here -->
+        <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>0</integer></dict>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/vakandi/.bun/bin:/Users/vakandi/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/vakandi</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/vakandi/EliaAI</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/vakandi/EliaAI/subworkers/logs/<agent_name>.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/vakandi/EliaAI/subworkers/logs/<agent_name>.log</string>
+</dict>
+</plist>
 ```
 
-Check logs:
-```bash
-tail -f logs/promoter_yourco.log
-```
-
-### 8.2 Test YourBrand Promoter Manually
+### 7.2 Load & Verify
 
 ```bash
-cd /path/to/EliaAI
-./scripts/trigger_yourbrand_promoter.sh
-```
-
-Check logs:
-```bash
-tail -f logs/promoter_yourbrand.log
-```
-
-### 8.3 Verify LaunchAgents
-
-```bash
-# Check if running
-launchctl list | grep -i promoter
-
-# Show current agents
+launchctl load /Users/vakandi/EliaAI/subworkers/plists/com.elia.<agent-id>.plist
 launchctl list | grep "com.elia"
 ```
 
 ---
 
+## 8. Enable/Disable & Schedule Management
+
+### 8.1 The `.enabled` Gate
+
+Every subworker has a gate file at `subworkers/<agent-id>/.enabled`:
+
+| State | File | Behavior |
+|-------|------|----------|
+| **Enabled** | `.enabled` exists | LaunchAgent runs on schedule; manual runs work without `--force` |
+| **Disabled** | `.enabled` missing | LaunchAgent skips scheduled runs; manual runs require `--force` flag |
+
+**The trigger template (`trigger_template.js`) checks this file on every run:**
+- If `.enabled` exists → proceed normally
+- If `.enabled` missing AND no `--force` flag → exit code 0 (skip)
+- If `.enabled` missing AND `--force` flag → proceed (manual override)
+
+### 8.2 Electron UI — Subworker Popup (`ui_electron/subworker-popup.html`)
+
+The Electron UI provides a visual interface to manage all subworkers:
+
+**Features:**
+- **Toggle switches** — Click to enable/disable any subworker
+- **Schedule badges** — Shows configured schedule (e.g., "10:00–23:00 daily")
+- **Run now button** — Manual trigger with model selection from the current `opencode models` catalog
+- **Logs button** — Opens latest run log
+- **Runs dropdown** — Shows recent run history with exit codes and durations
+
+**How toggling works (via `ui_electron/src/main.js`):**
+
+```javascript
+ipcMain.on('toggle-subworker', (event, name) => {
+  const subworkerDir = path.join(subworkersRoot, name);
+  const plistName = `com.elia.${name}`;
+  const plistPath = path.join(subworkersRoot, 'plists', `${plistName}.plist`);
+  const enabledPath = path.join(subworkerDir, '.enabled');
+
+  if (fs.existsSync(enabledPath)) {
+    // DISABLE: remove .enabled + unload from launchd
+    fs.unlinkSync(enabledPath);
+    if (fs.existsSync(plistPath)) {
+      execSync(`launchctl bootout gui/$(id -u) ${plistPath} 2>/dev/null || true`);
+    }
+  } else {
+    // ENABLE: create .enabled + load into launchd
+    fs.writeFileSync(enabledPath, 'enabled\n', 'utf8');
+    if (fs.existsSync(plistPath)) {
+      execSync(`launchctl bootstrap gui/$(id -u) ${plistPath} 2>/dev/null || true`);
+    }
+  }
+  // Reply with new state
+  event.reply('subworker-toggled', { name, enabled, running });
+});
+```
+
+**Key behaviors:**
+- **Enable** → Creates `.enabled` file + `launchctl bootstrap` the plist
+- **Disable** → Removes `.enabled` file + `launchctl bootout` the plist
+- **Requires plist** — Toggle only works if `subworkers/plists/com.elia.<name>.plist` exists
+- **State sync** — UI receives `subworker-toggled` reply and updates toggle visuals
+
+### 8.3 Changing Schedule Times
+
+**To change a subworker's schedule:**
+
+1. **Edit the plist** at `subworkers/plists/com.elia.<agent-id>.plist`
+2. **Modify the `StartCalendarInterval` array** — each `<dict>` defines one scheduled time:
+   ```xml
+   <key>StartCalendarInterval</key>
+   <array>
+       <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
+       <dict><key>Hour</key><integer>14</integer><key>Minute</key><integer>30</integer></dict>
+       <dict><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
+   </array>
+   ```
+3. **Reload the LaunchAgent** (required for changes to take effect):
+   ```bash
+   launchctl bootout gui/$(id -u) /Users/vakandi/EliaAI/subworkers/plists/com.elia.<agent-id>.plist
+   launchctl bootstrap gui/$(id -u) /Users/vakandi/EliaAI/subworkers/plists/com.elia.<agent-id>.plist
+   ```
+
+**Common schedule patterns:**
+| Pattern | StartCalendarInterval |
+|---------|----------------------|
+| Every hour 9am–11pm | Hours 9–23, Minute 0 |
+| Twice daily (9am, 2pm) | Hour 9 + Hour 14, Minute 0 |
+| Every 30 min (9am–5pm) | Hours 9–17, Minutes 0 + 30 |
+| Once daily at 6am | Hour 6, Minute 0 |
+
+**⚠️ Important:** After editing the plist, you **MUST** reload it with `launchctl bootout` + `bootstrap`. The Electron UI toggle does this automatically when you enable/disable, but manual plist edits require manual reload.
+
+### 8.4 Setting Up a New Subworker for Auto-Run
+
+For a subworker to run automatically on schedule:
+
+1. **Create the plist** at `subworkers/plists/com.elia.<agent-id>.plist` (use template in §7.1)
+2. **Create `.enabled` file**: `touch subworkers/<agent-id>/.enabled`
+3. **Load into launchd**: `launchctl bootstrap gui/$(id -u) subworkers/plists/com.elia.<agent-id>.plist`
+4. **Verify**: `launchctl list | grep com.elia.<agent-id>` — should show a PID or `-` (loaded, waiting for schedule)
+
+**Or use the Electron UI:**
+1. Open the subworker popup
+2. Click the toggle switch for the agent
+3. The UI creates `.enabled` + loads the plist automatically
+
+### 8.5 Current Subworker Status (as of Aug 2026)
+
+| Subworker | .enabled | Plist | Launchd Status | Schedule |
+|-----------|----------|-------|----------------|----------|
+| refund-hunter | ✅ | ✅ | Loaded (PID 62965) | 10:00–22:00 hourly |
+| bene2luxe-promoter | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
+| bene2luxe-suppliers | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
+| cobou-promoter | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
+| mirorpay-community-organic | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
+| mirorpay-seo | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
+| mirrorpay-telegram | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
+| vcam-community-organic | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
+| vcam-seo | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
+| teleorbit-community-organic | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
+| teleorbit-seo | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
+| reddit-saas-scraper | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
+| tempack-dev | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
+| tiktok-content | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
+
+**To enable any subworker:** Click the toggle switch in the Electron UI (or run `touch subworkers/<agent-id>/.enabled` + `launchctl bootstrap gui/$(id -u) subworkers/plists/com.elia.<agent-id>.plist` manually).
+
+---
+
 ## 9. Troubleshooting
 
-### Issue: Account Ban
+| Issue | Solution |
+|-------|----------|
+| Agent not responding | Check `launchctl list \| grep com.elia` |
+| Trigger skips with ".enabled not found" | Create `subworkers/<agent-id>/.enabled` or run with `--force` flag for manual terminal runs |
+| OpenCode TUI says `Config invalid - run doctor` and shows `../.omo/omo.jsonc: Un...` | The project config is likely wrapped in `[opencode]` when it should use top-level `agents` / `categories` / `task` / `teams`. Flatten the file to the current `omo.jsonc` schema and keep `[opencode]` only for actual harness overrides like `codegraph`. |
+| Parallel subworkers crash OpenCode with `FileSystem.open (.../opencode.log)` | The trigger should be launching with per-run temp `XDG_DATA_HOME` / `XDG_CACHE_HOME` / `XDG_STATE_HOME`. If you still see the host path, update `trigger_template.js` and restart the Electron UI so the button picks up the new wrapper. |
+| `EPERM: operation not permitted` on `oh-my-opencode` | Bun global package is a symlink to a local source checkout. Fix: `rm -rf ~/.bun/install/global/node_modules/oh-my-opencode && bun install -g oh-my-opencode` |
+| MCP not connecting | `mcp-cli list` + restart if needed |
+| Rate limited | Wait 1h + reduce frequency |
+| Account banned | Stop immediately, wait 24-48h |
 
-**Solution:**
-1. Stop the LaunchAgent immediately
-2. Wait 24-48 hours
-3. Reduce action rate
-4. Use longer delays between actions
-5. Warm up account gradually
+### 8.1 Bun Global Symlink Pitfall (macOS EPERM)
 
-### Issue: Rate Limited
+**Symptom**: The trigger script's log shows `EPERM: operation not permitted` when trying to read `oh-my-opencode.js`, even though the file exists and permissions look correct. The error happens at the Node.js module loading stage (`Module._extensions..js` → `defaultLoadImpl` → `readFileSync`).
 
-**Solution:**
-1. Use exponential backoff
-2. Add more delay between actions
-3. Rotate accounts
-4. Use residential proxies
+**Root cause**: `bun install -g oh-my-opencode` was run from within a local clone of the oh-my-openagent repository. Bun creates a **symlink** in `~/.bun/install/global/node_modules/oh-my-opencode` pointing to the local checkout instead of copying the package files. When `oh-my-opencode` tries to load modules through this symlink chain, macOS blocks the read because the local checkout files may have `com.apple.provenance` extended attributes (set on downloaded/quarantined files).
 
-### Issue: MCP Not Connecting
+**Detection**:
+```bash
+# Check if the global package is a symlink
+ls -la ~/.bun/install/global/node_modules/oh-my-opencode
+# If it shows: oh-my-opencode -> /some/local/path → BROKEN
+# If it shows: drwxr-xr-x ... oh-my-opencode → OK (proper install)
+```
 
-**Solution:**
-1. Check MCP server is running: `mcp-cli list`
-2. Restart MCP: `pkill -f mcp && mcp-cli &`
-3. Verify config: `mcp-cli call <server> list_tools`
+**Fix**:
+```bash
+rm -rf ~/.bun/install/global/node_modules/oh-my-opencode
+bun install -g oh-my-opencode
+```
 
----
+**Prevention**: The Node.js trigger (`trigger_template.js`) handles binary resolution via a `which()` function that checks `~/.bun/bin`, `~/.opencode/bin`, `/opt/homebrew/bin`, and `/usr/local/bin`. If `oh-my-opencode` is not found, the trigger fails immediately with a clear error message instead of a cryptic EPERM stack trace.
 
-## 10. Checklist Final
-
-Coche chaque étape quand elle est COMPLÉTÉE:
-
-- [ ] **Step 1:** Dossiers créés
-  ```bash
-  ls /path/to/EliaAI/subworkers/
-  # Doit显示: yourco-promoter/ yourbrand-promoter/ scripts/ plists/ logs/
-  ```
-
-- [ ] **Step 2:** PROMPT.md YourCo créé
-  ```bash
-  cat /path/to/EliaAI/subworkers/yourco-promoter/PROMPT.md | head -30
-  ```
-
-- [ ] **Step 3:** PROMPT.md YourBrand créé
-  ```bash
-  cat /path/to/EliaAI/subworkers/yourbrand-promoter/PROMPT.md | head -30
-  ```
-
-- [ ] **Step 4:** OpenCode configuré + redémarré
-  ```bash
-  # Après redémarrage: /agents doit montrer les 2 nouveaux agents
-  ```
-
-- [ ] **Step 5:** Librairies Python installées
-  ```bash
-  python3 -c "import instagrapi, linkedin_scraper, TikTokApi; print('OK')"
-  ```
-
-- [ ] **Step 6:** Scripts trigger créés + exécutables
-  ```bash
-  ls -la /path/to/EliaAI/subworkers/scripts/
-  # Doit montrer: trigger_yourco_promoter.sh, trigger_yourbrand_promoter.sh (avec *)
-  ```
-
-- [ ] **Step 7:** LaunchAgent plists créés
-  ```bash
-  ls /path/to/EliaAI/subworkers/plists/
-  # Doit montrer: com.elia.yourco-promoter.plist, com.elia.yourbrand-promoter.plist
-  ```
-
-- [ ] **Step 8:** LaunchAgents chargés et actifs
-  ```bash
-  launchctl list | grep -i promoter
-  # Doit montrer: com.elia.yourco-promoter, com.elia.yourbrand-promoter
-  ```
-
-- [ ] **Step 9:** Test réussi - rapport Discord envoyé
-  ```bash
-  # Vérifier dans Discord #clients: rapport received
-  tail -50 /path/to/EliaAI/subworkers/logs/promoter_yourco.log
-  ```
-
----
-
-**QUESTIONS FRÉQUENTES**
-
-| Question | Réponse |
-|----------|---------|
-| Le bot ne répond pas | Vérifier: `launchctl list \| grep -i promoter` |
-| MCP pas connect | `mcp-cli list` + restart si besoin |
-| Rate limit atteint | Attendre 1h + réduire fréquence |
-| Ban account | Arrêter immédiatement, attendre 24-48h |
+**Why it only affects `oh-my-opencode run` and not `oh-my-opencode --version`**: The `--version` flag reads `package.json` directly from the wrapper script location and exits before loading the platform-specific binary. The `run` command (and most other commands) trigger the full module loading chain, which traverses the symlink and hits macOS security restrictions.
 
 ---
 

@@ -633,19 +633,72 @@
     const runsCache = {};
     // Track selected model per agent: { agentName: modelSlug }
     const modelSelections = {};
+    const DEFAULT_SUBWORKER_MODEL = 'opencode/big-pickle';
+    const MODEL_CHOICES = [
+      { runtime: 'opencode/big-pickle', display: 'Big Pickle' },
+      { runtime: 'opencode/nemotron-3.5-lightning-free', display: 'opencode/nemotron-3.5-lightning-free' },
+      { runtime: 'opencode/nemotron-3-ultra-free', display: 'opencode/nemotron-3-ultra-free' },
+      { runtime: 'opencode/hy3-free', display: 'opencode/hy3-free' },
+      { runtime: 'opencode/laguna-s-2.1-free', display: 'opencode/laguna-s-2.1-free' },
+      { runtime: 'opencode/mimo-v2.5-free', display: 'opencode/mimo-v2.5-free' },
+      { runtime: 'opencode/deepseek-v4-flash-free', display: 'opencode/deepseek-v4-flash-free' },
+      { runtime: 'google/gemini-2.5-flash-lite', display: 'google/gemini-2.5-flash-lite' },
+      { runtime: 'google/gemma-4-26b-a4b-it', display: 'google/gemma-4-26b-a4b-it' },
+      { runtime: 'google/gemma-4-31b-it', display: 'google/gemma-4-31b-it' },
+    ];
+    const MODEL_LABELS = Object.fromEntries(MODEL_CHOICES.map(choice => [choice.runtime, choice.display]));
+    const MODEL_ALIASES = {
+      'opencode/nemotron-3-lightning-free': 'opencode/nemotron-3.5-lightning-free',
+      'opencode/hy-free': 'opencode/hy3-free',
+      'opencode/laguna-free': 'opencode/laguna-s-2.1-free',
+      'opencode/north-code': 'opencode/big-pickle',
+      'google/gemini-2.5-flash-lite:free': 'google/gemini-2.5-flash-lite',
+      'google/gemma-4-26b-a4b-it:free': 'google/gemma-4-26b-a4b-it',
+      'google/gemma-4-31b-it:free': 'google/gemma-4-31b-it',
+    };
+
+    function normalizeModelId(model) {
+      if (!model) return DEFAULT_SUBWORKER_MODEL;
+      const aliased = MODEL_ALIASES[model] || model;
+      if (!aliased.includes('/')) {
+        if (aliased.startsWith('gemini-') || aliased.startsWith('gemma-')) {
+          return `google/${aliased}`;
+        }
+      }
+      return aliased;
+    }
+
+    function getModelLabel(model) {
+      const normalized = normalizeModelId(model);
+      return MODEL_LABELS[normalized] || normalized.split('/').pop();
+    }
 
     async function loadModelSelections() {
       try {
         const saved = await window.popupAPI.getModelSelections();
         if (saved && typeof saved === 'object') {
-          Object.assign(modelSelections, saved);
+          Object.entries(saved).forEach(([name, model]) => {
+            const normalized = normalizeModelId(model);
+            modelSelections[name] = normalized;
+            if (normalized !== model) {
+              window.popupAPI.saveModelSelection(name, normalized);
+            }
+          });
         }
       } catch (_) {}
     }
 
     function saveModelSelection(name, model) {
-      modelSelections[name] = model;
-      window.popupAPI.saveModelSelection(name, model);
+      const normalized = normalizeModelId(model);
+      modelSelections[name] = normalized;
+      window.popupAPI.saveModelSelection(name, normalized);
+    }
+
+    function buildModelOptions(name, selectedModel) {
+      return MODEL_CHOICES.map(choice => {
+        const selectedCls = selectedModel === choice.runtime ? ' selected' : '';
+        return `<div class="model-option${selectedCls}" data-model="${choice.runtime}"><span class="model-dot"></span>${escHtml(choice.display)}</div>`;
+      }).join('');
     }
 
     function renderSubworkers(workers) {
@@ -664,6 +717,8 @@
       }
       grid.innerHTML = '';
       workers.forEach((w, idx) => {
+        const selectedModel = normalizeModelId(modelSelections[w.name] || DEFAULT_SUBWORKER_MODEL);
+        modelSelections[w.name] = selectedModel;
         const wrap = document.createElement('div');
         wrap.className = 'subworker-card-wrap';
         wrap.dataset.agentName = w.name;
@@ -686,12 +741,9 @@
             <div class="subworker-name-row">
               <div class="subworker-name">${escHtml(w.label)}</div>
               <div class="model-select-wrap">
-                <div class="model-badge" data-name="${w.name}" title="Select model">⚡ ${(modelSelections[w.name] || 'opencode/big-pickle').split('/').pop()}</div>
+                <div class="model-badge" data-name="${w.name}" title="Select model">⚡ ${escHtml(getModelLabel(selectedModel))}</div>
                 <div class="model-dropdown" data-name="${w.name}">
-                  <div class="model-option${(!modelSelections[w.name] || modelSelections[w.name] === 'opencode/big-pickle') ? ' selected' : ''}" data-model="opencode/big-pickle"><span class="model-dot"></span>big-pickle</div>
-                  <div class="model-option${modelSelections[w.name] === 'opencode/deepseek-v4-flash-free' ? ' selected' : ''}" data-model="opencode/deepseek-v4-flash-free"><span class="model-dot"></span>deepseek-v4-flash (free)</div>
-                  <div class="model-option${modelSelections[w.name] === 'opencode/mimo-v2.5-free' ? ' selected' : ''}" data-model="opencode/mimo-v2.5-free"><span class="model-dot"></span>mimo-v2.5 (free)</div>
-                  <div class="model-option${modelSelections[w.name] === 'opencode/nemotron-3-ultra-free' ? ' selected' : ''}" data-model="opencode/nemotron-3-ultra-free"><span class="model-dot"></span>nemotron-3-ultra (free)</div>
+                  ${buildModelOptions(w.name, selectedModel)}
                 </div>
               </div>
               <button class="start-btn" data-name="${w.name}" title="Start agent">
@@ -772,7 +824,7 @@
         btn.addEventListener('click', function(e) {
           e.stopPropagation();
           const name = this.dataset.name;
-          const model = modelSelections[name] || 'opencode/big-pickle';
+          const model = normalizeModelId(modelSelections[name] || DEFAULT_SUBWORKER_MODEL);
           window.popupAPI.runSubworkerNow(name, model);
         });
       });
@@ -796,7 +848,7 @@
       document.querySelectorAll('.model-option').forEach(opt => {
         opt.addEventListener('click', function(e) {
           e.stopPropagation();
-          const model = this.dataset.model;
+          const model = normalizeModelId(this.dataset.model);
           const dropdown = this.closest('.model-dropdown');
           const name = dropdown.dataset.name;
           const badge = dropdown.previousElementSibling;
@@ -804,7 +856,7 @@
           dropdown.querySelectorAll('.model-option').forEach(o => o.classList.remove('selected'));
           this.classList.add('selected');
           // Update badge text
-          badge.textContent = '⚡ ' + model.split('/').pop();
+          badge.textContent = '⚡ ' + getModelLabel(model);
           // Store selection
           saveModelSelection(name, model);
           // Close dropdown

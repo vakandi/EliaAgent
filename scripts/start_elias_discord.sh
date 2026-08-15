@@ -39,7 +39,7 @@ for env in "${BOT_DIR}/.env" "${AGENT_DIR}/.env"; do
         
         source venv/bin/activate
         
-        if ! python -c "import discord" 2>/dev/null; then
+        if ! python -c "import discord" 2>/dev/null || ! python -c "import structlog" 2>/dev/null; then
             echo "Installing dependencies..."
             pip install -r requirements.txt
         fi
@@ -47,9 +47,9 @@ for env in "${BOT_DIR}/.env" "${AGENT_DIR}/.env"; do
         echo "Starting EliaDiscord bot..."
         mkdir -p "${BOT_DIR}/logs"
         if [[ -n "$PROXY_HTTP" ]]; then
-            env HTTP_PROXY="$PROXY_HTTP" HTTPS_PROXY="$PROXY_HTTPS" http_proxy="$PROXY_HTTP" https_proxy="$PROXY_HTTPS" python bot.py
+            env HTTP_PROXY="$PROXY_HTTP" HTTPS_PROXY="$PROXY_HTTPS" http_proxy="$PROXY_HTTP" https_proxy="$PROXY_HTTPS" python main.py
         else
-            python bot.py
+            python main.py
         fi
         exit 0
     fi

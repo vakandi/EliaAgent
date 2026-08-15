@@ -36,6 +36,41 @@ const EliaAIRoot = path.join(__dirname, '..', '..');
 const contextPath = path.join(EliaAIRoot, 'context');
 const subworkersRoot = path.join(EliaAIRoot, 'subworkers');
 
+function resolveNodeBin() {
+  const explicitNode = process.env.ELIA_NODE_BIN;
+  if (explicitNode && fs.existsSync(explicitNode)) return explicitNode;
+
+  const home = process.env.HOME || require('os').homedir();
+  const candidates = [];
+  const nvmRoot = path.join(home, '.nvm', 'versions', 'node');
+  try {
+    if (fs.existsSync(nvmRoot)) {
+      candidates.push(
+        ...fs.readdirSync(nvmRoot)
+          .filter(version => version.startsWith('v'))
+          .sort()
+          .reverse()
+          .map(version => path.join(nvmRoot, version, 'bin', 'node'))
+      );
+    }
+  } catch (_) {}
+  candidates.push(
+    path.join(home, '.bun', 'bin', 'node'),
+    '/opt/homebrew/bin/node',
+    '/usr/local/bin/node',
+  );
+  for (const candidate of candidates) {
+    if (candidate && fs.existsSync(candidate)) return candidate;
+  }
+
+  try {
+    const fromPath = execSync('which node', { encoding: 'utf8' }).trim();
+    if (fromPath) return fromPath;
+  } catch (_) {}
+
+  return '/usr/bin/env node';
+}
+
 function loadContextFiles() {
   const context = { memory: '', tools: '', business: '' };
   try {
@@ -362,8 +397,8 @@ function getSubworkerStatus() {
           { encoding: 'utf8' }
         ).trim();
         if (out && !out.includes('Could not find')) {
-          const lastField = out.split('\t').pop() || '';
-          running = lastField !== ''; // non-empty = process is running
+          const pidField = out.split('\t')[0] || '';
+          running = pidField !== '' && /^\d+$/.test(pidField.trim());
         }
       } catch (e) {}
 
@@ -457,7 +492,7 @@ ipcMain.on('get-selected-model', (event) => {
   // This will be handled by the renderer process
   // We need to get the selected model from the renderer
   mainWindow?.webContents.executeJavaScript(`
-    localStorage.getItem('selectedModel') || 'minimax'
+    localStorage.getItem('selectedModel') || 'opencode/nemotron-3-lightning-free'
   `).then(model => {
     event.reply('selected-model', model);
   });
@@ -475,7 +510,7 @@ ipcMain.on('set-selected-model', (event, model) => {
 const opencodeModelPath = path.join(EliaAIRoot, '.opencode_model');
 function writeModelForCron(model) {
   if (!model || typeof model !== 'string') return;
-  const safe = ['big-pickle', 'nvidia', 'minimax'].includes(model) ? model : 'minimax';
+  const safe = ['opencode/big-pickle', 'big-pickle', 'opencode/nemotron-3-lightning-free', 'opencode/mimo-v2.5-free', 'opencode/deepseek-v4-flash-free'].includes(model) ? model : 'opencode/nemotron-3-lightning-free';
   try {
     fs.writeFileSync(opencodeModelPath, safe + '\n', 'utf8');
   } catch (e) {
@@ -652,8 +687,8 @@ ipcMain.on('toggle-subworker', (event, name) => {
       { encoding: 'utf8' }
     ).trim();
     if (out && !out.includes('Could not find')) {
-      const lastField = out.split('\t').pop() || '';
-      running = lastField !== '';
+      const pidField = out.split('\t')[0] || '';
+      running = pidField !== '' && /^\d+$/.test(pidField.trim());
     }
   } catch (e) {}
 
@@ -730,7 +765,7 @@ ipcMain.on('open-logs-terminal', () => {
   const path = require('path');
   
   // Find latest opencode_interactive log file
-  const logsDir = path.join(EliaAIRoot, 'logs');
+  const logsDir = '/Users/vakandi/EliaAI/logs';
   let latestLog = null;
   let latestTime = 0;
   
@@ -749,7 +784,7 @@ ipcMain.on('open-logs-terminal', () => {
   } catch (e) {}
   
   // Fallback to cron.log if no opencode log found
-  const logFile = latestLog || path.join(EliaAIRoot, 'logs', 'cron.log');
+  const logFile = latestLog || '/Users/vakandi/EliaAI/logs/cron.log';
   // Show whole file + follow in realtime
   const cmd = 'tail -n 5000 -f ' + logFile;
   
@@ -814,7 +849,8 @@ ipcMain.on('run-subworker-now', (_event, name, model) => {
   }
   const agentName = name.replace(/-/g, '_');
   const modelFlag = model ? ` --model ${model}` : '';
-  const termCmd = `node "${triggerScript}" --agent ${agentName}${modelFlag} --force 2>&1 | tee /tmp/subworker_run_${name}.log; echo "EXIT:$?"`;
+  const nodeBin = resolveNodeBin();
+  const termCmd = `${JSON.stringify(nodeBin)} "${triggerScript}" --agent ${agentName}${modelFlag} --force 2>&1 | tee /tmp/subworker_run_${name}.log; echo "EXIT:$?"`;
   const script = [
     'tell application "Terminal" to activate',
     'tell application "Terminal" to do script ' + JSON.stringify(termCmd),
@@ -822,7 +858,12 @@ ipcMain.on('run-subworker-now', (_event, name, model) => {
     'tell application "Terminal" to set bounds of front window to {20, 50, 900, 500}'
   ].map(s => '-e ' + JSON.stringify(s)).join(' ');
   exec('osascript ' + script, (error) => {
-    if (error) console.error('run-subworker-now error:', error.message);
+    if (error) { console.error('run-subworker-now error:', error.message); return; }
+    const enabledPath = path.join(subworkersRoot, name, '.enabled');
+    const enabled = fs.existsSync(enabledPath);
+    if (subworkerPopup && !subworkerPopup.isDestroyed()) {
+      subworkerPopup.webContents.send('subworker-toggled', { name, enabled, running: true });
+    }
   });
 });
 
@@ -995,11 +1036,12 @@ ipcMain.on('execute-elia-command', () => {
   mainWindow.webContents.executeJavaScript('localStorage.getItem("selectedModel") || "minimax"')
     .then(model => {
       const modelMap = {
-        'big-pickle': 'big-pickle',
-        'nvidia': 'nvidia',
-        'minimax': 'minimax'
+        'opencode/big-pickle': 'opencode/big-pickle',
+        'opencode/nemotron-3-lightning-free': 'opencode/nemotron-3-lightning-free',
+        'opencode/mimo-v2.5-free': 'opencode/mimo-v2.5-free',
+        'opencode/deepseek-v4-flash-free': 'opencode/deepseek-v4-flash-free'
       };
-      const modelValue = modelMap[model] || 'minimax';
+      const modelValue = modelMap[model] || 'opencode/nemotron-3-lightning-free';
 
       const proxyEnabled = fs.existsSync(proxyStatePath);
 
@@ -1017,7 +1059,7 @@ ipcMain.on('execute-elia-command', () => {
               const user = parts[3];
               const pass = parts[4];
               const proxyUrl = `http://${user}:${pass}@${ip}:${port}`;
-              cmd = `cd ${EliaAIRoot} && env HTTP_PROXY="${proxyUrl}" HTTPS_PROXY="${proxyUrl}" http_proxy="${proxyUrl}" https_proxy="${proxyUrl}" ELIA_MODEL=${modelValue} ~/Documents/dictate.command`;
+              cmd = `cd /Users/vakandi/EliaAI && env HTTP_PROXY="${proxyUrl}" HTTPS_PROXY="${proxyUrl}" http_proxy="${proxyUrl}" https_proxy="${proxyUrl}" ELIA_MODEL=${modelValue} /Users/vakandi/Documents/dictate.command`;
             }
           }
         } catch (e) {
@@ -1026,7 +1068,7 @@ ipcMain.on('execute-elia-command', () => {
       }
 
       if (!cmd) {
-        cmd = `cd ${EliaAIRoot} && ELIA_MODEL=${modelValue} ~/Documents/dictate.command`;
+        cmd = `cd /Users/vakandi/EliaAI && ELIA_MODEL=${modelValue} /Users/vakandi/Documents/dictate.command`;
       }
 
       const script = [
@@ -1063,7 +1105,7 @@ ipcMain.on('execute-mini-orb', () => {
           const user = parts[3];
           const pass = parts[4];
           const proxyUrl = `http://${user}:${pass}@${ip}:${port}`;
-          cmd = `env HTTP_PROXY="${proxyUrl}" HTTPS_PROXY="${proxyUrl}" http_proxy="${proxyUrl}" https_proxy="${proxyUrl}" ${EliaAIRoot}/scripts/voice-command-only.sh`;
+          cmd = `env HTTP_PROXY="${proxyUrl}" HTTPS_PROXY="${proxyUrl}" http_proxy="${proxyUrl}" https_proxy="${proxyUrl}" /Users/vakandi/EliaAI/scripts/voice-command-only.sh`;
         }
       }
     } catch (e) {
@@ -1072,7 +1114,7 @@ ipcMain.on('execute-mini-orb', () => {
   }
   
   if (!cmd) {
-    cmd = `${EliaAIRoot}/scripts/voice-command-only.sh`;
+    cmd = '/Users/vakandi/EliaAI/scripts/voice-command-only.sh';
   }
   
   const script = [
@@ -1151,7 +1193,7 @@ function loadCurrentModel() {
     const modelPath = path.join(EliaAIRoot, '.opencode_model');
     if (fs.existsSync(modelPath)) {
       const model = fs.readFileSync(modelPath, 'utf8').trim();
-      if (['big-pickle', 'nvidia', 'minimax'].includes(model)) {
+      if (['big-pickle', 'opencode/big-pickle', 'nemotron-lightning', 'mimo-v2.5-free', 'deepseek-v4-flash-free'].includes(model)) {
         trayMenuState.selectedModel = model;
         return model;
       }
@@ -1165,7 +1207,7 @@ function loadCurrentModel() {
 // Get current scheduler settings — standardEnabled follows the real LaunchAgent plist (not stale .scheduler_state).
 function getCurrentCronSettings() {
   const stateFile = path.join(EliaAIRoot, '.scheduler_state');
-  const home = process.env.HOME;
+  const home = process.env.HOME || '/Users/vakandi';
   const launchdPlist = path.join(home, 'Library/LaunchAgents/com.elia.elia-agent.plist');
   const morningPlist = path.join(home, 'Library/LaunchAgents/com.elia.elia-agent-morning.plist');
   const plistInstalled = fs.existsSync(launchdPlist);
@@ -1264,8 +1306,12 @@ function updateTrayMenu() {
   
   const models = [
     { id: 'minimax', label: 'MiniMax 2.5' },
-    { id: 'big-pickle', label: 'Big Pickle' },
-    { id: 'nvidia', label: 'Kimi 2.5' }
+    { id: 'opencode/big-pickle', label: 'Big Pickle (OpenCode Zen)' },
+    { id: 'nvidia', label: 'Kimi 2.5' },
+    { id: 'hy3', label: 'Hy3' },
+    { id: 'laguna', label: 'Laguna' },
+    { id: 'nemotron-ultra', label: 'Nemotron Ultra' },
+    { id: 'nemotron-lightning', label: 'Nemotron Lightning' }
   ];
 
   const modelSubmenu = models.map(m => ({
@@ -1459,7 +1505,7 @@ function saveTraySettings() {
 }
 
 function createTray() {
-  const iconPath = path.join(EliaAIRoot, 'ui_electron', 'imgs', 'electronui.png');
+  const iconPath = '/Users/vakandi/EliaAI/ui_electron/imgs/electronui.png';
   let trayIcon = nativeImage.createFromPath(iconPath);
   if (trayIcon.isEmpty()) {
     trayIcon = nativeImage.createEmpty();
@@ -1522,7 +1568,7 @@ function runMorningSpeak() {
   const fs = require('fs');
   const path = require('path');
   
-  const eliaAI = EliaAIRoot;
+  const eliaAI = '/Users/vakandi/EliaAI';
   const promptFile = path.join(eliaAI, '.morning_briefing_prompt.txt');
   
   const morningPrompt = `MORNING BRIEFING - COMPREHENSIVE DAILY UPDATE:
@@ -1542,7 +1588,7 @@ MUST DO:
 2. CHECK TELEGRAM: Read recent messages from Watson IA group (chat ID: -5148361692)
 3. CHECK WHATSAPP: Read B2LUXE BUSINESS (120363408208578679@g.us) and COBOU PowerRangers (120363420711538035@g.us)
 4. CHECK JIRA: Get pending tickets for BEN, COBOUAGENC, ZOVAPANEL, TIKYT
-5. CHECK MEMORY FILES: Read ~/EliaAI/memory/*.md for important context
+5. CHECK MEMORY FILES: Read /Users/vakandi/EliaAI/memory/*.md for important context
 6. GATHER BUSINESS UPDATES: Status of all 8 businesses
 7. IDENTIFY ACTION ITEMS: What needs Wael's attention today?
 8. IDENTIFY WAITING ON: What are team members waiting for?

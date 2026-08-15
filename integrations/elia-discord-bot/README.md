@@ -1,68 +1,106 @@
-# EliaDiscord Bot
+# EliaDiscord Bot v2 — Production SaaS Rebuild
 
-Discord integration for EliaAI - Talk to Elia from any channel in your Discord server.
+## 🎯 Goal
 
-## Quick Start
+Rebuild the EliaDiscord bot from scratch to be a high-performance, scalable, and reliable production SaaS integration. The current version has perfect logic (message queue, context injection, channel awareness) but suffers from performance bottlenecks that cause lagging and crashes after a single message.
 
-### 1. Create a Discord Bot
+## 🚀 Architecture Principles
 
-1. Go to https://discord.com/developers/applications
-2. Create a new application
-3. Go to "Bot" section and create a bot
-4. Enable **Message Content Intent** in Bot settings
-5. Copy the bot token
+1.  **Async-First**: All I/O operations (HTTP requests, file I/O) must be non-blocking.
+2.  **Concurrency Control**: Use semaphores to limit concurrent OpenCode requests, preventing resource exhaustion.
+3.  **Stateless Design**: Move session state out of the process (Redis/DB) or use ephemeral sessions to allow horizontal scaling.
+4.  **Observability**: Structured logging and health checks for monitoring.
+5.  **Graceful Degradation**: Handle OpenCode downtime or slowness without crashing the Discord bot.
 
-### 2. Invite Bot to Server
+## 🧩 Features (Preserved from v1)
 
-1. Go to "OAuth2" → "URL Generator"
-2. Select scopes: `bot`
-3. Select permissions: `Send Messages`, `Read Message History`, `Use Slash Commands`
-4. Use the generated URL to invite the bot
+*   **Context Injection**: Automatically injects channel context (name, ID, recent messages) into the prompt so the AI knows where to answer.
+*   **MCP Integration**: Prompts are formatted to include `mcp-cli` instructions for direct Discord replies.
+*   **Triggers**: Responds to bot mentions and replies.
+*   **Slash Commands**:
+    *   `/elia <message>`: Talk to Elia.
+    *   `/elia-reset`: Reset session.
+    *   `/elia-new`: Create new session.
+    *   `/elia-session-list`: List sessions.
+    *   `/elia-session-select`: Switch session.
+*   **Error Reporting**: Logs errors to a dedicated Discord channel.
+*   **Access Control**: Restrict slash commands and mention triggers to approved Discord user IDs via `DISCORD_ALLOWED_USER_IDS`.
 
-### 3. Configure
+## 🛠️ Technical Stack
 
-```bash
-cd elia-discord-bot
-cp .env.example .env
+*   **Language**: Python 3.11+
+*   **Discord Library**: `discord.py` (async)
+*   **HTTP Client**: `httpx` (async) — replacing synchronous `opencode-ai` calls.
+*   **Logging**: `structlog` (structured, performant).
+*   **State Management**: In-memory with TTL (or optional Redis).
+*   **Deployment**: Docker container.
+
+### Access Control
+
+Set `DISCORD_ALLOWED_USER_IDS` to a comma-separated list of Discord user IDs. The bot will only accept `/elia`, `/elia-new`, `/elia-reset`, `/elia-session-list`, and @mention prompts from those users.
+
+## 📦 Project Structure
+
+```
+integrations/elia-discord-bot/
+├── pyproject.toml
+├── Dockerfile
+├── docker-compose.yml
+├── README.md
+├── src/
+│   ├── __init__.py
+│   ├── bot.py              # Discord bot core
+│   ├── config.py           # Settings & Environment
+│   ├── opencode_client.py  # Async OpenCode API wrapper
+│   ├── session_manager.py  # Session lifecycle
+│   ├── message_handler.py  # Message processing & formatting
+│   ├── context_tracker.py  # Channel context tracking
+│   └── logging_config.py   # Structured logging setup
+└── .env.example
 ```
 
-Edit `.env`:
-```
-DISCORD_BOT_TOKEN=your_token_here
-OPENCODE_HOST=http://localhost:8080
-OPENCODE_API_KEY=
-```
+## 🚨 Performance Bottlenecks to Fix
 
-### 4. Install & Run
+1.  **Synchronous HTTP Calls**: `opencode-ai` uses synchronous `requests` under the hood. Replace with `httpx.AsyncClient`.
+2.  **Busy-Wait Loop**: The current `send_message` polls session status every 2s. Replace with async polling or webhooks if available.
+3.  **Single-Threaded Queue**: The `MessageQueue` processes one message at a time. Replace with a worker pool controlled by `asyncio.Semaphore`.
+4.  **Memory Leaks**: `MessageTracker` grows indefinitely. Implement TTL-based eviction.
+5.  **Blocking Initialization**: `_detect_opencode_host` runs synchronous HTTP checks. Make it async.
 
-```bash
-# Via script
-../scripts/start_elias_discord.sh
+## 📋 Implementation Plan
 
-# Or manually
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-python bot.py
-```
+### Phase 1: Core Infrastructure
+1.  **Setup**: `pyproject.toml` with dependencies (`discord.py`, `httpx`, `structlog`).
+2.  **Config**: `config.py` using `pydantic-settings` for environment variables.
+3.  **Logging**: `structlog` configuration for JSON logging.
 
-## Usage
+### Phase 2: Async OpenCode Client
+1.  **Wrapper**: `opencode_client.py` with `httpx.AsyncClient`.
+2.  **Endpoints**: `create_session`, `send_message`, `list_sessions`, `delete_session`.
+3.  **Retry Logic**: Exponential backoff for transient errors.
 
-### Mention Elia
-```
-@YourBotName hey, can you help me with something?
-```
+### Phase 3: Message Handling
+1.  **Formatter**: `message_handler.py` to format prompts with Discord context.
+2.  **Context Tracker**: `context_tracker.py` with TTL-based message history.
+3.  **Concurrency**: `asyncio.Semaphore` to limit concurrent OpenCode requests.
 
-### Slash Commands
-- `/elia <message>` - Talk to Elia directly
-- `/elia-reset` - Reset session and start fresh
+### Phase 4: Discord Bot Integration
+1.  **Bot Core**: `bot.py` with `discord.py` client.
+2.  **Events**: `on_ready`, `on_message`.
+3.  **Commands**: Slash commands implementation.
 
-## Commands
+### Phase 5: Deployment
+1.  **Dockerfile**: Multi-stage build for small image.
+2.  **Health Check**: `/health` endpoint for monitoring.
 
-```bash
-# Start bot
-./scripts/start_elias_discord.sh
+## 🧪 Testing Strategy
 
-# Stop bot
-./scripts/stop_elias_discord.sh
-```
+*   **Unit Tests**: Mock OpenCode API calls.
+*   **Integration Tests**: Mock Discord API.
+*   **Load Testing**: Simulate multiple concurrent users.
+
+## 📊 Success Metrics
+
+*   **Latency**: Response time < 2s for simple queries.
+*   **Throughput**: Handle 10+ concurrent messages without queuing delays.
+*   **Stability**: Run for 24h+ without crashes or memory leaks.

@@ -7,6 +7,28 @@
 
 ---
 
+## 🚫 RÈGLE ABSOLUE N°1 — LES AGENTS NE SE MODIFIENT JAMAIS EUX-MÊMES
+
+> **CE PRÉFIXE EST TRANSMIS À TOUS LES SUBWORKERS, SANS EXCEPTION. AUCUN AGENT N'ÉDITE, NE CRÉE, NE SUPPRIME NI NE REMPLACE SA PROPRE INFRASTRUCTURE.**
+
+**Interdiction totale et permanente**, applicable à chaque run, quel que soit le contexte : run normal, run forcé (`--force`), mode setup, mode débug, tâche ambiguë, "PROMPT.md partagé par l'utilisateur", etc.
+
+**Fichiers VERROUILLÉS (lecture seule pour l'agent) :**
+- Son propre `PROMPT.md` (`subworkers/<agent>/PROMPT.md`)
+- Son fichier de personnalité (`~/.config/opencode/agents/<agent>.md`)
+- Ses scripts de trigger, `.enabled`, `.loop_mode`, plists (`subworkers/plists/`, `~/Library/LaunchAgents/`)
+- `SUBWORKERS_SYSTEM.md`, `opencode.json`, registres d'agents, `context/TOOLS.md`
+- Ses skills (`~/.config/opencode/skills/<agent>/`)
+- **TOUT fichier situé hors de son `workspace/`**
+
+**Territoire d'écriture :** chaque agent n'écrit QUE dans `subworkers/<agent>/workspace/`. Tout le reste du système est en lecture seule.
+
+**Comportement attendu si un fichier système semble cassé ou manquant :** signaler dans `HANDOFF_NEXT_SESSION.md` + rapport de fin de run. **NE JAMAIS corriger soi-même.** Seul Wael ou l'agent principal Elia modifie le système.
+
+> ⚠️ Un subworker qui se modifie lui-même = violation fatale. Ceci n'est pas une suggestion, c'est la règle n°1 du système.
+
+---
+
 ## Table of Contents
 
 1. [Overview](#1-overview)
@@ -16,6 +38,7 @@
 5. [Trigger Template](#5-trigger-template)
 6. [Tools & MCP Servers](#6-tools--mcp-servers)
 7. [LaunchAgent Setup](#7-launchagent-setup)
+8. [Enable/Disable & Schedule Management](#8-enabledisable--schedule-management)
 
 ---
 
@@ -55,7 +78,16 @@ EliaAI/subworkers/
 │   ├── <agent_name>.log          # Aggregate logs
 │   └── runs/
 │       └── <agent_name>/         # Per-run logs
-└── <agent-id>/
+├── vcam-community-organic/       # VcamAndroid Community Manager (social content, engagement)
+│   ├── PROMPT.md
+│   └── workspace/
+├── vcam-seo/                     # VcamAndroid SEO Strategist (blog, rankings, GEO)
+│   ├── PROMPT.md
+│   └── workspace/
+├── refund-hunter/                # RefundHunter (ecommerce refund policy & resale research, Google Doc daily)
+│   ├── PROMPT.md
+│   └── workspace/
+└── <agent-id>/                   # Template — replace with actual agent ID
     ├── PROMPT.md                 # Task-specific instructions
     ├── .enabled                  # Gate file — presence = active
     ├── .loop_mode                # (Optional) Server-attach loop mode
@@ -70,8 +102,8 @@ EliaAI/subworkers/
 ### Creating a New Subworker
 
 ```bash
-mkdir -p ~/EliaAI/subworkers/<agent-id>/workspace
-touch ~/EliaAI/subworkers/<agent-id>/.enabled  # or use --force to skip
+mkdir -p /Users/vakandi/EliaAI/subworkers/<agent-id>/workspace
+touch /Users/vakandi/EliaAI/subworkers/<agent-id>/.enabled  # or use --force to skip
 ```
 
 ---
@@ -118,11 +150,11 @@ Create `subworkers/<agent-id>/workspace/opencode.json`:
   },
   "permissions": {
     "read": {
-      "allow": ["~/EliaAI/subworkers/<agent-id>/workspace/**"],
+      "allow": ["/Users/vakandi/EliaAI/subworkers/<agent-id>/workspace/**"],
       "deny": ["**"]
     },
     "write": {
-      "allow": ["~/EliaAI/subworkers/<agent-id>/workspace/**"],
+      "allow": ["/Users/vakandi/EliaAI/subworkers/<agent-id>/workspace/**"],
       "deny": ["**"]
     },
     "execute": {
@@ -150,7 +182,7 @@ Every subworker's PROMPT.md **MUST** include these instructions:
 ```
 ## Workspace Constraint
 You MUST only read and write files inside your `workspace/` folder:
-`~/EliaAI/subworkers/<agent-id>/workspace/`
+`/Users/vakandi/EliaAI/subworkers/<agent-id>/workspace/`
 Never write files outside this folder. All system paths outside workspace/ are blocked.
 
 ## Daily Folders
@@ -159,13 +191,63 @@ Write your work logs, research, and outputs into today's folder.
 The folder is idempotent — only one per day regardless of how many times the trigger runs.
 You can read all previous days' folders to understand context and history.
 
+## Handoff
+At the START of every run, read `workspace/HANDOFF_NEXT_SESSION.md` — it tells you exactly where the previous run left off, what's done, and what to do next.
+At the END of every run, overwrite `workspace/HANDOFF_NEXT_SESSION.md` with current state so the next session can pick up seamlessly. Never leave stale tasks in the "Next priorities" section.
+
 ## Mempalace
 To orient yourself on every run:
-1. Check `workspace/` for the latest day folder to read today's work-in-progress
-2. Scan previous days' docs for relevant context: decisions made, blockers, next steps
-3. If you need to revisit something from days ago, navigate by date: `workspace/2026-04-01/`
-4. Write a summary of what you did today into the current day's folder before finishing
+1. Read `workspace/HANDOFF_NEXT_SESSION.md` for the latest battle plan (completed, pending, next priorities)
+2. Check `workspace/` for the latest day folder to read today's work-in-progress
+3. Scan previous days' docs for relevant context: decisions made, blockers, next steps
+4. If you need to revisit something from days ago, navigate by date: `workspace/2026-04-01/`
+5. Before finishing, write a summary into the current day's folder AND update `HANDOFF_NEXT_SESSION.md`
 ```
+
+### 3.5 Discord Channel Setup — Mandatory for Reporting
+
+Every subworker that reports via Discord **MUST** have a dedicated channel. Discord is the ONLY interaction point between subworkers and the user — there is no other way for agents to communicate results, ask questions, or escalate blockers.
+
+**When creating a new subworker, follow this procedure:**
+
+1. **List available Discord guilds:**
+```bash
+mcp-cli call discord-server-mcp list_guilds '{}'
+```
+
+2. **Ask the user which guild to use** — present the list of available guilds with their names and IDs. The user chooses the guild where the agent should report.
+
+3. **List categories in the chosen guild:**
+```bash
+mcp-cli call discord-server-mcp list_categories '{"guild_id":"<chosen_guild_id>"}'
+```
+
+4. **Ask the user which category** to place the agent's reporting channel under. Categories organize channels logically (e.g., "MIRORPAY", "BENE2LUXE", "REPORTS").
+
+5. **Create the channel in the right category:**
+```bash
+mcp-cli call discord-server-mcp create_channel '{
+  "guild_id": "<guild_id>",
+  "name": "<agent-name>-reports",
+  "type": 0,
+  "parent_id": "<category_id>"
+}'
+```
+
+6. **Save the channel ID** — the response returns the new channel's ID. Use this in the PROMPT.md reporting section:
+```markdown
+## 💬 REPORTING — Discord
+**Canal:** `<channel_id>` (<guild_name> / <category_name>)
+**Outil:** `mcp-cli call discord-server-mcp send_message`
+```
+
+**Why this matters:**
+- Agents cannot ask questions or escalate issues without a Discord channel
+- Each agent needs its own channel to avoid cross-talk between subworkers
+- The channel MUST be in the correct category for organization
+- The channel ID is what the agent uses to send reports via `mcp-cli call discord-server-mcp send_message`
+
+**⚠️ DO NOT hardcode Discord channel IDs in PROMPT.md without first creating the channel via this procedure.** Channel IDs are unique per guild — copying an ID from another agent's PROMPT.md will send messages to the wrong channel.
 
 ---
 
@@ -288,7 +370,18 @@ opencode agent list 2>&1 | grep "<agent-id>"
 
 If it shows `(subagent)` instead of `(all)`, the frontmatter `mode: all` is missing or incorrect. If it doesn't show at all, check `opencode.json` syntax and file paths.
 
-### 4.6 Restart OpenCode
+### 4.6 Model IDs Must Match `opencode models`
+
+The subworker UI and manual trigger must use the same model IDs that `opencode models` prints on this machine.
+
+- Treat `opencode models` as the source of truth for the current catalog.
+- Use the exact model string that the runtime accepts, not an old alias copied from a past popup.
+- If a saved UI selection points to a stale alias, normalize it once on load and resave the fixed value.
+- Do not invent provider prefixes or `:free` suffixes unless they are present in the current catalog and accepted by the trigger path.
+
+For the Electron popup, the model badge and the "Run now" button should always round-trip through the same normalized model ID.
+
+### 4.7 Restart OpenCode
 
 New agents only appear after restarting opencode TUI sessions:
 
@@ -310,8 +403,8 @@ Existing running opencode instances cache the agent list at startup — config c
 The universal trigger template (Node.js) handles all subworker launch logic. No per-agent wrapper scripts needed — the launchd plist passes `--agent <name>` directly:
 
 ```xml
-<string>node</string>
-<string>~/EliaAI/subworkers/scripts/trigger_template.js</string>
+<string>/Users/vakandi/.bun/bin/node</string>
+<string>/Users/vakandi/EliaAI/subworkers/scripts/trigger_template.js</string>
 <string>--agent</string>
 <string>my_agent</string>
 ```
@@ -334,8 +427,9 @@ node scripts/trigger_template.js --agent my_agent --force
 | **`-d` flag** | Passes `--directory workspace/` to `oh-my-opencode run` for per-agent config |
 | **Mode detection** | `task` (single-shot) vs `loop` (server-attach with `/ulw-loop`) |
 | **Per-run logging** | Each run logged individually + aggregate log |
-| **Proxy support** | Via `.proxy_enabled` file |
-
+| **OpenCode sandboxing** | Each trigger run creates a fresh temp XDG sandbox for OpenCode data/cache/state so parallel subworkers do not share `~/.local/share/opencode` or other host runtime files |
+| **Proxy support** | When `.proxy_enabled` is present, the trigger refreshes proxy state via `setup/switch-proxy.sh` before launching the agent |
+| **Recovery resume** | On retry, the trigger tries to recover the prior `Session:` line from the previous run log, waits 20s, and resends `continue the work` into the same session via `--session-id` before falling back to a fresh run |
 ### 5.3 Mode Selection
 
 **Task mode** (default): Single-shot execution. Agent runs once and exits.
@@ -344,7 +438,7 @@ node scripts/trigger_template.js --agent my_agent --force
 
 ```bash
 # Enable loop mode for an agent
-touch ~/EliaAI/subworkers/<agent-id>/.loop_mode
+touch /Users/vakandi/EliaAI/subworkers/<agent-id>/.loop_mode
 ```
 
 ### 5.4 Creating a New Subworker
@@ -377,6 +471,110 @@ This marker is always written after `oh-my-opencode run` exits, regardless of su
 4. `exit 0` → green duration badge (success)
 5. `exit non-zero` → orange "crashed" badge with duration (agent failed mid-run)
 6. If marker not found: yellow "● RUNNING" badge (agent still executing or trigger script crashed before reaching the marker)
+
+### 5.6 Retry & Session Recovery
+
+When a subworker run fails, the trigger now prefers to reuse the previous OpenCode session instead of starting over.
+
+Recovery flow:
+
+1. Read the previous run log and extract the last `Session:` / `Session ID:` value.
+2. Wait 20 seconds before the first recovery resend.
+3. Re-run `oh-my-opencode run` with `--session-id <recovered-session-id>`.
+4. Send the short continuation prompt `continue the work` into that same session.
+5. If the reuse path returns `promptAsync skipped by gate: active`, keep the same session and retry it again after another cooldown instead of immediately falling back.
+6. If the resume is killed or does not validate after the same-session retries are exhausted, log the reason and let the outer retry loop decide whether to try a fresh run.
+7. Between outer retry attempts, wait a random 20-40 seconds so parallel subworkers do not all restart on the same second.
+
+Why this exists:
+
+- It keeps continuity in the same session when the agent is still salvageable.
+- It gives the session time to settle before replaying the prompt.
+- It makes the retry logs explicit enough to diagnose whether the failure was reuse, validation, or an external kill.
+- If OpenCode itself fails before a session ever exists, that is handled as a bootstrap failure first: the server connection layer retries the timed-out start before the outer trigger falls back to a fresh run.
+- The trigger now also isolates OpenCode runtime state per run by exporting temp `XDG_DATA_HOME` / `XDG_CACHE_HOME` / `XDG_STATE_HOME` values, which prevents concurrent subworkers from fighting over the same OpenCode log/database files.
+- When proxy mode is enabled, the trigger refreshes the proxy first via `setup/switch-proxy.sh`, then injects the resulting proxy env into the actual agent run while keeping localhost traffic unproxied.
+
+Relevant log lines:
+
+- `[RECOVERY] Session lookup result: ...`
+- `[RECOVERY] Cooling down before reusing session ...`
+- `[RECOVERY] Dispatching continuation prompt to session ...`
+- `[RECOVERY] Continuation dispatch returned exit_code=...`
+- `[RECOVERY] Reuse result: blockedByActive=..., validated=...`
+- `[RECOVERY] Session ... is still active; keeping the same session and retrying after cooldown`
+- `[RECOVERY] Exhausted same-session retries ...`
+- `[RETRY] ...s remaining` heartbeat lines while waiting to restart
+- In task mode, cleanup is scoped to owned loop servers only; it does not kill unrelated ports used by sibling subworkers.
+- Retry backoff is randomized in the 20-40 second range to reduce startup collisions when several subworkers fail at once.
+
+### 5.7 Handoff File (`HANDOFF_NEXT_SESSION.md`)
+
+Every subworker run **MUST** end by writing or updating a handoff file at the workspace root:
+
+```
+workspace/HANDOFF_NEXT_SESSION.md
+```
+
+**Purpose:** This file is the bridge between runs. It tells the next session exactly where the previous one left off — what was done, what's pending, and what to do next. Without it, each run starts blind and risks duplicating work or repeating completed tasks.
+
+**What the agent MUST write before finishing:**
+
+```markdown
+# Handoff — <agent-id>
+
+**Last run:** YYYY-MM-DD HH:MM
+**Run status:** success | partial | failed
+
+## ✅ Completed this run
+- [Specific task 1 with detail]
+- [Specific task 2 with detail]
+
+## 🔄 In progress
+- [Task still being worked on — include exact file paths, line numbers, or state]
+
+## ⏳ Next priorities (in order)
+1. [Most important next action — be specific, not vague]
+2. [Second priority]
+3. [Third priority]
+
+## 🚫 Do NOT repeat
+- [Specific actions that were already attempted and completed]
+- [Dead ends or approaches that were tried and rejected]
+
+## 🔒 Blockers / Decisions needed
+- [Any blockers preventing progress]
+- [Decisions that need human input — include context so the next run can proceed or escalate]
+
+## 📂 Key files touched
+- path/to/file.py — [what was changed]
+- path/to/other.md — [what was done]
+```
+
+**Rules for the handoff file:**
+
+1. **Overwrite, don't append** — Each run replaces the entire file. The file reflects the LATEST state, not a history log.
+2. **Be specific** — "Worked on auth" is useless. "Fixed token refresh in `auth.py:45` — added 30s buffer before expiry" is actionable.
+3. **Name dead ends** — If a run tried something that failed, the next run must know NOT to retry it. Include "Do NOT repeat" entries.
+4. **Prioritize the next run** — The "Next priorities" section is the most important part. The agent reads this FIRST to know what to do.
+5. **No stale tasks** — If a task was completed, move it to "Completed" or delete it. Never leave finished work in "Next priorities."
+
+**How the agent uses it on startup:**
+
+When a subworker starts a new run, the Mempalace protocol (§3.4) should include reading this file:
+
+```
+## Startup Protocol
+1. Read workspace/HANDOFF_NEXT_SESSION.md — this tells you exactly what to do next
+2. Follow the "Next priorities" section in order
+3. Do NOT redo anything listed in "Do NOT repeat"
+4. At the end of your run, overwrite HANDOFF_NEXT_SESSION.md with the current state
+```
+
+**Why this matters:**
+
+- **Without handoff:** Each run re-reads all context from scratch, potentially redoing completed work, missing in-progress tasks, or retrying dead ends.
+- **With handoff:** Each run starts with a precise battle plan. The agent knows what's done, what's next, and what to avoid. Work advances every run instead of spinning.
 
 ---
 
@@ -458,8 +656,8 @@ mcp-cli list
 
     <key>ProgramArguments</key>
     <array>
-        <string>node</string>
-        <string>~/EliaAI/subworkers/scripts/trigger_template.js</string>
+<string>node</string>
+        <string>/Users/vakandi/EliaAI/subworkers/scripts/trigger_template.js</string>
         <string>--agent</string>
         <string><agent_id_with_underscores></string>
     </array>
@@ -477,19 +675,19 @@ mcp-cli list
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>/Users/vakandi/.bun/bin:/Users/vakandi/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>HOME</key>
-        <string>~</string>
+        <string>/Users/vakandi</string>
     </dict>
 
     <key>WorkingDirectory</key>
-    <string>~/EliaAI</string>
+    <string>/Users/vakandi/EliaAI</string>
 
     <key>StandardOutPath</key>
-    <string>~/EliaAI/subworkers/logs/<agent_name>.log</string>
+    <string>/Users/vakandi/EliaAI/subworkers/logs/<agent_name>.log</string>
 
     <key>StandardErrorPath</key>
-    <string>~/EliaAI/subworkers/logs/<agent_name>.log</string>
+    <string>/Users/vakandi/EliaAI/subworkers/logs/<agent_name>.log</string>
 </dict>
 </plist>
 ```
@@ -497,18 +695,147 @@ mcp-cli list
 ### 7.2 Load & Verify
 
 ```bash
-launchctl load ~/EliaAI/subworkers/plists/com.elia.<agent-id>.plist
+launchctl load /Users/vakandi/EliaAI/subworkers/plists/com.elia.<agent-id>.plist
 launchctl list | grep "com.elia"
 ```
 
 ---
 
-## 8. Troubleshooting
+## 8. Enable/Disable & Schedule Management
+
+### 8.1 The `.enabled` Gate
+
+Every subworker has a gate file at `subworkers/<agent-id>/.enabled`:
+
+| State | File | Behavior |
+|-------|------|----------|
+| **Enabled** | `.enabled` exists | LaunchAgent runs on schedule; manual runs work without `--force` |
+| **Disabled** | `.enabled` missing | LaunchAgent skips scheduled runs; manual runs require `--force` flag |
+
+**The trigger template (`trigger_template.js`) checks this file on every run:**
+- If `.enabled` exists → proceed normally
+- If `.enabled` missing AND no `--force` flag → exit code 0 (skip)
+- If `.enabled` missing AND `--force` flag → proceed (manual override)
+
+### 8.2 Electron UI — Subworker Popup (`ui_electron/subworker-popup.html`)
+
+The Electron UI provides a visual interface to manage all subworkers:
+
+**Features:**
+- **Toggle switches** — Click to enable/disable any subworker
+- **Schedule badges** — Shows configured schedule (e.g., "10:00–23:00 daily")
+- **Run now button** — Manual trigger with model selection from the current `opencode models` catalog
+- **Logs button** — Opens latest run log
+- **Runs dropdown** — Shows recent run history with exit codes and durations
+
+**How toggling works (via `ui_electron/src/main.js`):**
+
+```javascript
+ipcMain.on('toggle-subworker', (event, name) => {
+  const subworkerDir = path.join(subworkersRoot, name);
+  const plistName = `com.elia.${name}`;
+  const plistPath = path.join(subworkersRoot, 'plists', `${plistName}.plist`);
+  const enabledPath = path.join(subworkerDir, '.enabled');
+
+  if (fs.existsSync(enabledPath)) {
+    // DISABLE: remove .enabled + unload from launchd
+    fs.unlinkSync(enabledPath);
+    if (fs.existsSync(plistPath)) {
+      execSync(`launchctl bootout gui/$(id -u) ${plistPath} 2>/dev/null || true`);
+    }
+  } else {
+    // ENABLE: create .enabled + load into launchd
+    fs.writeFileSync(enabledPath, 'enabled\n', 'utf8');
+    if (fs.existsSync(plistPath)) {
+      execSync(`launchctl bootstrap gui/$(id -u) ${plistPath} 2>/dev/null || true`);
+    }
+  }
+  // Reply with new state
+  event.reply('subworker-toggled', { name, enabled, running });
+});
+```
+
+**Key behaviors:**
+- **Enable** → Creates `.enabled` file + `launchctl bootstrap` the plist
+- **Disable** → Removes `.enabled` file + `launchctl bootout` the plist
+- **Requires plist** — Toggle only works if `subworkers/plists/com.elia.<name>.plist` exists
+- **State sync** — UI receives `subworker-toggled` reply and updates toggle visuals
+
+### 8.3 Changing Schedule Times
+
+**To change a subworker's schedule:**
+
+1. **Edit the plist** at `subworkers/plists/com.elia.<agent-id>.plist`
+2. **Modify the `StartCalendarInterval` array** — each `<dict>` defines one scheduled time:
+   ```xml
+   <key>StartCalendarInterval</key>
+   <array>
+       <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
+       <dict><key>Hour</key><integer>14</integer><key>Minute</key><integer>30</integer></dict>
+       <dict><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
+   </array>
+   ```
+3. **Reload the LaunchAgent** (required for changes to take effect):
+   ```bash
+   launchctl bootout gui/$(id -u) /Users/vakandi/EliaAI/subworkers/plists/com.elia.<agent-id>.plist
+   launchctl bootstrap gui/$(id -u) /Users/vakandi/EliaAI/subworkers/plists/com.elia.<agent-id>.plist
+   ```
+
+**Common schedule patterns:**
+| Pattern | StartCalendarInterval |
+|---------|----------------------|
+| Every hour 9am–11pm | Hours 9–23, Minute 0 |
+| Twice daily (9am, 2pm) | Hour 9 + Hour 14, Minute 0 |
+| Every 30 min (9am–5pm) | Hours 9–17, Minutes 0 + 30 |
+| Once daily at 6am | Hour 6, Minute 0 |
+
+**⚠️ Important:** After editing the plist, you **MUST** reload it with `launchctl bootout` + `bootstrap`. The Electron UI toggle does this automatically when you enable/disable, but manual plist edits require manual reload.
+
+### 8.4 Setting Up a New Subworker for Auto-Run
+
+For a subworker to run automatically on schedule:
+
+1. **Create the plist** at `subworkers/plists/com.elia.<agent-id>.plist` (use template in §7.1)
+2. **Create `.enabled` file**: `touch subworkers/<agent-id>/.enabled`
+3. **Load into launchd**: `launchctl bootstrap gui/$(id -u) subworkers/plists/com.elia.<agent-id>.plist`
+4. **Verify**: `launchctl list | grep com.elia.<agent-id>` — should show a PID or `-` (loaded, waiting for schedule)
+
+**Or use the Electron UI:**
+1. Open the subworker popup
+2. Click the toggle switch for the agent
+3. The UI creates `.enabled` + loads the plist automatically
+
+### 8.5 Current Subworker Status (as of Aug 2026)
+
+| Subworker | .enabled | Plist | Launchd Status | Schedule |
+|-----------|----------|-------|----------------|----------|
+| refund-hunter | ✅ | ✅ | Loaded (PID 62965) | 10:00–22:00 hourly |
+| bene2luxe-promoter | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
+| bene2luxe-suppliers | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
+| cobou-promoter | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
+| mirorpay-community-organic | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
+| mirorpay-seo | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
+| mirrorpay-telegram | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
+| vcam-community-organic | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
+| vcam-seo | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
+| teleorbit-community-organic | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
+| teleorbit-seo | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
+| reddit-saas-scraper | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
+| tempack-dev | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
+| tiktok-content | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
+
+**To enable any subworker:** Click the toggle switch in the Electron UI (or run `touch subworkers/<agent-id>/.enabled` + `launchctl bootstrap gui/$(id -u) subworkers/plists/com.elia.<agent-id>.plist` manually).
+
+---
+
+## 9. Troubleshooting
 
 | Issue | Solution |
 |-------|----------|
 | Agent not responding | Check `launchctl list \| grep com.elia` |
 | Trigger skips with ".enabled not found" | Create `subworkers/<agent-id>/.enabled` or run with `--force` flag for manual terminal runs |
+| OpenCode TUI says `Config invalid - run doctor` and shows `../.omo/omo.jsonc: Un...` | The project config is likely wrapped in `[opencode]` when it should use top-level `agents` / `categories` / `task` / `teams`. Flatten the file to the current `omo.jsonc` schema and keep `[opencode]` only for actual harness overrides like `codegraph`. |
+| Parallel subworkers crash OpenCode with `FileSystem.open (.../opencode.log)` | The trigger should be launching with per-run temp `XDG_DATA_HOME` / `XDG_CACHE_HOME` / `XDG_STATE_HOME`. If you still see the host path, update `trigger_template.js` and restart the Electron UI so the button picks up the new wrapper. |
 | `EPERM: operation not permitted` on `oh-my-opencode` | Bun global package is a symlink to a local source checkout. Fix: `rm -rf ~/.bun/install/global/node_modules/oh-my-opencode && bun install -g oh-my-opencode` |
 | MCP not connecting | `mcp-cli list` + restart if needed |
 | Rate limited | Wait 1h + reduce frequency |

@@ -4,6 +4,14 @@
 set -euo pipefail
 
 AGENT_DIR="$HOME/EliaAI"
+
+# ============================================================
+# SCHEDULER DISABLE GUARD
+# ============================================================
+if [[ -f "${AGENT_DIR}/.scheduler_disabled" ]]; then
+    echo "[GUARD] .scheduler_disabled found — launchd launcher disabled. Exiting."
+    exit 0
+fi
 PROXY_CONF="$HOME/.proxychains.conf"
 LOG_DIR="$AGENT_DIR/logs"
 NTFY_TOPIC="OpenCode"
@@ -52,16 +60,37 @@ PORT=4096
 restart_count=0
 current_delay=5
 
+is_already_opencode_server() {
+    local pid
+    pid=$(lsof -ti :"$PORT" 2>/dev/null | head -1)
+    [[ -z "$pid" ]] && return 1
+    local process_name
+    process_name=$(ps -p "$pid" -o comm= 2>/dev/null || echo "")
+    # NOTE: macOS `ps -o comm=` returns the FULL PATH for node, so match substring.
+    [[ "$process_name" == *"opencode"* ]] || [[ "$process_name" == *"node"* ]] || return 1
+    return 0
+}
+
 log "=== OpenCode Server Starting ==="
 
+if nc -z 127.0.0.1 $PORT 2>/dev/null && is_already_opencode_server; then
+    log "Existing opencode server on port $PORT — exiting cleanly (no kill)"
+    exit 0
+fi
+
 while [[ $restart_count -lt $MAX_RESTARTS ]]; do
-    # Kill existing on port
+    # Kill existing on port — but ONLY if it's not an opencode server
     if nc -z 127.0.0.1 $PORT 2>/dev/null; then
-        existing=$(lsof -ti :$PORT 2>/dev/null | head -1)
-        if [[ -n "$existing" ]]; then
-            log "Killing existing server (PID: $existing)"
-            kill -9 $existing 2>/dev/null || true
-            sleep 2
+        if is_already_opencode_server; then
+            log "Port $PORT holds an opencode server - preserving it and exiting."
+            exit 0
+        else
+            existing=$(lsof -ti :$PORT 2>/dev/null | head -1)
+            if [[ -n "$existing" ]]; then
+                log "Killing non-opencode process on port $PORT (PID: $existing)"
+                kill -9 $existing 2>/dev/null || true
+                sleep 2
+            fi
         fi
     fi
 

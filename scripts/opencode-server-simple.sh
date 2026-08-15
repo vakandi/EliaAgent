@@ -1,4 +1,16 @@
 #!/bin/zsh
+
+# ============================================================
+# SCHEDULER DISABLE GUARD
+# If .scheduler_disabled exists, exit immediately without running.
+# Create this file to permanently disable all scheduled/interactive agent runs:
+#   touch ~/EliaAI/.scheduler_disabled
+# ============================================================
+if [[ -f "$HOME/EliaAI/.scheduler_disabled" ]]; then
+    echo "[GUARD] .scheduler_disabled found — agent disabled. Exiting."
+    exit 0
+fi
+
 AGENT_DIR="$HOME/EliaAI"
 PROXY_CONF="$HOME/.proxychains.conf"
 PORT=4096
@@ -25,8 +37,8 @@ fi
 
 echo "[SERVER] Starting on port $PORT..."
 if [[ -n "$PROXY_HTTP" ]]; then
-    env HTTP_PROXY="$PROXY_HTTP" HTTPS_PROXY="$PROXY_HTTPS" http_proxy="$PROXY_HTTP" https_proxy="$PROXY_HTTPS" ~/.opencode/bin/opencode serve --port $PORT &
+    env HTTP_PROXY="$PROXY_HTTP" HTTPS_PROXY="$PROXY_HTTPS" http_proxy="$PROXY_HTTP" https_proxy="$PROXY_HTTPS" /Users/vakandi/.opencode/bin/opencode serve --port $PORT &
 else
-    ~/.opencode/bin/opencode serve --port $PORT &
+    /Users/vakandi/.opencode/bin/opencode serve --port $PORT &
 fi
 echo "Server started"

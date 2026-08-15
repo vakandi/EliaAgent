@@ -4,6 +4,17 @@
 
 set -euo pipefail
 
+# ============================================================
+# SCHEDULER DISABLE GUARD
+# If .scheduler_disabled exists, exit immediately without running.
+# Create this file to permanently disable all scheduled/interactive agent runs:
+#   touch ~/EliaAI/.scheduler_disabled
+# ============================================================
+if [[ -f "$HOME/EliaAI/.scheduler_disabled" ]]; then
+    echo "[GUARD] .scheduler_disabled found — agent disabled. Exiting."
+    exit 0
+fi
+
 # Get the directory where this script is located, then get parent (EliaAI root)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 AGENT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -14,7 +25,7 @@ export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
 export PATH="$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.nvm/versions/node/v20.20.2/bin:$PATH"
 
-source ~/.zshrc 2>/dev/null || true
+source /Users/vakandi/.zshrc 2>/dev/null || true
 
 # Read model from .opencode_model if set
 MODEL_FILE="${AGENT_DIR}/.opencode_model"
