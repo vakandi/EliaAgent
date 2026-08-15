@@ -1,27 +1,39 @@
 #!/bin/bash
-# Wrapper opencode avec proxy via variables d'environnement
+# Wrapper opencode avec proxy via variables d'environnement.
+# Bun honors HTTP_PROXY/HTTPS_PROXY, so we export the full set here before
+# launching the OpenCode process.
 
-# ============================================================
-# SCHEDULER DISABLE GUARD
-# If .scheduler_disabled exists, exit immediately without running.
-# Create this file to permanently disable all agent launches:
-#   touch ~/EliaAI/.scheduler_disabled
-# ============================================================
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-AGENT_DIR="$(dirname "$SCRIPT_DIR")"
+set -euo pipefail
 
 PROXY_CONF="$HOME/.proxychains.conf"
-PROXY_LINE=$(grep "http " "$PROXY_CONF" | head -1)
-IP=$(echo "$PROXY_LINE" | awk '{print $2}')
-PORT=$(echo "$PROXY_LINE" | awk '{print $3}')
-USER=$(echo "$PROXY_LINE" | awk '{print $4}')
-PASS=$(echo "$PROXY_LINE" | awk '{print $5}')
+
+if [[ ! -f "$PROXY_CONF" ]]; then
+    echo "❌ Proxy config not found: $PROXY_CONF" >&2
+    exit 1
+fi
+
+PROXY_LINE="$(grep -v '^#' "$PROXY_CONF" | grep '^http ' | head -1 || true)"
+if [[ -z "$PROXY_LINE" ]]; then
+    echo "❌ No proxy entry found in $PROXY_CONF" >&2
+    exit 1
+fi
+
+read -r _ IP PORT USER PASS <<< "$PROXY_LINE"
+if [[ -z "${IP:-}" || -z "${PORT:-}" || -z "${USER:-}" || -z "${PASS:-}" ]]; then
+    echo "❌ Invalid proxy entry in $PROXY_CONF: $PROXY_LINE" >&2
+    exit 1
+fi
+
+PROXY_URL="http://${USER}:${PASS}@${IP}:${PORT}"
 
 echo "🔧 Proxy activé: $IP:$PORT"
-env HTTP_PROXY="http://${USER}:${PASS}@${IP}:${PORT}" \
-    HTTPS_PROXY="http://${USER}:${PASS}@${IP}:${PORT}" \
-    http_proxy="http://${USER}:${PASS}@${IP}:${PORT}" \
-    https_proxy="http://${USER}:${PASS}@${IP}:${PORT}" \
+exec env \
+    HTTP_PROXY="$PROXY_URL" \
+    HTTPS_PROXY="$PROXY_URL" \
+    ALL_PROXY="$PROXY_URL" \
+    http_proxy="$PROXY_URL" \
+    https_proxy="$PROXY_URL" \
+    all_proxy="$PROXY_URL" \
     NO_PROXY="127.0.0.1,localhost,::1" \
     no_proxy="127.0.0.1,localhost,::1" \
     opencode "$@"

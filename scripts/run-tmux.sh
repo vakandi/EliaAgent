@@ -1,28 +1,42 @@
 #!/bin/zsh
 
 # ============================================================
-# TMUX INSIDE TMUX GUARD
-# If already inside a tmux session, do NOT exec tmux attach —
-# that would replace the calling shell and kill the parent pane.
+# SCHEDULER DISABLE GUARD
+# If .scheduler_disabled exists, exit immediately without running.
+# Create this file to permanently disable all scheduled/interactive agent runs:
+#   touch ~/EliaAI/.scheduler_disabled
 # ============================================================
-if [[ -n "$TMUX" ]]; then
-    echo "[GUARD] Already inside tmux session ($TMUX) — skipping tmux attach."
-    echo "[GUARD] To attach to the 'elia' session manually: tmux attach -t elia"
+if [[ -f "$HOME/EliaAI/.scheduler_disabled" ]]; then
+    echo "[GUARD] .scheduler_disabled found — agent disabled. Exiting."
     exit 0
 fi
 
-if tmux has-session -t elia 2>/dev/null; then
-    exec tmux attach -t elia
+SESSION="elia-ui"
+
+# Track whether we're inside tmux (for attachment decision only)
+INSIDE_TMUX=false
+if [[ -n "$TMUX" ]]; then
+    INSIDE_TMUX=true
+    echo "[run-tmux] Already inside tmux session ($TMUX) — will create sessions but skip attach."
 fi
-tmux new-session -d -s elia
-tmux split-window -h -t elia
-tmux split-window -h -t elia:0.1
+
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+    tmux new-session -A -s "$SESSION"
+    exit 0
+fi
+tmux new-session -d -s "$SESSION"
+tmux split-window -h -t "$SESSION"
+tmux split-window -h -t "$SESSION":0.1
 if [[ -f "$HOME/EliaAI/.proxy_enabled" ]]; then
-    tmux send-keys -t elia:0.0 "~/EliaAI/setup/opencode-proxy.sh serve --port 4096" C-m
+    tmux send-keys -t "$SESSION":0.0 "~/EliaAI/setup/opencode-proxy.sh serve --port 4096" C-m
 else
-    tmux send-keys -t elia:0.0 "opencode serve --port 4096" C-m
+    tmux send-keys -t "$SESSION":0.0 "opencode serve --port 4096" C-m
 fi
-tmux send-keys -t elia:0.1 "~/EliaAI/scripts/start_elias_discord.sh" C-m
-tmux send-keys -t elia:0.2 "cd ~/EliaAI/ui_electron && npm start" C-m
+tmux send-keys -t "$SESSION":0.1 "~/EliaAI/scripts/start_elias_discord.sh" C-m
+tmux send-keys -t "$SESSION":0.2 "cd ~/EliaAI/ui_electron && npm start" C-m
 sleep 3
-tmux attach -t elia
+if [[ "$INSIDE_TMUX" == "false" ]]; then
+    TMUX= tmux new-session -A -s "$SESSION"
+else
+    echo "[run-tmux] Sessions are ready. Attach manually: tmux attach -t $SESSION"
+fi

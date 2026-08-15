@@ -11,6 +11,17 @@
 #   Pane 1: Discord bot
 #   Pane 2: UI Electron
 #
+# =============================================================================
+# SCHEDULER DISABLE GUARD
+# If .scheduler_disabled exists, exit immediately without running.
+# Create this file to permanently disable all scheduled/interactive agent runs:
+#   touch ~/EliaAgent/.scheduler_disabled
+# =============================================================================
+if [[ -f "$HOME/EliaAgent/.scheduler_disabled" ]]; then
+    echo "[GUARD] .scheduler_disabled found — agent disabled. Exiting."
+    exit 0
+fi
+#
 # Kept only for reference. Delete when no one remembers this existed.
 # =============================================================================
 
@@ -21,7 +32,7 @@
 # ============================================================
 if [[ -n "$TMUX" ]]; then
     echo "[GUARD] Already inside tmux session ($TMUX) — skipping elia-ui-4win.sh (deprecated)."
-    echo "[GUARD] To attach manually: tmux attach -t elia"
+    echo "[GUARD] To attach manually: tmux attach -t elia-ui"
     exit 0
 fi
 
@@ -34,7 +45,7 @@ fi
 # ============================================================
 echo "⛔ [DEPRECATED] elia-ui-4win.sh est deprecated et dangereux."
 echo "    Utilise EliaUI.command (3 panes) à la place."
-echo "    Pour attacher à une session existante: tmux attach -t elia"
+echo "    Pour attacher à une session existante: tmux attach -t elia-ui"
 exit 1
 
 # Window 1: OpenCode server (opencode-serve.sh)
@@ -48,24 +59,24 @@ AGENT_DIR="$HOME/EliaAI"
 SCRIPTS_DIR="$AGENT_DIR/scripts"
 
 # Kill any existing tmux session
-tmux kill-session -t elia 2>/dev/null || true
+tmux kill-session -t elia-ui 2>/dev/null || true
 sleep 1
 
 # Create new tmux session with window 1 (OpenCode server)
-echo "Creating tmux session 'elia' with 4 windows..."
-tmux new-session -d -s elia -n "opencode" "bash $SCRIPTS_DIR/opencode-serve.sh 4096"
+echo "Creating tmux session 'elia-ui' with 4 windows..."
+tmux new-session -d -s elia-ui -n "opencode" "bash $SCRIPTS_DIR/opencode-serve.sh 4096"
 
 # Create window 2 (CodeMem Viewer)
-tmux new-window -t elia -n "codemem" "bash $SCRIPTS_DIR/codemem-viewer.sh"
+tmux new-window -t elia-ui -n "codemem" "bash $SCRIPTS_DIR/codemem-viewer.sh"
 
 # Create window 3 (Agents)
-tmux new-window -t elia -n "agents" "bash $SCRIPTS_DIR/start_agents.sh"
+tmux new-window -t elia-ui -n "agents" "bash $SCRIPTS_DIR/start_agents.sh"
 
 # Create window 4 (UI)
-tmux new-window -t elia -n "ui" "bash $SCRIPTS_DIR/elia-ui.sh"
+tmux new-window -t elia-ui -n "ui" "bash $SCRIPTS_DIR/elia-ui.sh"
 
 # Select first window
-tmux select-window -t elia:1
+tmux select-window -t elia-ui:1
 
 echo "✅ EliaUI started with 4 tmux windows:"
 echo "  Window 1: OpenCode server (opencode-serve.sh)"
@@ -73,8 +84,8 @@ echo "  Window 2: CodeMem Viewer (codemem-viewer.sh)"
 echo "  Window 3: Agents (start_agents.sh)"
 echo "  Window 4: UI (elia-ui.sh)"
 echo ""
-echo "Attach with: tmux attach -t elia"
+echo "Attach with: tmux attach -t elia-ui"
 echo "Switch windows: Ctrl-b 1, Ctrl-b 2, Ctrl-b 3, Ctrl-b 4"
 
-# Attach to tmux session
-tmux attach -t elia
+# Attach to tmux session (use new-session -A to avoid exec hijacking terminal)
+TMUX= tmux new-session -A -s elia-ui

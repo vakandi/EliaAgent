@@ -724,27 +724,11 @@
   }
 
   /* Model-specific colors - HIGHEST SPECIFICITY */
-  div#context-status-row .context-status-card .model-badge[data-model="big-pickle"].selected {
+  div#context-status-row .context-status-card .model-badge[data-model="opencode/big-pickle"].selected {
     background: rgba(255,107,107,0.3) !important;
     border-color: #ff6b6b !important;
     color: #ff6b6b !important;
     box-shadow: 0 0 8px rgba(255,107,107,0.4) !important;
-    transform: scale(1.05) !important;
-  }
-
-  div#context-status-row .context-status-card .model-badge[data-model="nvidia"].selected {
-    background: rgba(76,175,80,0.3) !important;
-    border-color: #4caf50 !important;
-    color: #4caf50 !important;
-    box-shadow: 0 0 8px rgba(76,175,80,0.4) !important;
-    transform: scale(1.05) !important;
-  }
-
-  div#context-status-row .context-status-card .model-badge[data-model="minimax"].selected {
-    background: rgba(255,193,7,0.3) !important;
-    border-color: #ffc107 !important;
-    color: #ffc107 !important;
-    box-shadow: 0 0 8px rgba(255,193,7,0.4) !important;
     transform: scale(1.05) !important;
   }
 
@@ -1300,9 +1284,7 @@
     <div class="context-status-card">
       <div class="card-title">MODELS</div>
       <div style="display: flex; gap: 4px; flex-wrap: wrap;">
-        <span class="model-badge" id="badge-bigpickle" data-model="big-pickle" onclick="selectModel('big-pickle')">BigPickle</span>
-        <span class="model-badge" id="badge-kimi25" data-model="nvidia" onclick="selectModel('nvidia')">Kimi2.5</span>
-        <span class="model-badge" id="badge-minimax25" data-model="minimax" onclick="selectModel('minimax')">MiniMax2.5</span>
+        <span class="model-badge" id="badge-bigpickle" data-model="opencode/big-pickle" onclick="selectModel('opencode/big-pickle')">Big Pickle</span>
       </div>
     </div>
     <div class="context-status-card">
@@ -1327,12 +1309,14 @@ let selectedModel = 'minimax'; // Default model
 
 function selectModel(model) {
   console.log('selectModel called with:', model);
+  if (model === 'big-pickle') model = 'opencode/big-pickle';
   selectedModel = model;
   
   const modelInfo = {
-    'big-pickle': { context: '200K', tokens: '200K' },
-    'nvidia': { context: '128K', tokens: '128K' },
-    'minimax': { context: '1M', tokens: '1M' }
+    'opencode/big-pickle': { context: '200K', tokens: '200K' },
+    'opencode/nemotron-3-lightning-free': { context: '128K', tokens: '128K' },
+    'opencode/mimo-v2.5-free': { context: '1M', tokens: '1M' },
+    'opencode/deepseek-v4-flash-free': { context: '128K', tokens: '128K' }
   };
   const info = modelInfo[model] || { context: '—', tokens: '—' };
   
@@ -1344,8 +1328,8 @@ function selectModel(model) {
   const debugText = document.getElementById('debug-text');
   if (debugText) {
     debugText.textContent = 'Selected: ' + model;
-    debugText.style.color = model === 'big-pickle' ? '#ff6b6b' : 
-                                   model === 'nvidia' ? '#4caf50' : 
+    debugText.style.color = model === 'opencode/big-pickle' ? '#ff6b6b' :
+                                   model === 'nvidia' ? '#4caf50' :
                                    '#ffc107';
   }
   
@@ -1537,7 +1521,7 @@ function selectPeriodBadge(interval) {
 // Simple test function
 window.testBadge = function() {
   console.log('Test function called');
-  selectModel('big-pickle');
+  selectModel('opencode/big-pickle');
 };
 
 // Wait for DOM and setup
@@ -1565,7 +1549,7 @@ window.addEventListener('DOMContentLoaded', function() {
   if (bigPickleTest) {
     bigPickleTest.onclick = function() {
       console.log('BigPickle clicked!'); // Debug
-      selectModel('big-pickle');
+      selectModel('opencode/big-pickle');
     };
   }
   

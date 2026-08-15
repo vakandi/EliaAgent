@@ -1,6 +1,17 @@
 #!/bin/bash
 set -uo pipefail
 
+# ============================================================
+# SCHEDULER DISABLE GUARD
+# If .scheduler_disabled exists, exit immediately without running.
+# Create this file to permanently disable all scheduled/interactive agent runs:
+#   touch ~/EliaAI/.scheduler_disabled
+# ============================================================
+if [[ -f "$HOME/EliaAI/.scheduler_disabled" ]]; then
+    echo "[GUARD] .scheduler_disabled found — agent disabled. Exiting."
+    exit 0
+fi
+
 USER_MAC="$(whoami)"
 export HOME="/Users/${USER_MAC}"
 
@@ -12,7 +23,7 @@ export PATH="$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:
 command -v rec >/dev/null 2>&1 || { echo "❌ 'rec' command not found (sox)"; exit 1; }
 command -v sox >/dev/null 2>&1 || { echo "❌ sox not installed"; exit 1; }
 
-AGENT_DIR="~/EliaAI"
+AGENT_DIR="/Users/vakandi/EliaAI"
 TRANSCRIPT_FILE="/tmp/transcript.txt"
 echo -n "" > "$TRANSCRIPT_FILE"
 
@@ -50,7 +61,7 @@ if [[ "$WORD_COUNT" -gt 1 ]]; then
     fi
     
     cd "$AGENT_DIR"
-    ~/EliaAI/scripts/voice-command.sh --extra-prompt="$TRANSCRIPT" $PROXY_FLAG
+    /Users/vakandi/EliaAI/scripts/voice-command.sh --extra-prompt="$TRANSCRIPT" $PROXY_FLAG
 else
     echo "⏭️  Trop court ($WORD_COUNT mots)"
 fi

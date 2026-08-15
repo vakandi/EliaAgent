@@ -1,46 +1,64 @@
 #!/bin/zsh
-# EliaUI — Open tmux session with all 3 Elia services
-# Discord bot + Electron UI + OpenCode serve
+# EliaUI — Open tmux session with Elia services
+# opencode serve runs in its own session for crash isolation
+# Discord bot + Electron UI run in elia-ui session
 
 SESSION="elia-ui"
+SERVER_SESSION="opencode-serve"
 
-# Guard: already inside tmux
+# Track whether we're inside tmux (for attachment decision only)
+INSIDE_TMUX=false
 if [[ -n "$TMUX" ]]; then
-    echo "Already inside a tmux session. To attach manually: tmux attach -t $SESSION"
-    echo "This window will close in 5 seconds..."
-    sleep 5
-    exit 0
+    INSIDE_TMUX=true
+    echo "[EliaUI] Already inside tmux session ($TMUX) — will create sessions but skip attach."
 fi
 
-# Create session only if it doesn't exist
+is_already_opencode_server() {
+    local port="${1:-4096}"
+    local pid
+    pid=$(lsof -ti :"$port" 2>/dev/null | head -1)
+    [[ -z "$pid" ]] && return 1
+    local process_name
+    process_name=$(ps -p "$pid" -o comm= 2>/dev/null || echo "")
+    # Accept "opencode" binary OR "node" process (opencode runs on Node.js)
+    # NOTE: macOS `ps -o comm=` returns the FULL PATH for node, so match substring.
+    [[ "$process_name" == *"opencode"* ]] || [[ "$process_name" == *"node"* ]] || return 1
+    return 0
+}
+
+# Start opencode server in its own isolated session (crash-safe)
+# Skip if an opencode server is already running on port 4096
+if ! tmux has-session -t "$SERVER_SESSION" 2>/dev/null; then
+    if ! is_already_opencode_server 4096; then
+        echo "[EliaUI] Starting opencode server in dedicated session '$SERVER_SESSION'..."
+        tmux new-session -d -s "$SERVER_SESSION" -n "Server"
+        tmux send-keys -t "$SERVER_SESSION" "cd ~/EliaAI && ./scripts/opencode-serve.sh 4096" Enter
+        sleep 2
+    fi
+fi
+
+# Create elia-ui session only if it doesn't exist
 if ! tmux has-session -t "$SESSION" 2>/dev/null; then
     tmux new-session -d -s "$SESSION" -n "EliaAI"
 
-    # Split into 3 panes: left half, right top, right bottom
-    # Pane 0 (left): opencode serve
-    # Pane 1 (right top): Discord bot
-    # Pane 2 (right bottom): Electron UI
-    tmux split-window -h -t "$SESSION":0
-    tmux split-window -v -t "$SESSION":0.1
-
-    # Resize: give pane 0 50% width
-    tmux select-layout -t "$SESSION":0 main-vertical
+    # Split into 2 panes: Discord bot (top) + Electron UI (bottom)
+    # Pane 0: Discord bot
+    # Pane 1: Electron UI
+    tmux split-window -v -t "$SESSION":0
     sleep 1
 
-    # Start opencode serve in pane 0
-    tmux send-keys -t "$SESSION":0.0 "cd ~/EliaAgent && ./scripts/opencode-serve.sh 4096" Enter
-
-    # Small delay so the scripts don't clash on startup
-    sleep 2
-
-    # Start Discord bot in pane 1 (right top)
-    tmux send-keys -t "$SESSION":0.1 "cd ~/EliaAgent && ./scripts/start_elias_discord.sh" Enter
+    # Start Discord bot in pane 0 (top)
+    tmux send-keys -t "$SESSION":0.0 "cd ~/EliaAI && ./scripts/start_elias_discord.sh" Enter
 
     sleep 1
 
-    # Start Electron UI in pane 2 (right bottom)
-    tmux send-keys -t "$SESSION":0.2 "cd ~/EliaAgent/ui_electron && npm start" Enter
+    # Start Electron UI in pane 1 (bottom)
+    tmux send-keys -t "$SESSION":0.1 "cd ~/EliaAI/ui_electron && npm start" Enter
 fi
 
-# Attach to the session
-TMUX= tmux attach-session -t "$SESSION"
+# Attach only if NOT already inside tmux (attaching from inside tmux replaces the current shell)
+if [[ "$INSIDE_TMUX" == "false" ]]; then
+    TMUX= tmux new-session -A -s "$SESSION"
+else
+    echo "[EliaUI] Sessions are ready. Attach manually: tmux attach -t $SESSION"
+fi
