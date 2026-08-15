@@ -5,7 +5,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/OpenCode-big--pickle-FF6B6B?style=flat&logo=openai" alt="OpenCode">
   <img src="https://img.shields.io/badge/Status-Production%20Ready-22C55E?style=flat" alt="Status">
-  <img src="https://img.shields.io/badge/Memory-1.3GB%20%7C%203400%2B%20Sessions-8B5CF6?style=flat" alt="Memory">
+  <img src="https://img.shields.io/badge/Memory-9.3GB%20%7C%203400%2B%20Sessions-8B5CF6?style=flat" alt="Memory">
   <img src="https://img.shields.io/badge/Subagents-13%20Specialized-3B82F6?style=flat" alt="Subagents">
   <img src="https://img.shields.io/badge/UI-Electron%20Overlay-F59E0B?style=flat&logo=electron" alt="Electron UI">
   <img src="https://img.shields.io/badge/Voice-Whisper%20Dictation-EC4899?style=flat" alt="Voice">
