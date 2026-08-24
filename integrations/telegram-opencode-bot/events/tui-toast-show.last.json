@@ -1,0 +1,9 @@
+{
+  "type": "tui.toast.show",
+  "properties": {
+    "title": "· OhMyOpenCode 3.14.0",
+    "message": "Sisyphus on steroids is steering OpenCode.",
+    "variant": "info",
+    "duration": 150
+  }
+}

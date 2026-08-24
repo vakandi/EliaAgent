@@ -1,0 +1,7 @@
+{
+  "type": "file.watcher.updated",
+  "properties": {
+    "file": "~/.config/opencode/AGENTS.md",
+    "event": "change"
+  }
+}

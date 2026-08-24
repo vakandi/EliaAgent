@@ -1,0 +1,9 @@
+{
+  "type": "session.status",
+  "properties": {
+    "sessionID": "ses_2accbc6c4ffeBiU2Myvojy4boi",
+    "status": {
+      "type": "idle"
+    }
+  }
+}
