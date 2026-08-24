@@ -1,15 +1,15 @@
 {
-  "skill_name": "yourapp-ga-marketing-review",
+  "skill_name": "your-saas-ga-marketing-review",
   "evals": [
     {
       "id": 0,
-      "prompt": "check how yourapp is converting — run the full marketing review. i want to see traffic, conversion funnel, revenue, ab test analysis, and top pages with recommendations.",
-      "expected_output": "A comprehensive .md report file saved to yourapp-marketing-review/ with all 7 sections: Executive Summary, Traffic Overview, Conversion Funnel, AB Test/Variant Analysis, Revenue & Conversion Value, Top Pages Analysis, Recommendations. All GA4 tools (ga4_traffic_sources, ga4_user_behavior, ga4_page_performance, ga4_conversion_funnel, ga4_realtime) are called. Vercel rolling-release status is checked. The report has data-backed claims and actionable recommendations.",
+      "prompt": "check how your-saas is converting — run the full marketing review. i want to see traffic, conversion funnel, revenue, ab test analysis, and top pages with recommendations.",
+      "expected_output": "A comprehensive .md report file saved to your-saas-marketing-review/ with all 7 sections: Executive Summary, Traffic Overview, Conversion Funnel, AB Test/Variant Analysis, Revenue & Conversion Value, Top Pages Analysis, Recommendations. All GA4 tools (ga4_traffic_sources, ga4_user_behavior, ga4_page_performance, ga4_conversion_funnel, ga4_realtime) are called. Vercel rolling-release status is checked. The report has data-backed claims and actionable recommendations.",
       "files": [],
       "expectations": [
         "The skill calls ALL 5 core GA4 tools via gsc-mcp (ga4_traffic_sources, ga4_user_behavior, ga4_page_performance, ga4_conversion_funnel, ga4_realtime)",
-        "The skill checks Vercel rolling-release status using `vercel rr fetch` from [your-homepage] directory",
-        "A .md report file is saved to yourapp-marketing-review/ with a date-stamped filename",
+        "The skill checks Vercel rolling-release status using `vercel rr fetch` from your-saas-homepage directory",
+        "A .md report file is saved to your-saas-marketing-review/ with a date-stamped filename",
         "The report contains at least 5 of the 7 required sections from the template",
         "The report includes 3-5 actionable recommendations based on the data",
         "The report references actual data values (not placeholder text like 'X' or 'N/A')"
@@ -17,8 +17,8 @@
     },
     {
       "id": 1,
-      "prompt": "just give me a quick pulse on traffic and ab tests for yourapp. no need for the full report, just the key numbers on traffic sources, user behavior, and whether our variant test is running.",
-      "expected_output": "A focused .md report saved to yourapp-marketing-review/ with key sections: Traffic Overview (sources, devices, countries), AB Test status (Vercel + variant events), and 1-2 quick recommendations. Not the full 7-section template — lighter weight.",
+      "prompt": "just give me a quick pulse on traffic and ab tests for your-saas. no need for the full report, just the key numbers on traffic sources, user behavior, and whether our variant test is running.",
+      "expected_output": "A focused .md report saved to your-saas-marketing-review/ with key sections: Traffic Overview (sources, devices, countries), AB Test status (Vercel + variant events), and 1-2 quick recommendations. Not the full 7-section template — lighter weight.",
       "files": [],
       "expectations": [
         "The skill calls ga4_traffic_sources and ga4_user_behavior (at minimum) via gsc-mcp",
@@ -31,14 +31,14 @@
     {
       "id": 2,
       "prompt": "i want to see the conversion funnel and if our ab test is working. how many people view pricing vs start a form vs convert? and is the variant test producing better engagement?",
-      "expected_output": "A focused .md report saved to yourapp-marketing-review/ with the Conversion Funnel (each step with drop-off rates) and AB Test/Variant Analysis (Vercel status + GA4 ab_variant_viewed events + recommendations on variant performance). Includes revenue data where available.",
+      "expected_output": "A focused .md report saved to your-saas-marketing-review/ with the Conversion Funnel (each step with drop-off rates) and AB Test/Variant Analysis (Vercel status + GA4 ab_variant_viewed events + recommendations on variant performance). Includes revenue data where available.",
       "files": [],
       "expectations": [
         "The skill calls ga4_conversion_funnel via gsc-mcp",
         "The skill calls ga4_page_performance to find pricing page and revenue data",
         "The skill checks Vercel rolling-release status",
         "The skill looks for ab_variant_viewed events in the funnel data",
-        "A .md file is saved to yourapp-marketing-review/",
+        "A .md file is saved to your-saas-marketing-review/",
         "The report includes drop-off rates between funnel steps"
       ]
     }

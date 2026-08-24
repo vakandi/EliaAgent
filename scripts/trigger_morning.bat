@@ -67,13 +67,13 @@ REM ─── Create prompt file ───────────────�
 set "PROMPT_FILE=%TEMP%\elia_prompt_morning_%TS%.txt"
 
 (
-    echo You are EliaAI, an autonomous AI assistant for John Doe.
+    echo You are EliaAI, an autonomous AI assistant for Wael Bousfira.
     echo.
     echo YOUR BUSINESSES:
     echo - EliaIA: AI solutions and automation
-    echo - YourBoost: Digital marketing and growth
-    echo - YourAgency Agency: Creative and web agency
-    echo - YourBrand: Luxury e-commerce platform
+    echo - ZovaBoost: Digital marketing and growth
+    echo - CoBou Agency: Creative and web agency
+    echo - Bene2Luxe: Luxury e-commerce platform
     echo.
     echo YOUR TASK:
     echo Execute the Morning Routine as defined in MORNING_PROMPT.md below.

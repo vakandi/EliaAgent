@@ -21,7 +21,7 @@ Automatically monitor and collect prompts and work sessions from Cursor, Windsur
 // Linux: ~/.config/Cursor/History/
 
 const cursorConfig = {
-  historyPath: "C:\\Users\\vakandi\\AppData\\Roaming\\Cursor\\History",
+  historyPath: "C:\\Users\\your-username\\AppData\\Roaming\\Cursor\\History",
   extractPrompts: true,
   analyzeContext: true,
   maxFiles: 100
@@ -31,7 +31,7 @@ const cursorConfig = {
 ### Windsurf IDE
 ```javascript
 const windsurfConfig = {
-  historyPath: "C:\\Users\\vakandi\\AppData\\Roaming\\Windsurf\\History",
+  historyPath: "C:\\Users\\your-username\\AppData\\Roaming\\Windsurf\\History",
   monitorInterval: 300000, // 5 minutes
   extractPatterns: [
     "user_prompt",
@@ -44,7 +44,7 @@ const windsurfConfig = {
 ### Kiro IDE
 ```javascript
 const kiroConfig = {
-  historyPath: "C:\\Users\\vakandi\\AppData\\Roaming\\Kiro\\History",
+  historyPath: "C:\\Users\\your-username\\AppData\\Roaming\\Kiro\\History",
   sessionTracking: true,
   projectAssociation: true
 };
@@ -68,7 +68,7 @@ console.log(prompts);
 ```javascript
 const projectContext = await cursor_monitor({
   action: "analyze_project",
-  projectPath: "C:\\Users\\vakandi\\Documents\\projects\\AccForge",
+  projectPath: "C:\\Users\\your-username\\Documents\\projects\\AccForge",
   includePrompts: true,
   summarizeSession: true
 });
@@ -121,7 +121,7 @@ const dailySummary = await cursor_monitor({
       focus: "Security audit and API development"
     },
     {
-      name: "YourBrand",
+      name: "your-brand",
       prompts: 20,
       focus: "Frontend optimization"
     }

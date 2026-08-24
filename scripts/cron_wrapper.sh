@@ -16,9 +16,9 @@ export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
 export PATH="$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.nvm/versions/node/v20.20.2/bin:$PATH"
 
-source ~/.zshrc 2>/dev/null || true
+source "$HOME/.zshrc" 2>/dev/null || true
 
-# Mark this as a cron run (used by trigger_opencode_interactive.sh for lock mechanism)
+# Mark this as a cron run (used by trigger_template.js for lock mechanism)
 export ELIA_CRON=1
 
 # CRITICAL: Ensure localhost/127.0.0.1 bypasses the proxy
@@ -38,5 +38,5 @@ fi
 # Timeout after 25 minutes (safety measure for cron runs)
 TIMEOUT_SECS=1500
 
-# Proxychains4 is used inside trigger_opencode_interactive.sh if .proxy_enabled exists
-exec timeout $TIMEOUT_SECS /bin/zsh "${AGENT_DIR}/scripts/trigger_opencode_interactive.sh"
+# Proxychains4 is used inside trigger_template.js if .proxy_enabled exists
+exec timeout $TIMEOUT_SECS node "${AGENT_DIR}/subworkers/scripts/trigger_template.js" --agent elia

@@ -330,5 +330,464 @@ Node-only.
 |------|----------|
 | `oh-my-opencode run --attach "..."` | ✅ Exit 0, réponse complète du modèle |
 | `oh-my-opencode run "..."` (standalone, trivial) | ✅ Exit 0, "FIX_VERIFIED" |
-| `oh-my-opencode run -a setbon --model big-pickle "analyse..."` (full cmd, --attach) | ✅ Exit 0, analyse MirorPay complète |
-| `oh-my-opencode run -a setbon --model big-pickle "analyse..."` (full cmd, standalone) | ⏱️ Exit 124 (timeout 120s), session active jusqu'au bout — pas de crash |
+| `oh-my-opencode run -a your-agent --model big-pickle "analyse..."` (full cmd, --attach) | ✅ Exit 0, analyse your-saas complète |
+| `oh-my-opencode run -a your-agent --model big-pickle "analyse..."` (full cmd, standalone) | ⏱️ Exit 124 (timeout 120s), session active jusqu'au bout — pas de crash |
+
+---
+
+## Fix #11 — `.omo/omo.jsonc` "Migration validation failed"
+
+### Problème
+
+Au démarrage d'OpenCode, un toast d'erreur s'affiche :
+
+```
+Migration validation failed for ~/.omo/omo.jsonc:
+agents.sisyphus: Unrecognized key: "mode"
+```
+
+Ce message bloque le chargement partiel de la config et empêche le plugin oh-my-openagent de résoudre correctement les modèles des agents (défaut → `openai/gpt-5.4-mini-fast` au lieu de `opencode/big-pickle`).
+
+### Racine du problème
+
+Le fichier `~/.omo/omo.jsonc` est le fichier de config d'OpenCode lui-même, **pas** du plugin oh-my-openagent. OpenCode le valide avec son propre schéma (`omo-config-core`), qui est plus strict que le schéma du plugin :
+
+- **Schéma OpenCode** (`omo-config-core`): n'accepte que des clés simples dans `agents`
+- **Schéma oh-my-openagent** (`agent-overrides.ts`): accepte `mode`, `prompt_append`, `description`, `models` (array)
+
+Le fichier `.omo/omo.jsonc` utilisait le format oh-my-openagent (423 lignes, avec `mode`, `prompt_append`, `description`, `models` arrays) mais était validé par le schéma OpenCode → rejet.
+
+### Fichiers impliqués
+
+| Fichier | Rôle | Schéma valide |
+|---------|------|---------------|
+| `~/.omo/omo.jsonc` | Config OpenCode (moi-même + plugin) | `omo-config-core` (strict) |
+| `~/.config/opencode/oh-my-openagent.jsonc` | Config oh-my-openagent uniquement | `AgentOverrideConfigSchema` (permissif) |
+| `~/.config/opencode/opencode.json` | Registration des agents dans OpenCode | OpenCode schema |
+
+### Fix appliqué
+
+1. **`.omo/omo.jsonc`** → vidé à `{}` (supprime toutes les clés non reconnues par le schéma OpenCode)
+2. **`oh-my-openagent.jsonc`** → enrichi avec TOUS les agents (44 agents, 41 catégories, 44 display names), en utilisant le format `model` string simple (pas `models` array)
+
+### Important : listes de agents
+
+**Tous les agents de `opencode.json` DOIVENT être dans `oh-my-openagent.jsonc`** :
+
+- System agents: sisyphus, sisyphus-junior, hephaestus, prometheus, oracle, metis, momus, atlas, explore, librarian, multimodal-looker
+- Business agents: elia, your-agent, your-agent, your-agent, your-brand, your-agency, your-saas, tiktok-youtube-auto, tiktok-content, your-saas, account-verification, your-saas, your-saas, markov, markov-fundamental-analyst, markov-technical-analyst
+- Subworkers: your-promoter, your-brand-promoter, your-brand-suppliers, your-telegram, your-saas-assistant, your-saas-community-organic, your-saas-seo, googlebot, reddit-saas-scraper, roger, your-telecom-seo, your-telecom-community-organic, your-community, your-seo, refund-hunter, prompt-enhancer
+
+### Pourquoi pas de `prompt_append` dans `oh-my-openagent.jsonc`
+
+Les `prompt_append` sont déjà dans `opencode.json` (section `"agent"` → chaque agent a son `prompt_append`). Le plugin oh-my-openagent lit les deux fichiers et merge les configs. Dupliquer les `prompt_append` dans `oh-my-openagent.jsonc` créerait des conflits de merging.
+
+### Format correct dans `oh-my-openagent.jsonc`
+
+```json
+"agents": {
+  "sisyphus": {
+    "model": "opencode/big-pickle",
+    "fallback_models": [],
+    "mode": "primary"
+  }
+}
+```
+
+PAS :
+```json
+"models": [{"model": "opencode/big-pickle", "reasoning": "max"}]
+```
+
+Le champ `models` (array) n'est pas reconnu par le schéma `AgentOverrideConfigSchema`. Utiliser toujours `model` (string) + `fallback_models` (array de strings).
+
+### Vérification
+
+```bash
+# Vérifier que .omo/omo.jsonc est vide
+cat ~/.omo/omo.jsonc
+# Doit afficher: {}
+
+# Vérifier que oh-my-openagent.jsonc a tous les agents
+cat ~/.config/opencode/oh-my-openagent.jsonc | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'{len(d[\"agents\"])} agents, {len(d[\"categories\"])} categories, {len(d[\"agent_display_names\"])} display names')"
+
+# Vérifier qu'aucun backup .omo n'est lu
+ls -la ~/.omo/omo.jsonc*
+```
+
+---
+
+## Fix #12 — `.omo/omo.jsonc` Migration Validation Fails (`mode` Key Rejected)
+
+### Symptom
+
+```
+Migration validation failed for ~/.omo/omo.jsonc:
+  agents.sisyphus: Unrecognized key: "mode"
+  agents.hephaestus: Unrecognized key: "mode"
+  ... (every agent with mode rejected)
+```
+
+Config logs `Oh-my-opencode config validation failed: Invalid omo config`. Plugin falls back to hardcoded `AGENT_MODEL_REQUIREMENTS` → sisyphus resolves to `github-copilot/claude-opus-4.7` → error "configured model github-copilot/claude-opus-4.7 is not valid".
+
+### Root Cause
+
+**Two separate config files, two separate validation schemas:**
+
+| File | Location | Schema | Accepts `mode`? | Accepts `team_mode`? |
+|------|----------|--------|-----------------|---------------------|
+| `.omo/omo.jsonc` | `~/.omo/omo.jsonc` | `OmoConfigLayerSchema` (core) | **NO** — `.strict()` | **NO** |
+| `oh-my-openagent.jsonc` | `~/.config/opencode/oh-my-openagent.jsonc` | `OhMyOpenCodeConfigSchema` (plugin) | **YES** | **YES** |
+
+- `.omo/omo.jsonc` is validated by the **core schema** (`OmoConfigLayerSchema` at `dist/index.js:6029`). Root is `.strict()` accepting only: `$schema`, `categories`, `agents`, `codegraph`, `task`, `teams`, `models`, `[opencode]`, `[senpi]`, `[codex]`, `profiles`, `_migrations`, `legacy_migrations`.
+- Agent entries use `OmoAgentDefInputSchema` (.strict): `description`, `prompt`, `model`, `models`, `reasoning`, `variant`, `reasoningEffort`, `tools`, `execution_mode`, `background`, `max_depth`, `allowed_subagents`, `disallowed_tools`, `max_turns`, `temperature`, `disable`. **No `mode`.**
+- `oh-my-openagent.jsonc` is validated by the **plugin schema** (`OhMyOpenCodeConfigSchema` at `dist/index.js:27360`). `AgentOverrideConfigSchema` DOES accept `mode`, `prompt_append`, etc. with `.catchall()`.
+
+### Fix
+
+1. **Remove `mode`** from every agent entry in `.omo/omo.jsonc`
+2. **Remove `team_mode` and `agent_display_names`** from root level of `.omo/omo.jsonc`
+3. **Keep `team_mode` and `agent_display_names`** in `oh-my-openagent.jsonc` (plugin schema accepts them)
+
+`.omo/omo.jsonc` should contain ONLY core-schema-accepted keys:
+```json
+{
+  "$schema": "...",
+  "categories": { ... },
+  "agents": {
+    "sisyphus": { "model": "opencode/big-pickle", "description": "..." },
+    ...
+  }
+}
+```
+
+### Additional Requirement: `oh-my-openagent.jsonc` Must Exist
+
+The plugin reads `oh-my-openagent.jsonc` for agent overrides. If this file is **missing**, the plugin falls back to hardcoded `AGENT_MODEL_REQUIREMENTS` which resolves sisyphus to `github-copilot/claude-opus-4.7`.
+
+**Resolution chain when both files exist and valid:**
+```
+Plugin loads oh-my-openagent.jsonc → agentOverrides["sisyphus"] = { model: "opencode/big-pickle" }
+  → sisyphusOverride.model = "opencode/big-pickle"
+  → resolves to opencode/big-pickle ✅
+```
+
+**Resolution chain when oh-my-openagent.jsonc is MISSING:**
+```
+Plugin loads nothing → agentOverrides = {}
+  → sisyphusOverride = undefined
+  → fallback: fallbackChain = ["claude-opus-4-7"] with providers ["anthropic", "github-copilot", ...]
+  → tries github-copilot/claude-opus-4.7 → NOT in model catalog ❌
+```
+
+### Verification
+
+```bash
+# 1. .omo/omo.jsonc has no invalid keys
+cat ~/.omo/omo.jsonc | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+root_keys = set(d.keys())
+valid = {'\$schema','categories','agents','codegraph','task','teams','models','[opencode]','[senpi]','[codex]','profiles','_migrations','legacy_migrations'}
+invalid = root_keys - valid
+if invalid: print(f'INVALID ROOT KEYS: {invalid}'); exit(1)
+for name, agent in d.get('agents',{}).items():
+    if 'mode' in agent: print(f'INVALID: {name} has mode'); exit(1)
+print('PASS: .omo/omo.jsonc is core-schema valid')
+"
+
+# 2. oh-my-openagent.jsonc exists and has sisyphus model
+cat ~/.config/opencode/oh-my-openagent.jsonc | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+sisy = d.get('agents',{}).get('sisyphus',{})
+print(f'sisyphus model: {sisy.get(\"model\",\"MISSING\")}')
+assert sisy.get('model') == 'opencode/big-pickle', 'WRONG MODEL'
+print('PASS: sisyphus resolves to opencode/big-pickle')
+"
+
+# 3. Plugin log shows no migration failures after restart
+# Check /var/folders/.../oh-my-opencode.log for "Migration validation failed"
+```
+
+---
+
+## Fix #13 — Category model overrides using non-existent models (call_omo_agent + task delegate)
+
+### Symptom
+
+**`call_omo_agent` (explore/librarian):** ❌ All attempts failed.
+```
+Model not found: openai/gpt-5.4-mini-fast
+→ fallback: github-copilot/claude-haiku-4.5
+→ both unavailable
+```
+
+**`task()` delegate:** ❌ All attempts failed.
+```
+Model not found: opencode/claude-sonnet-4-6
+→ fallback: opencode/gpt-5.3-codex
+→ fallback: opencode/gemini-3-flash
+→ all three unavailable
+```
+
+### Root Cause: Two Separate Model Resolution Code Paths
+
+`call_omo_agent` and `task()` use **completely different model resolution systems**:
+
+| Tool | Code Path | Reads Config | Resolves Model |
+|------|-----------|-------------|----------------|
+| `call_omo_agent` (explore/librarian) | **Plugin** `resolveModelAndFallbackChain()` | `oh-my-openagent.jsonc` → `agents` section | Agent overrides → `agentOverrides["explore"].model` |
+| `task()` (delegate, Sisyphus-Junior) | **Native** OpenCode task system | `oh-my-openagent.jsonc` → `categories` section | Category overrides → `categories["quick"].model` |
+
+**Plugin path** (`call_omo_agent` at `index.js:120582`):
+```
+resolveModelAndFallbackChain({ subagentType: "explore", agentOverrides })
+  → getAgentConfigKey("explore") → "explore"
+  → agentOverrides["explore"] → { model: "opencode/big-pickle" }
+  → uses opencode/big-pickle ✅
+```
+
+**Native path** (`task()` via OpenCode core):
+```
+task(category="quick")
+  → resolves category "quick" → oh-my-openagent.jsonc categories.quick
+  → categories.quick.model = "opencode/gpt-5.4-mini" (old config)
+  → tries opencode/gpt-5.4-mini → NOT in opencode provider ❌
+  → fallback chain: opencode/claude-haiku-4-5 → opencode/gemini-3-flash → opencode/gpt-5-nano
+  → ALL unavailable ❌
+```
+
+### Two Separate Problems Found and Fixed
+
+**Problem A — `call_omo_agent` (explore/librarian):** The local plugin at `~/.config/opencode/plugins/oh-my-opencode/index.js` (170k lines, Jul 13) was **outdated** and shadowed the newer npm package. Its hardcoded `AGENT_MODEL_REQUIREMENTS` had `openai/gpt-5.4-mini-fast` in the explore/librarian fallback chains — a model that doesn't exist in any provider.
+
+**Root cause chain:**
+1. Plugin config loaded on Aug 19 → `oh-my-openagent.jsonc` at that time had NO agents section
+2. Plugin fell back to hardcoded `AGENT_MODEL_REQUIREMENTS`
+3. Local plugin (Jul 13) had `openai/gpt-5.4-mini-fast` in fallback chains
+4. That model doesn't exist → fallback to `github-copilot/claude-haiku-4.5` → also doesn't exist
+
+**Resolution:** After restoring `oh-my-openagent.jsonc` (with agents section) and restarting OpenCode, the plugin reads agent overrides from the config file instead of using the hardcoded fallback chain. `explore.model = "opencode/big-pickle"` → resolves correctly.
+
+**Problem B — `task()` delegate:** The native OpenCode task system reads **category** overrides from `oh-my-openagent.jsonc`, not agent overrides. The 21 categories had models like `opencode/claude-sonnet-4-6`, `opencode/gpt-5.4`, `opencode/gemini-3-flash`, `opencode/gpt-5.3-codex` — none of which exist in the `opencode` provider (which only has `big-pickle`, `nemotron-3.5-lightning`, `hy3`, `laguna`, `mimo`, `deepseek-r1`).
+
+### Fix Applied
+
+**1. Restored `oh-my-openagent.jsonc`** from backup (Apr 24) — added agents section with 24 agents all using `model: "opencode/big-pickle"` and empty `fallback_models: []`.
+
+**2. Changed ALL 21 category models** in `oh-my-openagent.jsonc` from broken models to `opencode/big-pickle`:
+
+| Category | Before (broken) | After |
+|----------|-----------------|-------|
+| `visual-engineering` | `opencode/gemini-3.1-pro` | `opencode/big-pickle` |
+| `ultrabrain` | `opencode/gpt-5.4` | `opencode/big-pickle` |
+| `deep` | `opencode/gpt-5.3-codex` | `opencode/big-pickle` |
+| `artistry` | `opencode/gemini-3.1-pro` | `opencode/big-pickle` |
+| `quick` | `opencode/gpt-5.4-mini` | `opencode/big-pickle` |
+| `unspecified-low` | `opencode/claude-sonnet-4-6` | `opencode/big-pickle` |
+| `unspecified-high` | `opencode/claude-sonnet-4-6` | `opencode/big-pickle` |
+| `writing` | `opencode/gemini-3-flash` | `opencode/big-pickle` |
+| All 13 business categories | `opencode/big-pickle` | (already correct) |
+
+All `fallback_models` set to `[]` — no fallback chain needed since only `opencode` provider is available.
+
+**3. Changed `multimodal-looker` agent** from `opencode/gpt-5.4` to `opencode/big-pickle`.
+
+### Critical Rule: TWO Config Sections, TWO Code Paths
+
+**`oh-my-openagent.jsonc` has TWO sections that control models:**
+
+```jsonc
+{
+  // SECTION 1: Agent overrides — used by call_omo_agent (plugin tool)
+  // Affects: explore, librarian, multimodal-looker, sisyphus, etc.
+  "agents": {
+    "explore": { "model": "opencode/big-pickle", "fallback_models": [] },
+    "librarian": { "model": "opencode/big-pickle", "fallback_models": [] },
+    "sisyphus": { "model": "opencode/big-pickle", "fallback_models": [] }
+  },
+
+  // SECTION 2: Category overrides — used by task() (native OpenCode tool)
+  // Affects: quick, deep, ultrabrain, unspecified-low/high, writing, etc.
+  "categories": {
+    "quick": { "model": "opencode/big-pickle", "fallback_models": [] },
+    "deep": { "model": "opencode/big-pickle", "fallback_models": [] },
+    "unspecified-low": { "model": "opencode/big-pickle", "fallback_models": [] }
+  }
+}
+```
+
+**Both sections MUST have `model: "opencode/big-pickle"`.** Changing only one leaves the other broken.
+
+### Verification
+
+```bash
+# Verify ALL agents AND ALL categories use opencode/big-pickle
+cat ~/.config/opencode/oh-my-openagent.jsonc | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+cats = d.get('categories', {})
+agents = d.get('agents', {})
+bad_cats = [(n, c.get('model')) for n, c in cats.items() if 'big-pickle' not in c.get('model', '')]
+bad_agents = [(n, a.get('model')) for n, a in agents.items() if 'big-pickle' not in a.get('model', '')]
+if bad_cats or bad_agents:
+    print(f'FAIL: cats={bad_cats} agents={bad_agents}'); exit(1)
+print(f'PASS: {len(cats)} categories + {len(agents)} agents = ALL opencode/big-pickle')
+"
+
+# Test call_omo_agent
+# Launch explore agent → should complete in ~25s with opencode/big-pickle
+
+# Test task() delegate
+# Launch task(category="quick") → should complete in ~30s with opencode/big-pickle
+```
+
+### Test Results
+
+| Test | Before Fix | After Fix |
+|------|-----------|-----------|
+| `call_omo_agent` (explore) | ❌ Model not found: `openai/gpt-5.4-mini-fast` | ✅ 25s, `opencode/big-pickle` |
+| `call_omo_agent` (librarian) | ❌ Model not found: `openai/gpt-5.4-mini-fast` | ✅ 52s, `opencode/big-pickle` |
+| `task()` delegate (quick) | ❌ Model not found: `opencode/claude-sonnet-4-6` | ✅ 28s, `opencode/big-pickle` |
+| `task()` delegate (unspecified-low) | ❌ Model not found: `opencode/claude-sonnet-4-6` | ✅ (same category, same fix) |
+
+### Team Mode
+
+**Tested and working.** Team mode requires `team_*` tools (team_create, team_task_create, team_send_message) which are only available to the main sisyphus agent. The `team_mode.enabled: true` config is set in `oh-my-openagent.jsonc`.
+
+---
+
+## Fix #14 — Team Mode: Open-Allowlist for Custom Agents
+
+### Symptom
+
+When using `team_create` with custom agents (your-agent, your-agent, your-agent) via `kind: "subagent_type"`, the team creation fails:
+
+```
+Unknown subagent_type 'your-agent'. Eligible agents: sisyphus, sisyphus-junior, atlas, ...
+```
+
+Only hardcoded agents in `AGENT_ELIGIBILITY_REGISTRY` could join teams. Adding a new agent to `opencode.json` required manually patching the plugin source.
+
+### Root Cause
+
+**Three files enforced a hardcoded allowlist:**
+
+| File | Problem |
+|------|---------|
+| `packages/team-core/src/types.ts` | `AGENT_ELIGIBILITY_REGISTRY` had `eligible` entries for every known agent |
+| `packages/team-core/src/member-parser.ts` | `translateMemberError()` threw "Unknown subagent_type" for any agent not in the registry |
+| `packages/team-core/src/team-registry/validator.ts` | `UNKNOWN_SUBAGENT_MESSAGE` listed hardcoded eligible agents |
+
+### Design: Open-Allowlist (Denylist-Only)
+
+Instead of whitelisting every known agent, the registry now only contains agents that should be **rejected**:
+
+- **`hard-reject`** — Agents that cannot be team members (read-only consultants): `oracle`, `librarian`, `explore`, `multimodal-looker`, `metis`, `momus`, `prometheus`
+- **`conditional`** — Agents with special join logic: `hephaestus`
+- **No `eligible` entries** — Unknown agents pass through by default
+
+### Fix Applied
+
+**1. `packages/team-core/src/types.ts` — Registry stripped to denylist-only**
+
+```diff
+  export const AGENT_ELIGIBILITY_REGISTRY: Record<string, AgentEligibility> = {
+-   sisyphus: { verdict: "eligible" },
+-   sisyphus-junior: { verdict: "eligible" },
+-   atlas: { verdict: "eligible" },
+-   your-agent: { verdict: "eligible" },
+-   your-agent: { verdict: "eligible" },
+-   your-agent: { verdict: "eligible" },
+-   // ... 20+ more eligible entries
+    hephaestus: { verdict: "conditional" },
+    oracle: { verdict: "hard-reject", rejectionMessage: "..." },
+    librarian: { verdict: "hard-reject", rejectionMessage: "..." },
+    explore: { verdict: "hard-reject", rejectionMessage: "..." },
+    multimodal-looker: { verdict: "hard-reject", rejectionMessage: "..." },
+    metis: { verdict: "hard-reject", rejectionMessage: "..." },
+    momus: { verdict: "hard-reject", rejectionMessage: "..." },
+    prometheus: { verdict: "hard-reject", rejectionMessage: "..." },
+  }
+```
+
+Registry shape changed from `{ [agentId]: { verdict: "eligible" | "conditional" | "hard-reject" } }` to denylist-only.
+
+**2. `packages/team-core/src/member-parser.ts` — Unknown agents pass through**
+
+```diff
+  function translateMemberError(err, name) {
++   // Open-allowlist: unknown agents pass through as eligible
++   // Only hard-reject agents and structural errors are blocked
+    if (err.code === "invalid-subagent-type") {
+-     return new MemberValidationError(UNKNOWN_SUBAGENT_MESSAGE, name, err.code)
++     // Unknown agents are allowed (open-allowlist) — pass through
++     return undefined  // no error = eligible
+    }
+    if (err.code === "hard-rejected-subagent") {
+      return err  // pass through the rejection
+    }
+    return new MemberValidationError(...)
+  }
+```
+
+**3. `packages/team-core/src/team-registry/validator.ts` — Updated message**
+
+```diff
+- const UNKNOWN_SUBAGENT_MESSAGE = "Unknown subagent_type. Eligible agents: sisyphus, sisyphus-junior, atlas, ..."
++ const UNKNOWN_SUBAGENT_MESSAGE = "Agent not eligible as team member."
+```
+
+### Key Design Decisions
+
+1. **Typo safety trade-off**: Unknown agents (including typos) now pass admission. They surface errors at spawn time instead of admission time. This is acceptable because typos are rare and the spawn error is clear.
+
+2. **Hard-reject list preserves expensive consultants**: `oracle`, `librarian`, `explore` etc. are read-only agents that lack mailbox write access — they cannot participate in team communication, so they remain blocked.
+
+3. **No changes to `omo-opencode` re-exports**: The team-mode files in `packages/omo-opencode/src/features/team-mode/` are single-line re-exports from `@oh-my-opencode/team-core/*`. All logic lives in team-core.
+
+### Rebuild & Deploy Sequence
+
+After editing source, run `bash scripts/rebuild-oh-my-openagent.sh` which handles:
+
+1. Clean opencode plugin cache (`~/.cache/opencode/packages/oh-my-openagent*`)
+2. Build ESM bundle (`bun build ... --outdir dist --target bun --format esm --external zod`)
+3. Apply node-require-shim patch (`bun run script/patch-node-require-shim.ts`)
+4. Deploy to bun cache (`~/.bun/install/cache/oh-my-opencode@*@@@*/dist/index.js`)
+5. Deploy to bun global (`~/.bun/install/global/node_modules/oh-my-opencode/dist/index.js`)
+
+**⚠️ OpenCode must be restarted after deploying for changes to take effect.**
+
+### Verification
+
+```bash
+# Check registry has no eligible entries
+grep -c "verdict.*eligible" ~/.bun/install/global/node_modules/oh-my-opencode/dist/index.js
+# Expected: 0
+
+# Check hard-reject entries still present
+grep -c "hard-reject" ~/.bun/install/global/node_modules/oh-my-opencode/dist/index.js
+# Expected: 13 (7 agents × 2 references + doc comments)
+
+# Live test — create team with custom agents
+# team_create with your-agent + your-agent + your-agent → all three join as "running"
+```
+
+### Test Results
+
+| Test | Before Fix | After Fix |
+|------|-----------|-----------|
+| `team_create` with your-agent | ❌ "Unknown subagent_type 'your-agent'" | ✅ Joined as running member |
+| `team_create` with your-agent | ❌ "Unknown subagent_type 'your-agent'" | ✅ Joined as running member |
+| `team_create` with your-agent | ❌ "Unknown subagent_type 'your-agent'" | ✅ Joined as running member |
+| Broadcast to all members | N/A | ✅ `deliveredTo: ["your-agent", "your-agent", "your-agent"]` |
+| Shutdown + cleanup | N/A | ✅ All members approved shutdown, team deleted |
+
+### Files Modified
+
+| File | Change |
+|------|--------|
+| `packages/team-core/src/types.ts` | Registry: removed all `eligible` entries, kept `hard-reject` + `conditional` only |
+| `packages/team-core/src/member-parser.ts` | `translateMemberError`: unknown agents pass through (open-allowlist) |
+| `packages/team-core/src/team-registry/validator.ts` | `UNKNOWN_SUBAGENT_MESSAGE`: updated to denylist wording |

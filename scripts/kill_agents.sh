@@ -92,6 +92,18 @@ kill_with_animation() {
     fi
 }
 
+is_opencode_server_port() {
+    local pid=$1
+    local port_pids
+    port_pids=($(lsof -ti :4096 2>/dev/null || echo ""))
+    for port_pid in "${port_pids[@]}"; do
+        if [[ "$pid" == "$port_pid" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 kill_all_opencode() {
     echo ""
     log "=== AGGRESSIVE OPENCODE CLEANUP ==="
@@ -120,6 +132,11 @@ kill_all_opencode() {
             fi
         fi
         
+        if is_opencode_server_port "$pid"; then
+            log "Skipping opencode-serve on port 4096 (PID: $pid)"
+            continue
+        fi
+        
         if kill -0 "$pid" 2>/dev/null; then
             log "Killing opencode main process PID: $pid"
             kill -9 "$pid" 2>/dev/null || true
@@ -130,6 +147,11 @@ kill_all_opencode() {
     local node_pids
     node_pids=($(pgrep -f "node.*opencode" 2>/dev/null || echo ""))
     for pid in "${node_pids[@]}"; do
+        if is_opencode_server_port "$pid"; then
+            log "Skipping opencode-serve node subprocess on port 4096 (PID: $pid)"
+            continue
+        fi
+        
         if kill -0 "$pid" 2>/dev/null; then
             log "Killing opencode node subprocess PID: $pid"
             kill -9 "$pid" 2>/dev/null || true
@@ -141,11 +163,21 @@ kill_all_opencode() {
     local remaining
     remaining=($(pgrep -f "opencode" 2>/dev/null | grep -v "^$$\$" || echo ""))
     if [[ ${#remaining[@]} -gt 0 ]]; then
-        warning "Force killing remaining: ${remaining[*]}"
+        local safe_to_kill=()
         for pid in "${remaining[@]}"; do
-            kill -9 "$pid" 2>/dev/null || true
-            killed=$((killed + 1))
+            if is_opencode_server_port "$pid"; then
+                log "Preserving opencode-serve on port 4096 (PID: $pid)"
+            else
+                safe_to_kill+=("$pid")
+            fi
         done
+        if [[ ${#safe_to_kill[@]} -gt 0 ]]; then
+            warning "Force killing remaining: ${safe_to_kill[*]}"
+            for pid in "${safe_to_kill[@]}"; do
+                kill -9 "$pid" 2>/dev/null || true
+                killed=$((killed + 1))
+            done
+        fi
     fi
     
     echo ""

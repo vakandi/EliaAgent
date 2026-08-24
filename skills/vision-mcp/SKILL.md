@@ -61,7 +61,7 @@ mcp-cli call vision-mcp check_api_keys '{}'
 ### Product Image Analysis (Best)
 ```bash
 mcp-cli call vision-mcp analyze_image '{
-  "image_paths": ["/path/to/screenshot.png"],
+  "image_paths": ["~/Downloads/46526.png"],
   "prompt": "This is a product image. Product: Pull Prada €100. Describe brand, color, design, text visible",
   "model": "nvidia/nemotron-nano-12b-v2-vl:free"
 }'
@@ -70,7 +70,7 @@ mcp-cli call vision-mcp analyze_image '{
 ### Multi-Image Product Comparison
 ```bash
 mcp-cli call vision-mcp analyze_image '{
-  "image_paths": ["/path/to/product1.png","/path/to/product2.png"],
+  "image_paths": ["~/Downloads/product1.png","~/Downloads/product2.png"],
   "prompt": "Compare these two products: brand differences, price tags, condition",
   "model": "qwen/qwen2.5-vl-72b-instruct:free"
 }'
@@ -79,7 +79,7 @@ mcp-cli call vision-mcp analyze_image '{
 ### OCR / Text Extraction
 ```bash
 mcp-cli call vision-mcp extract_text '{
-  "image_paths": ["/path/to/screenshot.png"],
+  "image_paths": ["~/Downloads/46526.png"],
   "model": "nvidia/nemotron-nano-12b-v2-vl:free"
 }'
 ```
@@ -104,7 +104,7 @@ mcp-cli call vision-mcp analyze_image '{"image_paths": ["/path/to.jpg"], "prompt
 
 ## API Keys
 
-Config file: `/path/to/vision-mcp/.env`
+Config file: `~/mcps_server/vision_mcp/.env`
 
 - `MISTRAL_API_KEY` - For Mistral provider
 - `OPENROUTER_API_KEY` - For OpenRouter provider

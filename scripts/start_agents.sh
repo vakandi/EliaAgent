@@ -19,8 +19,8 @@ if [[ -f "${AGENT_DIR}/.scheduler_disabled" ]]; then
     exit 0
 fi
 
-TRIGGER_SCRIPT="${AGENT_DIR}/scripts/trigger_opencode_interactive.sh"
-PROMPT_FILE="${AGENT_DIR}/PROMPT.md"
+TRIGGER_SCRIPT="${AGENT_DIR}/subworkers/scripts/trigger_template.js"
+PROMPT_FILE="${AGENT_DIR}/subworkers/elia/PROMPT.md"
 AGENT_PAYLOADS_DIR="${AGENT_DIR}/.agent_payloads"
 # Colors for output
 RED='\033[0;31m'
@@ -118,13 +118,13 @@ mkdir -p "$AGENT_PAYLOADS_DIR"
 
 # Check if trigger script exists
 if [[ ! -f "$TRIGGER_SCRIPT" ]]; then
-    error "trigger_opencode_interactive.sh not found at: $TRIGGER_SCRIPT"
+    error "trigger_template.js not found at: $TRIGGER_SCRIPT"
     exit 1
 fi
 
 # Check if trigger script is executable
 if [[ ! -x "$TRIGGER_SCRIPT" ]]; then
-    log "Making trigger_opencode_interactive.sh executable..."
+    log "Making trigger_template.js executable..."
     chmod +x "$TRIGGER_SCRIPT"
 fi
 
@@ -224,9 +224,9 @@ fi
 
 if [[ -n "${EXTRA_PROMPT_FILE:-}" ]]; then
     EXTRA_CONTENT=$(cat "$EXTRA_PROMPT_FILE")
-    "$TRIGGER_SCRIPT" "$EXTRA_CONTENT"
+    node "$TRIGGER_SCRIPT" --agent elia --prompt "$EXTRA_CONTENT"
 else
-    "$TRIGGER_SCRIPT"
+    node "$TRIGGER_SCRIPT" --agent elia
 fi
 
 EXIT_CODE=$?

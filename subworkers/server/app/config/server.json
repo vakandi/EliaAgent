@@ -1,0 +1,17 @@
+{
+  "port": 5656,
+  "log_level": "INFO",
+  "opencode": {
+    "server_url": "http://127.0.0.1:4096",
+    "health_check_interval": 10,
+    "max_restarts": 10,
+    "backoff_max": 30,
+    "startup_timeout": 60
+  },
+  "alert": {
+    "enabled": true,
+    "electron_url": "http://localhost:3000",
+    "ntfy_topic": "AITeamHelper",
+    "debounce_seconds": 300
+  }
+}

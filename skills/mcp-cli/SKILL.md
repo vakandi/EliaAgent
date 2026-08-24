@@ -1,6 +1,6 @@
 ---
 name: mcp-cli
-description: Access external services via mcp-cli wrapper (WhatsApp, Discord, Jira, SSH, Gmail, Coolify). Use skill(name="mcp-cli") to load this skill before calling any mcp-cli commands.
+description: Access external services via mcp-cli wrapper (WhatsApp, Discord, Jira, SSH, Gmail, Coolify, GSC). Use skill(name="mcp-cli") to load this skill before calling any mcp-cli commands. Full tool reference: ~/EliaAI/context/TOOLS.md
 ---
 
 # MCP-CLI Skill
@@ -15,6 +15,14 @@ description: Access external services via mcp-cli wrapper (WhatsApp, Discord, Ji
 </invoke>
 ```
 
+### ⚠️ NEVER use `mcp-cli list` — it's useless
+
+To see all available servers, just run bare `mcp-cli` (no arguments). `mcp-cli list` does NOT work.
+
+### 📖 Full tool reference lives in `~/EliaAI/context/TOOLS.md`
+
+That file is the **single source of truth** for every MCP server, tool, parameter, and example. Always check it first.
+
 ## Coolify CLI & MCP
 
 ### Coolify CLI (installed at ~/.local/bin/coolify)
@@ -23,7 +31,7 @@ description: Access external services via mcp-cli wrapper (WhatsApp, Discord, Ji
 # Configure context (run once)
 ~/.local/bin/coolify context add \
   --name production \
-  --url https://dashboard.[your-agency].com \
+  --url https://dashboard.your-agency.agency \
   --token YOUR_COOLIFY_API_TOKEN
 
 # List projects
@@ -75,8 +83,8 @@ mcp-cli call coolify deploy_application '{"application_id":"..."}'
 ### WhatsApp
 ```bash
 mcp-cli call whatsapp list_chats '{"limit":20}'
-mcp-cli call whatsapp list_messages '{"chat_jid":"000000000000000000@g.us","limit":30}'
-mcp-cli call whatsapp send_message '{"recipient":"000000000000000000@g.us","message":"Hello"}'
+mcp-cli call whatsapp list_messages '{"chat_jid":"120363408208578679@g.us","limit":30}'
+mcp-cli call whatsapp send_message '{"recipient":"120363420711538035@g.us","message":"Hello"}'
 mcp-cli call whatsapp download_media '{"message_id":"...","chat_jid":"..."}'
 ```
 
@@ -116,14 +124,14 @@ mcp-cli call gmail search_emails '{"query":"in:inbox newer_than:7d","maxResults"
 mcp-cli call gmail send_email '{"to":["email@example.com"],"subject":"Subject","body":"Body"}'
 ```
 
-### Email: contact@[your-agency].com (IONOS)
+### Email: contact@your-agency.agency (IONOS)
 ```bash
-mcp-cli call mail_contact_youragency_agency list_emails_metadata '{"limit":20}'
-mcp-cli call mail_contact_youragency_agency get_emails_content '{"email_id":"..."}'
-mcp-cli call mail_contact_youragency_agency send_email '{"to":"...","subject":"...","body":"..."}'
+mcp-cli call mail_contact_your-agency_agency list_emails_metadata '{"limit":20}'
+mcp-cli call mail_contact_your-agency_agency get_emails_content '{"email_id":"..."}'
+mcp-cli call mail_contact_your-agency_agency send_email '{"to":"...","subject":"...","body":"..."}'
 ```
 
-### Email: youragency_distribution (Distribution)
+### Email: your-agency_distribution (Distribution)
 ```bash
 mcp-cli call mail_contact_cofibou_distribution list_emails_metadata '{"limit":20}'
 mcp-cli call mail_contact_cofibou_distribution send_email '{"to":"...","subject":"...","body":"..."}'
@@ -136,57 +144,98 @@ mcp-cli call github-copilot list_issues '{"repo":"owner/repo"}'
 mcp-cli call github-copilot create_issue '{"repo":"owner/repo","title":"...","body":"..."}'
 ```
 
-### Playwright (Browser Automation)
+### Playwright (Browser Automation — single session)
 ```bash
 mcp-cli call playwright browser_navigate '{"url":"https://example.com"}'
 mcp-cli call playwright browser_snapshot
 mcp-cli call playwright browser_click '{"selector":"button"}'
 ```
 
-### YourBrand API (Full Backend)
+### Parallel Browser MCP (Multi-Session — 26 tools)
+
+**⚠️ SESSION ISOLATION:** Each agent MUST create its own session with a distinct name. Never reuse sessions — assume another agent is using the MCP. Close your session when done.
+
+**⚠️ mcp-cli Limitation:** `mcp-cli call` spawns a new process per call → session state lost. Use **native MCP** in OpenCode for multi-step workflows. `get_sessions` works via mcp-cli (no state needed).
+
 ```bash
-# Orders
-mcp-cli call [your_mcp] get_orders '{"limit":20}'
-mcp-cli call [your_mcp] get_order_by_id '{"order_id":123}'
-mcp-cli call [your_mcp] update_order_status '{"order_id":123,"status":"shipped"}'
+# Quick check (works via mcp-cli — no state needed)
+mcp-cli call parallel-browser-mcp get_sessions '{}'
 
-# Products
-mcp-cli call [your_mcp] get_products '{"limit":20}'
-mcp-cli call [your_mcp] search_products '{"query":"Premium Item"}'
-mcp-cli call [your_mcp] get_all_brands
-
-# Users
-mcp-cli call [your_mcp] get_users '{"limit":20}'
-mcp-cli call [your_mcp] get_new_users '{"days":7}'
-
-# Analytics
-mcp-cli call [your_mcp] get_order_stats
-mcp-cli call [your_mcp] get_analytics
-mcp-cli call [your_mcp] get_financial_summary
-
-# Snapchat
-mcp-cli call [your_mcp] get_snapchat_army_info
-mcp-cli call [your_mcp] get_snapchat_device_health
-mcp-cli call [your_mcp] get_snapchat_campaigns
-mcp-cli call [your_mcp] get_snapchat_leads
-
-# WhatsApp
-mcp-cli call [your_mcp] get_whatsapp_chats
-mcp-cli call [your_mcp] get_whatsapp_messages '{"chat_id":123}'
-mcp-cli call [your_mcp] send_whatsapp_message '{"chat_id":123,"message":"..."}'
-
-# System
-mcp-cli call [your_mcp] get_system_health
-mcp-cli call [your_mcp] get_recent_notifications
+# Full workflow — use native MCP tool_call in OpenCode:
+# 1. start_session → {"id":1,"provider":"playwright"}
+# 2. browser_navigate → {"sessionId":1,"url":"https://..."}
+# 3. browser_snapshot / browser_click / browser_fill / browser_screenshot / browser_evaluate
+# 4. close_session → {"sessionId":1,"closed":true}
 ```
 
-### Image Generation Free MCP (Pollinations.ai — no API key)
-```bash
-# Generate an image from a text prompt (auto-saves to output/, returns file_path)
-mcp-cli call image-generation-free-mcp generate_image '{"prompt":"a cat riding a bicycle","width":512,"height":512}'
+**Session naming:** `{agent}_{task}` — e.g. `elia_morning`, `bene2_scrape`, `gilfoyle_deploy`
 
-# List available models (flux, turbo)
-mcp-cli call image-generation-free-mcp list_models '{}'
+**Providers:** `playwright` (local, default), `browserbase`, `anchor`, `cloudflare`
+
+### your-brand API (Full Backend)
+```bash
+# Orders
+mcp-cli call your-brand_mcp get_orders '{"limit":20}'
+mcp-cli call your-brand_mcp get_order_by_id '{"order_id":123}'
+mcp-cli call your-brand_mcp update_order_status '{"order_id":123,"status":"shipped"}'
+
+# Products
+mcp-cli call your-brand_mcp get_products '{"limit":20}'
+mcp-cli call your-brand_mcp search_products '{"query":"Stone Cargo"}'
+mcp-cli call your-brand_mcp get_all_brands
+
+# Users
+mcp-cli call your-brand_mcp get_users '{"limit":20}'
+mcp-cli call your-brand_mcp get_new_users '{"days":7}'
+
+# Analytics
+mcp-cli call your-brand_mcp get_order_stats
+mcp-cli call your-brand_mcp get_analytics
+mcp-cli call your-brand_mcp get_financial_summary
+
+# Snapchat
+mcp-cli call your-brand_mcp get_snapchat_army_info
+mcp-cli call your-brand_mcp get_snapchat_device_health
+mcp-cli call your-brand_mcp get_snapchat_campaigns
+mcp-cli call your-brand_mcp get_snapchat_leads
+
+# WhatsApp
+mcp-cli call your-brand_mcp get_whatsapp_chats
+mcp-cli call your-brand_mcp get_whatsapp_messages '{"chat_id":123}'
+mcp-cli call your-brand_mcp send_whatsapp_message '{"chat_id":123,"message":"..."}'
+
+# System
+mcp-cli call your-brand_mcp get_system_health
+mcp-cli call your-brand_mcp get_recent_notifications
+```
+
+### Apple Image Generator (Apple Intelligence + Pollinations — 16 tools)
+
+**Full reference:** `skill(name="apple-image-generator")` → reads `~/.config/opencode/skills/apple-image-generator/SKILL.md`
+
+Two engines: Apple Intelligence (on-device stylized art) and Pollinations.ai (cloud photorealistic). 40+ platform presets, text overlay, watermark, smart crop, batch generation.
+
+```bash
+# Check what's available
+mcp-cli call apple_intelligence list_engines '{}'
+
+# Generate photorealistic image (Pollinations — free, no API key)
+mcp-cli call apple_intelligence generate_image '{"prompt":"professional product photo","engine":"pollinations"}'
+
+# Generate stylized art (Apple Intelligence — on-device)
+mcp-cli call apple_intelligence generate_image '{"prompt":"cute robot","engine":"apple","style":"illustration"}'
+
+# Generate + crop for multiple social platforms
+mcp-cli call apple_intelligence generate_social_pack '{"prompt":"product launch","platforms":["instagram_post","twitter_post","linkedin_post"]}'
+
+# Use predefined bundle
+mcp-cli call apple_intelligence generate_bundle '{"prompt":"startup announcement","bundle":"startup_kit"}'
+
+# Add text overlay to existing image
+mcp-cli call apple_intelligence add_text_overlay '{"image_path":"/path/to/img.png","text":"SALE 50% OFF","font_size":64}'
+
+# Crop existing image to platform sizes
+mcp-cli call apple_intelligence crop_image '{"image_path":"/path/to/photo.jpg","platforms":["instagram_post","facebook_post"]}'
 ```
 
 ### Vision MCP (Multi-Provider Image Analysis)
@@ -199,8 +248,10 @@ mcp-cli call vision-mcp analyze_image '{"image_paths": ["/path/to/image.jpg"], "
 mcp-cli call vision-mcp analyze_image '{"image_paths": ["img1.jpg","img2.jpg"], "prompt": "Compare these two marketing images"}'
 ```
 
-### Zernio (Multi-Platform Social Media Engine — 33 tools)
+### Zernio (Multi-Platform Social Media Engine — 44 tools)
 **Use for:** Posting, scheduling, and managing content across 15+ social platforms (Twitter/X, Instagram, Facebook, LinkedIn, TikTok, YouTube, Pinterest, Reddit, Bluesky, Threads, Snapchat, Telegram, WhatsApp, Discord, Google Business).
+
+**📖 Full reference:** `~/EliaAI/context/ZERNIO_TOOLS.md` — Complete tool schemas, platform-specific data formats, and examples for every platform.
 
 **Architecture:** Multi-account with per-account proxies. 3 accounts:
 - `account-1` (tweetsyncai) → Instagram, Pinterest
@@ -264,6 +315,25 @@ mcp-cli call zernio zernio_get_follower_stats '{"account_id":"account-1"}'
 - Connected account IDs come from `zernio_list_connected_accounts`. Profile IDs come from `zernio_list_profiles`.
 - Proxy strategy: Each account has its own HTTPS proxy + user-agent. Free tier = 2 platforms per account.
 - All errors return `{ success: false, error: "description" }`. 401/403/429 throw, everything else returns clean error response.
+
+### HeyGen MCP (Video Generation — 12 tools)
+**Use for:** AI video generation, avatars, text-to-speech, video translation, and video editing via HeyGen API.
+
+**📖 Full reference:** `~/EliaAI/context/HEYGEN_TOOLS.md` — Complete tool schemas, avatar list, voice options, and workflow examples.
+
+```bash
+# List available avatars
+mcp-cli call heygen-mcp list_avatars '{}'
+
+# Generate video from text
+mcp-cli call heygen-mcp create_video '{"title":"Product Demo","input":[{"voice":{"voice_id":"..."},"text":"Hello world"}]}'
+
+# Check video status
+mcp-cli call heygen-mcp get_video_status '{"video_id":"..."}'
+
+# List video templates
+mcp-cli call heygen-mcp list_templates '{}'
+```
 
 ### Discord Server MCP
 ```bash
@@ -335,12 +405,43 @@ mcp-cli call telegram-scraper join_group \
 
 # Inviter des membres scrapés vers ton channel
 mcp-cli call telegram-scraper invite_members \
-  '{"target_channel":"https://t.me/YourAppChannel","max_invites":20,"speed":"slow"}'
+  '{"target_channel":"https://t.me/MirrorPayChannel","max_invites":20,"speed":"slow"}'
 
 # Options partagées:
-#   account_index (optional): 0=the user (lecture seule), 1+=scrapers (par défaut)
+#   account_index (optional): 0=owner (read-only), 1+=scrapers (par défaut)
 #   speed: "slow" (30-45s entre invites) ou "normal"
 ```
+
+### Google Search Console MCP (58 tools)
+
+**Server:** `gsc-mcp` — Full docs in `~/EliaAI/context/TOOLS.md` (section "🔍 GSC MCP")
+
+```bash
+# Inspect URL (tested: uses "site" + "url")
+mcp-cli call gsc-mcp inspect_url '{"site":"sc-domain:your-saas.com","url":"https://your-saas.com/stripe-cloaking"}'
+
+# Submit URL for indexing (tested: only needs "url")
+mcp-cli call gsc-mcp submit_url '{"url":"https://your-saas.com/stripe-cloaking"}'
+
+# Batch submit
+mcp-cli call gsc-mcp submit_batch '{"urls":["https://your-saas.com/stripe-cloaking","https://your-saas.com/pricing"]}'
+
+# Performance overview
+mcp-cli call gsc-mcp get_performance_overview '{"site":"sc-domain:your-saas.com"}'
+
+# Quick wins (pages ready to push to page 1)
+mcp-cli call gsc-mcp quick_wins '{"site":"sc-domain:your-saas.com"}'
+
+# List sitemaps
+mcp-cli call gsc-mcp list_sitemaps '{"site":"sc-domain:your-saas.com"}'
+```
+
+### ⚠️ GSC Pitfalls (tested)
+| Pitfall | Fix |
+|---------|-----|
+| `inspect_url` expects `site` + `url` | NOT `site_url` + `inspection_url` |
+| `submit_url` / `submit_batch` | Only need `url`/`urls`, no `site` param |
+| GA4 tools ignore `site` | Use `account` directly |
 
 ## Common Issues
 
@@ -348,14 +449,15 @@ mcp-cli call telegram-scraper invite_members \
 |-------|----------|
 | `SERVER_NOT_FOUND: ssh-mpc-server...` | Use correct name: `ssh-server-multisaasdeploy` (NOT `ssh-mpc-server-multisaasdeploy`) |
 | Tool not found | Check server name spelling exactly |
+| `mcp-cli list` returns nothing | Run bare `mcp-cli` (no args) to list all servers |
 
 ## Business Groups (WhatsApp JIDs)
-- YOURAGENCY Team: `000000000000000000@g.us`
-- YOURBRAND Business: `000000000000000000@g.us`
-- YOURBRAND: `000000000000000000@g.us`
+- B2B Group: `120363420711538035@g.us`
+- Your Brand Group: `120363408208578679@g.us`
+- Partner Group: `120363405622746597@g.us`
 
 ## Jira Projects
-- YourBrand: `BEN`
-- YourAgency Agency: `YOURAGENCY`
+- your-brand: `YOURBRAND`
+- your-agency: `YOURAGENCY`
 - TikTok/YouTube: `TIKYT`
-- YourBoost: `ZOVAPANEL`
+- Your SaaS: `YOURSAAS`

@@ -4,9 +4,9 @@ set -euo pipefail
 # Script to manually test codemem batch processing with OpenCode Zen (big-pickle)
 # This bypasses the observer client and directly tests the LLM call
 
-CODENEM_DIR="~/EliaAI/integrations/codemem"
-DB_PATH="~/.codemem/mem.sqlite"
-LOG_FILE="~/EliaAI/logs/codemem_batch_test.log"
+CODENEM_DIR=""$HOME/EliaAI"/integrations/codemem"
+DB_PATH=""$HOME/.codemem"/mem.sqlite"
+LOG_FILE=""$HOME/EliaAI"/logs/codemem_batch_test.log"
 
 echo "=== CodeMem Batch Test with OpenCode Zen ===" | tee -a "$LOG_FILE"
 echo "Date: $(date)" | tee -a "$LOG_FILE"
@@ -70,9 +70,9 @@ opencode run --model big-pickle "Reply with just: HELLO_TEST" 2>&1 | tee -a "$LO
 
 # Step 6: Check viewer logs for observer calls
 echo -e "\n=== Step 6: Check viewer logs ===" | tee -a "$LOG_FILE"
-if [ -f "~/EliaAI/logs/codemem_viewer.log" ]; then
+if [ -f ""$HOME/EliaAI"/logs/codemem_viewer.log" ]; then
     echo "Last 50 lines of viewer log:" | tee -a "$LOG_FILE"
-    tail -50 ~/EliaAI/logs/codemem_viewer.log 2>&1 | grep -i "observer\|batch\|openai\|big.pickle\|zen" | tee -a "$LOG_FILE" || echo "No observer-related logs" | tee -a "$LOG_FILE"
+    tail -50 "$HOME/EliaAI"/logs/codemem_viewer.log 2>&1 | grep -i "observer\|batch\|openai\|big.pickle\|zen" | tee -a "$LOG_FILE" || echo "No observer-related logs" | tee -a "$LOG_FILE"
 fi
 
 echo -e "\n=== Test complete ===" | tee -a "$LOG_FILE"

@@ -1,6 +1,6 @@
 ---
 name: tiktok-analytics
-description: "TikTok account analytics and content monitoring using agent-browser. Use when: (1) Check TikTok business account performance, (2) Get views/comments/engagement metrics, (3) Verify if content was posted, (4) Monitor account health and growth, (5) Generate TikTok performance reports for the user's businesses. Triggers: check TikTok, tiktok analytics, how are my TikToks doing, was content posted, TikTok engagement, views on TikTok, TikTok report."
+description: "TikTok account analytics and content monitoring using agent-browser. Use when: (1) Check TikTok business account performance, (2) Get views/comments/engagement metrics, (3) Verify if content was posted, (4) Monitor account health and growth, (5) Generate TikTok performance reports for the owner's businesses. Triggers: check TikTok, tiktok analytics, how are my TikToks doing, was content posted, TikTok engagement, views on TikTok, TikTok report."
 ---
 
 # TikTok Analytics Skill
@@ -28,7 +28,7 @@ TikTok accounts are stored in:
 - `@context/business.md` - Business TikTok accounts
 - `@context/TOOLS.md` - Tool configuration
 
-**If no accounts configured yet**: Ask the user to provide TikTok account credentials/usernames.
+**If no accounts configured yet**: Ask the owner to provide TikTok account credentials/usernames.
 
 ## Workflow: Check TikTok Analytics
 
@@ -198,11 +198,11 @@ Profile heading: heading "1 Following 2225 Followers 1.5M Likes"
 
 | Business | Username | Purpose |
 |----------|----------|---------|
-| **YourBrand** | @luxe2bene | Drive traffic to WhatsApp for luxury fashion sales |
+| **your-brand** | @luxe2bene | Drive traffic to WhatsApp for luxury fashion sales |
 
 ## Business Context
 
-### YourBrand (@luxe2bene)
+### your-brand (@luxe2bene)
 - **Purpose**: Drive traffic to WhatsApp for luxury fashion sales
 - **Target**: France & Switzerland audiences
 - **Success metric**: Views → WhatsApp conversions

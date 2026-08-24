@@ -7,7 +7,7 @@ mkdir -p "${SCRIPT_DIR}/logs"
 
 echo "=== SSL Monitor - $(date) ===" | tee -a "$LOG_FILE"
 
-declare -a domains=("[yourbrand].com" "[yoursaas].com" "[yourservice].com" "[yourbusiness].com")
+declare -a domains=("your-brand.com" "your-saas.com" "your-other-saas.com" "your-agency.com")
 
 for domain in "${domains[@]}"; do
     expiry=$(echo | openssl s_client -servername "$domain" -connect "$domain":443 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)

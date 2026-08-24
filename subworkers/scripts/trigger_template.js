@@ -1,16 +1,11 @@
 #!/usr/bin/env node
 import { execSync, spawn } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { createConnection } from "node:net";
 
 const AGENT_DIR = join(homedir(), "EliaAI");
-const SESSION_REUSE_COOLDOWN_MS = 20_000;
-const SESSION_REUSE_MAX_COOLDOWN_MS = 60_000;
-const RETRY_BACKOFF_MIN_MS = 20_000;
-const RETRY_BACKOFF_MAX_MS = 40_000;
-const RECOVERY_RESEND_MAX_ATTEMPTS = 6;
 
 function parseArgs() {
   const args = process.argv.slice(2);
@@ -83,228 +78,45 @@ class Trigger {
     this.agentId = this.agentName.replace(/_/g, "-");
 
     this.subworkerDir = join(AGENT_DIR, "subworkers", this.agentId);
-    this.workspaceDir = join(this.subworkerDir, "workspace");
+    this.mainAgentName = this.readMainAgentName();
+    this.isMainAgent = this.agentId === this.mainAgentName;
+    this.workspaceDir = this.isMainAgent ? AGENT_DIR : join(this.subworkerDir, "workspace");
     this.logDir = join(AGENT_DIR, "subworkers", "logs");
     this.aggregateLog = join(this.logDir, `${this.agentName}.log`);
     this.runsDir = join(this.logDir, "runs", this.agentName);
     const now = new Date();
     this.ts = `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,"0")}${String(now.getDate()).padStart(2,"0")}_${String(now.getHours()).padStart(2,"0")}${String(now.getMinutes()).padStart(2,"0")}${String(now.getSeconds()).padStart(2,"0")}`;
     this.runLog = join(this.runsDir, `${this.ts}.log`);
-    this.activeRunLog = this.runLog;
-    this.spawnedServerPid = null;
-    this.opencodeSandboxRoot = mkdtempSync(join(tmpdir(), `subworkers-opencode-${this.agentName}-`));
-    this.opencodeDataHome = join(this.opencodeSandboxRoot, "data");
-    this.opencodeCacheHome = join(this.opencodeSandboxRoot, "cache");
-    this.opencodeStateHome = join(this.opencodeSandboxRoot, "state");
-    this.proxyEnv = {};
-    mkdirSync(this.opencodeDataHome, { recursive: true });
-    mkdirSync(this.opencodeCacheHome, { recursive: true });
-    mkdirSync(this.opencodeStateHome, { recursive: true });
 
     mkdirSync(this.runsDir, { recursive: true });
     mkdirSync(this.workspaceDir, { recursive: true });
-    mkdirSync(join(this.workspaceDir, "docs", new Date().toISOString().slice(0, 10)), { recursive: true });
-    this.log(`[SANDBOX] OpenCode sandbox root: ${this.opencodeSandboxRoot}`);
+    if (!this.isMainAgent) {
+      mkdirSync(join(this.workspaceDir, "docs", new Date().toISOString().slice(0, 10)), { recursive: true });
+    }
   }
 
-  readSessionIdFromLog(runLogPath) {
-    if (!existsSync(runLogPath)) return null;
+  readMainAgentName() {
     try {
-      const text = readFileSync(runLogPath, "utf-8");
-      const matches = text.matchAll(/\bSession(?: ID)?:\s*(ses_[A-Za-z0-9_-]+)/gi);
-      let latest = null;
-      for (const match of matches) {
-        latest = match[1] || latest;
-      }
-      return latest;
-    } catch {
-      return null;
-    }
-  }
-
-  collectRecoveryCandidates(attempt) {
-    const candidates = [];
-    for (let i = attempt - 1; i >= 1; i--) {
-      candidates.push(join(this.runsDir, `${this.ts}${i === 1 ? "" : `_retry${i - 1}`}.log`));
-    }
-    return candidates;
-  }
-
-  describeExitCode(exitCode) {
-    if (exitCode === 0) return "success";
-    if (exitCode === 124) return "watchdog timeout / killed";
-    if (exitCode === 137) return "SIGKILL / external kill";
-    return `exit ${exitCode}`;
-  }
-
-  async waitWithLog(ms, reason) {
-    const seconds = Math.round(ms / 1000);
-    this.log(`${reason} — waiting ${seconds}s`);
-    await sleep(ms);
-    this.log(`${reason} — wait finished`);
-  }
-
-  async waitWithHeartbeat(ms, reason) {
-    const stepMs = 10_000;
-    let remainingMs = ms;
-    while (remainingMs > 0) {
-      const chunkMs = Math.min(stepMs, remainingMs);
-      await sleep(chunkMs);
-      remainingMs -= chunkMs;
-      if (remainingMs > 0) {
-        this.log(`${reason} — ${Math.round(remainingMs / 1000)}s remaining`);
-      }
-    }
-  }
-
-  getRecoveryRetryDelayMs(recoveryAttempt) {
-    const retryIndex = Math.max(1, recoveryAttempt - 1);
-    return Math.min(
-      SESSION_REUSE_COOLDOWN_MS + ((retryIndex - 1) * 10_000),
-      SESSION_REUSE_MAX_COOLDOWN_MS,
-    );
-  }
-
-  getRetryBackoffMs() {
-    const min = RETRY_BACKOFF_MIN_MS;
-    const max = RETRY_BACKOFF_MAX_MS;
-    return Math.floor(min + (Math.random() * (max - min)));
-  }
-
-  async resumeExistingSession(runLog, sessionId, sourceLog) {
-    let exitCode = 1;
-    let validated = false;
-    let resumeBlockedByActiveSession = false;
-
-    for (let recoveryAttempt = 1; recoveryAttempt <= RECOVERY_RESEND_MAX_ATTEMPTS; recoveryAttempt++) {
-      if (recoveryAttempt > 1) {
-        const retryDelayMs = this.getRecoveryRetryDelayMs(recoveryAttempt);
-        await this.waitWithLog(
-          retryDelayMs,
-          `[RECOVERY] Reattempting same session ${sessionId} (attempt ${recoveryAttempt}/${RECOVERY_RESEND_MAX_ATTEMPTS}, delay=${Math.round(retryDelayMs / 1000)}s)`
-        );
-      }
-
-      this.log(`[RECOVERY] Reusing session ${sessionId} with continuation prompt`);
-      this.log(`[RECOVERY] Dispatching continuation prompt to session ${sessionId}: "continue the work"`);
-      exitCode = this.mode === "loop"
-        ? await this.runLoopMode(runLog, sessionId)
-        : await this.runTaskMode("continue the work", runLog, sessionId);
-      this.log(`[RECOVERY] Continuation dispatch returned exit_code=${exitCode} (${this.describeExitCode(exitCode)}) for session ${sessionId}`);
-
-      resumeBlockedByActiveSession = this.isResumeBlockedByActiveSession(runLog);
-      validated = exitCode === 0 && this.validateRun(runLog);
-      this.log(`[RECOVERY] Reuse result: blockedByActive=${resumeBlockedByActiveSession}, validated=${validated}`);
-
-      if (validated) {
-        this.log(`[RECOVERY] Continuation prompt accepted for session ${sessionId}`);
-        return { exitCode, validated, resumeBlockedByActiveSession, sessionId, sourceLog };
-      }
-
-      if (resumeBlockedByActiveSession) {
-        this.log(
-          `[RECOVERY] Session ${sessionId} is still active; keeping the same session and retrying after cooldown`
-        );
-      } else {
-        this.log(`[RECOVERY] Resume attempt did not validate — keeping the same session for another retry (reason=${this.describeExitCode(exitCode)})`);
-      }
-    }
-
-    this.log(
-      `[RECOVERY] Exhausted same-session retries for ${sessionId} without validation; leaving fallback decision to the outer retry loop`
-    );
-    return { exitCode, validated, resumeBlockedByActiveSession, sessionId, sourceLog };
+      const p = join(AGENT_DIR, "subworkers", "main-agent.json");
+      if (!existsSync(p)) return "elia";
+      const d = JSON.parse(readFileSync(p, "utf-8"));
+      if (d && typeof d.name === "string" && d.name) return d.name;
+    } catch {}
+    return "elia";
   }
 
   log(msg, target) {
     const line = `[${new Date().toISOString().replace("T", " ").slice(0, 19)}] ${msg}`;
     console.log(line);
     appendFileSync(this.aggregateLog, line + "\n");
-    appendFileSync(target || this.activeRunLog || this.runLog, line + "\n");
-  }
-
-  buildEnv() {
-    return {
-      ...process.env,
-      XDG_DATA_HOME: this.opencodeDataHome,
-      XDG_CACHE_HOME: this.opencodeCacheHome,
-      XDG_STATE_HOME: this.opencodeStateHome,
-      ...this.proxyEnv,
-      OPENCODE_DISABLE_AUTOUPDATE: "1",
-      OPENCODE_DISABLE_MODELS_FETCH: "1",
-    };
-  }
-
-  refreshProxy() {
-    if (!this.useProxy) return;
-
-    const switchProxyScript = join(AGENT_DIR, "setup", "switch-proxy.sh");
-    if (!existsSync(switchProxyScript)) {
-      this.log(`[PROXY] switch-proxy.sh not found at ${switchProxyScript}`);
-      return;
-    }
-
-    this.log(`[PROXY] Refreshing proxy via ${switchProxyScript}`);
-    const output = execSync(`/bin/bash "${switchProxyScript}"`, {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-      cwd: AGENT_DIR,
-    });
-    if (output.trim()) {
-      for (const line of output.trim().split("\n")) {
-        this.log(`[PROXY] ${line}`);
-      }
-    }
-
-    const proxyConf = join(homedir(), ".proxychains.conf");
-    let proxyLine = null;
-    try {
-      const content = readFileSync(proxyConf, "utf8");
-      proxyLine = content.split("\n").find((line) => {
-        const trimmed = line.trim();
-        return trimmed && !trimmed.startsWith("#") && trimmed.startsWith("http ");
-      }) ?? null;
-    } catch (error) {
-      this.log(`[PROXY] Failed to read ${proxyConf}: ${error instanceof Error ? error.message : String(error)}`);
-    }
-
-    if (!proxyLine) {
-      this.log("[PROXY] No proxy line found after refresh; continuing without proxy env overrides");
-      return;
-    }
-
-    const parts = proxyLine.trim().split(/\s+/);
-    if (parts.length < 5) {
-      this.log(`[PROXY] Unexpected proxy line format: ${proxyLine}`);
-      return;
-    }
-
-    const [, ip, port, user, pass] = parts;
-    const proxyUrl = `http://${user}:${pass}@${ip}:${port}`;
-    this.proxyEnv = {
-      HTTP_PROXY: proxyUrl,
-      HTTPS_PROXY: proxyUrl,
-      http_proxy: proxyUrl,
-      https_proxy: proxyUrl,
-      NO_PROXY: "127.0.0.1,localhost,::1",
-      no_proxy: "127.0.0.1,localhost,::1",
-    };
-    this.log(`[PROXY] Proxy refreshed for run: ${ip}:${port}`);
+    appendFileSync(target || this.runLog, line + "\n");
   }
 
   resolveBinaries() {
-    const localOmoBin = join(AGENT_DIR, "setup", "oh-my-openagent", "bin", "oh-my-opencode.js");
-    if (existsSync(localOmoBin)) {
-      this.omoBin = localOmoBin;
-      this.log(`[BIN] Using repo-local oh-my-opencode at ${this.omoBin}`);
-    } else {
-      this.omoBin = which("oh-my-opencode");
-    }
+    this.omoBin = which("oh-my-opencode");
     if (!this.omoBin) { this.log("FATAL: oh-my-opencode not found"); process.exit(1); }
-    this.log(`[BIN] Using oh-my-opencode=${this.omoBin}`);
     this.opencodeBin = which("opencode");
     if (!this.opencodeBin) { this.log("FATAL: opencode not found"); process.exit(1); }
-    this.log(`[BIN] Using opencode=${this.opencodeBin}`);
   }
 
   checkEnabled() {
@@ -334,6 +146,21 @@ class Trigger {
     if (this.useProxy) this.log("[PROXY] Proxy mode enabled");
   }
 
+  loadModelSelection() {
+    if (this.modelOverride) return;
+    try {
+      const p = join(AGENT_DIR, "ui_electron", "model-selections.json");
+      if (!existsSync(p)) return;
+      const sel = JSON.parse(readFileSync(p, "utf-8"));
+      if (sel && typeof sel === "object" && typeof sel[this.agentName] === "string" && sel[this.agentName]) {
+        this.modelOverride = sel[this.agentName];
+        this.log(`[MODEL] Using ${this.modelOverride} from model-selections.json`);
+      }
+    } catch (e) {
+      this.log(`[MODEL] load error: ${e.message}`);
+    }
+  }
+
   runCommand(cmd, args, runLogPath) {
     return new Promise((resolve) => {
       const watchdogMs = this.watchdogMin * 60_000;
@@ -343,7 +170,7 @@ class Trigger {
         cwd: AGENT_DIR,
         stdio: ["ignore", "pipe", "pipe"],
         detached: true,
-        env: this.buildEnv(),
+        env: { ...process.env },
       });
 
       proc.stdout.on("data", (chunk) => {
@@ -374,24 +201,21 @@ class Trigger {
     });
   }
 
-  async runTaskMode(prompt, runLog, sessionId = null) {
+  async runTaskMode(prompt, runLog) {
     const args = ["run", "-d", this.workspaceDir, "-a", this.agentId];
-    if (sessionId) args.push("--session-id", sessionId);
     if (this.modelOverride) args.push("--model", this.modelOverride);
     args.push(prompt);
     return this.runCommand(this.omoBin, args, runLog);
   }
 
-  async runLoopMode(runLog, sessionId = null) {
+  async runLoopMode(runLog) {
     const port = 4096;
     if (!(await checkPort(port))) {
       this.log(`[SERVER] Starting server on port ${port}`);
       const serverCmd = this.useProxy
         ? ["proxychains4", "-f", `${homedir()}/.proxychains.conf`, "opencode", "serve", "--port", String(port)]
         : ["opencode", "serve", "--port", String(port)];
-      const serverProc = spawn(serverCmd[0], serverCmd.slice(1), { detached: true, stdio: "ignore", env: { ...process.env, XDG_DATA_HOME: this.opencodeDataHome, XDG_CACHE_HOME: this.opencodeCacheHome, XDG_STATE_HOME: this.opencodeStateHome, OPENCODE_DISABLE_AUTOUPDATE: "1", OPENCODE_DISABLE_MODELS_FETCH: "1" } });
-      this.spawnedServerPid = serverProc.pid ?? null;
-      serverProc.unref();
+      spawn(serverCmd[0], serverCmd.slice(1), { detached: true, stdio: "ignore", env: { ...process.env } }).unref();
       await sleep(3000);
     } else {
       this.log(`[SERVER] Running on port ${port} — attaching`);
@@ -399,7 +223,6 @@ class Trigger {
     const loopCmd = existsSync(join(AGENT_DIR, ".ralph_mode")) ? "/ralph-loop" : "/ulw-loop";
     this.log(`Loop: ${loopCmd}`);
     const args = ["run", "--attach", `http://127.0.0.1:${port}`, "-d", this.workspaceDir, "-a", this.agentId];
-    if (sessionId) args.push("--session-id", sessionId);
     if (this.modelOverride) args.push("--model", this.modelOverride);
     args.push(loopCmd);
     return this.runCommand(this.omoBin, args, runLog);
@@ -420,33 +243,16 @@ class Trigger {
     return false;
   }
 
-  isResumeBlockedByActiveSession(runLog) {
-    if (!existsSync(runLog)) return false;
-    try {
-      const text = readFileSync(runLog, "utf-8");
-      return text.includes("promptAsync skipped by gate: active") ||
-        text.includes("Session is not idle");
-    } catch {
-      return false;
-    }
-  }
-
   async cleanupServers() {
-    if (!this.spawnedServerPid) {
-      this.log("[CLEANUP] Skipping cleanup; no owned loop server was spawned by this trigger");
-      return;
-    }
-
-    try {
-      this.log(`[CLEANUP] Killing owned loop server PID ${this.spawnedServerPid}`);
+    for (const port of [4096, 4097, 4098, 4099, 4100]) {
       try {
-        process.kill(-this.spawnedServerPid, "SIGKILL");
-      } catch {
-        process.kill(this.spawnedServerPid, "SIGKILL");
-      }
-      await sleep(1000);
-    } catch (error) {
-      this.log(`[CLEANUP] Owned loop server cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+        const pids = execSync(`lsof -ti:${port}`, { encoding: "utf-8" }).trim();
+        if (pids) {
+          this.log(`[CLEANUP] Killing orphaned server(s) on port ${port}: ${pids}`);
+          for (const pid of pids.split(/\s+/)) { try { process.kill(parseInt(pid), 9); } catch {} }
+          await sleep(1000);
+        }
+      } catch {}
     }
   }
 
@@ -457,81 +263,33 @@ class Trigger {
     const prompt = this.loadPrompt();
     this.detectMode();
     this.detectProxy();
-    if (this.useProxy) this.refreshProxy();
+    this.loadModelSelection();
 
     let exitCode = 0;
     for (let attempt = 1; attempt <= this.maxRetries + 1; attempt++) {
       const runLog = attempt === 1 ? this.runLog : join(this.runsDir, `${this.ts}_retry${attempt - 1}.log`);
-      this.activeRunLog = runLog;
       if (attempt > 1) this.log(`Retry ${attempt - 1}/${this.maxRetries} — attempt ${attempt}`);
 
       const runStart = Date.now();
-      const previousRunLog = attempt > 1 ? (attempt === 2 ? this.runLog : join(this.runsDir, `${this.ts}_retry${attempt - 2}.log`)) : null;
-      let recoveredSessionId = null;
-      let recoveredSessionSource = null;
-      let validated = false;
-      let resumeBlockedByActiveSession = false;
-
-      if (attempt > 1) {
-        const candidates = this.collectRecoveryCandidates(attempt);
-        this.log(`[RECOVERY] Previous run log: ${previousRunLog || "n/a"}`);
-        this.log(`[RECOVERY] Recovery candidates: ${candidates.join(" -> ")}`);
-        for (const candidate of candidates) {
-          const sessionId = this.readSessionIdFromLog(candidate);
-          if (sessionId) {
-            recoveredSessionId = sessionId;
-            recoveredSessionSource = candidate;
-            break;
-          }
-        }
-        this.log(`[RECOVERY] Session lookup result: ${recoveredSessionId || "none found"}`);
-        if (recoveredSessionSource) {
-          this.log(`[RECOVERY] Session source: ${recoveredSessionSource}`);
-        }
-      }
-
-      if (attempt > 1 && recoveredSessionId) {
-        await this.waitWithLog(
-          SESSION_REUSE_COOLDOWN_MS,
-          `[RECOVERY] Cooling down before reusing session ${recoveredSessionId}`
-        );
-        const recoveryResult = await this.resumeExistingSession(runLog, recoveredSessionId, recoveredSessionSource || previousRunLog || runLog);
-        exitCode = recoveryResult.exitCode;
-        validated = recoveryResult.validated;
-        resumeBlockedByActiveSession = recoveryResult.resumeBlockedByActiveSession;
-        if (!validated && !resumeBlockedByActiveSession) {
-          this.log(`[RECOVERY] Resume attempts exhausted for session ${recoveredSessionId}; falling back to a fresh session`);
-        }
-      } else if (attempt > 1) {
-        this.log("[RECOVERY] No reusable session id found in any prior log; skipping continuation path");
-      }
-
-      if (!(attempt > 1 && recoveredSessionId && (validated || resumeBlockedByActiveSession))) {
-        if (attempt > 1 && recoveredSessionId) {
-          this.log("[RECOVERY] Starting fresh session after reuse path");
-        }
-        exitCode = this.mode === "loop"
-          ? await this.runLoopMode(runLog)
-          : await this.runTaskMode(prompt, runLog);
-        validated = exitCode === 0 && this.validateRun(runLog);
-      }
+      exitCode = this.mode === "loop"
+        ? await this.runLoopMode(runLog)
+        : await this.runTaskMode(prompt, runLog);
 
       const duration = Math.round((Date.now() - runStart) / 1000);
       this.log(`Run completed: exit_code=${exitCode} duration=${duration}s attempt=${attempt}`, runLog);
 
-      if (validated) {
+      if (exitCode === 0 && this.validateRun(runLog)) {
         this.log("Run validated successfully", runLog);
         break;
       }
       if (attempt <= this.maxRetries) {
-        const retryBackoffMs = this.getRetryBackoffMs();
-        this.log(`Will retry in ${Math.round(retryBackoffMs / 1000)}s...`);
-        await this.waitWithHeartbeat(retryBackoffMs, "[RETRY]");
-        if (this.mode === "loop" && !resumeBlockedByActiveSession) await this.cleanupServers();
+        this.log("Will retry in 5s...");
+        await sleep(5000);
+        if (this.mode === "task") await this.cleanupServers();
       }
     }
 
-    if (this.mode === "loop") await this.cleanupServers();
+    if (this.mode === "task") await this.cleanupServers();
     this.log(`EOF_SUBWORKER_EXIT:${exitCode}`);
     return exitCode;
   }

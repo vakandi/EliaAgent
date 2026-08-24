@@ -1,5 +1,35 @@
 # EliaAgent Release Notes
 
+## Version: v6.1.0 (August 24, 2026)
+
+### 📱 Official Clients: macOS TopBar + Mobile App · 🌍 Remote Access via Cloudflare Tunnel
+
+The ecosystem now ships two first-class clients for managing your subworkers in realtime,
+plus secure remote access from anywhere.
+
+**macOS — EliaTopBar (native Swift menu-bar app):**
+- Full realtime subworker dashboard over WebSocket: live agent states (running/idle/error/done), running counts, server health
+- Chat & session viewer with streaming output, reasoning blocks and tool-call details
+- Trigger / enable / disable, model + reasoning-variant switching, main-agent control
+- One-click Cloudflare Tunnel setup and a live tunnel status indicator
+
+**Mobile — EliaSubworkers (Android today, iOS-ready · Expo / React Native):**
+- Same realtime dashboard optimized for touch, with automatic LAN discovery
+- Chat & sessions browser per agent: markdown rendering, collapsible reasoning, tool-call details
+- Schedule calendar projecting interval & cron runs across the week, with collision picker
+- Run notifications (finish / fail), profile photos, shared-token auth
+
+**🌍 Cloudflare Tunnel remote access (both clients):**
+- In-app wizard: domain + Cloudflare API token → automatic tunnel creation, DNS routing,
+  connector startup and public verification — step by step
+- Permanent by design: the `cloudflared` connector restarts with Docker; set it up once
+- Shared-token auth (`ELIA_AUTH_TOKEN`) protects every HTTP call and WebSocket handshake
+- Deployable anywhere: run the stack on your Mac or a VPS and reach it from any network
+
+**Links:** [EliaTopBar](https://github.com/vakandi/Elia-Topbar) · [EliaAndroidApp](https://github.com/vakandi/EliaAndroidApp)
+
+---
+
 ## Version: v5.0.1 (July 12, 2026)
 
 ### 🛡️ Subworker Premature Completion Fix — 10 Critical Bugfixes

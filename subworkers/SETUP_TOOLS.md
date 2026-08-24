@@ -130,14 +130,14 @@ mcp-cli call vision-mcp analyze_image '{"image_url": "https://..."}'
 
 ## 7. Capabilities Requises par Agent
 
-### youragency-promoter:
+### your-b2b-agent:
 - ✅ LinkedIn: Post, comment, connect, message
 - ✅ X: Post, like, retweet, reply, search
 - ✅ Reddit: Comment, post (via browser)
 - ✅ Discord: Send reports (mcp-cli)
 - ✅ WhatsApp: Alerts (mcp-cli)
 
-### yourbrand-promoter:
+### your-retail-agent:
 - ✅ Instagram: Like, comment, post, DM, story, get media
 - ✅ TikTok: Comment, like (via browser)
 - ✅ FB Marketplace: Post listings, search, message

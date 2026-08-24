@@ -46,8 +46,8 @@ Files in `brain/raw/**` use this path pattern:
 
 Example:
 ```
-[[../../../wiki/people/User|User]]
-[[../../../wiki/businesses/[Your Brand]|[Your Brand]]]
+[[../../../wiki/people/Owner|Owner]]
+[[../../../wiki/businesses/YourBrand|YourBrand]]
 ```
 
 ### Why ../../../wiki/ ?
@@ -127,7 +127,7 @@ python3 comprehensive_linker.py
 
 ### People
 ```python
-"User": ("../../../wiki/people/User", "User")
+"Owner": ("../../../wiki/people/Owner", "Owner")
 "Thomas": ("../../../wiki/people/Thomas-Cogne", "Thomas")
 "Ali": ("../../../wiki/people/Ali", "Ali")
 "Rida": ("../../../wiki/people/Rida", "Rida")
@@ -137,19 +137,18 @@ python3 comprehensive_linker.py
 
 ### Businesses
 ```python
-"[Your Brand]": ("../../../wiki/businesses/[Your Brand]", "[Your Brand]")
-"YOURBRAND": ("../../../wiki/businesses/YOURBRAND-BUSINESS", "YOURBRAND")
-"[Your SaaS]": ("../../../wiki/businesses/[Your SaaS]", "[Your SaaS]")
-"[Your Agency]": ("../../../wiki/businesses/[Your Agency]-Agency", "[Your Agency]")
-"[YOUR PARTNER]": ("../../../wiki/businesses/[Your Partner]", "[YOUR PARTNER]")
-"[Your Business]": ("../../../wiki/businesses/[Your Business]", "[Your Business]")
-"[Your Service]": ("../../../wiki/businesses/[Your Service]", "[Your Service]")
+"YourBrand": ("../../../wiki/businesses/YourBrand", "YourBrand")
+"ZovaBoost": ("../../../wiki/businesses/ZovaBoost", "ZovaBoost")
+"YourAgency": ("../../../wiki/businesses/YourAgency", "YourAgency")
+"YourTelecom": ("../../../wiki/businesses/YourTelecom", "YourTelecom")
+"OGBoujee": ("../../../wiki/businesses/OGBoujee", "OGBoujee")
+"Netfluxe": ("../../../wiki/businesses/Netfluxe", "Netfluxe")
 ```
 
 ### Channels
 ```python
 "Telegram": ("../../../wiki/channels/Telegram", "Telegram")
-"WhatsApp": ("../../../wiki/channels/WhatsApp-YOURBRAND", "WhatsApp")
+"WhatsApp": ("../../../wiki/channels/WhatsApp", "WhatsApp")
 "Discord": ("../../../wiki/channels/Discord-EliaWorkSpace", "Discord")
 ```
 
@@ -159,8 +158,8 @@ python3 comprehensive_linker.py
 "SSH": ("../../../wiki/systems/SSH-Servers", "SSH")
 "Jira": ("../../../wiki/systems/Jira-Tickets-Index", "Jira")
 "MCP": ("../../../wiki/tools/MCP-Tools", "MCP")
-"Stripe": ("../../../wiki/businesses/[Your Brand]#stripe", "Stripe")
-"Shopify": ("../../../wiki/businesses/[Your Brand]#shopify", "Shopify")
+"Stripe": ("../../../wiki/businesses/YourBrand#stripe", "Stripe")
+"Shopify": ("../../../wiki/businesses/YourBrand#shopify", "Shopify")
 ```
 
 ### AI & Tools

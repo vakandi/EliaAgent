@@ -36,39 +36,18 @@ const EliaAIRoot = path.join(__dirname, '..', '..');
 const contextPath = path.join(EliaAIRoot, 'context');
 const subworkersRoot = path.join(EliaAIRoot, 'subworkers');
 
-function resolveNodeBin() {
-  const explicitNode = process.env.ELIA_NODE_BIN;
-  if (explicitNode && fs.existsSync(explicitNode)) return explicitNode;
-
-  const home = process.env.HOME || require('os').homedir();
-  const candidates = [];
-  const nvmRoot = path.join(home, '.nvm', 'versions', 'node');
+// ── Main agent (default: elia) ───────────────────────────────
+let _cachedMainAgent = 'elia';
+function getMainAgentName() {
   try {
-    if (fs.existsSync(nvmRoot)) {
-      candidates.push(
-        ...fs.readdirSync(nvmRoot)
-          .filter(version => version.startsWith('v'))
-          .sort()
-          .reverse()
-          .map(version => path.join(nvmRoot, version, 'bin', 'node'))
-      );
+    const data = execSync('curl -sf http://127.0.0.1:5656/main-agent', { encoding: 'utf8', timeout: 3000 });
+    const parsed = JSON.parse(data);
+    if (parsed && typeof parsed.name === 'string' && parsed.name) {
+      _cachedMainAgent = parsed.name;
+      return parsed.name;
     }
   } catch (_) {}
-  candidates.push(
-    path.join(home, '.bun', 'bin', 'node'),
-    '/opt/homebrew/bin/node',
-    '/usr/local/bin/node',
-  );
-  for (const candidate of candidates) {
-    if (candidate && fs.existsSync(candidate)) return candidate;
-  }
-
-  try {
-    const fromPath = execSync('which node', { encoding: 'utf8' }).trim();
-    if (fromPath) return fromPath;
-  } catch (_) {}
-
-  return '/usr/bin/env node';
+  return _cachedMainAgent;
 }
 
 function loadContextFiles() {
@@ -85,16 +64,6 @@ function loadContextFiles() {
   return context;
 }
 
-function getOpencodeStatus() {
-  try {
-    const pgrepOut = execSync('pgrep -f "oh-my-opencode" 2>/dev/null || pgrep -f "start_agents\\.sh" 2>/dev/null || pgrep -f "trigger_opencode" 2>/dev/null || true', { encoding: 'utf8' }).trim();
-    const pids = pgrepOut ? pgrepOut.split(/\s+/).filter(Boolean) : [];
-    return pids.length > 0;
-  } catch (e) {
-    return false;
-  }
-}
-
 function loadConfig() {
   try {
     config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
@@ -107,7 +76,7 @@ function loadConfig() {
 }
 
 const WIN_W = 350;
-const WIN_H = 250;
+const WIN_H = 310;
 const positionPath = path.join(__dirname, '..', '.elia-position.json');
 const SET_POSITION_FLAG = process.argv.includes('--set-position');
 
@@ -202,82 +171,35 @@ function createWindow() {
   });
 }
 
-// ── Agent status (start_agents.sh / opencode) ─────────────────────────────
+// ── Agent status (Docker subworker system) ──────────────────────────────
+let _mainAgentRunning = false;
+let _mainAgentStartedAt = 0;
+
 function getAgentStatus() {
   try {
-    // Get the opencode serve PID (daemon) to exclude it
-    const servePid = execSync('pgrep -f "opencode serve$" 2>/dev/null || echo ""', { encoding: 'utf8' }).trim().split(/\s+/)[0];
-    
-    // Match EliaAI-specific agent processes first (most specific)
-    let pgrepOut = execSync(
-      'pgrep -f "oh-my-opencode" 2>/dev/null || pgrep -f "start_agents\\.sh" 2>/dev/null || pgrep -f "trigger_opencode" 2>/dev/null || true',
-      { encoding: 'utf8' }
-    ).trim();
-    
-    const pids = pgrepOut ? pgrepOut.split(/\s+/).filter(Boolean) : [];
-    
-    // Filter out serve PID from the results
-    const allPids = pids.filter(pid => pid !== servePid);
-    
-    // If no specific agent after filtering, get first opencode that's NOT the serve daemon
-    if (allPids.length === 0) {
-      pgrepOut = execSync(
-        `pgrep -x opencode 2>/dev/null | grep -v "${servePid}" | head -1 || true`,
-        { encoding: 'utf8' }
-      ).trim();
-      const fallbackPids = pgrepOut ? pgrepOut.split(/\s+/).filter(Boolean) : [];
-      const pid = fallbackPids[0];
-      if (!pid) return { running: false };
-      if (servePid && pid === servePid) return { running: false };
-      const etimeOut = execSync(`ps -o etime= -p ${pid} 2>/dev/null || true`, { encoding: 'utf8' }).trim();
-      if (!etimeOut) return { running: false };
-      const trimmed = etimeOut.trim();
-      const dashParts = trimmed.split('-');
-      let timePart = trimmed;
-      let days = 0;
-      if (dashParts.length > 1) {
-        days = parseInt(dashParts[0], 10) || 0;
-        timePart = dashParts[1];
-      }
-      const parts = timePart.split(':').map(s => parseInt(s, 10) || 0);
-      let totalSec = days * 86400;
-      if (parts.length === 1) totalSec += parts[0];
-      else if (parts.length === 2) totalSec += parts[0] * 60 + parts[1];
-      else if (parts.length >= 3) totalSec += parts[0] * 3600 + parts[1] * 60 + parts[2];
-      if (totalSec < 3) return { running: false };
-      let formatted = totalSec < 120 ? `${totalSec}s` : `${Math.floor(totalSec / 60)}m ${totalSec % 60}s`;
-      if (totalSec >= 3600) formatted = `${Math.floor(totalSec / 3600)}h ${Math.floor((totalSec % 3600) / 60)}m`;
-      return { running: true, pid, elapsedSeconds: totalSec, formatted };
+    const mainAgentName = getMainAgentName();
+    const data = execSync(
+      'curl -sf http://127.0.0.1:5656/status',
+      { encoding: 'utf8', timeout: 5000 }
+    );
+    const parsed = JSON.parse(data);
+    const sw = (parsed.subworkers || []).find(s => s.name === mainAgentName);
+    const running = sw ? (sw.running || false) : false;
+
+    if (running && !_mainAgentRunning) {
+      _mainAgentStartedAt = Date.now();
+    } else if (!running) {
+      _mainAgentStartedAt = 0;
     }
-    
-    const pid = allPids[0];
-    if (!pid) return { running: false };
+    _mainAgentRunning = running;
 
-    const etimeOut = execSync(`ps -o etime= -p ${pid} 2>/dev/null || true`, { encoding: 'utf8' }).trim();
-    if (!etimeOut) return { running: false };
+    if (!running) return { running: false };
 
-    // etime format: [[dd-]hh:]mm:ss
-    const trimmed = etimeOut.trim();
-    const dashParts = trimmed.split('-');
-    let timePart = trimmed;
-    let days = 0;
-    if (dashParts.length > 1) {
-      days = parseInt(dashParts[0], 10) || 0;
-      timePart = dashParts[1];
-    }
-    const parts = timePart.split(':').map(s => parseInt(s, 10) || 0);
-    let totalSec = days * 86400;
-    if (parts.length === 1) totalSec += parts[0];
-    else if (parts.length === 2) totalSec += parts[0] * 60 + parts[1];
-    else if (parts.length >= 3) totalSec += parts[0] * 3600 + parts[1] * 60 + parts[2];
+    const elapsedSeconds = Math.floor((Date.now() - _mainAgentStartedAt) / 1000);
+    let formatted = elapsedSeconds < 120 ? `${elapsedSeconds}s` : `${Math.floor(elapsedSeconds / 60)}m ${elapsedSeconds % 60}s`;
+    if (elapsedSeconds >= 3600) formatted = `${Math.floor(elapsedSeconds / 3600)}h ${Math.floor((elapsedSeconds % 3600) / 60)}m`;
 
-    // Require at least 3 seconds elapsed - ignore processes that just started
-    if (totalSec < 3) return { running: false };
-
-    let formatted = totalSec < 120 ? `${totalSec}s` : `${Math.floor(totalSec / 60)}m ${totalSec % 60}s`;
-    if (totalSec >= 3600) formatted = `${Math.floor(totalSec / 3600)}h ${Math.floor((totalSec % 3600) / 60)}m`;
-
-    return { running: true, pid, elapsedSeconds: totalSec, formatted };
+    return { running: true, elapsedSeconds, formatted };
   } catch (e) {
     return { running: false };
   }
@@ -365,19 +287,15 @@ function parsePlistSchedule(plistPath) {
 function getSubworkerStatus() {
   const results = [];
   try {
-    const items = fs.readdirSync(subworkersRoot, { withFileTypes: true });
-    const skipDirs = new Set(['logs', 'plists', 'scripts']);
-    for (const item of items) {
-      if (!item.isDirectory()) continue;
-      if (skipDirs.has(item.name)) continue;
-
-      const dirPath = path.join(subworkersRoot, item.name);
-      const promptPath = path.join(dirPath, 'PROMPT.md');
-      const enabledPath = path.join(dirPath, '.enabled');
-      const plistName = `com.elia.${item.name}`;
-      const plistPath = path.join(subworkersRoot, 'plists', `${plistName}.plist`);
-
-      // Read description from PROMPT.md first line
+    const http = require('http');
+    const data = require('child_process').execSync(
+      'curl -sf http://127.0.0.1:5656/status',
+      { encoding: 'utf8', timeout: 5000 }
+    );
+    const parsed = JSON.parse(data);
+    const mainAgentName = getMainAgentName();
+    for (const sw of (parsed.subworkers || [])) {
+      const promptPath = path.join(subworkersRoot, sw.name, 'PROMPT.md');
       let description = '';
       try {
         const firstLine = fs.readFileSync(promptPath, 'utf8').split('\n')[0] || '';
@@ -385,35 +303,15 @@ function getSubworkerStatus() {
       } catch (e) {
         description = '';
       }
-
-      // Check .enabled flag
-      const enabled = fs.existsSync(enabledPath);
-
-      // Check launchd status
-      let running = false;
-      try {
-        const out = require('child_process').execSync(
-          `launchctl list ${plistName} 2>/dev/null || true`,
-          { encoding: 'utf8' }
-        ).trim();
-        if (out && !out.includes('Could not find')) {
-          const pidField = out.split('\t')[0] || '';
-          running = pidField !== '' && /^\d+$/.test(pidField.trim());
-        }
-      } catch (e) {}
-
-      // Parse schedule from plist
-      const schedule = parsePlistSchedule(plistPath);
-
       results.push({
-        name: item.name,
-        label: item.name.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
+        name: sw.name,
+        label: sw.name.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
         description,
-        path: dirPath,
-        enabled,
-        running,
-        plistExists: fs.existsSync(plistPath),
-        schedule
+        path: path.join(subworkersRoot, sw.name),
+        enabled: sw.enabled !== false,
+        running: sw.running || false,
+        isMain: sw.name === mainAgentName,
+        schedule: sw.schedule || null
       });
     }
     results.sort((a, b) => a.name.localeCompare(b.name));
@@ -492,7 +390,7 @@ ipcMain.on('get-selected-model', (event) => {
   // This will be handled by the renderer process
   // We need to get the selected model from the renderer
   mainWindow?.webContents.executeJavaScript(`
-    localStorage.getItem('selectedModel') || 'opencode/nemotron-3-lightning-free'
+    localStorage.getItem('selectedModel') || 'opencode/big-pickle'
   `).then(model => {
     event.reply('selected-model', model);
   });
@@ -506,11 +404,19 @@ ipcMain.on('set-selected-model', (event, model) => {
   writeModelForCron(model);
 });
 
-// Persist selected model for cron/trigger_opencode.sh (Elia choice = cron job model)
+// Persist selected model for cron/trigger (Elia choice = cron job model)
 const opencodeModelPath = path.join(EliaAIRoot, '.opencode_model');
+const MODEL_SHORT_MAP = {
+  'opencode/big-pickle': 'big-pickle',
+  'opencode/deepseek-v4-flash-free': 'deepseek-v4-flash-free',
+  'opencode/mimo-v2.5-free': 'mimo-v2.5-free',
+  'opencode/nemotron-3-ultra-free': 'nemotron-3-ultra-free'
+};
+const SAFE_MODELS = ['big-pickle', 'deepseek-v4-flash-free', 'mimo-v2.5-free', 'nemotron-3-ultra-free', 'minimax', 'nvidia', 'deepseek', 'mimo', 'nemotron'];
 function writeModelForCron(model) {
   if (!model || typeof model !== 'string') return;
-  const safe = ['opencode/big-pickle', 'big-pickle', 'opencode/nemotron-3-lightning-free', 'opencode/mimo-v2.5-free', 'opencode/deepseek-v4-flash-free'].includes(model) ? model : 'opencode/nemotron-3-lightning-free';
+  const short = MODEL_SHORT_MAP[model] || model;
+  const safe = SAFE_MODELS.includes(short) ? short : 'big-pickle';
   try {
     fs.writeFileSync(opencodeModelPath, safe + '\n', 'utf8');
   } catch (e) {
@@ -521,27 +427,10 @@ ipcMain.on('save-model-for-cron', (_event, model) => {
   writeModelForCron(model);
 });
 
-// OMO & RALPH/ULW Toggle IPC Handlers
-// ULW is now the DEFAULT mode. Ralph mode uses .ralph_mode file.
-const opencodeOmoPath = path.join(EliaAIRoot, '.omo_disabled');
+// OMO is always enabled. Ralph/ULW toggle uses .ralph_mode file.
 const opencodeRalphPath = path.join(EliaAIRoot, '.ralph_mode');
 
-function writeOmoState(enabled) {
-  try {
-    if (enabled) {
-      if (fs.existsSync(opencodeOmoPath)) fs.unlinkSync(opencodeOmoPath);
-    } else {
-      fs.writeFileSync(opencodeOmoPath, 'disabled\n', 'utf8');
-    }
-    console.log('OMO state:', enabled ? 'enabled' : 'disabled');
-  } catch (e) {
-    console.error('writeOmoState:', e.message);
-  }
-}
-
 function writeRalphMode(enabled) {
-  // When Ralph is enabled, create .ralph_mode file
-  // When ULW (default), delete .ralph_mode file
   try {
     if (enabled) {
       fs.writeFileSync(opencodeRalphPath, 'enabled\n', 'utf8');
@@ -554,37 +443,32 @@ function writeRalphMode(enabled) {
   }
 }
 
-ipcMain.on('omo-toggle', (_event, enabled) => {
-  writeOmoState(enabled);
+ipcMain.on('omo-toggle', (_event, _enabled) => {
+  console.log('OMO toggle ignored — always enabled');
 });
 
 ipcMain.on('ulw-toggle', (_event, enabled) => {
-  // enabled=true means ULW is ON (Ralph OFF), enabled=false means Ralph ON (ULW OFF)
-  // We store Ralph state (inverse of ULW)
   writeRalphMode(!enabled);
 });
 
 const manageCronScript = path.join(EliaAIRoot, 'scripts/manage_cron.sh');
 
-ipcMain.on('cron-toggle', (_event, { action, interval }) => {
-  const { execSync } = require('child_process');
-  let cmd;
-  if (action === 'uninstall') {
-    cmd = `/bin/zsh "${manageCronScript}" uninstall`;
-    console.log('Uninstalling launchd scheduler (cron-toggle)...');
-  } else if (action === 'install') {
-    cmd = `/bin/zsh "${manageCronScript}" install --interval ${interval} --start 9 --end 23`;
-    console.log('Installing launchd scheduler with interval:', interval);
-  } else {
+ipcMain.on('cron-toggle', (_event, { action }) => {
+  const { exec } = require('child_process');
+  if (action !== 'install' && action !== 'uninstall') {
     console.error('cron-toggle: unknown action', action);
     return;
   }
-  try {
-    execSync(cmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-    console.log('cron-toggle: OK');
-  } catch (error) {
-    console.error('Cron toggle error:', error.message);
-  }
+  const agentName = getMainAgentName();
+  const endpoint = action === 'install' ? 'enable' : 'disable';
+  const url = `http://127.0.0.1:5656/${endpoint}/${encodeURIComponent(agentName)}`;
+  exec(`curl -s -X POST "${url}"`, (error, stdout) => {
+    if (error) {
+      console.error('cron-toggle error:', error.message);
+    } else {
+      console.log(`cron-toggle: ${action} ${agentName} ->`, stdout);
+    }
+  });
 });
 
 ipcMain.on('show-cron-popup', () => {
@@ -650,66 +534,57 @@ ipcMain.on('get-subworkers', (event) => {
   event.reply('subworkers-list', workers);
 });
 
+ipcMain.on('set-main-agent', (event, name) => {
+  const clean = typeof name === 'string' ? name.replace(/[^a-zA-Z0-9_-]/g, '') : '';
+  try {
+    const agentName = clean || 'elia';
+    execSync(`curl -sf -X POST http://127.0.0.1:5656/main-agent -H "Content-Type: application/json" -d '{"name":"${agentName}"}'`, { encoding: 'utf8', timeout: 5000 });
+    _cachedMainAgent = agentName;
+    if (subworkerPopup && !subworkerPopup.isDestroyed()) {
+      subworkerPopup.webContents.send('subworkers-list', getSubworkerStatus());
+    }
+    event.reply('main-agent-set', { success: true, name: agentName });
+  } catch (e) {
+    console.error('set-main-agent error:', e.message);
+    event.reply('main-agent-set', { success: false, error: e.message });
+  }
+});
+
 // Toggle subworker enabled state
 ipcMain.on('toggle-subworker', (event, name) => {
   if (!name) return;
-  const subworkerDir = path.join(subworkersRoot, name);
-  const plistName = `com.elia.${name}`;
-  const plistPath = path.join(subworkersRoot, 'plists', `${plistName}.plist`);
-  const enabledPath = path.join(subworkerDir, '.enabled');
+  const { execSync } = require('child_process');
 
-  let enabled = false;
   try {
-    if (fs.existsSync(enabledPath)) {
-      fs.unlinkSync(enabledPath);
-      enabled = false;
-      // Unload from launchd if plist exists
-      if (fs.existsSync(plistPath)) {
-        require('child_process').execSync(`launchctl bootout gui/$(id -u) ${plistPath} 2>/dev/null || true`);
-      }
-    } else {
-      fs.writeFileSync(enabledPath, 'enabled\n', 'utf8');
-      enabled = true;
-      // Load into launchd if plist exists
-      if (fs.existsSync(plistPath)) {
-        require('child_process').execSync(`launchctl bootstrap gui/$(id -u) ${plistPath} 2>/dev/null || true`);
-      }
-    }
+    const current = JSON.parse(
+      execSync('curl -sf http://127.0.0.1:5656/status', { encoding: 'utf8', timeout: 5000 })
+    );
+    const sw = (current.subworkers || []).find(s => s.name === name);
+    const currentlyEnabled = sw ? sw.enabled !== false : false;
+    const endpoint = currentlyEnabled ? 'disable' : 'enable';
+    const result = JSON.parse(
+      execSync(`curl -sf -X POST http://127.0.0.1:5656/${endpoint}/${encodeURIComponent(name)}`, {
+        encoding: 'utf8', timeout: 5000
+      })
+    );
+    event.reply('subworker-toggled', { name, enabled: result.enabled, running: false });
   } catch (e) {
     console.error(`toggle-subworker ${name}:`, e.message);
+    event.reply('subworker-toggled', { name, enabled: false, running: false });
   }
-
-  // Check running state after toggle
-  let running = false;
-  try {
-    const out = require('child_process').execSync(
-      `launchctl list ${plistName} 2>/dev/null || true`,
-      { encoding: 'utf8' }
-    ).trim();
-    if (out && !out.includes('Could not find')) {
-      const pidField = out.split('\t')[0] || '';
-      running = pidField !== '' && /^\d+$/.test(pidField.trim());
-    }
-  } catch (e) {}
-
-  event.reply('subworker-toggled', { name, enabled, running });
 });
 
 // Run Morning Routine
 ipcMain.on('run-morning-routine', () => {
   const { exec } = require('child_process');
-  const morningScript = path.join(EliaAIRoot, 'scripts/trigger_morning.sh');
-  if (fs.existsSync(morningScript)) {
-    exec(`/bin/zsh "${morningScript}"`, (error, stdout, stderr) => {
-      if (error) {
-        console.error('Morning routine error:', error.message);
-      } else {
-        console.log('Morning routine started:', stdout);
-      }
-    });
-  } else {
-    console.error('Morning routine script not found:', morningScript);
-  }
+  const triggerUrl = 'http://127.0.0.1:5656/trigger/elia';
+  exec(`curl -s -X POST "${triggerUrl}"`, (error, stdout, stderr) => {
+    if (error) {
+      console.error('Morning routine error:', error.message);
+    } else {
+      console.log('Morning routine triggered:', stdout);
+    }
+  });
 });
 
 // Run Morning Speak (vocal briefing)
@@ -739,18 +614,14 @@ ipcMain.on('close-popup', () => {
 // Run Manual Cron (from cron popup)
 ipcMain.on('run-cron-manual', () => {
   const { exec } = require('child_process');
-  const startAgentsScript = path.join(EliaAIRoot, 'scripts/start_agents.sh');
-  if (fs.existsSync(startAgentsScript)) {
-    exec(`/bin/zsh "${startAgentsScript}"`, (error, stdout, stderr) => {
-      if (error) {
-        console.error('Manual cron error:', error.message);
-      } else {
-        console.log('Manual cron started:', stdout);
-      }
-    });
-  } else {
-    console.error('start_agents.sh not found:', startAgentsScript);
-  }
+  const triggerUrl = 'http://127.0.0.1:5656/trigger/elia';
+  exec(`curl -s -X POST "${triggerUrl}"`, (error, stdout, stderr) => {
+    if (error) {
+      console.error('Manual cron error:', error.message);
+    } else {
+      console.log('Manual cron triggered:', stdout);
+    }
+  });
 });
 
 // Open URL in browser
@@ -765,7 +636,7 @@ ipcMain.on('open-logs-terminal', () => {
   const path = require('path');
   
   // Find latest opencode_interactive log file
-  const logsDir = '/Users/vakandi/EliaAI/logs';
+  const logsDir = path.join(path.dirname(path.dirname(__dirname)), 'logs');
   let latestLog = null;
   let latestTime = 0;
   
@@ -784,7 +655,7 @@ ipcMain.on('open-logs-terminal', () => {
   } catch (e) {}
   
   // Fallback to cron.log if no opencode log found
-  const logFile = latestLog || '/Users/vakandi/EliaAI/logs/cron.log';
+  const logFile = latestLog || path.join(path.dirname(path.dirname(__dirname)), 'logs', 'cron.log');
   // Show whole file + follow in realtime
   const cmd = 'tail -n 5000 -f ' + logFile;
   
@@ -822,7 +693,7 @@ ipcMain.on('open-subworker-logs', (_event, name) => {
       type: 'info',
       title: 'No logs',
       message: `No run logs yet for ${name}.`,
-      detail: 'Run the trigger script once to generate the first log file.'
+      detail: 'Trigger the subworker once (server) to generate the first log file.'
     });
     return;
   }
@@ -841,16 +712,8 @@ ipcMain.on('open-subworker-logs', (_event, name) => {
 ipcMain.on('run-subworker-now', (_event, name, model) => {
   if (!name) return;
   const { exec } = require('child_process');
-  const triggerScript = path.join(subworkersRoot, 'scripts', 'trigger_template.js');
-  if (!fs.existsSync(triggerScript)) {
-    const { dialog } = require('electron');
-    dialog.showMessageBox({ type: 'error', title: 'Trigger not found', message: `No trigger script: ${triggerScript}` });
-    return;
-  }
-  const agentName = name.replace(/-/g, '_');
-  const modelFlag = model ? ` --model ${model}` : '';
-  const nodeBin = resolveNodeBin();
-  const termCmd = `${JSON.stringify(nodeBin)} "${triggerScript}" --agent ${agentName}${modelFlag} --force 2>&1 | tee /tmp/subworker_run_${name}.log; echo "EXIT:$?"`;
+  const triggerUrl = `http://127.0.0.1:5656/trigger/${encodeURIComponent(name)}`;
+  const termCmd = `curl -s -X POST "${triggerUrl}" | tee /tmp/subworker_run_${name}.log; echo "EXIT:$?"`;
   const script = [
     'tell application "Terminal" to activate',
     'tell application "Terminal" to do script ' + JSON.stringify(termCmd),
@@ -859,10 +722,20 @@ ipcMain.on('run-subworker-now', (_event, name, model) => {
   ].map(s => '-e ' + JSON.stringify(s)).join(' ');
   exec('osascript ' + script, (error) => {
     if (error) { console.error('run-subworker-now error:', error.message); return; }
-    const enabledPath = path.join(subworkersRoot, name, '.enabled');
-    const enabled = fs.existsSync(enabledPath);
-    if (subworkerPopup && !subworkerPopup.isDestroyed()) {
-      subworkerPopup.webContents.send('subworker-toggled', { name, enabled, running: true });
+    try {
+      const statusData = require('child_process').execSync(
+        'curl -sf http://127.0.0.1:5656/status', { encoding: 'utf8', timeout: 5000 }
+      );
+      const parsed = JSON.parse(statusData);
+      const sw = (parsed.subworkers || []).find(s => s.name === name);
+      const enabled = sw ? sw.enabled !== false : false;
+      if (subworkerPopup && !subworkerPopup.isDestroyed()) {
+        subworkerPopup.webContents.send('subworker-toggled', { name, enabled, running: true });
+      }
+    } catch (e) {
+      if (subworkerPopup && !subworkerPopup.isDestroyed()) {
+        subworkerPopup.webContents.send('subworker-toggled', { name, enabled: true, running: true });
+      }
     }
   });
 });
@@ -956,7 +829,7 @@ ipcMain.on('get-subworker-runs', (event, name) => {
               run.timeAgo = timeAgo(startDate);
 
               // Read tail to find status marker
-              // trigger_template.sh writes: [timestamp] EOF_SUBWORKER_EXIT:<code>
+              // Legacy run logs end with: [timestamp] EOF_SUBWORKER_EXIT:<code>
               // This is a unique string the AI can never produce.
               const tailLen = Math.min(stats.size, 300);
               const tailBuf = Buffer.alloc(tailLen);
@@ -1007,15 +880,11 @@ ipcMain.on('open-subworker-log-file', (_event, logFilePath) => {
 });
 
 ipcMain.on('get-toggle-states', (event) => {
-  const omoEnabled = !fs.existsSync(opencodeOmoPath);
-  // ULW is default (enabled when .ralph_mode does NOT exist)
   const ulwEnabled = !fs.existsSync(opencodeRalphPath);
-  
-  // Get actual scheduler state from launchd
   const cronSettings = getCurrentCronSettings();
   
   event.reply('toggle-states', { 
-    omoEnabled, 
+    omoEnabled: true, 
     ulwEnabled,
     cronEnabled: cronSettings.standardEnabled,
     cronInterval: cronSettings.interval,
@@ -1035,13 +904,7 @@ ipcMain.on('execute-elia-command', () => {
 
   mainWindow.webContents.executeJavaScript('localStorage.getItem("selectedModel") || "minimax"')
     .then(model => {
-      const modelMap = {
-        'opencode/big-pickle': 'opencode/big-pickle',
-        'opencode/nemotron-3-lightning-free': 'opencode/nemotron-3-lightning-free',
-        'opencode/mimo-v2.5-free': 'opencode/mimo-v2.5-free',
-        'opencode/deepseek-v4-flash-free': 'opencode/deepseek-v4-flash-free'
-      };
-      const modelValue = modelMap[model] || 'opencode/nemotron-3-lightning-free';
+      const rawModel = (model || 'opencode/big-pickle').replace(/^opencode\//, '');
 
       const proxyEnabled = fs.existsSync(proxyStatePath);
 
@@ -1059,7 +922,7 @@ ipcMain.on('execute-elia-command', () => {
               const user = parts[3];
               const pass = parts[4];
               const proxyUrl = `http://${user}:${pass}@${ip}:${port}`;
-              cmd = `cd /Users/vakandi/EliaAI && env HTTP_PROXY="${proxyUrl}" HTTPS_PROXY="${proxyUrl}" http_proxy="${proxyUrl}" https_proxy="${proxyUrl}" ELIA_MODEL=${modelValue} /Users/vakandi/Documents/dictate.command`;
+              cmd = `cd ~/EliaAI && env HTTP_PROXY="${proxyUrl}" HTTPS_PROXY="${proxyUrl}" http_proxy="${proxyUrl}" https_proxy="${proxyUrl}" ELIA_MODEL=${rawModel} ~/Documents/dictate.command`;
             }
           }
         } catch (e) {
@@ -1068,7 +931,7 @@ ipcMain.on('execute-elia-command', () => {
       }
 
       if (!cmd) {
-        cmd = `cd /Users/vakandi/EliaAI && ELIA_MODEL=${modelValue} /Users/vakandi/Documents/dictate.command`;
+        cmd = `cd ~/EliaAI && ELIA_MODEL=${rawModel} ~/Documents/dictate.command`;
       }
 
       const script = [
@@ -1105,7 +968,7 @@ ipcMain.on('execute-mini-orb', () => {
           const user = parts[3];
           const pass = parts[4];
           const proxyUrl = `http://${user}:${pass}@${ip}:${port}`;
-          cmd = `env HTTP_PROXY="${proxyUrl}" HTTPS_PROXY="${proxyUrl}" http_proxy="${proxyUrl}" https_proxy="${proxyUrl}" /Users/vakandi/EliaAI/scripts/voice-command-only.sh`;
+          cmd = `env HTTP_PROXY="${proxyUrl}" HTTPS_PROXY="${proxyUrl}" http_proxy="${proxyUrl}" https_proxy="${proxyUrl}" ~/EliaAI/scripts/voice-command-only.sh`;
         }
       }
     } catch (e) {
@@ -1114,7 +977,7 @@ ipcMain.on('execute-mini-orb', () => {
   }
   
   if (!cmd) {
-    cmd = '/Users/vakandi/EliaAI/scripts/voice-command-only.sh';
+    cmd = '~/EliaAI/scripts/voice-command-only.sh';
   }
   
   const script = [
@@ -1190,10 +1053,24 @@ function toggleProxy(enabled) {
 // Load current model from file or default
 function loadCurrentModel() {
   try {
+    if (fs.existsSync(modelSelectionsPath)) {
+      const sel = JSON.parse(fs.readFileSync(modelSelectionsPath, 'utf8'));
+      if (sel && typeof sel === 'object' && typeof sel['elia'] === 'string' && sel['elia']) {
+        const short = sel['elia'].replace(/^opencode\//, '');
+        if (SAFE_MODELS.includes(short)) {
+          trayMenuState.selectedModel = short;
+          return short;
+        }
+      }
+    }
+  } catch (e) {
+    console.error('Load model selections:', e.message);
+  }
+  try {
     const modelPath = path.join(EliaAIRoot, '.opencode_model');
     if (fs.existsSync(modelPath)) {
       const model = fs.readFileSync(modelPath, 'utf8').trim();
-      if (['big-pickle', 'opencode/big-pickle', 'nemotron-lightning', 'mimo-v2.5-free', 'deepseek-v4-flash-free'].includes(model)) {
+      if (SAFE_MODELS.includes(model)) {
         trayMenuState.selectedModel = model;
         return model;
       }
@@ -1201,13 +1078,13 @@ function loadCurrentModel() {
   } catch (e) {
     console.error('Load current model:', e.message);
   }
-  return 'minimax';
+  return 'big-pickle';
 }
 
 // Get current scheduler settings — standardEnabled follows the real LaunchAgent plist (not stale .scheduler_state).
 function getCurrentCronSettings() {
   const stateFile = path.join(EliaAIRoot, '.scheduler_state');
-  const home = process.env.HOME || '/Users/vakandi';
+  const home = process.env.HOME || '~';
   const launchdPlist = path.join(home, 'Library/LaunchAgents/com.elia.elia-agent.plist');
   const morningPlist = path.join(home, 'Library/LaunchAgents/com.elia.elia-agent-morning.plist');
   const plistInstalled = fs.existsSync(launchdPlist);
@@ -1305,13 +1182,10 @@ function updateTrayMenu() {
   const cronSettings = getCurrentCronSettings();
   
   const models = [
-    { id: 'minimax', label: 'MiniMax 2.5' },
-    { id: 'opencode/big-pickle', label: 'Big Pickle (OpenCode Zen)' },
-    { id: 'nvidia', label: 'Kimi 2.5' },
-    { id: 'hy3', label: 'Hy3' },
-    { id: 'laguna', label: 'Laguna' },
-    { id: 'nemotron-ultra', label: 'Nemotron Ultra' },
-    { id: 'nemotron-lightning', label: 'Nemotron Lightning' }
+    { id: 'big-pickle', label: 'Big Pickle' },
+    { id: 'deepseek-v4-flash-free', label: 'DeepSeek V4 Flash' },
+    { id: 'mimo-v2.5-free', label: 'MIMO V2.5' },
+    { id: 'nemotron-3-ultra-free', label: 'Nemotron 3 Ultra' }
   ];
 
   const modelSubmenu = models.map(m => ({
@@ -1505,7 +1379,7 @@ function saveTraySettings() {
 }
 
 function createTray() {
-  const iconPath = '/Users/vakandi/EliaAI/ui_electron/imgs/electronui.png';
+  const iconPath = path.join(path.dirname(path.dirname(__dirname)), 'ui_electron', 'imgs', 'electronui.png');
   let trayIcon = nativeImage.createFromPath(iconPath);
   if (trayIcon.isEmpty()) {
     trayIcon = nativeImage.createEmpty();
@@ -1568,7 +1442,7 @@ function runMorningSpeak() {
   const fs = require('fs');
   const path = require('path');
   
-  const eliaAI = '/Users/vakandi/EliaAI';
+  const eliaAI = path.join(path.dirname(path.dirname(__dirname)));
   const promptFile = path.join(eliaAI, '.morning_briefing_prompt.txt');
   
   const morningPrompt = `MORNING BRIEFING - COMPREHENSIVE DAILY UPDATE:
@@ -1586,9 +1460,9 @@ SPEAK AT THESE MOMENTS:
 MUST DO:
 1. CHECK GOOGLE CALENDAR: Use gws-workspace list-events to get today's meetings and events
 2. CHECK TELEGRAM: Read recent messages from Watson IA group (chat ID: -5148361692)
-3. CHECK WHATSAPP: Read B2LUXE BUSINESS (120363408208578679@g.us) and COBOU PowerRangers (120363420711538035@g.us)
-4. CHECK JIRA: Get pending tickets for BEN, COBOUAGENC, ZOVAPANEL, TIKYT
-5. CHECK MEMORY FILES: Read /Users/vakandi/EliaAI/memory/*.md for important context
+3. CHECK WHATSAPP: Read your main business group and team group
+4. CHECK JIRA: Get pending tickets for your projects
+5. CHECK MEMORY FILES: Read ~/EliaAI/memory/*.md for important context
 6. GATHER BUSINESS UPDATES: Status of all 8 businesses
 7. IDENTIFY ACTION ITEMS: What needs Wael's attention today?
 8. IDENTIFY WAITING ON: What are team members waiting for?

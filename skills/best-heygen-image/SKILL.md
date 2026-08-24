@@ -1,6 +1,6 @@
 ---
 name: best-heygen-image
-description: Generate blog hero images (1200×630px) that reflect article ideas, audience pain points, and marketing psychology. Uses the HeyGen Content MCP pipeline (HTML/CSS + Playwright screenshot). **Trigger on ANY request for blog images, hero images, social share cards, or article thumbnails — even if the user just says "make an image for this article" or "create a blog hero."** Also trigger when the user provides article content (title, pain point, audience) and needs a matching visual. Designed for YourApp, YourCheckout, and e-commerce marketing content. Each image is tailored to the article's core message, target audience pain point, and desired emotional response.
+description: Generate blog hero images (1200×630px) that reflect article ideas, audience pain points, and marketing psychology. Uses the HeyGen Content MCP pipeline (HTML/CSS + Playwright screenshot). **Trigger on ANY request for blog images, hero images, social share cards, or article thumbnails — even if the user just says "make an image for this article" or "create a blog hero."** Also trigger when the user provides article content (title, pain point, audience) and needs a matching visual. Designed for your-saas, FlowCheckout, and e-commerce marketing content. Each image is tailored to the article's core message, target audience pain point, and desired emotional response.
 ---
 
 # Best HeyGen Image — Blog Hero Image Generator
@@ -10,6 +10,21 @@ description: Generate blog hero images (1200×630px) that reflect article ideas,
 Create blog hero images (1200×630px) that actually convert readers by targeting the **exact pain point** of the article's audience. This skill uses the HeyGen Content MCP server's HTML composition pipeline with Playwright rendering.
 
 **Key principle**: Every design choice (color, typography, layout, stat) must serve the article's core message and the reader's emotional state at the point of reading.
+
+## When to Use HeyGen vs Apple Image Playground
+
+| Content Type | Tool | Why |
+|-------------|------|-----|
+| **Blog hero images** | ✅ HeyGen (this skill) | HTML/CSS gives full control over text — search engines can read title, stats, CTAs |
+| **Blog post in-content images** | ✅ HeyGen | Same SEO reasoning — text must be crawlable |
+| **Community posts (Instagram, TikTok, LinkedIn)** | ❌ Use Apple Image Playground | Better quality, human-facing, no SEO requirement |
+| **Social media stories/reels** | ❌ Use Apple Image Playground | Visual quality matters more than crawlable text |
+| **Email headers** | ❌ Use Apple Image Playground | Visual only, no SEO value |
+| **Product mockups** | ✅ HeyGen | Need pixel-perfect text (prices, features) |
+
+**Apple Image Playground** (`mcp-cli call apple_intelligence generate_image`) = on-device generation, 1536×1536, styles: animation/emoji/illustration/sketch/messages-background. Better for visual quality when text isn't needed.
+
+**⚠️ ALL AI image generators (Flux, Turbo, DALL-E, Midjourney, Apple) produce UNREADABLE text.** If the image needs readable text (titles, stats, CTAs), use HeyGen HTML/CSS pipeline — it renders text via Playwright/Chromium so every letter is pixel-perfect.
 
 ## Workflow
 
@@ -73,7 +88,7 @@ Use the `generate_blog_image.py` script in the HeyGen Content MCP pipeline:
 
 ```bash
 # Single article
-cd /path/to/heygen-mcp
+cd ~/mcps_server/heygen-content-mcp
 .venv/bin/python HeyGen/generate_blog_image.py --article 1
 
 # All 4 articles
@@ -170,10 +185,10 @@ The `build_html()` function in `generate_blog_image.py` produces:
 
 ## Dev Notes
 
-- Script: `/path/to/heygen-mcp/HeyGen/generate_blog_image.py`
-- Output: `/path/to/heygen-mcp/HeyGen/output/blog/`
+- Script: `~/mcps_server/heygen-content-mcp/HeyGen/generate_blog_image.py`
+- Output: `~/mcps_server/heygen-content-mcp/HeyGen/output/blog/`
 - Resolution: 1200×630px (2:1 blog hero ratio)
 - Quality: JPEG 95%, 2x device scale factor
 - Dependencies: playwright, mcp (in .venv)
 - The Heygen MCP server definition is in `~/.config/mcp/mcp_servers.json` as `heygen-content-mcp`
-- MCP Server startup: `cd /path/to/heygen-mcp && .venv/bin/python main.py`
+- MCP Server startup: `cd ~/mcps_server/heygen-content-mcp && .venv/bin/python main.py`

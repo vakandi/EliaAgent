@@ -27,15 +27,6 @@ class EliaDiscordBot(discord.Client):
         self.semaphore = asyncio.Semaphore(self.settings.MAX_CONCURRENT_REQUESTS)
         self.bot_mention = None
 
-    def _is_user_allowed(self, user_id: int) -> bool:
-        return self.settings.is_discord_user_allowed(user_id)
-
-    async def _deny_access(self, interaction: discord.Interaction):
-        await interaction.response.send_message(
-            "You are not authorized to use this Elia bot.",
-            ephemeral=True,
-        )
-
     async def setup_hook(self):
         log.info("bot.starting")
         await self._register_commands()
@@ -46,13 +37,8 @@ class EliaDiscordBot(discord.Client):
         @self.tree.command(name="elia", description="Talk to Elia")
         @discord.app_commands.describe(message="Your message to Elia")
         async def elia_command(interaction: discord.Interaction, message: str):
-            if not self._is_user_allowed(interaction.user.id):
-                log.warning("discord.unauthorized_slash_command", user_id=str(interaction.user.id))
-                await self._deny_access(interaction)
-                return
-
             await interaction.response.defer()
-
+            
             async with self.semaphore:
                 guild_id = str(interaction.guild_id)
                 channel = interaction.channel
@@ -89,11 +75,6 @@ class EliaDiscordBot(discord.Client):
 
         @self.tree.command(name="elia-new", description="Create a fresh Elia session")
         async def new_command(interaction: discord.Interaction):
-            if not self._is_user_allowed(interaction.user.id):
-                log.warning("discord.unauthorized_slash_command", user_id=str(interaction.user.id))
-                await self._deny_access(interaction)
-                return
-
             await interaction.response.defer()
             guild_id = str(interaction.guild_id)
             self.session_manager.active_sessions.pop(guild_id, None)
@@ -105,11 +86,6 @@ class EliaDiscordBot(discord.Client):
 
         @self.tree.command(name="elia-reset", description="Reset Elia session and start fresh")
         async def reset_command(interaction: discord.Interaction):
-            if not self._is_user_allowed(interaction.user.id):
-                log.warning("discord.unauthorized_slash_command", user_id=str(interaction.user.id))
-                await self._deny_access(interaction)
-                return
-
             await interaction.response.defer()
             guild_id = str(interaction.guild_id)
             new_session = await self.session_manager.reset_session(guild_id)
@@ -120,11 +96,6 @@ class EliaDiscordBot(discord.Client):
 
         @self.tree.command(name="elia-session-list", description="List recent Elia sessions")
         async def session_list_command(interaction: discord.Interaction):
-            if not self._is_user_allowed(interaction.user.id):
-                log.warning("discord.unauthorized_slash_command", user_id=str(interaction.user.id))
-                await self._deny_access(interaction)
-                return
-
             await interaction.response.defer()
             sessions = await self.session_manager.list_sessions()
             if not sessions:
@@ -158,9 +129,6 @@ class EliaDiscordBot(discord.Client):
 
     async def on_message(self, message: discord.Message):
         if message.author.bot or isinstance(message.channel, discord.DMChannel):
-            return
-        if not self._is_user_allowed(message.author.id):
-            log.warning("discord.unauthorized_message", user_id=str(message.author.id), channel=str(message.channel.id))
             return
 
         content = message.content.strip()

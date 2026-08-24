@@ -1,4 +1,134 @@
-# EliaAI Release Notes — May 2026
+# EliaAI Release Notes
+
+---
+
+## 🚀 Version: v6.0.0 — 🤝 TEAM MODE + PUBLIC RELEASE (August 22, 2026)
+
+### ✨ The Big News: Team Mode — Multi-Agent Collaboration
+
+**🤝 What changed**: Multiple AI agents can now work together **in real-time**, talking to each other via a shared mailbox — not just delegating. Teams are accessible from **any OpenCode session**, work with **custom agents**, and can handle complex tasks that need multiple specialists working simultaneously.
+
+### Team Mode Features
+
+| Feature | What It Does |
+|---------|-------------|
+| **Real-time collaboration** | Agents send messages to each other, share findings, debate approaches, and coordinate — not just fire-and-forget |
+| **Works everywhere** | Accessible on all OpenCode sessions via `team_create`, `team_send_message`, `team_status` |
+| **Custom agents** | Your own agents (gilfoyle, setbon, picasso, etc.) can join teams — not limited to built-in agents |
+| **Subworker integration** | Complex subworker tasks can be delegated to team members for parallel execution |
+| **Open allowlist** | Any registered agent can join a team by default — no need to pre-approve each one |
+| **Task tracking** | Built-in task board within teams — create, claim, complete tasks with status updates |
+| **Shutdown control** | Members can request shutdown, lead approves/rejects — no rogue agents |
+
+### How It Works
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        TEAM MODE                                 │
+│                                                                  │
+│  user: "Build the landing page"                                  │
+│       │                                                          │
+│       ▼                                                          │
+│  team_create → lead agent + 3 specialists                        │
+│       │                                                          │
+│       ├──→ @gilfoyle: "Building the API endpoints"               │
+│       ├──→ @picasso: "Designing the UI components"               │
+│       └──→ @setbon: "Writing the marketing copy"                 │
+│                                                                  │
+│  Agents talk to each other via shared mailbox:                   │
+│       │                                                          │
+│       ├──→ @gilfoyle → @picasso: "API returns this shape"        │
+│       ├──→ @picasso → @gilfoyle: "What's the auth flow?"         │
+│       └──→ @setbon → @picasso: "The hero needs to convert"       │
+│                                                                  │
+│  Final result: Coordinated deliverable, not 3 isolated outputs   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Example: Create a Team
+
+```python
+# In any OpenCode session
+team_create(
+    teamName="landing-page-build",
+    members=[
+        {"name": "gilfoyle", "kind": "subagent_type", "prompt": "Build the FastAPI endpoints"},
+        {"name": "picasso", "kind": "subagent_type", "prompt": "Design the React landing page"},
+        {"name": "setbon", "kind": "subagent_type", "prompt": "Write conversion-optimized copy"},
+    ]
+)
+```
+
+### Subworker Integration
+
+Complex subworker tasks that need multiple perspectives can now use Team Mode internally:
+
+```python
+# A subworker can create a team for complex tasks
+team_create(
+    members=[
+        {"name": "explore", "kind": "subagent_type", "prompt": "Analyze the codebase"},
+        {"name": "librarian", "kind": "subagent_type", "prompt": "Research best practices"},
+    ]
+)
+```
+
+### Files Changed
+
+| Component | Change |
+|-----------|--------|
+| `oh-my-openagent/src/core/types.ts` | Added `TeamMember` type, team-related tool definitions |
+| `oh-my-openagent/src/core/member-parser.ts` | Open allowlist — custom agents join by default |
+| `oh-my-openagent/src/core/validator.ts` | Team validation with graceful fallback |
+| `setup/OH-MY-OPENCODE-CHANGES.md` | Full documentation of Team Mode changes |
+
+### Verification
+
+```bash
+# Test team creation
+opencode run --agent gilfoyle "Create a test team with 2 members"
+
+# Check team status
+team_status(teamRunId="team_xxx")
+
+# Send message to team
+team_send_message(teamRunId="team_xxx", to="*", body="Status update")
+```
+
+---
+
+### 🧹 Public Release Cleanup
+
+This release includes a comprehensive scrub of all sensitive data for the public EliaAgent repository:
+
+| Category | Action |
+|----------|--------|
+| **Business names** | mirorpay → your-saas, bene2luxe → your-brand, cobou → your-agency, teleorbit → your-telecom |
+| **Agent names** | setbon/gilfoyle/picasso → your-agent (in docs/templates) |
+| **Paths** | `/Users/vakandi` → `~` (markdown), `$HOME` (shell), `os.path.expanduser()` (Python) |
+| **Credentials** | All proxy creds, API keys, tokens, server IPs scrubbed |
+| **Personal data** | Wael → the owner/the developer, real domains → your-brand.com |
+| **Browser snapshots** | `.playwright-mcp/` removed (contained personal browsing data) |
+| **Private prompts** | `setup/prompts/` removed (private prompt templates) |
+| **Sync docs** | `setup/SYNC_PROMPT.md` removed from public (sync procedure stays private) |
+| **Skills** | 12 business-specific skills removed (higgsfield, mirorpay-specific, etc.) |
+| **Subworkers** | All subworker directories removed (private agent implementations) |
+
+### What's New in the Public Release
+
+- **Team Mode** — Multi-agent collaboration (see above)
+- **Open allowlist** — Custom agents join teams by default
+- **Rebuild script** — `scripts/rebuild-oh-my-openagent.sh` for oh-my-openagent rebuilds
+- **Clean templates** — All business references replaced with generic placeholders
+- **4 generic subworker examples** — refund-hunter, social-media, code-review, data-pipeline
+
+### Companion Repos
+
+| Repo | Purpose |
+|------|---------|
+| [EliaTopBar](https://github.com/vakandi/Elia-Topbar) | Menu bar app for subworker control |
+| [Elia-OC](https://github.com/vakandi/Elia-OC) | UI sessions management |
+| [EliaAgent](https://github.com/vakandi/EliaAgent) | This repo — public release |
 
 ---
 

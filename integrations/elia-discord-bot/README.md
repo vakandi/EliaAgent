@@ -24,7 +24,6 @@ Rebuild the EliaDiscord bot from scratch to be a high-performance, scalable, and
     *   `/elia-session-list`: List sessions.
     *   `/elia-session-select`: Switch session.
 *   **Error Reporting**: Logs errors to a dedicated Discord channel.
-*   **Access Control**: Restrict slash commands and mention triggers to approved Discord user IDs via `DISCORD_ALLOWED_USER_IDS`.
 
 ## 🛠️ Technical Stack
 
@@ -34,10 +33,6 @@ Rebuild the EliaDiscord bot from scratch to be a high-performance, scalable, and
 *   **Logging**: `structlog` (structured, performant).
 *   **State Management**: In-memory with TTL (or optional Redis).
 *   **Deployment**: Docker container.
-
-### Access Control
-
-Set `DISCORD_ALLOWED_USER_IDS` to a comma-separated list of Discord user IDs. The bot will only accept `/elia`, `/elia-new`, `/elia-reset`, `/elia-session-list`, and @mention prompts from those users.
 
 ## 📦 Project Structure
 

@@ -18,7 +18,7 @@ Ce skill génère automatiquement des compétences de vente complètes et prête
 
 ## Installation
 ```bash
-cd "C:\Users\vakandi\Documents\projects\WatsonIA\skills\sales-skills-generator"
+cd "C:\Users\your-username\Documents\projects\WatsonIA\skills\sales-skills-generator"
 pip install -r requirements.txt
 python setup.py install
 ```

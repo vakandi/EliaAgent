@@ -1,8 +1,8 @@
-# French Trends Skill - YourBrand
+# French Trends Skill - your-brand
 
 ## Overview
 
-This skill enables tracking and leveraging French youth culture, lifestyle trends, reality TV shows, and cultural moments for YourBrand luxury fashion marketing on TikTok and Instagram Reels.
+This skill enables tracking and leveraging French youth culture, lifestyle trends, reality TV shows, and cultural moments for your-brand luxury fashion marketing on TikTok and Instagram Reels.
 
 **Target Audience**: French/Swiss youth (18-35) interested in luxury fashion and aspirational lifestyle content.
 
@@ -263,7 +263,7 @@ agent-browser --profile ~/.agent-browser-profile open https://www.instagram.com/
 - [Expression] - [Usage]
 
 ### Hashtags:
-#YourBrand #ModeLuxe #FashionFrance #ParisianStyle
+#your-brand #ModeLuxe #FashionFrance #ParisianStyle
 ```
 
 ---
@@ -294,5 +294,5 @@ agent-browser --profile ~/.agent-browser-profile open https://www.instagram.com/
 
 *Skill Version: 1.0*  
 *Last Updated: Mars 2026*  
-*For: YourBrand Marketing Content*  
+*For: your-brand Marketing Content*  
 *Owner: Elia AI - WatsonIA System*

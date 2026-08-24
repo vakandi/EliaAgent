@@ -22,7 +22,7 @@ Access and analyze video content from Instagram saved posts with full transcript
 - Playwright - Navigates and extracts URLs ✅ VERIFIED
 
 **⚠️ CRITICAL: Auto Language Detection**
-- the user's saved videos are mostly ENGLISH
+- the owner's saved videos are mostly ENGLISH
 - NEVER hardcode `--language French`
 - Always use `--task transcribe` without `--language` flag
 - Whisper auto-detects language correctly
@@ -281,7 +281,7 @@ agent-browser $PROFILE get url
 ```
 Error: Redirected to /accounts/login/
 Solution: User must be logged into Instagram in the agent-browser profile
-Action: Ask the user to open Instagram and log in manually first
+Action: Ask the owner to open Instagram and log in manually first
 ```
 
 ### Video Not Loading

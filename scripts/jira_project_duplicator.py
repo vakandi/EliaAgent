@@ -22,7 +22,7 @@ JIRA_URL = "https://bsbagency.atlassian.net"
 
 def load_jira_config():
     """Load Jira configuration from mcp_servers.json"""
-    with open("~/Documents/mcps_server/mcp_servers.json") as f:
+    with open(os.path.expanduser("~/Documents/mcps_server/mcp_servers.json")) as f:
         config = json.load(f)
     atlassian_config = config["mcpServers"]["mcp-atlassian"]["env"]
     return atlassian_config["JIRA_EMAIL"], atlassian_config["JIRA_API_TOKEN"]

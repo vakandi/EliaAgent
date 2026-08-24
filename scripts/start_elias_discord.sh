@@ -39,7 +39,7 @@ for env in "${BOT_DIR}/.env" "${AGENT_DIR}/.env"; do
         
         source venv/bin/activate
         
-        if ! python -c "import discord" 2>/dev/null || ! python -c "import structlog" 2>/dev/null; then
+        if ! python -c "import discord" 2>/dev/null; then
             echo "Installing dependencies..."
             pip install -r requirements.txt
         fi

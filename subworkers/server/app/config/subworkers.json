@@ -1,0 +1,78 @@
+{
+  "subworkers": [
+    {
+      "name": "your-main-agent",
+      "enabled": false,
+      "schedule": {
+        "type": "interval",
+        "hours": [9, 12, 15, 18],
+        "minute": 0
+      },
+      "prompt_file": "PROMPT.md",
+      "workspace": "/data",
+      "agent_id": "your-main-agent",
+      "model": null,
+      "max_retries": 3,
+      "timeout_minutes": 60,
+      "proxy_enabled": false,
+      "mcp_servers": [],
+      "notify_discord": false
+    },
+    {
+      "name": "your-seo-agent",
+      "enabled": false,
+      "schedule": {
+        "type": "interval",
+        "hours": [10, 14, 18],
+        "minute": 0
+      },
+      "prompt_file": "PROMPT.md",
+      "workspace": "/data/subworkers/your-seo-agent/workspace",
+      "agent_id": "your-seo-agent",
+      "model": null,
+      "max_retries": 3,
+      "timeout_minutes": 30,
+      "proxy_enabled": false,
+      "mcp_servers": [],
+      "notify_discord": false
+    },
+    {
+      "name": "your-community-agent",
+      "enabled": false,
+      "schedule": {
+        "type": "interval",
+        "hours": [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23],
+        "minute": 0
+      },
+      "prompt_file": "PROMPT.md",
+      "workspace": "/data/subworkers/your-community-agent/workspace",
+      "agent_id": "your-community-agent",
+      "model": null,
+      "max_retries": 3,
+      "timeout_minutes": 30,
+      "proxy_enabled": false,
+      "mcp_servers": [],
+      "notify_discord": false
+    },
+    {
+      "name": "your-promoter-agent",
+      "enabled": false,
+      "schedule": {
+        "type": "interval",
+        "hours": [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
+        "minute": 30
+      },
+      "prompt_file": "PROMPT.md",
+      "workspace": "/data/subworkers/your-promoter-agent/workspace",
+      "agent_id": "your-promoter-agent",
+      "model": null,
+      "max_retries": 3,
+      "timeout_minutes": 30,
+      "proxy_enabled": false,
+      "mcp_servers": [],
+      "notify_discord": false
+    }
+  ],
+  "version": "1.0",
+  "last_modified": null
+}

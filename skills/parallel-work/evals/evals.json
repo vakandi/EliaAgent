@@ -1,0 +1,35 @@
+{
+  "skill_name": "parallel-work",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I have 4 failing test files in my FastAPI project after a big refactor. tests/test_auth.py has 3 failures, tests/test_billing.py has 2, tests/test_webhook.py has 5, and tests/test_rate_limit.py has 1. All seem like different root causes.",
+      "expected_output": "Should route to dispatching-parallel-agents pattern: group by failure domain (4 groups), dispatch 4 agents in parallel with full error context, each agent investigates one test file independently. Should NOT route to subagent-driven-development (no feature building here).",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Build me a complete blog system: admin panel for creating posts with auth, a public reader page, REST API for CRUD, and SEO metadata. Here's the spec: posts have title, body, author, tags, published_at. Admin needs login. Public page should be ISR.",
+      "expected_output": "Should route to subagent-driven-development: extract tasks from spec, dispatch implementer per task with TDD, two-stage review (spec compliance + code quality). Should NOT dispatch all as generic parallel agents (needs the review loop).",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "The homepage is slow. I need you to optimize the images, add caching to the API, and write a blog post about our performance improvements.",
+      "expected_output": "Should route to parallel-work general: 3 independent units (image optimization → visual-engineering, API caching → deep, blog post → writing), all dispatched in same message with appropriate skills loaded. No debugging or TDD review needed.",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "Fix the payment webhook bug that's causing duplicate charges, and also add a new analytics dashboard page with charts showing MRR, churn rate, and user growth.",
+      "expected_output": "Should SPLIT by type: bug fix → dispatching-parallel-agents (investigate webhook), dashboard → parallel-work general or subagent-driven-development (build new feature). Both dispatched in same message. Should NOT bundle into one agent.",
+      "files": []
+    },
+    {
+      "id": 5,
+      "prompt": "I need to migrate all my API routes from Express to FastAPI. There are about 15 endpoints across 5 files.",
+      "expected_output": "Should route to parallel-work general: decompose by file (5 units), each agent migrates one file's endpoints. All dispatched in parallel. Should load fastapi-pro skill. Should NOT route to subagent-driven-development (no spec/review loop needed for mechanical migration).",
+      "files": []
+    }
+  ]
+}

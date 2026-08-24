@@ -1,31 +1,12 @@
 # Subworkers System
 
-**Date:** April 2026  
-**Version:** 3.0
+**Date:** August 2026  
+**Version:** 4.0
 
 > Technical documentation for the autonomous subworker agent system.
-
----
-
-## 🚫 RÈGLE ABSOLUE N°1 — LES AGENTS NE SE MODIFIENT JAMAIS EUX-MÊMES
-
-> **CE PRÉFIXE EST TRANSMIS À TOUS LES SUBWORKERS, SANS EXCEPTION. AUCUN AGENT N'ÉDITE, NE CRÉE, NE SUPPRIME NI NE REMPLACE SA PROPRE INFRASTRUCTURE.**
-
-**Interdiction totale et permanente**, applicable à chaque run, quel que soit le contexte : run normal, run forcé (`--force`), mode setup, mode débug, tâche ambiguë, "PROMPT.md partagé par l'utilisateur", etc.
-
-**Fichiers VERROUILLÉS (lecture seule pour l'agent) :**
-- Son propre `PROMPT.md` (`subworkers/<agent>/PROMPT.md`)
-- Son fichier de personnalité (`~/.config/opencode/agents/<agent>.md`)
-- Ses scripts de trigger, `.enabled`, `.loop_mode`, plists (`subworkers/plists/`, `~/Library/LaunchAgents/`)
-- `SUBWORKERS_SYSTEM.md`, `opencode.json`, registres d'agents, `context/TOOLS.md`
-- Ses skills (`~/.config/opencode/skills/<agent>/`)
-- **TOUT fichier situé hors de son `workspace/`**
-
-**Territoire d'écriture :** chaque agent n'écrit QUE dans `subworkers/<agent>/workspace/`. Tout le reste du système est en lecture seule.
-
-**Comportement attendu si un fichier système semble cassé ou manquant :** signaler dans `HANDOFF_NEXT_SESSION.md` + rapport de fin de run. **NE JAMAIS corriger soi-même.** Seul Wael ou l'agent principal Elia modifie le système.
-
-> ⚠️ Un subworker qui se modifie lui-même = violation fatale. Ceci n'est pas une suggestion, c'est la règle n°1 du système.
+>
+> **Current runtime**: Python FastAPI server in Docker (port 5656) — JSON config + APScheduler replaces launchd. ColimaBar (menu bar) provides control/monitoring.
+> **Previous version**: `SUBWORKERS_SYSTEM_OLD.md` (v3.0 — Node.js trigger + launchd plists).
 
 ---
 
@@ -37,8 +18,9 @@
 4. [OpenCode Agent Registration](#4-opencode-agent-registration)
 5. [Trigger Template](#5-trigger-template)
 6. [Tools & MCP Servers](#6-tools--mcp-servers)
-7. [LaunchAgent Setup](#7-launchagent-setup)
-8. [Enable/Disable & Schedule Management](#8-enabledisable--schedule-management)
+7. [LaunchAgent Setup](#7-launchagent-setup-legacy)
+8. [Subworker Server (Docker + FastAPI)](#8-subworker-server-docker--fastapi)
+9. [ColimaBar (Menu Bar Control)](#9-colimabar-menu-bar-control)
 
 ---
 
@@ -50,20 +32,35 @@ Subworkers are autonomous AI agents that run on a schedule or trigger. Each subw
 - A **personality file** (`~/.config/opencode/agents/<agent-id>.md`) — loaded automatically by oh-my-opencode via the `-a` flag
 - A **PROMPT.md** with task-specific instructions — injected by the trigger
 - A **workspace folder** for isolated file I/O
-- A **trigger script** that launches via `oh-my-opencode run`
-- An optional **LaunchAgent plist** for scheduled execution
+- A **JSON schedule entry** in `server/app/config/subworkers.json` — defines schedule, enabled state, retries, timeout
+- A **runner** — the Docker FastAPI server (SubworkerRunner) launches via `oh-my-opencode run`
+
+> **Scheduling moved from launchd → APScheduler (Docker server).** LaunchAgent plists are legacy (see §7). Control is now via the REST API / WebSocket / ColimaBar (see §8, §9).
 
 ### Architecture
 
 ```
-Trigger (launchd / manual)
-  └─ trigger_template.js (Node.js, child_process.spawn)
-       ├── Creates workspace/ if missing
-       ├── Loads PROMPT.md
-       ├── oh-my-opencode run -d workspace/ -a <agent> "<task>"
-       │     └── oh-my-opencode loads personality from ~/.config/opencode/agents/<agent-id>.md
-       └── OpenCode loads workspace/opencode.json (per-agent permissions)
+EliaUI.command (launcher — 3 tmux sessions)
+  ├── opencode-serve   (port 4096 — OpenCode server)
+  ├── subworker-srv    (Docker container elia-subworker-srv, port 5656 — FastAPI)
+  └── elia-ui          (Discord bot + Electron UI)
+
+Docker container (host network)
+  └─ APScheduler (from subworkers.json)
+       └─ SubworkerRunner
+            ├── oh-my-opencode run -d workspace/ -a <agent> "<task>"
+            │     └── oh-my-opencode loads personality from ~/.config/opencode/agents/<agent-id>.md
+            └── OpenCode loads workspace/opencode.json (per-agent permissions)
+
+Manual/legacy (optional): trigger_template.js --agent <name>
+  └─ oh-my-opencode run -d workspace/ -a <agent> "<task>"
 ```
+
+### Control & Monitoring
+
+- **ColimaBar** (menu bar app, source `~/Documents/EliaTopBar`) — Trigger Now, Enable/Disable, View Logs, live status via WebSocket + HTTP polling.
+- **REST API** — `http://localhost:5656` (`/status`, `/trigger/{name}`, `/enable/{name}`, `/disable/{name}`, `/logs/{name}`, `/server/health`, WS `/ws`).
+- Full API contract + failure modes: [`docs/SUBWORKERS_COLIMABAR_CONNECTION.md`](../docs/SUBWORKERS_COLIMABAR_CONNECTION.md).
 
 ---
 
@@ -72,24 +69,30 @@ Trigger (launchd / manual)
 ```
 EliaAI/subworkers/
 ├── SUBWORKERS_SYSTEM.md          # This file
+├── SUBWORKERS_SYSTEM_OLD.md      # Previous version (v3.0 — launchd/Node.js era)
+├── server/                       # ★ PRIMARY RUNTIME (Docker FastAPI server)
+│   ├── Dockerfile                # python:3.12-slim + Node 20
+│   ├── docker-compose.yml        # container elia-subworker-srv, host network, port 5656
+│   ├── requirements.txt
+│   ├── app/
+│   │   ├── main.py               # FastAPI app, /health endpoint
+│   │   ├── config/
+│   │   │   ├── server.json       # port 5656, opencode URL 4096, alert settings
+│   │   │   └── subworkers.json   # ★ ALL subworker definitions + schedules (14)
+│   │   ├── routes/               # subworkers.py, server.py, websocket.py
+│   │   ├── services/             # scheduler, runner, session_monitor, health_manager, error_parser, alert_manager
+│   │   └── utils/                # opencode_client.py, exceptions.py
+│   └── tests/                    # pytest suite
 ├── scripts/
-│   └── trigger_template.js       # UNIVERSAL TEMPLATE (Node.js, no per-agent wrappers needed)
+│   └── trigger_template.js       # LEGACY/manual trigger (Node.js, no per-agent wrappers needed)
 ├── logs/
 │   ├── <agent_name>.log          # Aggregate logs
 │   └── runs/
 │       └── <agent_name>/         # Per-run logs
-├── vcam-community-organic/       # VcamAndroid Community Manager (social content, engagement)
-│   ├── PROMPT.md
-│   └── workspace/
-├── vcam-seo/                     # VcamAndroid SEO Strategist (blog, rankings, GEO)
-│   ├── PROMPT.md
-│   └── workspace/
-├── refund-hunter/                # RefundHunter (ecommerce refund policy & resale research, Google Doc daily)
-│   ├── PROMPT.md
-│   └── workspace/
-└── <agent-id>/                   # Template — replace with actual agent ID
+├── plists/                       # LEGACY — launchd plists (superseded by server scheduler)
+└── <agent-id>/
     ├── PROMPT.md                 # Task-specific instructions
-    ├── .enabled                  # Gate file — presence = active
+    ├── .enabled                  # Gate file — presence = active (legacy manual runs)
     ├── .loop_mode                # (Optional) Server-attach loop mode
     └── workspace/                # Runtime directory (auto-created)
         ├── opencode.json         # (Optional) Per-agent tool permissions
@@ -101,10 +104,10 @@ EliaAI/subworkers/
 
 ### Creating a New Subworker
 
-```bash
-mkdir -p /Users/vakandi/EliaAI/subworkers/<agent-id>/workspace
-touch /Users/vakandi/EliaAI/subworkers/<agent-id>/.enabled  # or use --force to skip
-```
+1. Create `subworkers/<agent-id>/PROMPT.md` + workspace (see §5.4)
+2. Add an entry to `server/app/config/subworkers.json` — `name`, `enabled: true`, `schedule` (`interval` hours+minute, or `cron`), `agent_id`, `max_retries`, `timeout_minutes`
+3. The server hot-reloads `subworkers.json` — no restart needed for config-only changes
+4. Manual terminal run (bypasses server): `node scripts/trigger_template.js --agent <agent-id> --force`
 
 ---
 
@@ -150,11 +153,11 @@ Create `subworkers/<agent-id>/workspace/opencode.json`:
   },
   "permissions": {
     "read": {
-      "allow": ["/Users/vakandi/EliaAI/subworkers/<agent-id>/workspace/**"],
+      "allow": ["~/EliaAI/subworkers/<agent-id>/workspace/**"],
       "deny": ["**"]
     },
     "write": {
-      "allow": ["/Users/vakandi/EliaAI/subworkers/<agent-id>/workspace/**"],
+      "allow": ["~/EliaAI/subworkers/<agent-id>/workspace/**"],
       "deny": ["**"]
     },
     "execute": {
@@ -182,7 +185,7 @@ Every subworker's PROMPT.md **MUST** include these instructions:
 ```
 ## Workspace Constraint
 You MUST only read and write files inside your `workspace/` folder:
-`/Users/vakandi/EliaAI/subworkers/<agent-id>/workspace/`
+`~/EliaAI/subworkers/<agent-id>/workspace/`
 Never write files outside this folder. All system paths outside workspace/ are blocked.
 
 ## Daily Folders
@@ -191,63 +194,13 @@ Write your work logs, research, and outputs into today's folder.
 The folder is idempotent — only one per day regardless of how many times the trigger runs.
 You can read all previous days' folders to understand context and history.
 
-## Handoff
-At the START of every run, read `workspace/HANDOFF_NEXT_SESSION.md` — it tells you exactly where the previous run left off, what's done, and what to do next.
-At the END of every run, overwrite `workspace/HANDOFF_NEXT_SESSION.md` with current state so the next session can pick up seamlessly. Never leave stale tasks in the "Next priorities" section.
-
 ## Mempalace
 To orient yourself on every run:
-1. Read `workspace/HANDOFF_NEXT_SESSION.md` for the latest battle plan (completed, pending, next priorities)
-2. Check `workspace/` for the latest day folder to read today's work-in-progress
-3. Scan previous days' docs for relevant context: decisions made, blockers, next steps
-4. If you need to revisit something from days ago, navigate by date: `workspace/2026-04-01/`
-5. Before finishing, write a summary into the current day's folder AND update `HANDOFF_NEXT_SESSION.md`
+1. Check `workspace/` for the latest day folder to read today's work-in-progress
+2. Scan previous days' docs for relevant context: decisions made, blockers, next steps
+3. If you need to revisit something from days ago, navigate by date: `workspace/2026-04-01/`
+4. Write a summary of what you did today into the current day's folder before finishing
 ```
-
-### 3.5 Discord Channel Setup — Mandatory for Reporting
-
-Every subworker that reports via Discord **MUST** have a dedicated channel. Discord is the ONLY interaction point between subworkers and the user — there is no other way for agents to communicate results, ask questions, or escalate blockers.
-
-**When creating a new subworker, follow this procedure:**
-
-1. **List available Discord guilds:**
-```bash
-mcp-cli call discord-server-mcp list_guilds '{}'
-```
-
-2. **Ask the user which guild to use** — present the list of available guilds with their names and IDs. The user chooses the guild where the agent should report.
-
-3. **List categories in the chosen guild:**
-```bash
-mcp-cli call discord-server-mcp list_categories '{"guild_id":"<chosen_guild_id>"}'
-```
-
-4. **Ask the user which category** to place the agent's reporting channel under. Categories organize channels logically (e.g., "MIRORPAY", "BENE2LUXE", "REPORTS").
-
-5. **Create the channel in the right category:**
-```bash
-mcp-cli call discord-server-mcp create_channel '{
-  "guild_id": "<guild_id>",
-  "name": "<agent-name>-reports",
-  "type": 0,
-  "parent_id": "<category_id>"
-}'
-```
-
-6. **Save the channel ID** — the response returns the new channel's ID. Use this in the PROMPT.md reporting section:
-```markdown
-## 💬 REPORTING — Discord
-**Canal:** `<channel_id>` (<guild_name> / <category_name>)
-**Outil:** `mcp-cli call discord-server-mcp send_message`
-```
-
-**Why this matters:**
-- Agents cannot ask questions or escalate issues without a Discord channel
-- Each agent needs its own channel to avoid cross-talk between subworkers
-- The channel MUST be in the correct category for organization
-- The channel ID is what the agent uses to send reports via `mcp-cli call discord-server-mcp send_message`
-
-**⚠️ DO NOT hardcode Discord channel IDs in PROMPT.md without first creating the channel via this procedure.** Channel IDs are unique per guild — copying an ID from another agent's PROMPT.md will send messages to the wrong channel.
 
 ---
 
@@ -370,18 +323,7 @@ opencode agent list 2>&1 | grep "<agent-id>"
 
 If it shows `(subagent)` instead of `(all)`, the frontmatter `mode: all` is missing or incorrect. If it doesn't show at all, check `opencode.json` syntax and file paths.
 
-### 4.6 Model IDs Must Match `opencode models`
-
-The subworker UI and manual trigger must use the same model IDs that `opencode models` prints on this machine.
-
-- Treat `opencode models` as the source of truth for the current catalog.
-- Use the exact model string that the runtime accepts, not an old alias copied from a past popup.
-- If a saved UI selection points to a stale alias, normalize it once on load and resave the fixed value.
-- Do not invent provider prefixes or `:free` suffixes unless they are present in the current catalog and accepted by the trigger path.
-
-For the Electron popup, the model badge and the "Run now" button should always round-trip through the same normalized model ID.
-
-### 4.7 Restart OpenCode
+### 4.6 Restart OpenCode
 
 New agents only appear after restarting opencode TUI sessions:
 
@@ -398,13 +340,15 @@ Existing running opencode instances cache the agent list at startup — config c
 
 ## 5. Trigger Template
 
+> ⚠️ **The Docker server (§8) is the PRIMARY scheduler now.** `trigger_template.js` remains for manual terminal runs and as the launchd fallback. The server's SubworkerRunner performs the same job (PROMPT.md loading, workspace auto-creation, per-run logging) via APScheduler.
+
 ### 5.1 Template File: `scripts/trigger_template.js`
 
 The universal trigger template (Node.js) handles all subworker launch logic. No per-agent wrapper scripts needed — the launchd plist passes `--agent <name>` directly:
 
 ```xml
-<string>/Users/vakandi/.bun/bin/node</string>
-<string>/Users/vakandi/EliaAI/subworkers/scripts/trigger_template.js</string>
+<string>~/.bun/bin/node</string>
+<string>~/EliaAI/subworkers/scripts/trigger_template.js</string>
 <string>--agent</string>
 <string>my_agent</string>
 ```
@@ -427,9 +371,8 @@ node scripts/trigger_template.js --agent my_agent --force
 | **`-d` flag** | Passes `--directory workspace/` to `oh-my-opencode run` for per-agent config |
 | **Mode detection** | `task` (single-shot) vs `loop` (server-attach with `/ulw-loop`) |
 | **Per-run logging** | Each run logged individually + aggregate log |
-| **OpenCode sandboxing** | Each trigger run creates a fresh temp XDG sandbox for OpenCode data/cache/state so parallel subworkers do not share `~/.local/share/opencode` or other host runtime files |
-| **Proxy support** | When `.proxy_enabled` is present, the trigger refreshes proxy state via `setup/switch-proxy.sh` before launching the agent |
-| **Recovery resume** | On retry, the trigger tries to recover the prior `Session:` line from the previous run log, waits 20s, and resends `continue the work` into the same session via `--session-id` before falling back to a fresh run |
+| **Proxy support** | Via `.proxy_enabled` file |
+
 ### 5.3 Mode Selection
 
 **Task mode** (default): Single-shot execution. Agent runs once and exits.
@@ -438,7 +381,7 @@ node scripts/trigger_template.js --agent my_agent --force
 
 ```bash
 # Enable loop mode for an agent
-touch /Users/vakandi/EliaAI/subworkers/<agent-id>/.loop_mode
+touch ~/EliaAI/subworkers/<agent-id>/.loop_mode
 ```
 
 ### 5.4 Creating a New Subworker
@@ -471,110 +414,6 @@ This marker is always written after `oh-my-opencode run` exits, regardless of su
 4. `exit 0` → green duration badge (success)
 5. `exit non-zero` → orange "crashed" badge with duration (agent failed mid-run)
 6. If marker not found: yellow "● RUNNING" badge (agent still executing or trigger script crashed before reaching the marker)
-
-### 5.6 Retry & Session Recovery
-
-When a subworker run fails, the trigger now prefers to reuse the previous OpenCode session instead of starting over.
-
-Recovery flow:
-
-1. Read the previous run log and extract the last `Session:` / `Session ID:` value.
-2. Wait 20 seconds before the first recovery resend.
-3. Re-run `oh-my-opencode run` with `--session-id <recovered-session-id>`.
-4. Send the short continuation prompt `continue the work` into that same session.
-5. If the reuse path returns `promptAsync skipped by gate: active`, keep the same session and retry it again after another cooldown instead of immediately falling back.
-6. If the resume is killed or does not validate after the same-session retries are exhausted, log the reason and let the outer retry loop decide whether to try a fresh run.
-7. Between outer retry attempts, wait a random 20-40 seconds so parallel subworkers do not all restart on the same second.
-
-Why this exists:
-
-- It keeps continuity in the same session when the agent is still salvageable.
-- It gives the session time to settle before replaying the prompt.
-- It makes the retry logs explicit enough to diagnose whether the failure was reuse, validation, or an external kill.
-- If OpenCode itself fails before a session ever exists, that is handled as a bootstrap failure first: the server connection layer retries the timed-out start before the outer trigger falls back to a fresh run.
-- The trigger now also isolates OpenCode runtime state per run by exporting temp `XDG_DATA_HOME` / `XDG_CACHE_HOME` / `XDG_STATE_HOME` values, which prevents concurrent subworkers from fighting over the same OpenCode log/database files.
-- When proxy mode is enabled, the trigger refreshes the proxy first via `setup/switch-proxy.sh`, then injects the resulting proxy env into the actual agent run while keeping localhost traffic unproxied.
-
-Relevant log lines:
-
-- `[RECOVERY] Session lookup result: ...`
-- `[RECOVERY] Cooling down before reusing session ...`
-- `[RECOVERY] Dispatching continuation prompt to session ...`
-- `[RECOVERY] Continuation dispatch returned exit_code=...`
-- `[RECOVERY] Reuse result: blockedByActive=..., validated=...`
-- `[RECOVERY] Session ... is still active; keeping the same session and retrying after cooldown`
-- `[RECOVERY] Exhausted same-session retries ...`
-- `[RETRY] ...s remaining` heartbeat lines while waiting to restart
-- In task mode, cleanup is scoped to owned loop servers only; it does not kill unrelated ports used by sibling subworkers.
-- Retry backoff is randomized in the 20-40 second range to reduce startup collisions when several subworkers fail at once.
-
-### 5.7 Handoff File (`HANDOFF_NEXT_SESSION.md`)
-
-Every subworker run **MUST** end by writing or updating a handoff file at the workspace root:
-
-```
-workspace/HANDOFF_NEXT_SESSION.md
-```
-
-**Purpose:** This file is the bridge between runs. It tells the next session exactly where the previous one left off — what was done, what's pending, and what to do next. Without it, each run starts blind and risks duplicating work or repeating completed tasks.
-
-**What the agent MUST write before finishing:**
-
-```markdown
-# Handoff — <agent-id>
-
-**Last run:** YYYY-MM-DD HH:MM
-**Run status:** success | partial | failed
-
-## ✅ Completed this run
-- [Specific task 1 with detail]
-- [Specific task 2 with detail]
-
-## 🔄 In progress
-- [Task still being worked on — include exact file paths, line numbers, or state]
-
-## ⏳ Next priorities (in order)
-1. [Most important next action — be specific, not vague]
-2. [Second priority]
-3. [Third priority]
-
-## 🚫 Do NOT repeat
-- [Specific actions that were already attempted and completed]
-- [Dead ends or approaches that were tried and rejected]
-
-## 🔒 Blockers / Decisions needed
-- [Any blockers preventing progress]
-- [Decisions that need human input — include context so the next run can proceed or escalate]
-
-## 📂 Key files touched
-- path/to/file.py — [what was changed]
-- path/to/other.md — [what was done]
-```
-
-**Rules for the handoff file:**
-
-1. **Overwrite, don't append** — Each run replaces the entire file. The file reflects the LATEST state, not a history log.
-2. **Be specific** — "Worked on auth" is useless. "Fixed token refresh in `auth.py:45` — added 30s buffer before expiry" is actionable.
-3. **Name dead ends** — If a run tried something that failed, the next run must know NOT to retry it. Include "Do NOT repeat" entries.
-4. **Prioritize the next run** — The "Next priorities" section is the most important part. The agent reads this FIRST to know what to do.
-5. **No stale tasks** — If a task was completed, move it to "Completed" or delete it. Never leave finished work in "Next priorities."
-
-**How the agent uses it on startup:**
-
-When a subworker starts a new run, the Mempalace protocol (§3.4) should include reading this file:
-
-```
-## Startup Protocol
-1. Read workspace/HANDOFF_NEXT_SESSION.md — this tells you exactly what to do next
-2. Follow the "Next priorities" section in order
-3. Do NOT redo anything listed in "Do NOT repeat"
-4. At the end of your run, overwrite HANDOFF_NEXT_SESSION.md with the current state
-```
-
-**Why this matters:**
-
-- **Without handoff:** Each run re-reads all context from scratch, potentially redoing completed work, missing in-progress tasks, or retrying dead ends.
-- **With handoff:** Each run starts with a precise battle plan. The agent knows what's done, what's next, and what to avoid. Work advances every run instead of spinning.
 
 ---
 
@@ -642,7 +481,9 @@ mcp-cli list
 
 ---
 
-## 7. LaunchAgent Setup
+## 7. LaunchAgent Setup (LEGACY)
+
+> ⚠️ **Superseded by the Docker server scheduler (§8).** Plists still exist under `plists/` and `trigger_template.js` still works, but the current system schedules via `subworkers.json` + APScheduler inside the container. Keep this section for rollback / manual machines.
 
 ### 7.1 Template Plist
 
@@ -656,8 +497,8 @@ mcp-cli list
 
     <key>ProgramArguments</key>
     <array>
-<string>node</string>
-        <string>/Users/vakandi/EliaAI/subworkers/scripts/trigger_template.js</string>
+        <string>~/.bun/bin/node</string>
+        <string>~/EliaAI/subworkers/scripts/trigger_template.js</string>
         <string>--agent</string>
         <string><agent_id_with_underscores></string>
     </array>
@@ -675,19 +516,19 @@ mcp-cli list
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/Users/vakandi/.bun/bin:/Users/vakandi/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>~/.bun/bin:~/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>HOME</key>
-        <string>/Users/vakandi</string>
+        <string>~</string>
     </dict>
 
     <key>WorkingDirectory</key>
-    <string>/Users/vakandi/EliaAI</string>
+    <string>~/EliaAI</string>
 
     <key>StandardOutPath</key>
-    <string>/Users/vakandi/EliaAI/subworkers/logs/<agent_name>.log</string>
+    <string>~/EliaAI/subworkers/logs/<agent_name>.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/vakandi/EliaAI/subworkers/logs/<agent_name>.log</string>
+    <string>~/EliaAI/subworkers/logs/<agent_name>.log</string>
 </dict>
 </plist>
 ```
@@ -695,147 +536,127 @@ mcp-cli list
 ### 7.2 Load & Verify
 
 ```bash
-launchctl load /Users/vakandi/EliaAI/subworkers/plists/com.elia.<agent-id>.plist
+launchctl load ~/EliaAI/subworkers/plists/com.elia.<agent-id>.plist
 launchctl list | grep "com.elia"
 ```
 
 ---
 
-## 8. Enable/Disable & Schedule Management
+## 8. Subworker Server (Docker + FastAPI)
 
-### 8.1 The `.enabled` Gate
+### 8.1 Overview
 
-Every subworker has a gate file at `subworkers/<agent-id>/.enabled`:
+The **primary runtime** is a Python FastAPI server in Docker. It replaces launchd scheduling with a centralized JSON config + APScheduler.
 
-| State | File | Behavior |
-|-------|------|----------|
-| **Enabled** | `.enabled` exists | LaunchAgent runs on schedule; manual runs work without `--force` |
-| **Disabled** | `.enabled` missing | LaunchAgent skips scheduled runs; manual runs require `--force` flag |
+| Aspect | Old (v3) | New (v4) |
+|--------|----------|----------|
+| Scheduling | 14 launchd plists | `subworkers.json` + APScheduler |
+| Server | Manual start/restart | HealthManager auto-recovery |
+| Task completion | EOF marker log parsing | Multi-layer API + process polling |
+| Error handling | None | ErrorParser (10 types) + backoff |
+| Alerts | None | macOS beep + Electron + ntfy.sh |
+| Status view | 14 separate logs | REST API + WebSocket |
+| Runtime | Shell + Node.js | Python FastAPI in Docker |
 
-**The trigger template (`trigger_template.js`) checks this file on every run:**
-- If `.enabled` exists → proceed normally
-- If `.enabled` missing AND no `--force` flag → exit code 0 (skip)
-- If `.enabled` missing AND `--force` flag → proceed (manual override)
+### 8.2 Start / Stop
 
-### 8.2 Electron UI — Subworker Popup (`ui_electron/subworker-popup.html`)
+Launched by `EliaUI.command` as the third tmux session (`subworker-srv`). Killing the launcher does **NOT** stop Docker.
 
-The Electron UI provides a visual interface to manage all subworkers:
-
-**Features:**
-- **Toggle switches** — Click to enable/disable any subworker
-- **Schedule badges** — Shows configured schedule (e.g., "10:00–23:00 daily")
-- **Run now button** — Manual trigger with model selection from the current `opencode models` catalog
-- **Logs button** — Opens latest run log
-- **Runs dropdown** — Shows recent run history with exit codes and durations
-
-**How toggling works (via `ui_electron/src/main.js`):**
-
-```javascript
-ipcMain.on('toggle-subworker', (event, name) => {
-  const subworkerDir = path.join(subworkersRoot, name);
-  const plistName = `com.elia.${name}`;
-  const plistPath = path.join(subworkersRoot, 'plists', `${plistName}.plist`);
-  const enabledPath = path.join(subworkerDir, '.enabled');
-
-  if (fs.existsSync(enabledPath)) {
-    // DISABLE: remove .enabled + unload from launchd
-    fs.unlinkSync(enabledPath);
-    if (fs.existsSync(plistPath)) {
-      execSync(`launchctl bootout gui/$(id -u) ${plistPath} 2>/dev/null || true`);
-    }
-  } else {
-    // ENABLE: create .enabled + load into launchd
-    fs.writeFileSync(enabledPath, 'enabled\n', 'utf8');
-    if (fs.existsSync(plistPath)) {
-      execSync(`launchctl bootstrap gui/$(id -u) ${plistPath} 2>/dev/null || true`);
-    }
-  }
-  // Reply with new state
-  event.reply('subworker-toggled', { name, enabled, running });
-});
+```bash
+cd ~/EliaAI/subworkers/server && docker compose up --build   # start
+docker compose down                                          # stop (container only)
+curl http://localhost:5656/health                            # health check → {"status":"ok",...}
 ```
 
-**Key behaviors:**
-- **Enable** → Creates `.enabled` file + `launchctl bootstrap` the plist
-- **Disable** → Removes `.enabled` file + `launchctl bootout` the plist
-- **Requires plist** — Toggle only works if `subworkers/plists/com.elia.<name>.plist` exists
-- **State sync** — UI receives `subworker-toggled` reply and updates toggle visuals
+Container: `elia-subworker-srv`, `network_mode: host`, `restart: unless-stopped`, port **5656**.
 
-### 8.3 Changing Schedule Times
+### 8.3 Configuration (JSON, hot-reloaded)
 
-**To change a subworker's schedule:**
+| File | Purpose |
+|------|---------|
+| `server/app/config/server.json` | Port (5656), OpenCode server URL (http://127.0.0.1:4096), health-check interval, max restarts, alert settings |
+| `server/app/config/subworkers.json` | All subworker definitions: `name`, `enabled`, `schedule` (`interval` = hours+minute / `cron`), `agent_id`, `max_retries`, `timeout_minutes`, `mcp_servers`, `notify_discord` |
 
-1. **Edit the plist** at `subworkers/plists/com.elia.<agent-id>.plist`
-2. **Modify the `StartCalendarInterval` array** — each `<dict>` defines one scheduled time:
-   ```xml
-   <key>StartCalendarInterval</key>
-   <array>
-       <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>0</integer></dict>
-       <dict><key>Hour</key><integer>14</integer><key>Minute</key><integer>30</integer></dict>
-       <dict><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>
-   </array>
-   ```
-3. **Reload the LaunchAgent** (required for changes to take effect):
-   ```bash
-   launchctl bootout gui/$(id -u) /Users/vakandi/EliaAI/subworkers/plists/com.elia.<agent-id>.plist
-   launchctl bootstrap gui/$(id -u) /Users/vakandi/EliaAI/subworkers/plists/com.elia.<agent-id>.plist
-   ```
+`subworkers.json` currently defines **4 subworkers** (your-main-agent, your-seo-agent, your-community-agent, your-promoter-agent).
 
-**Common schedule patterns:**
-| Pattern | StartCalendarInterval |
-|---------|----------------------|
-| Every hour 9am–11pm | Hours 9–23, Minute 0 |
-| Twice daily (9am, 2pm) | Hour 9 + Hour 14, Minute 0 |
-| Every 30 min (9am–5pm) | Hours 9–17, Minutes 0 + 30 |
-| Once daily at 6am | Hour 6, Minute 0 |
+### 8.4 API (localhost, no auth)
 
-**⚠️ Important:** After editing the plist, you **MUST** reload it with `launchctl bootout` + `bootstrap`. The Electron UI toggle does this automatically when you enable/disable, but manual plist edits require manual reload.
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/health` | Docker healthcheck (status/timestamp/uptime/version) |
+| GET | `/status` | All subworkers `{name, enabled, running, next_run, schedule_type}` |
+| GET | `/status/{name}` | Detail + schedule + agent_id + model |
+| PUT | `/status/{name}` | Edit config (schedule, agent_id, model, timeout, retries) |
+| POST | `/trigger/{name}` | Run now (optional `{prompt, model}` body) |
+| POST | `/enable/{name}` / `/disable/{name}` | Toggle enabled state |
+| POST | `/config/reload` | Hot-reload subworkers.json from disk |
+| GET | `/logs/{name}?lines=N` | Recent log lines from run files |
+| GET | `/sessions/{name}?limit=N` | OpenCode session messages (reasoning, tools, text) |
+| GET | `/server/health` | OpenCode server subprocess state/pid/restarts |
+| POST | `/server/restart` | Restart OpenCode server subprocess |
+| WS | `/ws` | Live events: `initial_status`, `pong`, `subworker_completed`, `subworker_error` |
 
-### 8.4 Setting Up a New Subworker for Auto-Run
+Interactive docs: `http://localhost:5656/docs`.
 
-For a subworker to run automatically on schedule:
+### 8.5 Run Lifecycle
 
-1. **Create the plist** at `subworkers/plists/com.elia.<agent-id>.plist` (use template in §7.1)
-2. **Create `.enabled` file**: `touch subworkers/<agent-id>/.enabled`
-3. **Load into launchd**: `launchctl bootstrap gui/$(id -u) subworkers/plists/com.elia.<agent-id>.plist`
-4. **Verify**: `launchctl list | grep com.elia.<agent-id>` — should show a PID or `-` (loaded, waiting for schedule)
+1. APScheduler fires at scheduled time
+2. SubworkerRunner checks OpenCode health
+3. CLI invocation: `opencode run -d {workspace} -a {agent} "{prompt}"`
+4. SessionMonitor polls OpenCode API every 2s
+5. Completion detection: process exit code → API status + idle timeout → message markers
+6. On failure: retry with exponential backoff; on session crash: resume with `--continue`
+7. Real-time updates broadcast via WebSocket; logs → `logs/runs/{name}/YYYYMMDD_HHMMSS.log`
 
-**Or use the Electron UI:**
-1. Open the subworker popup
-2. Click the toggle switch for the agent
-3. The UI creates `.enabled` + loads the plist automatically
+### 8.6 Tests & Dev
 
-### 8.5 Current Subworker Status (as of Aug 2026)
+```bash
+cd ~/EliaAI/subworkers/server
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app.main:app --reload --port 5656   # local dev
+pytest -v                                    # test suite (routes, scheduler, runner, health, error_parser, ...)
+```
 
-| Subworker | .enabled | Plist | Launchd Status | Schedule |
-|-----------|----------|-------|----------------|----------|
-| refund-hunter | ✅ | ✅ | Loaded (PID 62965) | 10:00–22:00 hourly |
-| bene2luxe-promoter | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
-| bene2luxe-suppliers | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
-| cobou-promoter | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
-| mirorpay-community-organic | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
-| mirorpay-seo | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
-| mirrorpay-telegram | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
-| vcam-community-organic | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
-| vcam-seo | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
-| teleorbit-community-organic | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
-| teleorbit-seo | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
-| reddit-saas-scraper | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
-| tempack-dev | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
-| tiktok-content | ❌ | ✅ | Not loaded | 9:00–23:00 hourly |
+### 8.7 Session Persistence (survives `nuke_docker.sh`)
 
-**To enable any subworker:** Click the toggle switch in the Electron UI (or run `touch subworkers/<agent-id>/.enabled` + `launchctl bootstrap gui/$(id -u) subworkers/plists/com.elia.<agent-id>.plist` manually).
+OpenCode session data lives on the **host** (`~/.local/share/opencode/opencode.db`) and run logs live in the bind-mounted `logs/` volume — both survive a full Docker nuke. What did NOT survive was reachability:
+
+| Failure point | Cause | Fix |
+|---------------|-------|-----|
+| Scheduler session map lost | `_last_session_ids` was an in-memory dict, wiped on container recreation | Persisted to `logs/scheduler_state.json` (bind-mounted → host); loaded at startup, saved after every run |
+| Old sessions unreachable via API | Fallback listing called `list_sessions()` without limit → server returns only the 100 most recent of ~40k sessions | Routes now request `limit=2000`; `OpenCodeClient.list_sessions(limit)` accepts any cap |
+
+State file: `logs/scheduler_state.json` on host (`/data/logs/` in container), written atomically (tmp + rename) after each subworker run. Corrupt or missing file is logged and ignored — scheduler starts empty.
 
 ---
 
-## 9. Troubleshooting
+## 9. ColimaBar (Menu Bar Control)
+
+ColimaBar (menu bar app, source `~/Documents/EliaTopBar`) connects to the server for real-time control:
+
+- ⚡ Trigger Now / Manual Run → `POST /trigger/{name}`
+- ▶️ Enable / ⏸️ Disable → `POST /enable|/disable/{name}`
+- 📋 View Logs… → `GET /sessions/{name}?limit=30` (reasoning, tools, text from OpenCode)
+- 🔗 Change Server URL… → UserDefaults `"subworkerServerURL"` (**default is `http://localhost:8080` — set it to `http://localhost:5656`** on fresh setups; the real server runs on 5656)
+- Live status: WS `/ws` with HTTP `/status` fallback (5s) + `/server/health` (30s)
+
+> ⚠️ `lastError` / `lastCompleted` are only delivered over WebSocket events, not in HTTP `/status`. The WS error event currently carries only the subworker `name` → menu bar shows "Unknown error".
+
+Full deep-dive: [`docs/SUBWORKERS_COLIMABAR_CONNECTION.md`](../docs/SUBWORKERS_COLIMABAR_CONNECTION.md)
+
+---
+
+## 10. Troubleshooting
 
 | Issue | Solution |
 |-------|----------|
-| Agent not responding | Check `launchctl list \| grep com.elia` |
+| Agent not responding | Check server: `curl http://localhost:5656/status` + `docker ps \| grep elia-subworker-srv` |
+| ColimaBar shows Disconnected | Set 🔗 Change Server URL… → `http://localhost:5656` (default is phantom 8080) |
+| Server container not running | `cd ~/EliaAI/subworkers/server && docker compose up --build` (or restart via `EliaUI.command`) |
+| OpenCode server down (auto-restart exhausted) | Check `/server/health`, restart via `POST /server/restart` or `~/EliaAI/scripts/opencode-serve.sh 4096` |
+| Schedule not firing | Verify entry in `subworkers.json` (`enabled: true`, hours/minute) — server hot-reloads config |
 | Trigger skips with ".enabled not found" | Create `subworkers/<agent-id>/.enabled` or run with `--force` flag for manual terminal runs |
-| OpenCode TUI says `Config invalid - run doctor` and shows `../.omo/omo.jsonc: Un...` | The project config is likely wrapped in `[opencode]` when it should use top-level `agents` / `categories` / `task` / `teams`. Flatten the file to the current `omo.jsonc` schema and keep `[opencode]` only for actual harness overrides like `codegraph`. |
-| Parallel subworkers crash OpenCode with `FileSystem.open (.../opencode.log)` | The trigger should be launching with per-run temp `XDG_DATA_HOME` / `XDG_CACHE_HOME` / `XDG_STATE_HOME`. If you still see the host path, update `trigger_template.js` and restart the Electron UI so the button picks up the new wrapper. |
 | `EPERM: operation not permitted` on `oh-my-opencode` | Bun global package is a symlink to a local source checkout. Fix: `rm -rf ~/.bun/install/global/node_modules/oh-my-opencode && bun install -g oh-my-opencode` |
 | MCP not connecting | `mcp-cli list` + restart if needed |
 | Rate limited | Wait 1h + reduce frequency |
@@ -864,6 +685,32 @@ bun install -g oh-my-opencode
 **Prevention**: The Node.js trigger (`trigger_template.js`) handles binary resolution via a `which()` function that checks `~/.bun/bin`, `~/.opencode/bin`, `/opt/homebrew/bin`, and `/usr/local/bin`. If `oh-my-opencode` is not found, the trigger fails immediately with a clear error message instead of a cryptic EPERM stack trace.
 
 **Why it only affects `oh-my-opencode run` and not `oh-my-opencode --version`**: The `--version` flag reads `package.json` directly from the wrapper script location and exits before loading the platform-specific binary. The `run` command (and most other commands) trigger the full module loading chain, which traverses the symlink and hits macOS security restrictions.
+
+---
+
+## 11. Elia — Main Agent (as a Subworker)
+
+**New feature (August 2026):** Elia, the main agent, is now also a subworker — the **main** one. The logic and code are the same as any other subworker; only the designation differs ("main" title or not).
+
+### 11.1 Designation
+
+- `subworkers/main-agent.json` holds `{"name":"elia"}` — the agent flagged as **MAIN**.
+- In the **subworker popup** (ui_electron), the main agent shows a **MAIN badge** and a **★/✕ edit button** to set (or unset) which agent is main. Elia is main by default.
+- The main agent runs with the **repo root** (`~/EliaAI`) as workspace instead of an isolated `subworkers/<name>/workspace/` — set via `workspace` in `subworkers/server/app/config/subworkers.json`.
+
+### 11.2 PROMPT.md location
+
+Elia's prompt moved **without editing** from the repo root (`PROMPT.md`) to **`subworkers/elia/PROMPT.md`** — the standard subworker location. The server loads it via `prompt_file: PROMPT.md` (relative to workspace) in `subworkers.json`. The root-level `PROMPT.md` no longer exists.
+
+### 11.3 Triggering
+
+Elia runs through the **Docker subworker server** (`elia-subworker-srv`, port 5656) — scheduled from `subworkers.json` and triggered via the REST API (cron, morning, voice, UI):
+
+```bash
+curl -s -X POST http://127.0.0.1:5656/trigger/elia
+```
+
+The server's `SubworkerRunner` uses the entry's `workspace` (repo root for the main agent) and `prompt_file` (`PROMPT.md`) to invoke `opencode run -d <workspace> -a elia <prompt>`. Subworkers other than the main one keep their isolated workspace.
 
 ---
 

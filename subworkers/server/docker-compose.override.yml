@@ -1,0 +1,9 @@
+# docker-compose.override.yml — development overrides
+# Automatically loaded by `docker compose up` alongside docker-compose.yml
+services:
+  subworker-srv:
+    build:
+      context: .
+      target: base
+    environment:
+      - LOG_LEVEL=DEBUG

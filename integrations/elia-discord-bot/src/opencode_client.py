@@ -36,12 +36,6 @@ class OpenCodeClient:
             if response.status_code == 200:
                 data = response.json()
                 return data.get("id")
-            log.error(
-                "opencode.create_session_http_error",
-                status=response.status_code,
-                body=response.text[:500],
-                title=title,
-            )
         except Exception as e:
             log.error("opencode.create_session_failed", error=str(e))
         return None
@@ -95,11 +89,6 @@ class OpenCodeClient:
             response = await self.client.get("/session")
             if response.status_code == 200:
                 return response.json()
-            log.error(
-                "opencode.list_sessions_http_error",
-                status=response.status_code,
-                body=response.text[:500],
-            )
         except Exception as e:
             log.error("opencode.list_sessions_failed", error=str(e))
         return []
