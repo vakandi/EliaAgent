@@ -1,5 +1,5 @@
 ---
-name: vakandi-rapid-api-builder
+name: your-username-rapid-api-builder
 description: |
   Build production-ready FastAPI backends for the RapidAPI marketplace.
   Scaffolds full-stack APIs with SQLAlchemy 2.0 async, Pydantic v2, 
@@ -8,11 +8,11 @@ description: |
   OpenHack API and LinkedIn Scrapper API.
 metadata:
   model: claude-sonnet-4-20250514
-  author: Gilfoyle / User
+  author: Gilfoyle / the developer
   source: Vakandi
 ---
 
-# RAPID API BUILDER — `vakandi-rapid-api-builder`
+# RAPID API BUILDER — `your-username-rapid-api-builder`
 
 ## Use this skill when
 

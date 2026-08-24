@@ -5,13 +5,13 @@
 set -euo pipefail
 
 # Configuration
-AGENT_DIR="~/EliaAI"
+AGENT_DIR=""$HOME/EliaAI""
 LOG_DIR="${AGENT_DIR}/logs"
 PID_DIR="/tmp/elia_codemem_pids"
 PID_FILE="${PID_DIR}/viewer.pid"
 LOG_FILE="${LOG_DIR}/codemem_viewer_standalone.log"
 PORT=38888
-DB_PATH="~/.codemem/mem.sqlite"
+DB_PATH=""$HOME/.codemem"/mem.sqlite"
 MAX_RESTARTS=10
 INITIAL_RESTART_DELAY=2
 MAX_RESTART_DELAY=30

@@ -1,34 +1,34 @@
 ---
-name: yourapp-ga-marketing-review
+name: your-saas-ga-marketing-review
 description: >-
-  Full marketing director review of YourApp's GA4 data — traffic sources,
+  Full marketing director review of your-saas's GA4 data — traffic sources,
   conversion funnel, user behavior, AB test variant performance, and revenue
   (plan pricing events). Uses gsc-mcp to pull all GA4 data + Vercel CLI to
   check rolling-release AB testing status. Saves a structured .md report with
   executive summary, findings, and action items.
 
   Trigger this skill whenever the user asks to:
-  - "Review YourApp analytics" / "Check YourApp conversion data"
-  - "How is YourApp converting?" / "Marketing review"
-  - "Check GA4 for YourApp" / "See YourApp traffic and revenue"
+  - "Review your-saas analytics" / "Check your-saas conversion data"
+  - "How is your-saas converting?" / "Marketing review"
+  - "Check GA4 for your-saas" / "See your-saas traffic and revenue"
   - "Analyze AB test variants" / "Check variant performance"
   - "Run a marketing audit" / "Conversion funnel review"
-  - Any request combining "YourApp" + "analytics/revenue/conversion/traffic"
-  - Even vague requests like "how are we doing with YourApp" or "give me the numbers"
+  - Any request combining "your-saas" + "analytics/revenue/conversion/traffic"
+  - Even vague requests like "how are we doing with your-saas" or "give me the numbers"
   
-  If the user asks about another project (YourBrand, YourCheckout, etc.) but
+  If the user asks about another project (your-brand, FlowCheckout, etc.) but
   the question is about marketing analytics, also trigger — the skill accepts
   an `account` param for multi-site support.
 
 compatibility:
   - Requires `gsc-mcp` MCP server registered in mcp_servers.json
   - Requires Vercel CLI (`vercel`) in PATH
-  - Requires [your-homepage] Vercel project linked locally
+  - Requires your-saas-homepage Vercel project linked locally
 ---
 
-# YourApp GA Marketing Review Skill
+# your-saas GA Marketing Review Skill
 
-You are a **data-driven marketing director** reviewing YourApp's performance. Your job is to:
+You are a **data-driven marketing director** reviewing your-saas's performance. Your job is to:
 1. Pull all available GA4 data via the GSC MCP (`gsc-mcp`) server
 2. Check Vercel AB testing status via the Vercel CLI
 3. Synthesize everything into a structured report saved as a `.md` file
@@ -38,10 +38,10 @@ You are a **data-driven marketing director** reviewing YourApp's performance. Yo
 
 | Source | Tool | What it gives you |
 |--------|------|-------------------|
-| **GSC MCP** | `mcp-cli call gsc-mcp <tool> '{"account":"yourapp"}'` | All GA4 data: traffic, users, conversions, revenue, variants |
-| **Vercel CLI** | `vercel rr fetch` from the [your-homepage] directory | Rolling release / AB testing configuration status |
+| **GSC MCP** | `mcp-cli call gsc-mcp <tool> '{"account":"your-saas"}'` | All GA4 data: traffic, users, conversions, revenue, variants |
+| **Vercel CLI** | `vercel rr fetch` from the your-saas-homepage directory | Rolling release / AB testing configuration status |
 
-**Key GA4 tools to call** (all via `gsc-mcp`, `account="yourapp"`):
+**Key GA4 tools to call** (all via `gsc-mcp`, `account="your-saas"`):
 - `ga4_traffic_sources` — Sessions by channel, source, medium (with engagement, conversions, revenue)
 - `ga4_user_behavior` — Device, country, new vs returning breakdown
 - `ga4_page_performance` — Per-page metrics (views, engagement, bounce, conversions, revenue)
@@ -58,7 +58,7 @@ You are a **data-driven marketing director** reviewing YourApp's performance. Yo
 - `sitemap_audit` — Sitemap URLs vs indexed status
 - `ga4_funnel` — Full funnel with custom steps (requires `steps` array)
 - `ga4_event_breakdown` — Query event count broken down by dimension or event parameter. For `ab_test_variant`, pass `event_name="ab_variant_viewed"` with `dimension_name="customEvent:ab_test_variant"`. ✅ Registered since 2026-07-08 — use `dimension_name`, NOT `parameter_key`.
-- `mcp-ga4-ultimate list_custom_dimensions` — List registered custom dimensions (use `account="yourapp"`).
+- `mcp-ga4-ultimate list_custom_dimensions` — List registered custom dimensions (use `account="mirrorpay"`).
 
 ### AB Test Variant Decoder
 
@@ -89,9 +89,9 @@ Format: `hero_{variant}|section2_{variant}|why_{variant}|how_{variant}|compare_{
 
 ### Step 1: Check Vercel AB Testing Status
 
-Run from the [your-homepage] directory:
+Run from the your-saas-homepage directory:
 ```bash
-vercel rr fetch --cwd /Users/dev/projects/my-project 2>&1
+vercel rr fetch --cwd ~/Documents/your-saas/your-saas-homepage 2>&1
 ```
 
 This tells you:
@@ -104,32 +104,32 @@ This tells you:
 
 ### Step 2: Pull GA4 Data
 
-Call each of the following tools in parallel where possible. Use `account="yourapp"` for all calls (omit for default which is also yourapp).
+Call each of the following tools in parallel where possible. Use `account="your-saas"` for all calls (omit for default which is also your-saas).
 
 ```bash
 # Core data (always pull these)
-mcp-cli call gsc-mcp ga4_traffic_sources '{"site_url":"sc-domain:[your-app].com"}'
-mcp-cli call gsc-mcp ga4_user_behavior '{"site_url":"sc-domain:[your-app].com"}'
-mcp-cli call gsc-mcp ga4_page_performance '{"site_url":"sc-domain:[your-app].com"}'
-mcp-cli call gsc-mcp ga4_conversion_funnel '{"site_url":"sc-domain:[your-app].com"}'
+mcp-cli call gsc-mcp ga4_traffic_sources '{"site_url":"sc-domain:your-saas.com"}'
+mcp-cli call gsc-mcp ga4_user_behavior '{"site_url":"sc-domain:your-saas.com"}'
+mcp-cli call gsc-mcp ga4_page_performance '{"site_url":"sc-domain:your-saas.com"}'
+mcp-cli call gsc-mcp ga4_conversion_funnel '{"site_url":"sc-domain:your-saas.com"}'
 
 # Pulse check
-mcp-cli call gsc-mcp ga4_realtime '{"site_url":"sc-domain:[your-app].com"}'
+mcp-cli call gsc-mcp ga4_realtime '{"site_url":"sc-domain:your-saas.com"}'
 ```
 
-**To get cleaner data (exclude the user's Morocco testing traffic):**
+**To get cleaner data (exclude the owner's Morocco testing traffic):**
 ```bash
 # Filter to US-only traffic for cleaner user behavior signal
-mcp-cli call gsc-mcp ga4_traffic_sources '{"site_url":"sc-domain:[your-app].com","account":"yourapp","country":"United States"}'
-mcp-cli call gsc-mcp ga4_user_behavior '{"site_url":"sc-domain:[your-app].com","account":"yourapp","country":"United States"}'
-mcp-cli call gsc-mcp ga4_page_performance '{"site_url":"sc-domain:[your-app].com","account":"yourapp","country":"United States"}'
+mcp-cli call gsc-mcp ga4_traffic_sources '{"site_url":"sc-domain:your-saas.com","account":"your-saas","country":"United States"}'
+mcp-cli call gsc-mcp ga4_user_behavior '{"site_url":"sc-domain:your-saas.com","account":"your-saas","country":"United States"}'
+mcp-cli call gsc-mcp ga4_page_performance '{"site_url":"sc-domain:your-saas.com","account":"your-saas","country":"United States"}'
 ```
 
 **If you need historical depth (weekly/bi-weekly reviews):**
 ```bash
-mcp-cli call gsc-mcp ga4_page_performance '{"site_url":"sc-domain:[your-app].com","account":"yourapp","start_date":"90daysAgo"}'
-mcp-cli call gsc-mcp traffic_health_check '{"site_url":"sc-domain:[your-app].com","account":"yourapp"}'
-mcp-cli call gsc-mcp page_analysis '{"site_url":"sc-domain:[your-app].com","account":"yourapp","page":"/pricing"}'
+mcp-cli call gsc-mcp ga4_page_performance '{"site_url":"sc-domain:your-saas.com","account":"your-saas","start_date":"90daysAgo"}'
+mcp-cli call gsc-mcp traffic_health_check '{"site_url":"sc-domain:your-saas.com","account":"your-saas"}'
+mcp-cli call gsc-mcp page_analysis '{"site_url":"sc-domain:your-saas.com","account":"your-saas","page":"/pricing"}'
 ```
 
 #### Quick AB Test Data Pull (run this in parallel with core data):
@@ -153,7 +153,7 @@ mcp-cli call gsc-mcp ga4_event_breakdown '{"event_name":"login","dimension_name"
 mcp-cli call gsc-mcp ga4_event_breakdown '{"event_name":"billing_upgrade_clicked","dimension_name":"customEvent:ab_test_variant","start_date":"90daysAgo"}'
 
 # 7. Check registered custom dimensions (confirm dimension exists)
-mcp-cli call mcp-ga4-ultimate list_custom_dimensions '{"property_id":"538362794","account":"yourapp"}'
+mcp-cli call mcp-ga4-ultimate list_custom_dimensions '{"property_id":"538362794","account":"mirrorpay"}'
 ```
 
 ### AB Test Extraction Protocol — 5-Step Analysis
@@ -237,17 +237,17 @@ This tells you:
 
 ### Step 3: Synthesize the Report
 
-Write the report to: `yourapp-marketing-review/YYYY-MM-DD-yourapp-marketing-review.md`
+Write the report to: `your-saas-marketing-review/YYYY-MM-DD-your-saas-marketing-review.md`
 
 Create the directory if it doesn't exist:
 ```bash
-mkdir -p /Users/dev/projects/marketing-review
+mkdir -p ~/Documents/your-saas/your-saas-marketing-review
 ```
 
 ## Report Template
 
 ```markdown
-# YourApp Marketing Review — YYYY-MM-DD
+# your-saas Marketing Review — YYYY-MM-DD
 
 ## Executive Summary
 _Brief (~3 sentences): Overall traffic trend, conversion health, revenue status,
@@ -395,22 +395,22 @@ _Crawled: YYYY-MM-DD HH:MM_
 
 Save all reports to:
 ```
-/Users/dev/projects/marketing-review/
+~/Documents/your-saas/your-saas-marketing-review/
 ```
 
-Filename format: `YYYY-MM-DD-yourapp-marketing-review.md`
+Filename format: `YYYY-MM-DD-your-saas-marketing-review.md`
 
-The `yourapp-marketing-review/` directory is organized as a running log. Each
+The `your-saas-marketing-review/` directory is organized as a running log. Each
 report is a standalone snapshot. The most recent report can be referenced as
 "the current marketing review."
 
 ## Data Quality — Pre-July 10 Contamination
 
-**⚠️ CRITICAL CONTEXT:** All traffic before **July 10, 2026** is heavily contaminated by the user's own development/testing traffic from Morocco (Casablanca). This manifests as:
+**⚠️ CRITICAL CONTEXT:** All traffic before **July 10, 2026** is heavily contaminated by the owner's own development/testing traffic from Morocco (Casablanca). This manifests as:
 - ~57% of sessions from Morocco (50 of 88)
 - ~70% Direct channel traffic (62 of 88)
 - Inflated `/auth/login`, `/dashboard/*`, `/dashboard/setup` page views
-- Auth/dashboard engagement rates skewed (the user spending hours testing)
+- Auth/dashboard engagement rates skewed (the owner spending hours testing)
 
 **In every report, you MUST:**
 1. Flag the Morocco/Direct traffic contamination in the Executive Summary
@@ -418,7 +418,7 @@ report is a standalone snapshot. The most recent report can be referenced as
 3. When possible, include a "US Only" view using the `country: "United States"` parameter on MCP tools to show cleaner data
 4. Do NOT dismiss all data — returning visitor rate (34%), blog engagement (100%), and social referral traffic (12 sessions from FB/IG) are genuine signals even if absolute numbers are small
 
-**After July 10, 2026:** Assume progressively cleaner data as the user will implement filtering (browser extension or GA4 Internal Traffic Data Filter). Continue flagging any unusual Morocco/Direct dominance.
+**After July 10, 2026:** Assume progressively cleaner data as the owner will implement filtering (browser extension or GA4 Internal Traffic Data Filter). Continue flagging any unusual Morocco/Direct dominance.
 
 ## Fallback Behavior
 
@@ -429,8 +429,8 @@ report is a standalone snapshot. The most recent report can be referenced as
 
 **If GA4 data returns empty or zeroes:**
 - Note whether the period makes sense (new site, recent launch, etc.)
-- Check if the GA4 property ID is correct (yourapp = 538362794)
-- Recommend verifying gtag (`G-XXXXXXXXXX`) is firing on the site
+- Check if the GA4 property ID is correct (your-saas = 538362794)
+- Recommend verifying gtag (`G-HXY60VCEV0`) is firing on the site
 
 **If any GSC MCP tool errors:**
 - Log the error in the report's "Data Quality" section

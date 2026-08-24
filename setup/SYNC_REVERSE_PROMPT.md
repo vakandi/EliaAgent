@@ -8,8 +8,8 @@
 ## Context
 
 You are working with TWO GitHub repos:
-- **Public**: `~/user/EliaAgent` (clean repo with latest updates)
-- **Private**: `~/user/YOUR_PRIVATE_REPO` (your working repo with personal data)
+- **Public**: `~/EliaAgent` (clean repo with latest updates)
+- **Private**: `~/YOUR_PRIVATE_REPO` (your working repo with personal data)
 
 Your task is to SYNC the public repo to the private repo, **preserving all your personal data** (credentials, configs, logs, etc.) while pulling in the latest features and fixes.
 
@@ -42,7 +42,7 @@ Your task is to SYNC the public repo to the private repo, **preserving all your 
 
 **IMPORTANT**: Before syncing, always read the release notes to understand what's new:
 ```bash
-cat ~/user/EliaAgent/setup/RELEASENOTES.md
+cat ~/EliaAgent/setup/RELEASENOTES.md
 ```
 
 This will tell you:
@@ -55,7 +55,7 @@ This will tell you:
 
 Run this to find differences:
 ```bash
-diff -rq ~/user/EliaAgent ~/user/YOUR_PRIVATE_REPO --exclude=".git" --exclude="*.log" --exclude="node_modules" --exclude="venv" --exclude="__pycache__" 2>/dev/null | head -100
+diff -rq ~/EliaAgent ~/YOUR_PRIVATE_REPO --exclude=".git" --exclude="*.log" --exclude="node_modules" --exclude="venv" --exclude="__pycache__" 2>/dev/null | head -100
 ```
 
 Or use explore agent for deeper analysis.
@@ -98,14 +98,14 @@ Or use explore agent for deeper analysis.
 Before pulling, backup critical files:
 ```bash
 # Create backup directory
-BACKUP_DIR="~/user/YOUR_PRIVATE_REPO/.sync_backup_$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="~/YOUR_PRIVATE_REPO/.sync_backup_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$BACKUP_DIR"
 
 # Backup critical files
-cp ~/user/YOUR_PRIVATE_REPO/.env "$BACKUP_DIR/" 2>/dev/null || true
-cp -r ~/user/YOUR_PRIVATE_REPO/context "$BACKUP_DIR/" 2>/dev/null || true
-cp ~/user/YOUR_PRIVATE_REPO/PROMPT.md "$BACKUP_DIR/" 2>/dev/null || true
-cp ~/user/YOUR_PRIVATE_REPO/MORNING_PROMPT.md "$BACKUP_DIR/" 2>/dev/null || true
+cp ~/YOUR_PRIVATE_REPO/.env "$BACKUP_DIR/" 2>/dev/null || true
+cp -r ~/YOUR_PRIVATE_REPO/context "$BACKUP_DIR/" 2>/dev/null || true
+cp ~/YOUR_PRIVATE_REPO/PROMPT.md "$BACKUP_DIR/" 2>/dev/null || true
+cp ~/YOUR_PRIVATE_REPO/MORNING_PROMPT.md "$BACKUP_DIR/" 2>/dev/null || true
 
 echo "✅ Backup created at: $BACKUP_DIR"
 ```
@@ -114,21 +114,21 @@ echo "✅ Backup created at: $BACKUP_DIR"
 
 ```bash
 # Pull updated scripts
-cp ~/user/EliaAgent/scripts/*.sh ~/user/YOUR_PRIVATE_REPO/scripts/
+cp ~/EliaAgent/scripts/*.sh ~/YOUR_PRIVATE_REPO/scripts/
 
 # Pull setup files (excluding README.md if you have custom changes)
-cp ~/user/EliaAgent/setup/*.sh ~/user/YOUR_PRIVATE_REPO/setup/
-cp ~/user/EliaAgent/setup/opencode-proxy.sh ~/user/YOUR_PRIVATE_REPO/setup/ 2>/dev/null || true
+cp ~/EliaAgent/setup/*.sh ~/YOUR_PRIVATE_REPO/setup/
+cp ~/EliaAgent/setup/opencode-proxy.sh ~/YOUR_PRIVATE_REPO/setup/ 2>/dev/null || true
 
 # Pull README.md (review first, then decide)
-# cp ~/user/EliaAgent/setup/README.md ~/user/YOUR_PRIVATE_REPO/setup/README.md
+# cp ~/EliaAgent/setup/README.md ~/YOUR_PRIVATE_REPO/setup/README.md
 
 # Pull RELEASENOTES.md
-cp ~/user/EliaAgent/setup/RELEASENOTES.md ~/user/YOUR_PRIVATE_REPO/setup/RELEASENOTES.md
+cp ~/EliaAgent/setup/RELEASENOTES.md ~/YOUR_PRIVATE_REPO/setup/RELEASENOTES.md
 
 # Pull UI updates (if you want them)
-# rm -rf ~/user/YOUR_PRIVATE_REPO/ui_electron
-# cp -R ~/user/EliaAgent/ui_electron ~/user/YOUR_PRIVATE_REPO/ui_electron
+# rm -rf ~/YOUR_PRIVATE_REPO/ui_electron
+# cp -R ~/EliaAgent/ui_electron ~/YOUR_PRIVATE_REPO/ui_electron
 ```
 
 ### Step 6: Handle Config Conflicts
@@ -150,7 +150,7 @@ cp ~/user/EliaAgent/setup/RELEASENOTES.md ~/user/YOUR_PRIVATE_REPO/setup/RELEASE
 ### Step 7: Rebuild Dependencies
 
 ```bash
-cd ~/user/YOUR_PRIVATE_REPO
+cd ~/YOUR_PRIVATE_REPO
 
 # Rebuild UI if you pulled ui_electron
 cd ui_electron
@@ -183,7 +183,7 @@ cd ../..
 ### Step 9: Commit Your Updates
 
 ```bash
-cd ~/user/YOUR_PRIVATE_REPO
+cd ~/YOUR_PRIVATE_REPO
 git add -A
 git status  # Verify only intended files
 git commit -m "chore: sync updates from EliaAgent v1.0.2"
@@ -196,7 +196,7 @@ git push origin main
 
 ### For Explore Agent:
 ```
-Compare ~/user/EliaAgent vs ~/user/YOUR_PRIVATE_REPO
+Compare ~/EliaAgent vs ~/YOUR_PRIVATE_REPO
 
 List ALL differences:
 - New files in EliaAgent (need pull)
@@ -216,7 +216,7 @@ Sync EliaAgent to YOUR_PRIVATE_REPO:
 5. Test your setup
 6. Commit updates
 
-Use ~/user/EliaAgent as source, ~/user/YOUR_PRIVATE_REPO as target.
+Use ~/EliaAgent as source, ~/YOUR_PRIVATE_REPO as target.
 ```
 
 ---
@@ -250,8 +250,8 @@ Create a sync script:
 #!/bin/bash
 # EliaAgent → YOUR_PRIVATE_REPO Sync Script
 
-SOURCE="~/user/EliaAgent"
-TARGET="~/user/YOUR_PRIVATE_REPO"
+SOURCE="~/EliaAgent"
+TARGET="~/YOUR_PRIVATE_REPO"
 
 echo "🔄 Syncing EliaAgent → YOUR_PRIVATE_REPO"
 

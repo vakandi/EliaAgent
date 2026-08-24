@@ -1,0 +1,51 @@
+{
+  "skill_name": "seo-review",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Can you review the SEO of https://your-saas.com ? I want a full audit with scores and prioritized fixes.",
+      "expected_output": "A complete SEO audit report with score breakdown, findings organized by priority (P0-P3), what's working section, AI search readiness assessment, and quick wins. Should use the 40-check scorecard and produce a numerical score out of 100.",
+      "assertions": [
+        {"type": "contains", "value": "# SEO Audit Report"},
+        {"type": "contains", "value": "Score Breakdown"},
+        {"type": "contains", "value": "P0"},
+        {"type": "contains", "value": "P1"},
+        {"type": "contains", "value": "Executive Summary"},
+        {"type": "contains", "value": "/100"},
+        {"type": "contains", "value": "robots.txt"},
+        {"type": "contains", "value": "AI Search Readiness"},
+        {"type": "contains", "value": "Quick Wins"}
+      ],
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Check https://stripe.com/docs for SEO issues. Just give me the top problems and a quick score.",
+      "expected_output": "A focused audit report for a documentation subdomain. Should catch any issues specific to docs pages (thin content, missing schema, heading hierarchy). Should still produce a score even if the user asked for 'quick' — abbreviated but complete.",
+      "assertions": [
+        {"type": "contains", "value": "# SEO Audit Report"},
+        {"type": "contains", "value": "Score Breakdown"},
+        {"type": "contains", "value": "/100"},
+        {"type": "contains", "value": "P0"},
+        {"type": "min_length", "value": 2000}
+      ],
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "I just launched my site at https://example.com — is it ready for Google and ChatGPT to find it? Do an SEO review.",
+      "expected_output": "An audit report that specifically addresses both traditional SEO (Google) and AI search readiness (ChatGPT/GPTBot). Should check robots.txt for AI crawler rules, llms.txt, structured data quality, and snippet-ready content formatting. Score should reflect both dimensions.",
+      "assertions": [
+        {"type": "contains", "value": "# SEO Audit Report"},
+        {"type": "contains", "value": "AI Search Readiness"},
+        {"type": "contains", "value": "Score Breakdown"},
+        {"type": "contains", "value": "GPTBot"},
+        {"type": "contains", "value": "robots.txt"},
+        {"type": "contains", "value": "Structured Data"},
+        {"type": "contains", "value": "/100"},
+        {"type": "min_length", "value": 2000}
+      ],
+      "files": []
+    }
+  ]
+}

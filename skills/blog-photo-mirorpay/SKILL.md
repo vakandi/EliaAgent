@@ -1,24 +1,24 @@
 ---
-name: blog-photo-yourapp
+name: blog-photo-your-saas
 description: >
-  Generate image prompts for YourApp blog posts. Use this skill whenever:
-  - The user asks to create/generate blog post images or hero images for YourApp
-  - The user wants to find YourApp blog posts that are missing photos/images
-  - The user needs image prompt ideas for YourApp blog content about payment cloaking, Stripe bans, Shopify/WooCommerce payments
+  Generate image prompts for your-saas blog posts. Use this skill whenever:
+  - The user asks to create/generate blog post images or hero images for your-saas
+  - The user wants to find your-saas blog posts that are missing photos/images
+  - The user needs image prompt ideas for your-saas blog content about payment cloaking, Stripe bans, Shopify/WooCommerce payments
   - The user says "make images for the blog", "generate prompts for blog photos", "check which posts need images"
-  - The user wants to create featured images following YourApp's visual style (dramatic 3D illustrations, split-screen X-ray, financial-tech aesthetic)
-  - Any task involving YourApp blog visual content, even if the user doesn't explicitly name the skill
-  - TRIGGER PROACTIVELY: If the user mentions blog posts and YourApp in the same context, suggest checking which posts need images
+  - The user wants to create featured images following your-saas's visual style (dramatic 3D illustrations, split-screen X-ray, financial-tech aesthetic)
+  - Any task involving your-saas blog visual content, even if the user doesn't explicitly name the skill
+  - TRIGGER PROACTIVELY: If the user mentions blog posts and your-saas in the same context, suggest checking which posts need images
 compatibility: "python3 (for the bundled fetch script), curl (for quick ad-hoc queries)"
 ---
 
-# YourApp Blog Photo Generator
+# your-saas Blog Photo Generator
 
-This skill helps you generate **SEO-optimized, conversion-driven image prompts** for YourApp blog articles. The workflow is:
+This skill helps you generate **SEO-optimized, conversion-driven image prompts** for your-saas blog articles. The workflow is:
 
 1. **Query Directus** to find which published blog posts don't have a featured image
 2. **List them** with title, slug, description
-3. **Generate custom image prompts** for each post (or a selected one) following YourApp's visual branding
+3. **Generate custom image prompts** for each post (or a selected one) following your-saas's visual branding
 
 ### Why blog images matter for SEO and conversions
 
@@ -29,7 +29,7 @@ This skill helps you generate **SEO-optimized, conversion-driven image prompts**
 | **Pinterest traffic** | Pinterest is a visual search engine. Well-pinned articles can drive traffic for **years** after publication. |
 | **Backlinks** | People link to articles that look professional. A blog post without a hero image looks unfinished and less authoritative. |
 | **Time on page** | A compelling hero image increases time-on-page and reduces bounce rate — both signals that help SEO rankings. |
-| **Brand recognition** | Consistent visual style across all blog images builds recognizable brand authority. When backlinkers see a YourApp image style, they associate it with quality. |
+| **Brand recognition** | Consistent visual style across all blog images builds recognizable brand authority. When backlinkers see a your-saas image style, they associate it with quality. |
 | **Click-through rate** | Articles with relevant, high-quality images get **94% more views** than those without. The image is the first thing readers see. |
 
 ---
@@ -39,10 +39,10 @@ This skill helps you generate **SEO-optimized, conversion-driven image prompts**
 Use the bundled Python script:
 
 ```bash
-python3 /path/to/blog-photo-skill/scripts/fetch_blog_posts.py
+python3 ~/.config/opencode/skills/blog-photo-your-saas/scripts/fetch_blog_posts.py
 ```
 
-This queries the YourApp Directus instance (`https://dash.[your-app].com`) and returns only published posts where `image` is `null`.
+This queries the your-saas Directus instance (`https://dash.your-saas.com`) and returns only published posts where `image` is `null`.
 
 **Options:**
 - `--all` — list ALL published posts (including ones that already have images)
@@ -83,7 +83,7 @@ This queries the YourApp Directus instance (`https://dash.[your-app].com`) and r
 ### Quick curl alternative (ad-hoc)
 
 ```bash
-curl -s "https://dash.[your-app].com/items/posts?filter=%7B%22_and%22%3A%5B%7B%22status%22%3A%7B%22_eq%22%3A%22published%22%7D%7D%2C%7B%22image%22%3A%7B%22_null%22%3Atrue%7D%7D%5D%7D&sort=-published_at&fields=id,title,slug,description,published_at,image&limit=25" \
+curl -s "https://dash.your-saas.com/items/posts?filter=%7B%22_and%22%3A%5B%7B%22status%22%3A%7B%22_eq%22%3A%22published%22%7D%7D%2C%7B%22image%22%3A%7B%22_null%22%3Atrue%7D%7D%5D%7D&sort=-published_at&fields=id,title,slug,description,published_at,image&limit=25" \
   -H "Authorization: Bearer sp-admin-token-2026-190c1875aec049db" | python3 -m json.tool
 ```
 
@@ -94,7 +94,7 @@ curl -s "https://dash.[your-app].com/items/posts?filter=%7B%22_and%22%3A%5B%7B%2
 **Before generating any image prompts, always retrieve the full article content** to understand what the post is about — its core message, key sections, tone, and the specific pain points it addresses.
 
 ```bash
-python3 /path/to/blog-photo-skill/scripts/fetch_blog_posts.py --slug=post-slug-here --full
+python3 ~/.config/opencode/skills/blog-photo-your-saas/scripts/fetch_blog_posts.py --slug=post-slug-here --full
 ```
 
 Extract key themes from the content:
@@ -110,15 +110,15 @@ For each blog post that needs an image, generate **exactly one image prompt — 
 
 **CRITICAL: Output the prompt directly in your response message.** Do NOT write it to files. The user needs to copy it directly from the chat to use with Midjourney/DALL-E/Stable Diffusion. The prompt should be clearly formatted and ready to copy-paste.
 
-### YourApp Visual Branding
+### your-saas Visual Branding
 
-The YourApp visual identity follows these patterns:
-- **Dramatic storytelling** — The problem is shown in dark/moody red tones, the solution (YourApp) in clean blue/white
-- **Metaphors**: funhouse mirrors, labyrinths, roulette wheels, crumbling cliffs, leaky pipes — always with YourApp as the clear fix
+The your-saas visual identity follows these patterns:
+- **Dramatic storytelling** — The problem is shown in dark/moody red tones, the solution (your-saas) in clean blue/white
+- **Metaphors**: funhouse mirrors, labyrinths, roulette wheels, crumbling cliffs, leaky pipes — always with your-saas as the clear fix
 - **Audience split**: Some images target merchants (B2B, technical, dashboard-focused), others target customers (emotional, trust-focused)
 - **Style range**: offer a mix — cinematic 3D, abstract isometric, split-screen X-ray, flat vector
 - **Format**: always 16:9 (1200×630px for OG images)
-- **Always include** `YourApp.com` logo in the image as the solution element
+- **Always include** `your-saas.com` logo in the image as the solution element
 
 ### SEO Optimization for Each Image
 
@@ -130,7 +130,7 @@ Every prompt option MUST include these SEO elements:
    - Clear focal point centered or on the left third (where text overlay would go)
    - High contrast so thumbnails are readable at small sizes
    - No critical details in the outer 10% (safe zone for platform cropping)
-   - YourApp branding visible even at 150px thumbnail size
+   - your-saas branding visible even at 150px thumbnail size
 
 ### Conversion Psychology for Each Image
 
@@ -142,7 +142,7 @@ Each image prompt must serve a specific conversion goal:
 | **Social share** | Bold, emotionally charged, easy to understand in 1 second | Viral/content marketing posts |
 | **Trust building** | Professional, clean, branded, authoritative | Tutorials, guides, "how to" articles |
 | **Urgency/action** | Red/amber tones, countdown or stats, problem-focused | "Why you're losing money" articles |
-| **Brand recall** | Strong YourApp blue/white presence, mirror metaphor visible | Any post, build recognition over time |
+| **Brand recall** | Strong your-saas blue/white presence, mirror metaphor visible | Any post, build recognition over time |
 
 **Rule**: Every image should pass the "1-second test" — someone scrolling on LinkedIn/Twitter should understand what the article is about within 1 second of seeing the image.
 
@@ -156,7 +156,7 @@ The single best prompt MUST include ALL of these elements:
 4. **OG check** — Confirm the image will work at 1200×630 and at thumbnail size
 5. **The prompt** — A detailed image generation prompt (200-400 words) that includes:
    - The problem visual (what the customer/merchant is struggling with)
-   - The YourApp solution visual (clean, blue, transparent)
+   - The your-saas solution visual (clean, blue, transparent)
    - Lighting/mood/color palette instructions
    - Technical quality tags (e.g., "hyper-detailed, 8k resolution, dramatic lighting")
 

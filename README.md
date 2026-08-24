@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/EliaAI-v3.0-8B5CF6?style=for-the-badge&logo=OpenAI&logoColor=white&labelColor=1E1B4B" alt="EliaAI v3.0">
+  <img src="https://img.shields.io/badge/EliaAI-v6.0-8B5CF6?style=for-the-badge&logo=OpenAI&logoColor=white&labelColor=1E1B4B" alt="EliaAI v6.0">
 </p>
 
 <p align="center">
@@ -101,6 +101,72 @@ Key dashboard features:
 
 ---
 
+## 👥 Team Mode — Multi-Agent Collaboration
+
+**Team Mode lets multiple AI agents work together in real-time, talking to each other via a shared mailbox.** Not simple delegation — actual bidirectional communication where agents share findings, debate solutions, and coordinate.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           TEAM MODE                                         │
+│                                                                             │
+│  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐            │
+│  │  Lead    │ ◄──│ Member A │ ◄──│ Member B │ ◄──│ Member C │            │
+│  │ (Orch.)  │ ──►│ (Backend)│ ──►│ (Frontend│ ──►│ (Marketing)│           │
+│  └────┬─────┘    └──────────┘    └──────────┘    └──────────┘            │
+│       │                                                                     │
+│       ▼                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────┐       │
+│  │  Shared Mailbox: messages, tasks, findings, decisions           │       │
+│  └─────────────────────────────────────────────────────────────────┘       │
+│                                                                             │
+│  🔁 Agents talk to EACH OTHER — not just to the user                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Key Features
+
+| Feature | Description |
+|---------|-------------|
+| **Any session** | Team Mode works in any OpenCode session — just type `/team-mode` or mention agents with `@agent-name` |
+| **Custom agents** | Use your own custom agents as team members — not just built-in ones |
+| **Bidirectional** | Agents send messages to each other, share findings, and debate approaches |
+| **Task assignment** | Lead creates tasks, assigns to specific members, monitors progress |
+| **Subworker integration** | Complex subworker tasks can be broken into team subtasks for parallel execution |
+
+### Usage
+
+```bash
+# Start a team with custom agents
+@team-mode assemble @gilfoyle @picasso @setbon
+
+# Or use the team-mode skill
+/team-mode
+
+# Create a team with mixed agents
+team_create(
+  name="my-project-team",
+  members=[
+    {name: "lead", kind: "category", category: "deep"},
+    {name: "gilfoyle", kind: "subagent_type", subagent_type: "gilfoyle"},
+    {name: "picasso", kind: "subagent_type", subagent_type: "picasso"}
+  ]
+)
+```
+
+### Use Cases
+
+| Scenario | Team Composition |
+|----------|-----------------|
+| **Full-stack feature** | Backend + Frontend + QA agents working in parallel |
+| **Code review** | Multiple reviewers examining different aspects simultaneously |
+| **Complex subworker tasks** | Break a heavy subworker task into team subtasks |
+| **Debugging** | Multiple agents investigating different hypotheses |
+| **Marketing campaign** | Copywriter + Designer + SEO agents coordinating |
+
+> 💡 **Team Mode is the bridge between single-agent and multi-agent workflows.** Use it when a task needs multiple perspectives or when you want agents to collaborate rather than just execute.
+
+---
+
 ## 🏗️ Architecture
 
 ```
@@ -178,6 +244,7 @@ Key dashboard features:
 | **💬 Discord Integration** | Chat with Elia via `@elia_bot` with persistent sessions | Access from any device |
 | **📊 Langfuse Telemetry** | OpenTelemetry tracing, cost tracking, performance metrics | Full observability |
 | **🌅 Morning Briefing** | Automated daily reports via Telegram/WhatsApp | Start informed |
+| **👥 Team Mode** | Multi-agent collaboration with shared mailbox, bidirectional communication | Complex tasks as team projects |
 
 ---
 
@@ -538,6 +605,28 @@ export LANGFUSE_BASEURL="https://cloud.langfuse.com"
 | **Telemetry** | Langfuse (OpenTelemetry) |
 | **Integration** | Discord.py, Python |
 | **Proxy** | HTTP_PROXY env vars, auto-rotation |
+
+---
+
+## 🖥️ Companion Repos
+
+EliaAI has dedicated repos for UI, mobile and system management:
+
+| Repo | Description | Link |
+|------|-------------|------|
+| **EliaTopBar** | macOS menu-bar app (native Swift) — full realtime subworker dashboard & management over WebSocket: live agent states, chat/session viewer with streaming output, trigger / enable / disable, model + variant switching, server health — plus voice control and cron scheduling | [github.com/vakandi/Elia-Topbar](https://github.com/vakandi/Elia-Topbar) |
+| **EliaAndroidApp** | Mobile command center (Android today, iOS-ready via Expo / React Native) — realtime fleet dashboard, chat streams with markdown rendering, schedule calendar projecting interval & cron runs, LAN discovery, run notifications | [github.com/vakandi/EliaAndroidApp](https://github.com/vakandi/EliaAndroidApp) |
+| **Elia-OC** | OpenCode session management UI — view, search, and manage all agent sessions in a clean interface | [github.com/vakandi/Elia-OC](https://github.com/vakandi/Elia-OC) |
+
+### 🌍 Access Your Subworkers From Anywhere
+
+Both clients ship a built-in **Cloudflare Tunnel** wizard: a one-time setup from your local
+network creates a free custom-domain tunnel (`https://your.domain`) straight into the subworker
+server — TLS end-to-end, no ports opened, no VPS required, and the connector survives every
+restart automatically. Prefer always-on hosting? Deploy the same stack on a VPS. Either way,
+your agents are reachable **anywhere, anytime**, protected by a shared auth token.
+
+For the best experience, install **EliaTopBar** alongside EliaAI — it gives you instant access to model switching, voice dictation, and cron controls without opening a terminal.
 
 ---
 

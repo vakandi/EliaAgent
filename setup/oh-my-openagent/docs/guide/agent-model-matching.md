@@ -2,6 +2,36 @@
 
 > **For agents and users**: Why each agent needs a specific model — and how to customize without breaking things.
 
+---
+
+## 🚨 READ THIS FIRST — SISYPHUS IS **NOT** A "RUN IT ON ANY MODEL" SYSTEM 🚨
+
+> **STOP. BEFORE YOU POINT SISYPHUS AT SOME OTHER MODEL, READ EVERY WORD BELOW. THIS IS THE SINGLE MOST IGNORED THING IN THIS WHOLE GUIDE.**
+
+**SISYPHUS HAS ONLY EVER BEEN TESTED AND VERIFIED ON THE EXACT MODELS LISTED IN THIS DOCUMENT — AND NOTHING, *NOTHING*, ELSE.** The supported set is narrow on purpose:
+
+- **Claude family:** Fable 5 · Opus 4.8 · Opus 4.7 · Sonnet 4.6
+- **Kimi:** K2.7 · K2.6 · K2.5
+- **GLM:** 5 / 5.1 *(acceptable — slightly looser on the long nested workflows)*
+- **GPT:** 5.4 / 5.5 *(dedicated GPT prompt path exists — supported, but still **NOT** the recommended default for the orchestrator)*
+
+**IF A MODEL IS NOT ON THAT LIST, IT IS 100% UNTESTED AND 100% UNVERIFIED WITH SISYPHUS.** It may not work at all. It may *look* like it works and then fall apart three tool-calls later. **AND IF IT SOMEHOW WORKS FOR YOU — THAT IS A LITERAL MIRACLE. IT IS NOT A SUPPORTED CONFIGURATION, IT IS NOT BLESSED, AND IT IS NOT A PROMISE THAT IT WILL STILL WORK TOMORROW.**
+
+**EVERY SINGLE PROMPT CHANGE TO SISYPHUS IS WRITTEN, TUNED, AND REGRESSION-CHECKED AGAINST THE MODELS ABOVE — AND ONLY THOSE MODELS.** Nobody is watching how an off-list model behaves. The consequences are not subtle:
+
+- **AN UNLISTED MODEL CAN BREAK AT THE *VERY NEXT PATCH*, WITH ZERO WARNING.** A prompt tweak that helps Claude/Kimi can silently shatter whatever fragile thing was holding your off-list model together — and we will *never notice*, because we are not testing it. Do not file it as a bug. It was never working on purpose.
+- **A PROMPT CANNOT FIX A MODEL.** Models have hard, intrinsic characteristics. No amount of prompt-carving makes a model do what it fundamentally *cannot* do. If a model is the wrong brain for orchestration, it stays the wrong brain — **forever**, no matter how perfectly the prompt is shaped. We have ground prompts down to the bone; the model that can't, still can't.
+
+**SO, GENUINELY AND SINCERELY, FROM THE BOTTOM OF OUR HEARTS: RUNNING SISYPHUS ON ANY MODEL NOT LISTED HERE IS STRONGLY, EMPHATICALLY, DESPERATELY *NOT* RECOMMENDED.** Do it anyway and you are fully on your own — and you should *expect* it to break.
+
+### MiniMax / Qwen / MiMo / DeepSeek as Sisyphus — JUST DON'T
+
+**We have NOT found any way to make MiniMax, Qwen, MiMo, or DeepSeek work acceptably as Sisyphus.** We tried. They do not hold up under Sisyphus's nested todo + delegation + orchestration prompt. This is not a "tune it more" situation — see the rule above: *a prompt cannot fix a model.*
+
+**MiniMax and Qwen in particular are so bad in the Sisyphus role that we would almost forbid it outright.** Treat **"Sisyphus on MiniMax"** and **"Sisyphus on Qwen"** as configurations you should simply *never* reach for. (These models still have legitimate jobs elsewhere — MiniMax for fast utility fallback, Qwen for visual work, both documented below — just **NEVER** as the orchestrator.)
+
+---
+
 ## The Core Insight: Models Are Developers
 
 Think of AI models as developers on a team. Each has a different brain, different personality, different strengths. **A model isn't just "smarter" or "dumber." It thinks differently.** Give the same instruction to Claude and GPT, and they'll interpret it in fundamentally different ways.
@@ -21,13 +51,15 @@ Sisyphus is the developer who knows everyone, goes everywhere, and gets things d
 - Understanding nuanced delegation and orchestration patterns
 - Producing well-structured, communicative output
 
-Using Sisyphus with older GPT models would be like taking your best project manager — the one who coordinates everyone, runs standups, and keeps the whole team aligned — and sticking them in a room alone to debug a race condition. Wrong fit. GPT-5.4 now has a dedicated Sisyphus prompt path, but GPT is still not the default recommendation for the orchestrator.
+Using Sisyphus with older GPT models would be like taking your best project manager — the one who coordinates everyone, runs standups, and keeps the whole team aligned — and sticking them in a room alone to debug a race condition. Wrong fit. GPT-5.4 and GPT-5.5 now have dedicated Sisyphus prompt paths, but GPT is still not the default recommendation for the orchestrator.
+
+> **⚠️ Sisyphus is ONLY tested on Claude (Fable 5 / Opus 4.8 / 4.7 / Sonnet 4.6), Kimi (K2.7 / K2.6 / K2.5), GLM (5 / 5.1), and GPT (5.4 / 5.5).** Anything else is untested, unsupported, and can break without warning. **MiniMax and Qwen as Sisyphus are strongly discouraged to the point we'd almost forbid it.** Read the **🚨 READ THIS FIRST** warning at the very top of this guide before you override the orchestrator's model.
 
 ### Hephaestus: The Deep Specialist
 
 Hephaestus is the developer who stays in their room coding all day. Doesn't talk much. Might seem socially awkward. But give them a hard technical problem and they'll emerge three hours later with a solution nobody else could have found.
 
-**This is why Hephaestus uses GPT-5.4.** GPT-5.4 is built for exactly this:
+**This is why Hephaestus uses GPT-5.6 sol (falling back to GPT-5.5).** The GPT-5.x flagship line is built for exactly this:
 
 - Deep, autonomous exploration without hand-holding
 - Multi-file reasoning across complex codebases
@@ -50,52 +82,210 @@ This matters for understanding why some agents support both model families while
 
 **GPT** (especially 5.2+) responds to **principle-driven** prompts — concise principles, XML structure, explicit decision criteria. More rules = more contradiction surface = more drift. GPT works best when you state the goal and let it figure out the mechanics.
 
-Real example: Prometheus's Claude prompt is ~1,100 lines across 7 files. The GPT prompt achieves the same behavior with 3 principles in ~121 lines. Same outcome, completely different approach.
+Prometheus used to mirror this split with separate model-family prompts. It now uses a single thin prompt backed by `ulw-plan`, so swapping its model changes the fallback choice, not the prompt file.
 
-Agents that support both families (Prometheus, Atlas) auto-detect your model at runtime and switch prompts via `isGptModel()`. You don't have to think about it.
+Atlas still supports model-family prompt behavior. Prometheus does not auto-switch prompts at runtime.
+
+---
+
+## Step 1 — Check What's Actually Available
+
+Before configuring anything, see what your current system can run.
+
+### List all available models
+
+```bash
+opencode models
+```
+
+This prints every `provider/model` combination you can address right now. Providers are derived from your connected auth + the `models.dev` catalogue.
+
+Opencode sorts the output so `opencode*` providers appear first — that's intentional, not cosmetic.
+
+### List connected providers
+
+```bash
+opencode auth list
+```
+
+Shows which providers you've already logged into.
+
+### If the model you want isn't listed
+
+You need to log in to that provider:
+
+```bash
+opencode auth login
+```
+
+The interactive picker prioritizes providers in this order:
+
+| Priority | Provider | Opencode's own hint |
+|---|---|---|
+| 0 | `opencode` | **(Recommended)** |
+| 1 | `opencode-go` | Low cost subscription for everyone |
+| 2 | `openai` | ChatGPT Plus/Pro or API key |
+| 3 | `github-copilot` | — |
+| 4 | `anthropic` | API key |
+| 5 | `google` | — |
+
+You can also skip the picker: `opencode auth login --provider opencode-go`.
+
+### Verify what oh-my-openagent will actually use
+
+```bash
+bunx oh-my-openagent doctor
+```
+
+This shows the **effective model resolution** for every agent and category based on your current auth state. If an agent says "system-default" instead of a real fallback, that's a signal you're missing providers from its chain.
+
+---
+
+## Step 2 — The Recommended Stack
+
+You don't need every provider. You need the right two.
+
+### The Optimal Combination: OpenCode Go + OpenAI Plus/Pro
+
+**~$30/month total.** Beats direct Anthropic + OpenAI + Google subscriptions (~$60+/month) on both cost and coverage.
+
+| Subscription | Cost | What You Get | Covers |
+|---|---|---|---|
+| **OpenCode Go** | $10/mo | `kimi-k2.5`, `kimi-k2.6`, `glm-5`, `glm-5.2`, `minimax-m2.5`, `minimax-m2.7`, `minimax-m3`, `mimo-v2-pro`, `qwen3.5-plus`, `qwen3.6-plus` | Claude-family alternatives (Kimi, GLM), Gemini-family alternatives (Qwen), utility/retrieval (MiniMax) |
+| **OpenAI Plus/Pro** | $20+/mo | `gpt-5.4`, `gpt-5.4-pro`, `gpt-5.5`, `gpt-5.5-codex`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` | GPT-native agents (Hephaestus, Oracle, Momus), GPT-5.6 category defaults (`deep`, `ultrabrain`, `unspecified-low`), GPT fallbacks for model-flexible agents |
+
+### Why this specific combination
+
+1. **Hephaestus requires the GPT-5.x family (default: GPT-5.6 sol).** It has no Claude-family fallback. ChatGPT Plus/Pro or OpenAI API access is the cheapest real path.
+2. **OpenCode Go covers the orchestration and creative surface.** Kimi K2.5/2.6 behaves like Claude for Sisyphus/Atlas. GLM-5 fills the long tail. Qwen handles visual tasks when Gemini isn't available.
+3. **No single provider can cover everything.** Anthropic-only setups break Hephaestus. OpenAI-only setups degrade Sisyphus. You need at least one from each family.
+
+### What if you already have a Claude subscription?
+
+Add `--claude=max20` (or `yes`) on install. The Claude chain default (Opus 4.7, snapshot-backed) activates for Sisyphus/Prometheus/Atlas and you still get the OpenCode Go fallbacks for free. Pin `claude-opus-4-8` or `claude-fable-5` to run the current top Claude with Sisyphus/Atlas tuned prompts; Prometheus keeps its single `ulw-plan`-backed prompt. Best-in-class orchestration + budget safety net.
+
+### What if you have zero subscriptions?
+
+OpenCode Go alone gets Sisyphus/Atlas/Oracle/Librarian/Explore working. Hephaestus won't activate without GPT access, so you lose autonomous deep work. Consider adding ChatGPT Plus as soon as you can.
+
+---
+
+## Step 3 — Model Family Alternatives (Priority Order)
+
+When the "native" model isn't available, oh-my-openagent walks each agent's fallback chain until something connects. The chains are hardcoded in [`packages/omo-opencode/src/shared/model-requirements.ts`](../../packages/omo-opencode/src/shared/model-requirements.ts). There is no single global priority list. Every agent and category has its own chain.
+
+There are two separate systems:
+
+- **model-fallback**: proactive resolution in `chat.params` using hardcoded `AGENT_MODEL_REQUIREMENTS` and `CATEGORY_MODEL_REQUIREMENTS`
+- **runtime-fallback**: reactive recovery from `session.error`, configurable per category/agent in runtime-fallback hooks
+
+### Current top tier vs the auto-resolution chain
+
+Two things move at different speeds, and the difference explains why "Opus 4.7" still appears as a default below:
+
+- **The current top models** are Claude **Fable 5** and **Opus 4.8**, and Kimi **K2.7**. Sisyphus and Atlas have dedicated tuned prompt paths for these models; Prometheus keeps one `ulw-plan`-backed prompt. Pin one in your config: `"anthropic/claude-opus-4-8"`, `"anthropic/claude-fable-5"`, `"opencode-go/kimi-k2.7-code"`. Use that when you want to opt into the newer model explicitly.
+- **The auto-resolution fallback chains** below still lead with **Opus 4.7** and **Kimi K2.6**. That is intentional, not stale: the chains only auto-select models the bundled capability snapshot is built against, so variant and context-window resolution stay correct. They promote Opus 4.8 / K2.7 to chain defaults once those land in the model catalog; until then you opt into the newer models — and their prompts — by naming them explicitly.
+
+So an "Opus 4.7 (max)" entry in the chains below is the snapshot-backed floor, not a recommendation to prefer 4.7 over 4.8.
+
+### Claude Family (communicative, instruction-following)
+
+Used by: Sisyphus, Atlas, Sisyphus-Junior, Metis (Claude path), Prometheus (primary fallback), `unspecified-low`, `unspecified-high`.
+
+| Priority | Model | Provider | Why |
+|---|---|---|---|
+| 1 | `claude-fable-5` / `claude-opus-4-8` / `claude-opus-4-7` (max) | `anthropic`, `github-copilot`, `opencode`, `vercel` | Best overall compliance with the ~1,100-line Sisyphus prompt. Sisyphus carries per-version prompts for all three; Prometheus uses its single `ulw-plan`-backed prompt. Opus 4.7 is the hardcoded chain default for budget stability. |
+| 2 | `claude-sonnet-4-6` | same | Faster, cheaper, still Claude. |
+| 3 | **`kimi-k2.7` - RECOMMENDED ALTERNATIVE (newest)** | `opencode-go`, `kimi-for-coding`, `moonshotai`, `opencode`, `vercel` | Restrained, outcome-first, and the top Kimi when Anthropic isn't connected. Agents with Kimi-specific prompt paths use their K2.7 tuning; Prometheus keeps its `ulw-plan`-backed prompt. |
+| 4 | **`kimi-k2.6` or `kimi-k2.5` — RECOMMENDED ALTERNATIVE** | same as K2.7 | Instruction-following mirrors Claude closely. Current default Kimi in the chains. |
+| 5 | **`glm-5` or `glm-5.2` — ACCEPTABLE ALTERNATIVE** | `opencode-go`, `zai-coding-plan`, `opencode`, `vercel` | Claude-like, slightly looser on long nested workflows. Solid fallback. |
+| 6 | `big-pickle` (GLM 4.6) | `opencode` | Free-tier safety net. |
+
+> **Kimi ≻ GLM.** Kimi (K2.7 newest, then K2.6/K2.5) holds up under Sisyphus's nested todo+delegation prompts better than GLM. Use Kimi whenever both are available.
+
+### GPT Family (principle-driven, autonomous)
+
+Used by: Hephaestus, Oracle, Momus, `deep`, `ultrabrain`, `quick`, `unspecified-low`, Prometheus (GPT fallback), Atlas (GPT path).
+
+| Priority | Model | Provider | Why |
+|---|---|---|---|
+| 1 | `gpt-5.6-sol` (xhigh / high / medium) | `openai`, `vercel` | The GPT-5.6 flagship. Default for Hephaestus (medium), Momus (xhigh), and `ultrabrain` (xhigh); first fallback for `deep`. |
+| 1 | `gpt-5.6-terra` (xhigh) | `openai`, `vercel` | GPT-5.6 mid-tier. New default for the `deep` category. |
+| 1 | `gpt-5.6-luna` (xhigh) | `openai`, `vercel` | GPT-5.6 light tier. New default for the `unspecified-low` category. |
+| 2 | `gpt-5.5` / `gpt-5.4` (pro / xhigh / high / medium) | `openai`, `github-copilot`, `opencode`, `vercel` | Previous flagship generation; first fallback on providers without GPT-5.6. Hephaestus requires this family. |
+| 3 | `gpt-5.5-codex` | same | Still the deep-coding powerhouse. Kept as an explicit override option. |
+| 3 | **DeepSeek — LIMITED ALTERNATIVE** (`deepseek-v3.2`, `deepseek-chat-v3.1`) | `openrouter/deepseek` | Closest OSS equivalent for autonomous coding behavior. Not wired into default chains — add via `fallback_models`. |
+| 4 | **MiniMax — STRONGLY DISCOURAGED** (`minimax-m3`, `minimax-m2.7`, `minimax-m2.5`) | `opencode-go`, `opencode`, `openrouter/minimax` | Used only in **utility** fallback chains (Explore, Librarian, `quick`). Consistency and long-context management issues make it a poor substitute for Hephaestus/Oracle. Do NOT override deep agents to MiniMax. |
+
+> **DeepSeek ≻≻ MiniMax.** DeepSeek retains GPT's autonomous exploration character. MiniMax loses coherence on multi-step deep work. MiniMax is fine for grep-style utility agents, nothing more.
+
+### Gemini Family (visual, different reasoning style)
+
+Used by: `visual-engineering`, `artistry`, Oracle (visual fallback), Multimodal-Looker.
+
+| Priority | Model | Provider | Why |
+|---|---|---|---|
+| 1 | `gemini-3.1-pro` (high) | `google`, `github-copilot`, `opencode`, `vercel` | Best for UI/UX, CSS, design tokens, layout decisions. `artistry` category **requires** this family. |
+| 2 | `gemini-3-flash` | same | Fast variant, writing/doc tasks. |
+| 3 | **Qwen — ALTERNATIVE** (`qwen3.6-plus`, `qwen3.5-plus`) | `opencode-go`, `openrouter/qwen` | Closest vision-capable substitute when Google isn't connected. Uses different reasoning style but handles visual tasks competently. |
+
+> **No GLM/Kimi here.** They're not Gemini substitutes for visual work. Use Qwen.
+
+---
+
+## Cheat Sheet: Substitution Rules
+
+| If you lose... | Swap to (in order) | Avoid |
+|---|---|---|
+| Claude Opus/Sonnet | Kimi K2.7 → K2.6/K2.5 → GLM 5 → Big Pickle | Older GPT models |
+| GPT-5.4/5.5 | GPT-5.5 Codex → DeepSeek v3.2 | MiniMax (except for utility work) |
+| Gemini 3.1 Pro | Qwen 3.6-plus / 3.5-plus | Claude/Kimi (wrong reasoning style for visual) |
+| GPT-5.4 Mini Fast (Explore/Librarian) | Qwen 3.5-plus → MiniMax M2.7 Highspeed → MiniMax M3 → Claude Haiku | Opus (massive cost waste) |
 
 ---
 
 ## Agent Profiles
 
+Exact runtime chains from [`agent-model-requirements.ts`](../../packages/model-core/src/agent-model-requirements.ts) and [`category-model-requirements.ts`](../../packages/model-core/src/category-model-requirements.ts).
+
 ### Communicators → Claude / Kimi / GLM
 
 These agents have Claude-optimized prompts — long, detailed, mechanics-driven. They need models that reliably follow complex, multi-layered instructions.
 
-| Agent        | Role              | Fallback Chain                         | Notes                                                                                             |
-| ------------ | ----------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| **Sisyphus** | Main orchestrator | anthropic\|github-copilot\|opencode\|vercel/claude-opus-4-6 (max) → opencode-go\|vercel/kimi-k2.5 → kimi-for-coding/k2p5 → opencode\|moonshotai\|moonshotai-cn\|firmware\|ollama-cloud\|aihubmix\|vercel/kimi-k2.5 → openai\|github-copilot\|opencode\|vercel/gpt-5.4 (medium) → zai-coding-plan\|opencode\|vercel/glm-5 → opencode/big-pickle | Exact runtime chain from `src/shared/model-requirements.ts`. |
-| **Metis**    | Plan gap analyzer | anthropic\|github-copilot\|opencode\|vercel/claude-opus-4-6 (max) → openai\|github-copilot\|opencode\|vercel/gpt-5.4 (high) → opencode-go\|vercel/glm-5 → kimi-for-coding/k2p5 | Exact runtime chain from `src/shared/model-requirements.ts`. |
+| Agent | Role | Fallback Chain |
+|---|---|---|
+| **Sisyphus** | Main orchestrator | `anthropic\|github-copilot\|opencode\|vercel/claude-opus-4-7` (max) → `opencode-go\|vercel/kimi-k2.6` → `kimi-for-coding/k2p5` → `opencode\|moonshotai\|moonshotai-cn\|firmware\|ollama-cloud\|aihubmix\|vercel/kimi-k2.5` → `openai\|github-copilot\|opencode\|vercel/gpt-5.5` (medium) → `zai-coding-plan\|opencode\|vercel/glm-5` → `opencode/big-pickle` |
+| **Metis** | Plan gap analyzer | `anthropic\|github-copilot\|opencode\|vercel/claude-sonnet-4-6` → `anthropic\|github-copilot\|opencode\|vercel/claude-opus-4-7` (max) → `openai\|github-copilot\|opencode\|vercel/gpt-5.5` (high) → `opencode-go\|vercel/glm-5.2` → `kimi-for-coding/k2p5` |
 
-### Dual-Prompt Agents → Claude preferred, GPT supported
+### Model-Flexible Planners → Claude preferred, GPT supported
 
-These agents ship separate prompts for Claude and GPT families. They auto-detect your model and switch at runtime.
+These agents can fall back across Claude, GPT, and Claude-like models. Atlas has model-family prompt behavior; Prometheus uses one thin `ulw-plan`-backed prompt regardless of model family.
 
-| Agent          | Role              | Fallback Chain                         | Notes                                                                |
-| -------------- | ----------------- | -------------------------------------- | -------------------------------------------------------------------- |
-| **Prometheus** | Strategic planner | anthropic\|github-copilot\|opencode\|vercel/claude-opus-4-6 (max) → openai\|github-copilot\|opencode\|vercel/gpt-5.4 (high) → opencode-go\|vercel/glm-5 → google\|github-copilot\|opencode\|vercel/gemini-3.1-pro | Exact runtime chain from `src/shared/model-requirements.ts`. |
-| **Atlas**      | Todo orchestrator | anthropic\|github-copilot\|opencode\|vercel/claude-sonnet-4-6 → opencode-go\|vercel/kimi-k2.5 → openai\|github-copilot\|opencode\|vercel/gpt-5.4 (medium) → opencode-go\|vercel/minimax-m2.7 | Exact runtime chain from `src/shared/model-requirements.ts`. |
+| Agent | Role | Fallback Chain |
+|---|---|---|
+| **Prometheus** | Strategic planner | `anthropic\|github-copilot\|opencode\|vercel/claude-opus-4-7` (max) → `openai\|github-copilot\|opencode\|vercel/gpt-5.5` (high) → `opencode-go\|vercel/glm-5.2` → `google\|github-copilot\|opencode\|vercel/gemini-3.1-pro` |
+| **Atlas** | Todo orchestrator | `anthropic\|github-copilot\|opencode\|vercel/claude-sonnet-4-6` → `opencode-go\|vercel/kimi-k2.6` → `openai\|github-copilot\|opencode\|vercel/gpt-5.5` (medium) → `opencode-go\|vercel/minimax-m3` → `opencode-go\|vercel/minimax-m2.7` |
 
 ### Deep Specialists → GPT
 
-These agents are built for GPT's principle-driven style. Their prompts assume autonomous, goal-oriented execution. Don't override to Claude.
+These agents are built for GPT's principle-driven style. Their prompts assume autonomous, goal-oriented execution. **Don't override to Claude.**
 
-| Agent          | Role                    | Fallback Chain                         | Notes                                            |
-| -------------- | ----------------------- | -------------------------------------- | ------------------------------------------------ |
-| **Hephaestus** | Autonomous deep worker  | openai\|github-copilot\|venice\|opencode\|vercel/gpt-5.4 (medium) | Single-entry chain. Requires one of those providers. The craftsman. |
-| **Oracle**     | Architecture consultant | openai\|github-copilot\|opencode\|vercel/gpt-5.4 (high) → google\|github-copilot\|opencode\|vercel/gemini-3.1-pro (high) → anthropic\|github-copilot\|opencode\|vercel/claude-opus-4-6 (max) → opencode-go\|vercel/glm-5 | Exact runtime chain from `src/shared/model-requirements.ts`. |
-| **Momus**      | Ruthless reviewer       | openai\|github-copilot\|opencode\|vercel/gpt-5.4 (xhigh) → anthropic\|github-copilot\|opencode\|vercel/claude-opus-4-6 (max) → google\|github-copilot\|opencode\|vercel/gemini-3.1-pro (high) → opencode-go\|vercel/glm-5 | Exact runtime chain from `src/shared/model-requirements.ts`. |
+| Agent | Role | Fallback Chain |
+|---|---|---|
+| **Hephaestus** | Autonomous deep worker | `openai\|vercel/gpt-5.6-sol` (medium) → `openai\|github-copilot\|opencode\|vercel/gpt-5.5` (medium) — GPT-only chain, requires one of those providers. The craftsman. |
+| **Oracle** | Architecture consultant | `openai\|github-copilot\|opencode\|vercel/gpt-5.5` (high) → `google\|github-copilot\|opencode\|vercel/gemini-3.1-pro` (high) → `anthropic\|github-copilot\|opencode\|vercel/claude-opus-4-7` (max) → `opencode-go\|vercel/glm-5.2` |
+| **Momus** | Ruthless reviewer | `openai\|vercel/gpt-5.6-sol` (xhigh) → `openai\|github-copilot\|opencode\|vercel/gpt-5.5` (xhigh) → `anthropic\|github-copilot\|opencode\|vercel/claude-opus-4-7` (max) → `google\|github-copilot\|opencode\|vercel/gemini-3.1-pro` (high) → `opencode-go\|vercel/glm-5.2` |
 
 ### Utility Runners → Speed over Intelligence
 
 These agents do grep, search, and retrieval. They intentionally use the fastest, cheapest models available. **Don't "upgrade" them to Opus** — that's hiring a senior engineer to file paperwork.
 
-| Agent                 | Role               | Fallback Chain                                 | Notes                                                 |
-| --------------------- | ------------------ | ---------------------------------------------- | ----------------------------------------------------- |
-| **Explore**           | Fast codebase grep | github-copilot\|xai\|vercel/grok-code-fast-1 → opencode-go\|vercel/minimax-m2.7-highspeed → opencode\|vercel/minimax-m2.7 → anthropic\|opencode\|vercel/claude-haiku-4-5 → opencode\|vercel/gpt-5-nano | Exact runtime chain from `src/shared/model-requirements.ts`. |
-| **Librarian**         | Docs/code search   | opencode-go\|vercel/minimax-m2.7 → opencode\|vercel/minimax-m2.7-highspeed → anthropic\|opencode\|vercel/claude-haiku-4-5 → opencode\|vercel/gpt-5-nano | Exact runtime chain from `src/shared/model-requirements.ts`. |
-| **Multimodal Looker** | Vision/screenshots | openai\|opencode\|vercel/gpt-5.4 (medium) → opencode-go\|vercel/kimi-k2.5 → zai-coding-plan\|vercel/glm-4.6v → openai\|github-copilot\|opencode\|vercel/gpt-5-nano | Exact runtime chain from `src/shared/model-requirements.ts`. |
-| **Sisyphus-Junior**   | Category executor  | anthropic\|github-copilot\|opencode\|vercel/claude-sonnet-4-6 → opencode-go\|vercel/kimi-k2.5 → openai\|github-copilot\|opencode\|vercel/gpt-5.4 (medium) → opencode-go\|vercel/minimax-m2.7 → opencode/big-pickle | Exact runtime chain from `src/shared/model-requirements.ts`. |
+| Agent | Role | Fallback Chain |
+|---|---|---|
+| **Explore** | Fast codebase grep | `openai/gpt-5.4-mini-fast` → `opencode-go/qwen3.5-plus` → `vercel/minimax-m2.7-highspeed` → `opencode-go\|vercel/minimax-m3` → `opencode-go\|vercel/minimax-m2.7` → `anthropic\|vercel/claude-haiku-4-5` → `openai\|vercel/gpt-5.4-nano` |
+| **Librarian** | Docs/code search | same as Explore |
+| **Multimodal Looker** | Vision/screenshots | `openai\|opencode\|vercel/gpt-5.5` (medium) → `opencode-go\|vercel/kimi-k2.6` → `zai-coding-plan\|vercel/glm-4.6v` → `openai\|github-copilot\|opencode\|vercel/gpt-5-nano` |
+| **Sisyphus-Junior** | Category executor | `anthropic\|github-copilot\|opencode\|vercel/claude-sonnet-4-6` → `opencode-go\|vercel/kimi-k2.6` → `openai\|github-copilot\|opencode\|vercel/gpt-5.5` (medium) → `opencode-go\|vercel/minimax-m3` → `opencode-go\|vercel/minimax-m2.7` → `opencode/big-pickle` |
 
 ---
 
@@ -103,14 +293,17 @@ These agents do grep, search, and retrieval. They intentionally use the fastest,
 
 ### Claude Family
 
-Communicative, instruction-following, structured output. Best for agents that need to follow complex multi-step prompts.
+Communicative, instruction-following, structured output. Best for agents that need to follow complex multi-step prompts. Sisyphus, Sisyphus-Junior, Atlas, and Metis use tuned prompt paths for supported communicative models. Prometheus uses one thin `ulw-plan`-backed prompt across model families.
 
 | Model                 | Strengths                                                                    |
 | --------------------- | ---------------------------------------------------------------------------- |
-| **Claude Opus 4.6**   | Best overall. Highest compliance with complex prompts. Default for Sisyphus. |
+| **Claude Fable 5**    | Top tier, above Opus. Highest compliance; has its own per-agent prompt variants. |
+| **Claude Opus 4.8**   | Current best Opus — steerable and literal. Dedicated per-agent prompt variants. |
+| **Claude Opus 4.7**   | Still excellent; the hardcoded default in the Sisyphus chain for budget stability. |
 | **Claude Sonnet 4.6** | Faster, cheaper. Good balance for everyday tasks.                            |
 | **Claude Haiku 4.5**  | Fast and cheap. Good for quick tasks and utility work.                       |
-| **Kimi K2.5**         | Behaves very similarly to Claude. Great all-rounder at lower cost.           |
+| **Kimi K2.7**         | Newest Kimi: restrained and outcome-first, a GPT-5.5-leaning Opus 4.8 in a Claude-family body. Top Kimi for the orchestrators; agents with Kimi-specific prompt paths use K2.7 tuning while Prometheus keeps its `ulw-plan`-backed prompt. |
+| **Kimi K2.6 / K2.5**  | Behave very similarly to Claude. Great all-rounders at lower cost; K2.6 is the current default Kimi in the Sisyphus chain. |
 | **GLM 5**             | Claude-like behavior. Solid for orchestration tasks.                         |
 
 ### GPT Family
@@ -119,8 +312,11 @@ Principle-driven, explicit reasoning, deep technical capability. Best for agents
 
 | Model             | Strengths                                                                                       |
 | ----------------- | ----------------------------------------------------------------------------------------------- |
-| **GPT-5.3 Codex** | Deep coding powerhouse. Autonomous exploration. Still available for deep category and explicit overrides. |
-| **GPT-5.4**       | High intelligence, strategic reasoning. Default for Oracle, Momus, and a key fallback for Prometheus / Atlas. Uses xhigh variant for Momus. |
+| **GPT-5.5 Codex** | Deep coding powerhouse. Autonomous exploration. Still available for deep category and explicit overrides. |
+| **GPT-5.6 Sol**   | The GPT-5.6 flagship. Default for Hephaestus (medium) and Momus (xhigh); default for the `ultrabrain` category and first fallback for `deep`. |
+| **GPT-5.6 Terra** | GPT-5.6 mid-tier. Default for the `deep` category (xhigh). |
+| **GPT-5.6 Luna**  | GPT-5.6 light tier. Default for the `unspecified-low` category (xhigh). |
+| **GPT-5.5**       | High intelligence, strategic reasoning. Default for Oracle, first fallback for Momus (xhigh) and Hephaestus, and a key fallback for Prometheus / Atlas. |
 | **GPT-5.4 Mini**  | Fast + strong reasoning. Good for lightweight autonomous tasks. Default for quick category. |
 | **GPT-5-Nano**    | Ultra-cheap, fast. Good for simple utility tasks.                                               |
 
@@ -130,7 +326,8 @@ Principle-driven, explicit reasoning, deep technical capability. Best for agents
 | -------------------- | ------------------------------------------------------------------------------------------------------------ |
 | **Gemini 3.1 Pro**   | Excels at visual/frontend tasks. Different reasoning style. Default for `visual-engineering` and `artistry`. |
 | **Gemini 3 Flash**   | Fast. Good for doc search and light tasks.                                                                   |
-| **Grok Code Fast 1** | Blazing fast code grep. Default for Explore agent.                                                           |
+| **GPT-5.4 Mini Fast** | Default for Explore and Librarian agents. Blazing-fast reasoning-capable mini model. |
+| **MiniMax M3**       | Latest MiniMax flagship. Primary MiniMax fallback in OpenCode Go utility chains, ahead of M2.7. |
 | **MiniMax M2.7**     | Fast and smart. Used in OpenCode Go and OpenCode Zen utility fallback chains. |
 | **MiniMax M2.7 Highspeed** | High-speed OpenCode catalog entry used in utility fallback chains that prefer the fastest available MiniMax path. |
 
@@ -142,10 +339,11 @@ A premium subscription tier ($10/month) that provides reliable access to Chinese
 
 | Model                    | Use Case                                                              |
 | ------------------------ | --------------------------------------------------------------------- |
-| **opencode-go/kimi-k2.5** | Vision-capable, Claude-like reasoning. Used by Sisyphus, Atlas, Sisyphus-Junior, Multimodal Looker. |
-| **opencode-go/glm-5**     | Text-only orchestration model. Used by Oracle, Prometheus, Metis, Momus.                           |
-| **opencode-go/minimax-m2.7** | Ultra-cheap, fast responses. Used by Librarian, Atlas, and Sisyphus-Junior for utility work. |
-| **opencode-go/minimax-m2.7-highspeed** | Even faster OpenCode Go MiniMax entry used by Explore when the high-speed catalog entry is available. |
+| **opencode-go/kimi-k2.6** | Vision-capable, Claude-like reasoning. Used by Sisyphus, Atlas, Sisyphus-Junior, Multimodal Looker. |
+| **opencode-go/glm-5.2**     | Text-only orchestration model. Used by Oracle, Prometheus, Metis, Momus, `deep`, and `ultrabrain`.  |
+| **opencode-go/minimax-m3** | Latest MiniMax flagship on OpenCode Go. Primary MiniMax fallback for Atlas, Sisyphus-Junior, Explore and Librarian, ahead of M2.7. |
+| **opencode-go/minimax-m2.7** | Ultra-cheap, fast responses. Used by Atlas, Sisyphus-Junior, Explore and Librarian fallbacks for utility work. |
+| **opencode-go/qwen3.5-plus** | Qwen coding model used as the first OpenCode Go utility fallback for Explore and Librarian when GPT-5.4 Mini Fast is unavailable. |
 
 **When It Gets Used:**
 
@@ -153,11 +351,11 @@ OpenCode Go models appear throughout the fallback chains as intermediate options
 
 **Go-Only Scenarios:**
 
-Some model identifiers like `k2p5` (paid Kimi K2.5) and `glm-5` may only be available through OpenCode Go subscription in certain regions. When configured with these short identifiers, the system resolves them through the opencode-go provider first.
+Some model identifiers in fallback chains are provider-specific aliases. For example, `k2p5` resolves through `kimi-for-coding`, while `glm-5` can resolve through `zai-coding-plan`, `opencode`, or `vercel` depending on availability.
 
 ### About Free-Tier Fallbacks
 
-You may see model names like `kimi-k2.5-free`, `minimax-m2.7`, `minimax-m2.7-highspeed`, or `big-pickle` (GLM 4.6) in the source code or logs. These are provider-specific or speed-optimized entries in fallback chains.
+You may see model names like `kimi-k2.5-free`, `minimax-m3`, `minimax-m2.7`, `minimax-m2.7-highspeed`, or `big-pickle` (GLM 4.6) in the source code or logs. These are provider-specific or speed-optimized entries in fallback chains.
 
 You don't need to configure them. The system includes them so it degrades gracefully when you don't have every paid subscription. If you have the paid version, the paid version is always preferred.
 
@@ -167,110 +365,193 @@ You don't need to configure them. The system includes them so it degrades gracef
 
 When agents delegate work, they don't pick a model name — they pick a **category**. The category maps to the right model automatically.
 
-| Category             | When Used                  | Fallback Chain                               |
-| -------------------- | -------------------------- | -------------------------------------------- |
-| `visual-engineering` | Frontend, UI, CSS, design  | google\|github-copilot\|opencode\|vercel/gemini-3.1-pro (high) → zai-coding-plan\|opencode\|vercel/glm-5 → anthropic\|github-copilot\|opencode\|vercel/claude-opus-4-6 (max) → opencode-go\|vercel/glm-5 → kimi-for-coding/k2p5 |
-| `ultrabrain`         | Maximum reasoning needed   | openai\|opencode\|vercel/gpt-5.4 (xhigh) → google\|github-copilot\|opencode\|vercel/gemini-3.1-pro (high) → anthropic\|github-copilot\|opencode\|vercel/claude-opus-4-6 (max) → opencode-go\|vercel/glm-5 |
-| `deep`               | Deep coding, complex logic | openai\|github-copilot\|venice\|opencode\|vercel/gpt-5.4 (medium) → anthropic\|github-copilot\|opencode\|vercel/claude-opus-4-6 (max) → google\|github-copilot\|opencode\|vercel/gemini-3.1-pro (high) |
-| `artistry`           | Creative, novel approaches | google\|github-copilot\|opencode\|vercel/gemini-3.1-pro (high) → anthropic\|github-copilot\|opencode\|vercel/claude-opus-4-6 (max) → openai\|github-copilot\|opencode\|vercel/gpt-5.4 |
-| `quick`              | Simple, fast tasks         | openai\|github-copilot\|opencode\|vercel/gpt-5.4-mini → anthropic\|github-copilot\|opencode\|vercel/claude-haiku-4-5 → google\|github-copilot\|opencode\|vercel/gemini-3-flash → opencode-go\|vercel/minimax-m2.7 → opencode\|vercel/gpt-5-nano |
-| `unspecified-high`   | General complex work       | anthropic\|github-copilot\|opencode\|vercel/claude-opus-4-6 (max) → openai\|github-copilot\|opencode\|vercel/gpt-5.4 (high) → zai-coding-plan\|opencode\|vercel/glm-5 → kimi-for-coding/k2p5 → opencode-go\|vercel/glm-5 → opencode\|vercel/kimi-k2.5 → opencode\|moonshotai\|moonshotai-cn\|firmware\|ollama-cloud\|aihubmix\|vercel/kimi-k2.5 |
-| `unspecified-low`    | General standard work      | anthropic\|github-copilot\|opencode\|vercel/claude-sonnet-4-6 → openai\|opencode\|vercel/gpt-5.3-codex (medium) → opencode-go\|vercel/kimi-k2.5 → google\|github-copilot\|opencode\|vercel/gemini-3-flash → opencode-go\|vercel/minimax-m2.7 |
-| `writing`            | Text, docs, prose          | google\|github-copilot\|opencode\|vercel/gemini-3-flash → opencode-go\|vercel/kimi-k2.5 → anthropic\|github-copilot\|opencode\|vercel/claude-sonnet-4-6 → opencode-go\|vercel/minimax-m2.7 |
+| Category | Used For | Default Model | Fallback Chain |
+|---|---|---|---|
+| `visual-engineering` | Frontend, UI, CSS, design | `google/gemini-3.1-pro` (high) | Gemini → `zai-coding-plan/glm-5` → `claude-opus-4-7` (max) → `opencode-go/glm-5.2` → `kimi-for-coding/k2p5` |
+| `artistry` | Creative, novel approaches | `google/gemini-3.1-pro` (high) | Gemini → `claude-opus-4-7` (max) → `gpt-5.5` |
+| `ultrabrain` | Maximum reasoning needed | `openai/gpt-5.6-sol` (xhigh) | `openai\|vercel/gpt-5.6-sol` (xhigh) → `openai\|opencode\|vercel/gpt-5.5` (xhigh) → `google\|github-copilot\|opencode\|vercel/gemini-3.1-pro` (high) → `anthropic\|github-copilot\|opencode\|vercel/claude-opus-4-7` (max) → `opencode-go\|vercel/glm-5.2` |
+| `deep` | Deep coding, complex logic | `openai/gpt-5.6-terra` (xhigh) | `openai\|vercel/gpt-5.6-terra` (xhigh) → `openai\|vercel/gpt-5.6-sol` (high) → `openai\|github-copilot\|opencode\|vercel/gpt-5.5` (medium) → `anthropic\|github-copilot\|opencode\|vercel/claude-opus-4-7` (max) → `google\|github-copilot\|opencode\|vercel/gemini-3.1-pro` (high) → `opencode-go\|vercel/kimi-k2.6` → `opencode-go\|vercel/glm-5.2` |
+| `quick` | Simple, fast tasks | `openai/gpt-5.4-mini` | GPT-5.4-mini → `anthropic\|github-copilot\|vercel/claude-haiku-4-5` → `gemini-3-flash` → `opencode-go/minimax-m3` → `opencode-go/minimax-m2.7` → `opencode/gpt-5-nano` |
+| `unspecified-high` | General complex work | `anthropic/claude-opus-4-7` (max) | Opus → `gpt-5.5` (high) → `zai-coding-plan/glm-5` → `kimi-for-coding/k2p5` → `opencode-go/glm-5.2` → `opencode/kimi-k2.5` → `moonshotai/kimi-k2.5` |
+| `unspecified-low` | General standard work | `openai/gpt-5.6-luna` (xhigh) | `openai\|vercel/gpt-5.6-luna` (xhigh) → `anthropic\|github-copilot\|opencode\|vercel/claude-sonnet-4-6` → `openai\|opencode\|vercel/gpt-5.5` (medium) → `opencode-go\|vercel/kimi-k2.6` → `google\|github-copilot\|opencode\|vercel/gemini-3-flash` → `opencode-go\|vercel/minimax-m3` → `minimax-coding-plan\|minimax-cn-coding-plan/MiniMax-M3` → `opencode-go\|vercel/minimax-m2.7` |
+| `writing` | Text, docs, prose | `kimi-for-coding/k2p5` | `gemini-3-flash` → `opencode-go/kimi-k2.6` → `claude-sonnet-4-6` → `opencode-go/minimax-m3` → `opencode-go/minimax-m2.7` |
 
 See the [Orchestration System Guide](./orchestration.md) for how agents dispatch tasks to categories.
 
 ### Vercel AI Gateway fallback coverage
 
-`src/shared/model-requirements.ts` now includes `vercel` on nearly every gateway-compatible fallback entry across both agent and category chains. Treat it as a universal extra provider path for the listed model IDs, not as a different model family. If a row above shows `|vercel` in the provider set, that is the current source-of-truth runtime fallback, not a docs-only convenience alias.
+`packages/omo-opencode/src/shared/model-requirements.ts` includes `vercel` on nearly every gateway-compatible fallback entry across both agent and category chains. Treat it as a universal extra provider path for the listed model IDs, not as a different model family.
 
 ---
 
 ## Customization
 
-### Example Configuration
+### Example A — Recommended Stack (OpenCode Go + OpenAI Plus/Pro)
 
 ```jsonc
 {
   "$schema": "https://raw.githubusercontent.com/code-yeongyu/oh-my-openagent/dev/assets/oh-my-opencode.schema.json",
 
   "agents": {
-    // Main orchestrator: Claude Opus or Kimi K2.5 work best
+    // Sisyphus: Kimi K2.7 is the top alternative to Claude for orchestration
     "sisyphus": {
-      "model": "kimi-for-coding/k2p5",
-      "ultrawork": { "model": "anthropic/claude-opus-4-6", "variant": "max" },
+      "model": "opencode-go/kimi-k2.7-code",
+      "ultrawork": { "model": "opencode-go/kimi-k2.7-code" },
     },
 
-    // Research agents: cheaper models are fine
-    "librarian": { "model": "google/gemini-3-flash" },
-    "explore": { "model": "github-copilot/grok-code-fast-1" },
+    // Hephaestus: needs GPT. ChatGPT Plus gets you here.
+    "hephaestus": { "model": "openai/gpt-5.6-sol", "variant": "medium" },
 
     // Architecture consultation: GPT or Claude Opus
-    "oracle": { "model": "openai/gpt-5.4", "variant": "high" },
+    "oracle": { "model": "openai/gpt-5.5", "variant": "high" },
 
-    // Prometheus inherits sisyphus model; just add prompt guidance
-    "prometheus": {
-      "prompt_append": "Leverage deep & quick agents heavily, always in parallel.",
-    },
+    // Prometheus keeps the same ulw-plan-backed prompt across model families
+    "prometheus": { "model": "opencode-go/kimi-k2.7-code" },
+
+    // Atlas also communicative — Kimi works great
+    "atlas": { "model": "opencode-go/kimi-k2.7-code" },
+
+    // Utility agents stay cheap
+    "explore": { "model": "opencode-go/qwen3.5-plus" },
+    "librarian": { "model": "opencode-go/qwen3.5-plus" },
   },
 
   "categories": {
-    "quick": { "model": "opencode/gpt-5-nano" },
-    "unspecified-low": { "model": "anthropic/claude-sonnet-4-6" },
-    "unspecified-high": { "model": "anthropic/claude-opus-4-6", "variant": "max" },
-    "visual-engineering": {
-      "model": "google/gemini-3.1-pro",
-      "variant": "high",
-    },
-    "writing": { "model": "google/gemini-3-flash" },
+    "visual-engineering": { "model": "opencode-go/qwen3.6-plus" },  // Qwen as Gemini alt
+    "deep": { "model": "openai/gpt-5.6-terra", "variant": "xhigh" },
+    "ultrabrain": { "model": "openai/gpt-5.6-sol", "variant": "xhigh" },
+    "quick": { "model": "openai/gpt-5.4-mini" },
+    "unspecified-low": { "model": "opencode-go/kimi-k2.7-code" },
+    "unspecified-high": { "model": "opencode-go/kimi-k2.7-code" },
+    "writing": { "model": "opencode-go/kimi-k2.7-code" },
   },
 
-  // Limit expensive providers; let cheap ones run freely
   "background_task": {
     "providerConcurrency": {
-      "anthropic": 3,
       "openai": 3,
-      "opencode": 10,
-      "zai-coding-plan": 10,
-    },
-    "modelConcurrency": {
-      "anthropic/claude-opus-4-6": 2,
-      "opencode/gpt-5-nano": 20,
+      "opencode-go": 10,
     },
   },
 }
 ```
 
-Run `opencode models` to see available models, `opencode auth login` to authenticate providers.
+### Example B — All Native (Anthropic + OpenAI + Google)
+
+Highest quality, highest cost. No surprises.
+
+```jsonc
+{
+  "agents": {
+    "sisyphus": {
+      "model": "anthropic/claude-opus-4-8",
+      "variant": "max",
+    },
+    "hephaestus": { "model": "openai/gpt-5.6-sol", "variant": "medium" },
+    "oracle": { "model": "openai/gpt-5.5", "variant": "high" },
+  },
+  "categories": {
+    "visual-engineering": { "model": "google/gemini-3.1-pro", "variant": "high" },
+    "deep": { "model": "openai/gpt-5.6-terra", "variant": "xhigh" },
+    "unspecified-high": { "model": "anthropic/claude-opus-4-8", "variant": "max" },
+  },
+}
+```
+
+### Example C — OpenCode Go Only (Budget, No GPT)
+
+Cheapest full-stack path. Hephaestus won't activate — accept that trade-off.
+
+```jsonc
+{
+  "agents": {
+    "sisyphus": { "model": "opencode-go/kimi-k2.7-code" },
+    "atlas": { "model": "opencode-go/kimi-k2.7-code" },
+    // Omit hephaestus entirely; it needs GPT.
+    "oracle": { "model": "opencode-go/glm-5.2" },  // Degraded but functional
+    "explore": { "model": "opencode-go/qwen3.5-plus" },
+    "librarian": { "model": "opencode-go/qwen3.5-plus" },
+  },
+  "categories": {
+    "visual-engineering": { "model": "opencode-go/qwen3.6-plus" },
+    "deep": { "model": "opencode-go/kimi-k2.7-code" },  // Not ideal — Kimi isn't GPT, but best available
+    "unspecified-high": { "model": "opencode-go/kimi-k2.7-code" },
+    "unspecified-low": { "model": "opencode-go/kimi-k2.7-code" },
+    "quick": { "model": "opencode-go/minimax-m2.7" },
+    "writing": { "model": "opencode-go/kimi-k2.7-code" },
+  },
+}
+```
+
+### Example D — Adding DeepSeek as GPT Alternative
+
+If you have OpenRouter and want DeepSeek in the chain when GPT is unavailable:
+
+```jsonc
+{
+  "agents": {
+    "oracle": {
+      "model": "openai/gpt-5.5",
+      "variant": "high",
+      "fallback_models": [
+        "anthropic/claude-opus-4-8",
+        { "model": "openrouter/deepseek/deepseek-v3.2", "temperature": 0.7 },
+        "opencode-go/glm-5.2",
+      ],
+    },
+  },
+}
+```
+
+`fallback_models` accepts a mix of plain model strings and per-fallback objects with `variant`, `reasoningEffort`, `temperature`, `top_p`, `maxTokens`, `thinking`.
+
+---
 
 ### Safe vs Dangerous Overrides
 
 **Safe** — same personality type:
 
-- Sisyphus: Opus → Sonnet, Kimi K2.5, GLM 5 (all communicative models)
-- Prometheus: Opus → GPT-5.4 (auto-switches to the GPT prompt)
-- Atlas: Claude Sonnet 4.6 → GPT-5.4 (auto-switches to the GPT prompt)
+- Sisyphus: Opus → Sonnet, Kimi K2.5/2.6, GLM 5 (all communicative models)
+- Prometheus: Opus → GPT-5.5 (same `ulw-plan`-backed prompt, different model)
+- Atlas: Claude Sonnet 4.6 → Kimi K2.6 → GPT-5.5 (auto-switches to the GPT prompt)
 
 **Dangerous** — personality mismatch:
 
-- Sisyphus → older GPT models: **Still a bad fit. GPT-5.4 is the only dedicated GPT prompt path.**
-- Hephaestus → Claude: **Built for Codex's autonomous style. Claude can't replicate this.**
-- Explore → Opus: **Massive cost waste. Explore needs speed, not intelligence.**
-- Librarian → Opus: **Same. Doc search doesn't need Opus-level reasoning.**
+- **Sisyphus → ANY model not on the tested list**: The supported set is Claude (Fable 5 / Opus 4.8 / 4.7 / Sonnet 4.6), Kimi (K2.7 / K2.6 / K2.5), GLM (5 / 5.1), GPT (5.4 / 5.5). Everything else is untested and can break at the very next patch. **A prompt cannot fix a model** — if it doesn't fit, no tuning makes it fit. See the **🚨 READ THIS FIRST** warning at the very top of this guide.
+- **Sisyphus → MiniMax / Qwen**: **Strongly discouraged to the point of "almost forbidden."** Neither holds up under the orchestration prompt. Never use them as the orchestrator.
+- **Sisyphus → MiMo / DeepSeek**: No working configuration found. Untested and unsupported as the orchestrator.
+- **Sisyphus → older GPT models**: Still a bad fit. GPT-5.4 and GPT-5.5 are the only dedicated GPT prompt paths.
+- **Hephaestus → Claude**: Built for Codex's autonomous style. Claude can't replicate this.
+- **Hephaestus → MiniMax**: MiniMax loses coherence on multi-step deep work. **Never do this.**
+- **Oracle → MiniMax**: Same reason. Oracle needs sustained reasoning; MiniMax drifts.
+- **Explore → Opus**: Massive cost waste. Explore needs speed, not intelligence.
+- **Librarian → Opus**: Same. Doc search doesn't need Opus-level reasoning.
+- **`visual-engineering` → Kimi/GLM**: Wrong reasoning style. Use Qwen if Gemini is unavailable, not Claude-likes.
 
-### How Model Resolution Works
+---
+
+## How Model Resolution Works
 
 Each agent has a fallback chain. The system tries models in priority order until it finds one available through your connected providers. You don't need to configure providers per model. Just authenticate (`opencode auth login`) and the system figures out which models are available and where.
 
-Core-agent tab cycling is deterministic via injected runtime order field. The fixed priority order is Sisyphus (order: 1), Hephaestus (order: 2), Prometheus (order: 3), and Atlas (order: 4), then the remaining agents follow.
+Resolution pipeline (from [`packages/omo-opencode/src/shared/model-resolution-pipeline.ts`](../../packages/omo-opencode/src/shared/model-resolution-pipeline.ts)):
+
+```
+1. Override          → User's explicit config or UI-selected model (primary agents only)
+2. Category default  → From category config (when agent has category set)
+3. User fallback_models → Configured strings/objects tried before hardcoded chain
+4. Provider fallback → AGENT_MODEL_REQUIREMENTS / CATEGORY_MODEL_REQUIREMENTS
+5. System default    → Ultimate safety net
+```
+
+Core-agent tab cycling is deterministic via injected runtime order field. The fixed priority order is Sisyphus (order: 0), Hephaestus (order: 1), Prometheus (order: 2), and Atlas (order: 3), then the remaining agents follow.
 
 Your explicit configuration always wins. If you set a specific model for an agent, that choice takes precedence even when resolution data is cold.
 
 Variant and `reasoningEffort` overrides are normalized to model-supported values, so cross-provider overrides degrade gracefully instead of failing hard.
 
-Model capabilities are models.dev-backed, with a refreshable cache and capability diagnostics. Use `bunx oh-my-opencode refresh-model-capabilities` to update the cache, or configure `model_capabilities.auto_refresh_on_start` to refresh at startup.
+Model capabilities are `models.dev`-backed, with a refreshable cache and capability diagnostics. Use `bunx oh-my-openagent refresh-model-capabilities` to update the cache, or configure `model_capabilities.auto_refresh_on_start` to refresh at startup.
 
-To see which models your agents will actually use, run `bunx oh-my-opencode doctor`. This shows effective model resolution based on your current authentication and config.
+To see which models your agents will actually use, run `bunx oh-my-openagent doctor`. This shows effective model resolution based on your current authentication and config.
 
 ```
 Agent Request → User Override (if configured) → Fallback Chain → System Default
@@ -284,17 +565,17 @@ You can load agent system prompts from external files using `file://` URLs in th
 {
   "agents": {
     "sisyphus": {
-      "prompt": "file:///path/to/custom-prompt.md"
+      "prompt": "file:///path/to/custom-prompt.md",
     },
     "oracle": {
-      "prompt_append": "file:///path/to/additional-context.md"
-    }
+      "prompt_append": "file:///path/to/additional-context.md",
+    },
   },
   "categories": {
     "deep": {
-      "prompt_append": "file:///path/to/deep-category-append.md"
-    }
-  }
+      "prompt_append": "file:///path/to/deep-category-append.md",
+    },
+  },
 }
 ```
 
@@ -307,4 +588,4 @@ The file content is loaded at runtime and injected into the agent's system promp
 - [Installation Guide](./installation.md) — Setup and authentication
 - [Orchestration System Guide](./orchestration.md) — How agents dispatch tasks to categories
 - [Configuration Reference](../reference/configuration.md) — Full config options
-- [`src/shared/model-requirements.ts`](../../src/shared/model-requirements.ts) — Source of truth for fallback chains
+- [`packages/omo-opencode/src/shared/model-requirements.ts`](../../packages/omo-opencode/src/shared/model-requirements.ts) — Source of truth for fallback chains

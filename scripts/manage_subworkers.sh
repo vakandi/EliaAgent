@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-AGENT_DIR="~/EliaAI"
+AGENT_DIR=""$HOME/EliaAI""
 SW_DIR="${AGENT_DIR}/subworkers"
 PLISTS_DIR="${SW_DIR}/plists"
 SCRIPTS_DIR="${SW_DIR}/scripts"
@@ -28,11 +28,11 @@ error()  { echo -e "${RED}[ERROR]${NC} $1"; }
 # ── Subworker definitions ──────────────────────────────────────────
 # Format: "dir_name:plist_name:trigger_script:log_file:display_name"
 SUBWORKERS=(
-  "yourapp-telegram:com.elia.yourapp-telegram:trigger_yourapp_telegram.sh:yourapp_telegram.log:YourApp Telegram"
-  "yourbrand-promoter:com.elia.yourbrand-promoter:trigger_yourbrand_promoter.sh:promoter_yourbrand.log:Your Brand Promoter"
-  "youragency-promoter:com.elia.youragency-promoter:trigger_youragency_promoter.sh:promoter_youragency.log:Your Agency Promoter"
-  "yourbrand-suppliers:com.elia.yourbrand-suppliers:trigger_yourbrand_suppliers.sh:suppliers_yourbrand.log:Your Brand Suppliers"
-  "tempack-dev:com.elia.tempack-dev:trigger_tempack_dev.sh:tempack_dev.log:Tempack Dev"
+  "saas-telegram:com.elia.saas-telegram:trigger_saas_telegram.sh:saas_telegram.log:SaaS Telegram"
+  "your-brand-promoter:com.elia.your-brand-promoter:trigger_your_brand_promoter.sh:promoter_your_brand.log:Your Brand Promoter"
+  "your-agency-promoter:com.elia.your-agency-promoter:trigger_your_agency_promoter.sh:promoter_your_agency.log:Your Agency Promoter"
+  "your-brand-suppliers:com.elia.your-brand-suppliers:trigger_your_brand_suppliers.sh:suppliers_your_brand.log:Your Brand Suppliers"
+  "saas-dev:com.elia.saas-dev:trigger_saas_dev.sh:saas_dev.log:SaaS Dev"
   "tiktok-content:com.elia.tiktok-content:trigger_tiktok_content.sh:tiktok_content.log:TikTok Content"
 )
 
@@ -327,18 +327,18 @@ Commands:
   uninstall <name>  Remove plist from ~/Library/LaunchAgents (keep .enabled)
 
 Subworkers:
-  yourapp-telegram   YourApp Telegram recruiter
-  yourbrand-promoter   Your Brand Promoter (IG, TikTok, FB)
-  youragency-promoter       Your Agency Promoter (LinkedIn, X, Reddit)
-  yourbrand-suppliers  Your Brand Supplier Finder
-  tempack-dev          Tempack SaaS Development
+  saas-telegram        SaaS Telegram recruiter
+  your-brand-promoter  Your Brand Promoter (IG, TikTok, FB)
+  your-agency-promoter Your Agency Promoter (LinkedIn, X, Reddit)
+  your-brand-suppliers Your Brand Supplier Finder
+  saas-dev             SaaS Development
   tiktok-content       TikTok Content Creator
 
 Examples:
   ./manage_subworkers.sh                          # show status table
-  ./manage_subworkers.sh disable yourapp-telegram
-  ./manage_subworkers.sh enable youragency-promoter
-  ./manage_subworkers.sh status yourbrand-promoter
+  ./manage_subworkers.sh disable saas-telegram
+  ./manage_subworkers.sh enable your-agency-promoter
+  ./manage_subworkers.sh status your-brand-promoter
 EOF
 }
 

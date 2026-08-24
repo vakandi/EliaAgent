@@ -22,7 +22,7 @@
   * { margin:0; padding:0; box-sizing:border-box; }
 
   html, body {
-    width: 350px; height: 250px;
+    width: 350px; height: 310px;
     background: transparent;
     overflow: hidden;
     font-family: 'Share Tech Mono', monospace;
@@ -35,7 +35,7 @@
      Hit-test: only #orb-close-row is non-transparent so only orb + close receive clicks;
      rest of window is click-through (setIgnoreMouseEvents(true, { forward: true })). */
   #app {
-    width: 350px; height: 250px;
+    width: 350px; height: 310px;
     position: relative;
     display: flex;
     flex-direction: column;
@@ -111,10 +111,6 @@
   /* CRON toggle - right below close button */
   #right-controls .cron-toggle {
     margin-top: -14px;
-  }
-  /* OMO toggle */
-  #right-controls .omo-toggle {
-    margin-top: 2px;
   }
   /* RALPH toggle */
   #right-controls .ralph-toggle {
@@ -639,12 +635,10 @@
     margin-top: 2px;
     padding-left: 25px;
     pointer-events: auto;
-    width: fit-content;
+    max-width: 320px;
   }
   .context-status-card {
-    flex: 1;
-    max-width: 88px;
-    padding: 3px 5px;
+    padding: 4px 6px;
     border: 1px solid var(--cyan3);
     border-radius: 4px;
     background: rgba(0,229,255,0.35);
@@ -708,28 +702,60 @@
     -webkit-app-region: no-drag;
   }
 
-  .model-badge.selected {
-    background: rgba(0,230,118,0.3) !important;
-    border-color: var(--green) !important;
-    color: var(--green) !important;
-    box-shadow: 0 0 8px rgba(0,230,118,0.4) !important;
-    transform: scale(1.05) !important;
-  }
-
   .model-badge:hover {
     background: rgba(0,229,255,0.2) !important;
     border-color: var(--cyan) !important;
     color: var(--cyan) !important;
-    transform: scale(1.1) !important;
+    transform: scale(1.05) !important;
   }
 
-  /* Model-specific colors - HIGHEST SPECIFICITY */
-  div#context-status-row .context-status-card .model-badge[data-model="opencode/big-pickle"].selected {
+  .model-minimax {
+    background: rgba(255,193,7,0.3) !important;
+    border-color: #ffc107 !important;
+    color: #ffc107 !important;
+    box-shadow: 0 0 6px rgba(255,193,7,0.4) !important;
+  }
+  .model-big-pickle {
     background: rgba(255,107,107,0.3) !important;
     border-color: #ff6b6b !important;
     color: #ff6b6b !important;
-    box-shadow: 0 0 8px rgba(255,107,107,0.4) !important;
-    transform: scale(1.05) !important;
+    box-shadow: 0 0 6px rgba(255,107,107,0.4) !important;
+  }
+  .model-nvidia {
+    background: rgba(76,175,80,0.3) !important;
+    border-color: #4caf50 !important;
+    color: #4caf50 !important;
+    box-shadow: 0 0 6px rgba(76,175,80,0.4) !important;
+  }
+  .model-deepseek {
+    background: rgba(33,150,243,0.3) !important;
+    border-color: #2196f3 !important;
+    color: #2196f3 !important;
+    box-shadow: 0 0 6px rgba(33,150,243,0.4) !important;
+  }
+  .model-mimo {
+    background: rgba(156,39,176,0.3) !important;
+    border-color: #9c27b0 !important;
+    color: #ce93d8 !important;
+    box-shadow: 0 0 6px rgba(156,39,176,0.4) !important;
+  }
+  .model-deepseek-v4-flash-free {
+    background: rgba(33,150,243,0.3) !important;
+    border-color: #2196f3 !important;
+    color: #2196f3 !important;
+    box-shadow: 0 0 6px rgba(33,150,243,0.4) !important;
+  }
+  .model-mimo-v2.5-free {
+    background: rgba(156,39,176,0.3) !important;
+    border-color: #9c27b0 !important;
+    color: #ce93d8 !important;
+    box-shadow: 0 0 6px rgba(156,39,176,0.4) !important;
+  }
+  .model-nemotron-3-ultra-free {
+    background: rgba(0,188,212,0.3) !important;
+    border-color: #00bcd4 !important;
+    color: #00e5ff !important;
+    box-shadow: 0 0 6px rgba(0,188,212,0.4) !important;
   }
 
   /* ═══════════════════════════════════════
@@ -886,7 +912,7 @@
     pointer-events: auto;
   }
 
-  .omo-toggle, .ralph-toggle {
+  .ralph-toggle {
     display: flex;
     align-items: center;
     gap: 2px;
@@ -903,35 +929,6 @@
     -webkit-app-region: no-drag;
     position: relative;
     z-index: 300;
-  }
-
-  .omo-toggle .toggle-switch {
-    width: 20px;
-    height: 10px;
-    border-radius: 5px;
-    background: rgba(255, 87, 34, 0.3);
-    position: relative;
-    transition: all 0.2s ease;
-  }
-  .omo-toggle .toggle-switch::after {
-    content: '';
-    position: absolute;
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: #ff5722;
-    top: 1px;
-    left: 1px;
-    transition: all 0.2s ease;
-    box-shadow: 0 0 4px rgba(255, 87, 34, 0.6);
-  }
-  .omo-toggle.enabled .toggle-switch {
-    background: rgba(33, 150, 243, 0.4);
-  }
-  .omo-toggle.enabled .toggle-switch::after {
-    left: 11px;
-    background: #2196f3;
-    box-shadow: 0 0 6px rgba(33, 150, 243, 0.8);
   }
 
   .ralph-toggle .toggle-switch {
@@ -961,51 +958,6 @@
     left: 11px;
     background: #00c853;
     box-shadow: 0 0 6px rgba(0, 200, 83, 0.8);
-  }
-
-  /* OMO Toggle - Orange/Blue theme */
-  .omo-toggle {
-    background: rgba(255, 87, 34, 0.15);
-    border: 1px solid #ff5722;
-    color: #ff5722;
-  }
-  .omo-toggle:hover {
-    background: rgba(255, 87, 34, 0.25);
-    box-shadow: 0 0 8px rgba(255, 87, 34, 0.4);
-  }
-  .omo-toggle.enabled {
-    background: rgba(33, 150, 243, 0.2);
-    border-color: #2196f3;
-    color: #2196f3;
-    box-shadow: 0 0 8px rgba(33, 150, 243, 0.4);
-  }
-  .omo-toggle .toggle-switch {
-    width: 28px;
-    height: 14px;
-    border-radius: 7px;
-    background: rgba(255, 87, 34, 0.3);
-    position: relative;
-    transition: all 0.2s ease;
-  }
-  .omo-toggle .toggle-switch::after {
-    content: '';
-    position: absolute;
-    width: 10px;
-    height: 10px;
-    border-radius: 50%;
-    background: #ff5722;
-    top: 2px;
-    left: 2px;
-    transition: all 0.2s ease;
-    box-shadow: 0 0 4px rgba(255, 87, 34, 0.6);
-  }
-  .omo-toggle.enabled .toggle-switch {
-    background: rgba(33, 150, 243, 0.4);
-  }
-  .omo-toggle.enabled .toggle-switch::after {
-    left: 16px;
-    background: #2196f3;
-    box-shadow: 0 0 6px rgba(33, 150, 243, 0.8);
   }
 
   /* RALPH/ULW Toggle - Blue/Green theme */
@@ -1054,7 +1006,7 @@
   }
 
   /* Toggle label transitions */
-  .omo-toggle .label-text, .ralph-toggle .label-text {
+  .ralph-toggle .label-text {
     transition: all 0.2s ease;
   }
 
@@ -1175,6 +1127,99 @@
     text-shadow: 0 0 8px rgba(0, 188, 212, 0.8);
   }
 
+  .model-dropdown {
+    display: none;
+    position: absolute;
+    bottom: 100%;
+    right: 0;
+    margin-bottom: 4px;
+    background: rgba(0,10,20,0.95);
+    border: 1px solid var(--cyan3);
+    border-radius: 4px;
+    z-index: 400;
+    max-height: 120px;
+    overflow-y: auto;
+    pointer-events: all;
+    min-width: 120px;
+  }
+  .model-dropdown.open { display: block; }
+  .model-dropdown-item {
+    font-family: 'Orbitron', monospace;
+    font-size: 7px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    padding: 3px 6px;
+    cursor: pointer;
+    color: var(--cyan3);
+    border-bottom: 1px solid rgba(0,229,255,0.08);
+    transition: all 0.15s;
+    -webkit-app-region: no-drag;
+  }
+  .model-dropdown-item:last-child { border-bottom: none; }
+  .model-dropdown-item:hover {
+    background: rgba(0,229,255,0.15);
+    color: var(--cyan);
+  }
+  .model-dropdown-item.active {
+    color: var(--green);
+    background: rgba(0,230,118,0.1);
+  }
+  .model-dropdown-item.active::before {
+    content: '● ';
+    color: var(--green);
+  }
+  .model-ctx {
+    opacity: 0.5;
+    margin-left: 4px;
+    font-size: 7px;
+  }
+  .model-provider {
+    opacity: 0.7;
+    margin-left: 6px;
+    font-size: 7px;
+    color: #ce93d8;
+    letter-spacing: 0.5px;
+  }
+
+  .info-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--cyan3);
+    transition: all 0.3s;
+    display: inline-block;
+  }
+  .info-dot.connected {
+    background: var(--green);
+    box-shadow: 0 0 6px var(--green);
+  }
+  .info-dot.error {
+    background: var(--red);
+    box-shadow: 0 0 6px var(--red);
+  }
+  .info-value {
+    font-family: 'Orbitron', monospace;
+    font-size: 8px;
+    font-weight: 600;
+    color: var(--cyan);
+    text-shadow: var(--glow2);
+  }
+  .subworker-inline {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 5px;
+    padding-top: 4px;
+    border-top: 1px solid rgba(0,229,255,0.25);
+  }
+  .subworker-inline .info-value {
+    font-size: 8px;
+  }
+  .info-sep {
+    color: var(--cyan);
+    font-size: 8px;
+  }
+
   /* Period Badges (in STATUS card) */
   .period-badge {
     font-family: 'Orbitron', monospace;
@@ -1268,10 +1313,6 @@
     <div class="subworker-toggle" id="subworker-toggle" onclick="showSubworkerPopup()">
       <span class="label-text" title="Gérer les subworkers">AGENTS</span>
     </div>
-    <div class="omo-toggle" id="omo-toggle" onclick="toggleOmo()">
-      <span class="toggle-switch"></span>
-      <span class="label-text">OMO</span>
-    </div>
     <div class="ralph-toggle" id="ralph-toggle" onclick="toggleRalphUlw()">
       <span class="toggle-switch"></span>
       <span class="label-text" id="ralph-ulw-label">ULW</span>
@@ -1281,13 +1322,18 @@
 
   <!-- MODELS + STATUS (right below orb, compact) -->
   <div id="context-status-row">
-    <div class="context-status-card">
+    <div class="context-status-card" style="position: relative;">
       <div class="card-title">MODELS</div>
-      <div style="display: flex; gap: 4px; flex-wrap: wrap;">
-        <span class="model-badge" id="badge-bigpickle" data-model="opencode/big-pickle" onclick="selectModel('opencode/big-pickle')">Big Pickle</span>
+      <span class="model-badge" id="active-model-badge" onclick="toggleModelDropdown(event)">big-pickle ▾</span>
+      <div class="model-dropdown" id="model-dropdown"></div>
+      <div class="subworker-inline">
+        <span class="info-dot" id="ws-dot"></span>
+        <span class="info-value" id="ws-value">—</span>
+        <span class="info-sep">·</span>
+        <span class="info-value" id="agents-count">—</span>
       </div>
     </div>
-    <div class="context-status-card">
+    <div class="context-status-card" style="max-width: 80px;">
       <div class="card-title">STATUS</div>
       <span class="card-badge stopped" id="agent-badge">—</span>
       <div id="cron-period-badges" style="display: flex; gap: 3px; margin-top: 4px; flex-wrap: wrap;">
@@ -1305,75 +1351,84 @@
 
 <script>
 // ── Model selection ─────────────────────────────────────
-let selectedModel = 'minimax'; // Default model
+const MODEL_LIST = [
+  { id: 'opencode/big-pickle', label: 'big-pickle', ctx: '200K', provider: 'opencode-zen' },
+  { id: 'opencode/nemotron-3.5-lightning-free', label: 'nemotron-3.5-lightning', ctx: '128K', provider: 'opencode-zen' },
+  { id: 'opencode/nemotron-3-ultra-free', label: 'nemotron-3-ultra', ctx: '128K', provider: 'opencode-zen' },
+  { id: 'opencode/hy3-free', label: 'hy3', ctx: '128K', provider: 'opencode-zen' },
+  { id: 'opencode/laguna-s-2.1-free', label: 'laguna-s-2.1', ctx: '128K', provider: 'opencode-zen' },
+  { id: 'opencode/mimo-v2.5-free', label: 'mimo-v2.5', ctx: '128K', provider: 'opencode-zen' },
+  { id: 'opencode/deepseek-v4-flash-free', label: 'deepseek-v4-flash', ctx: '128K', provider: 'opencode-zen' },
+  { id: 'google/gemini-2.5-flash-lite', label: 'gemini-2.5-flash-lite', ctx: '128K', provider: 'openrouter' },
+  { id: 'google/gemma-4-26b-a4b-it', label: 'gemma-4-26b', ctx: '128K', provider: 'openrouter' },
+  { id: 'google/gemma-4-31b-it', label: 'gemma-4-31b', ctx: '128K', provider: 'openrouter' },
+];
+let selectedModel = localStorage.getItem('selectedModel') || 'opencode/big-pickle';
+let dropdownOpen = false;
+
+function getModelLabel(id) {
+  const m = MODEL_LIST.find(x => x.id === id);
+  return m ? m.label : id.split('/').pop();
+}
+
+function renderModelDropdown() {
+  const dd = document.getElementById('model-dropdown');
+  if (!dd) return;
+  dd.innerHTML = MODEL_LIST.map(m =>
+    `<div class="model-dropdown-item${m.id === selectedModel ? ' active' : ''}" data-model="${m.id}">${m.label} <span class="model-ctx">${m.ctx}</span> <span class="model-provider">${m.provider}</span></div>`
+  ).join('');
+  dd.querySelectorAll('.model-dropdown-item').forEach(el => {
+    el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      selectModel(el.dataset.model);
+      closeModelDropdown();
+    });
+  });
+}
+
+function toggleModelDropdown(e) {
+  e.stopPropagation();
+  const dd = document.getElementById('model-dropdown');
+  if (!dd) return;
+  dropdownOpen = !dropdownOpen;
+  dd.classList.toggle('open', dropdownOpen);
+  if (dropdownOpen) renderModelDropdown();
+}
+
+function closeModelDropdown() {
+  dropdownOpen = false;
+  const dd = document.getElementById('model-dropdown');
+  if (dd) dd.classList.remove('open');
+}
+
+document.addEventListener('click', () => closeModelDropdown());
 
 function selectModel(model) {
-  console.log('selectModel called with:', model);
-  if (model === 'big-pickle') model = 'opencode/big-pickle';
   selectedModel = model;
-  
-  const modelInfo = {
-    'opencode/big-pickle': { context: '200K', tokens: '200K' },
-    'opencode/nemotron-3-lightning-free': { context: '128K', tokens: '128K' },
-    'opencode/mimo-v2.5-free': { context: '1M', tokens: '1M' },
-    'opencode/deepseek-v4-flash-free': { context: '128K', tokens: '128K' }
-  };
-  const info = modelInfo[model] || { context: '—', tokens: '—' };
-  
-  const ctxBadge = document.getElementById('model-context');
-  const tokBadge = document.getElementById('model-tokens');
-  if (ctxBadge) ctxBadge.textContent = 'Ctx: ' + info.context;
-  if (tokBadge) tokBadge.textContent = 'Max: ' + info.tokens;
-  
-  const debugText = document.getElementById('debug-text');
-  if (debugText) {
-    debugText.textContent = 'Selected: ' + model;
-    debugText.style.color = model === 'opencode/big-pickle' ? '#ff6b6b' :
-                                   model === 'nvidia' ? '#4caf50' :
-                                   '#ffc107';
+  const badge = document.getElementById('active-model-badge');
+  if (badge) {
+    badge.textContent = getModelLabel(model) + ' ▾';
+    badge.className = 'model-badge model-' + model.split('/').pop();
   }
-  
-  document.querySelectorAll('.model-badge').forEach(badge => {
-    badge.classList.remove('selected');
-  });
-  
-  const selectedBadge = document.querySelector('[data-model="' + model + '"]');
-  if (selectedBadge) {
-    selectedBadge.classList.add('selected');
-    console.log('Badge selected:', selectedBadge);
-  }
-  
   localStorage.setItem('selectedModel', model);
-  window.elia?.saveModelForCron?.(model);
+  window.elia?.saveModelForCron?.(model.split('/').pop());
+  window.popupAPI?.saveModelSelection?.('elia', model);
 }
 
-function loadSelectedModel() {
-  const saved = localStorage.getItem('selectedModel');
-  if (saved) {
-    selectModel(saved);
-  }
+async function loadSelectedModel() {
+  let saved = null;
+  try {
+    const sel = await window.popupAPI?.getModelSelections?.();
+    if (sel && typeof sel === 'object' && typeof sel['elia'] === 'string') {
+      saved = sel['elia'];
+    }
+  } catch (_) {}
+  if (!saved) saved = localStorage.getItem('selectedModel') || 'opencode/big-pickle';
+  if (!MODEL_LIST.some(m => m.id === saved)) saved = 'opencode/big-pickle';
+  selectModel(saved);
 }
 
-// OMO & RALPH/ULW Toggles
-// ULW is now the DEFAULT mode
-let omoEnabled = true;
 let ulwMode = true;
-
-function toggleOmo() {
-  omoEnabled = !omoEnabled;
-  const toggle = document.getElementById('omo-toggle');
-  if (omoEnabled) {
-    toggle.classList.add('enabled');
-  } else {
-    toggle.classList.remove('enabled');
-  }
-  localStorage.setItem('omoEnabled', omoEnabled);
-  window.elia?.onOmoToggle?.(omoEnabled);
-  if (window.electronAPI) {
-    window.electronAPI.send('omo-toggle', omoEnabled);
-  }
-  console.log('OMO toggled:', omoEnabled);
-}
 
 function toggleRalphUlw() {
   ulwMode = !ulwMode;
@@ -1395,19 +1450,6 @@ function toggleRalphUlw() {
 }
 
 function loadToggleStates() {
-  const savedOmo = localStorage.getItem('omoEnabled');
-  if (savedOmo !== null) {
-    omoEnabled = savedOmo === 'true';
-    const toggle = document.getElementById('omo-toggle');
-    if (omoEnabled) {
-      toggle.classList.add('enabled');
-    } else {
-      toggle.classList.remove('enabled');
-    }
-  } else {
-    document.getElementById('omo-toggle').classList.add('enabled');
-  }
-
   const savedUlw = localStorage.getItem('ulwMode');
   if (savedUlw !== null) {
     ulwMode = savedUlw === 'true';
@@ -1524,52 +1566,42 @@ window.testBadge = function() {
   selectModel('opencode/big-pickle');
 };
 
-// Wait for DOM and setup
+// ── Subworker info: WS + AGENTS ────────────────────────────
+function updateWsInfo(connected) {
+  const dot = document.getElementById('ws-dot');
+  const val = document.getElementById('ws-value');
+  if (dot) dot.className = 'info-dot' + (connected ? ' connected' : ' error');
+  if (val) val.textContent = connected ? 'LIVE' : 'DOWN';
+}
+
+function updateAgentsInfo(running, total) {
+  const el = document.getElementById('agents-count');
+  if (el) el.textContent = running + '/' + total + ' active';
+}
+
+function checkSubworkerServer() {
+  fetch('http://localhost:5656/status')
+    .then(r => {
+      if (!r.ok) throw new Error('not ok');
+      return r.json();
+    })
+    .then(data => {
+      updateWsInfo(true);
+      const running = (data.subworkers || []).filter(s => s.running).length;
+      const total = data.total || 0;
+      updateAgentsInfo(running, total);
+    })
+    .catch(() => {
+      updateWsInfo(false);
+      updateAgentsInfo(0, 0);
+    });
+}
+
 window.addEventListener('DOMContentLoaded', function() {
-  console.log('DOM loaded'); // Debug
-  
-  // Update debug text immediately
-  const debugText = document.getElementById('debug-text');
-  if (debugText) {
-    debugText.textContent = 'DOM Ready';
-  }
-  
-  // Test if badges exist
-  const bigPickleTest = document.getElementById('badge-bigpickle');
-  const kimiTest = document.getElementById('badge-kimi25');
-  const minimaxTest = document.getElementById('badge-minimax25');
-  
-  console.log('Badge elements test:', {
-    bigPickle: !!bigPickleTest,
-    kimi: !!kimiTest,
-    minimax: !!minimaxTest
-  }); // Debug
-  
-  // Simple direct assignment
-  if (bigPickleTest) {
-    bigPickleTest.onclick = function() {
-      console.log('BigPickle clicked!'); // Debug
-      selectModel('opencode/big-pickle');
-    };
-  }
-  
-  if (kimiTest) {
-    kimiTest.onclick = function() {
-      console.log('Kimi2.5 clicked!'); // Debug
-      selectModel('nvidia');
-    };
-  }
-  
-  if (minimaxTest) {
-    minimaxTest.onclick = function() {
-      console.log('MiniMax2.5 clicked!'); // Debug
-      selectModel('minimax');
-    };
-  }
-  
   loadSelectedModel();
   loadToggleStates();
-  console.log('Setup complete'); // Debug
+  checkSubworkerServer();
+  setInterval(checkSubworkerServer, 15000);
 });
 </script>
 <script>
@@ -1777,15 +1809,6 @@ if (window.elia) {
 // Also handle toggle state sync
 if (window.electronAPI) {
   window.electronAPI?.onToggleStates?.((states) => {
-    if (states.omoEnabled !== undefined && localStorage.getItem('omoEnabled') === null) {
-      omoEnabled = states.omoEnabled;
-      const toggle = document.getElementById('omo-toggle');
-      if (omoEnabled) {
-        toggle.classList.add('enabled');
-      } else {
-        toggle.classList.remove('enabled');
-      }
-    }
     if (states.ulwEnabled !== undefined && localStorage.getItem('ulwMode') === null) {
       ulwMode = states.ulwEnabled;
       const toggle = document.getElementById('ralph-toggle');

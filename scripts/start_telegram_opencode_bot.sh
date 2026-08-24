@@ -4,17 +4,6 @@
 
 set -euo pipefail
 
-# ============================================================
-# SCHEDULER DISABLE GUARD
-# If .scheduler_disabled exists, exit immediately without running.
-# Create this file to permanently disable all scheduled/interactive agent runs:
-#   touch ~/EliaAI/.scheduler_disabled
-# ============================================================
-if [[ -f "$HOME/EliaAI/.scheduler_disabled" ]]; then
-    echo "[GUARD] .scheduler_disabled found — agent disabled. Exiting."
-    exit 0
-fi
-
 AGENT_DIR="${0:A:h}"
 BOT_DIR="${AGENT_DIR}/integrations/telegram-opencode-bot"
 

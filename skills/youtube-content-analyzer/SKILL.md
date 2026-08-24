@@ -17,7 +17,7 @@ Ce skill analyse les transcriptions YouTube pour extraire des données marketing
 
 ## Installation
 ```bash
-cd "C:\Users\vakandi\Documents\projects\WatsonIA\skills\youtube-content-analyzer"
+cd "C:\Users\your-username\Documents\projects\WatsonIA\skills\youtube-content-analyzer"
 pip install -r requirements.txt
 python setup.py install
 ```

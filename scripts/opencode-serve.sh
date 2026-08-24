@@ -3,7 +3,6 @@ set -euo pipefail
 IFS=$'\n\t'
 
 AGENT_DIR="$HOME/EliaAI"
-
 PROXY_CONF="$HOME/.proxychains.conf"
 LOG_DIR="$AGENT_DIR/scripts/logs"
 LOG_FILE="$LOG_DIR/opencode-serve.log"
@@ -22,7 +21,7 @@ log() {
 
 preflight_check() {
     mkdir -p "$LOG_DIR" 2>/dev/null || true
-
+    
     if ! command -v opencode &>/dev/null; then
         log "ERROR: 'opencode' command not found in PATH"
         log "PATH: $PATH"
@@ -63,7 +62,7 @@ kill_port_process() {
         
         attempt=$((attempt + 1))
     done
-
+    
     if is_port_in_use; then
         log "ERROR: Failed to free port $PORT after $max_attempts attempts"
         return 1
@@ -152,32 +151,15 @@ is_already_opencode_server() {
     [[ -z "$pid" ]] && return 1
     
     local process_name=$(ps -p "$pid" -o comm= 2>/dev/null || echo "")
-    # Accept "opencode" binary OR "node" process (opencode runs on Node.js)
-    # NOTE: macOS `ps -o comm=` returns the FULL PATH for node, so match substring.
-    [[ "$process_name" == *"opencode"* ]] || [[ "$process_name" == *"node"* ]] || return 1
+    [[ "$process_name" == *"opencode"* ]] || return 1
     
-    # Retry nc -z up to 3 times to handle temporary unresponsiveness
-    local retry_count=3
-    local retry_delay=2
-    local attempt=0
+    if nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
+        log "[SERVER] Found existing opencode server on port $PORT (PID: $pid)"
+        echo "$pid" > "$PID_FILE"
+        return 0
+    fi
     
-    while [[ $attempt -lt $retry_count ]]; do
-        if nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
-            log "[SERVER] Found existing opencode server on port $PORT (PID: $pid)"
-            echo "$pid" > "$PID_FILE"
-            return 0
-        fi
-        attempt=$((attempt + 1))
-        if [[ $attempt -lt $retry_count ]]; then
-            log "[SERVER] Port $PORT not responding, retrying in ${retry_delay}s (attempt $attempt/$retry_count)..."
-            sleep $retry_delay
-        fi
-    done
-
-    # Even if nc fails, if there's an opencode process on the port, don't kill it
-    log "[SERVER] Found opencode process on port $PORT (PID: $pid) but port not responding - preserving anyway"
-    echo "$pid" > "$PID_FILE"
-    return 0
+    return 1
 }
 
 cleanup() {

@@ -1,0 +1,14 @@
+README.md
+pyproject.toml
+src/bot.py
+src/config.py
+src/context_tracker.py
+src/logging_config.py
+src/message_handler.py
+src/opencode_client.py
+src/session_manager.py
+src/elia_discord_bot.egg-info/PKG-INFO
+src/elia_discord_bot.egg-info/SOURCES.txt
+src/elia_discord_bot.egg-info/dependency_links.txt
+src/elia_discord_bot.egg-info/requires.txt
+src/elia_discord_bot.egg-info/top_level.txt

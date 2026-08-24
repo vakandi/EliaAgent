@@ -4,14 +4,6 @@
 set -euo pipefail
 
 AGENT_DIR="$HOME/EliaAI"
-
-# ============================================================
-# SCHEDULER DISABLE GUARD
-# ============================================================
-if [[ -f "${AGENT_DIR}/.scheduler_disabled" ]]; then
-    echo "[GUARD] .scheduler_disabled found — serve-fixed disabled. Exiting."
-    exit 0
-fi
 PROXY_CONF="$HOME/.proxychains.conf"
 LOG_FILE="/tmp/opencode_server_restart.log"
 
@@ -29,24 +21,9 @@ is_port_free() {
     ! nc -z 127.0.0.1 "$PORT" 2>/dev/null
 }
 
-is_already_opencode_server() {
-    local pid
-    pid=$(lsof -ti :"$PORT" 2>/dev/null | head -1)
-    [[ -z "$pid" ]] && return 1
-    local process_name
-    process_name=$(ps -p "$pid" -o comm= 2>/dev/null || echo "")
-    # NOTE: macOS `ps -o comm=` returns the FULL PATH for node, so match substring.
-    [[ "$process_name" == *"opencode"* ]] || [[ "$process_name" == *"node"* ]] || return 1
-    return 0
-}
-
 kill_existing() {
     if nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
-        if is_already_opencode_server; then
-            log "Port $PORT holds an opencode server - preserving it (no kill)."
-            return 1
-        fi
-        log "Port $PORT in use by non-opencode process - killing it..."
+        log "Port $PORT in use - killing existing server..."
         local existing_pid
         existing_pid=$(lsof -ti :"$PORT" 2>/dev/null | head -1)
         if [[ -n "$existing_pid" ]]; then
@@ -54,7 +31,6 @@ kill_existing() {
             sleep 2
         fi
     fi
-    return 0
 }
 
 start_server() {
@@ -91,16 +67,8 @@ main() {
     log "Port: $PORT"
     log "Max restarts: $MAX_RESTARTS"
 
-    if nc -z 127.0.0.1 "$PORT" 2>/dev/null && is_already_opencode_server; then
-        log "Existing opencode server on port $PORT — exiting cleanly (no kill)"
-        exit 0
-    fi
-
     while [[ $restart_count -lt $MAX_RESTARTS ]]; do
-        if ! kill_existing; then
-            log "Existing opencode server detected on port $PORT — adopting it"
-            exit 0
-        fi
+        kill_existing
 
         start_server &
         SERVER_PID=$!

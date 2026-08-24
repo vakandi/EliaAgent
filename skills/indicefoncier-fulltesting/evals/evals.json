@@ -1,0 +1,29 @@
+{
+  "skill_name": "indicefoncier-fulltesting",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Test the AI chat on indice.immobilia.ca: send a message, verify the agent actually ran by checking the Coolify logs of the ImmoSignal backend, and confirm the frontend shows the AI tools and reasoning while the response streams.",
+      "expected_output": "A test report proving: message reached POST /chat/execute (200), the agent session ran (log evidence from Coolify), reasoning/todo displayed in the UI, and any tool call rendered as a bubble or card.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Do a full-stack health check of ImmoSignal: backend /health, Directus reachability, frontend pages (/, /chat, /map, /profile, /pricing), and confirm the background polling pipeline has data in all realestate_* Directus collections (parcels, risk_sites, company_graphs, market_reports, street_views, successions).",
+      "expected_output": "Phase 0-2 evidence: curl bodies for infra, screenshots/DOM presence per page, /poll/status output showing the 6 mvp_* jobs enabled with recent last_polled_at, and non-empty realestate_* collections.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "Force the AI in the ImmoSignal chat to call the right MCP tools so the special UI cards appear: send prompts for (1) buildable land on a map, (2) a company officer/ownership graph, (3) a market report. Verify each card renders with the correct component and data using snapshot + JavaScript, and check the parallel-browser network log for errors.",
+      "expected_output": "Per-card evidence: tool name seen, expected allowlist prefix matched, correct component in DOM (MapView/CompanyGraphPanel/MarketReportPanel), card data present, window.__api_log showing /chat/execute + realestate_* reads with no 4xx/5xx/CORS.",
+      "files": []
+    },
+    {
+      "id": 4,
+      "prompt": "Test the paywall on EVERY credit-gated feature of ImmoSignal (chat, environmental overlays, successions factor, company graph, street view, map search, map overlay extra, market report, market report PDF). For each feature, force the locked state via localStorage (anon 0 credits then authed 0 credits), verify the FeatureLock overlay appears with the correct cost badge and CTA (\"Créer un compte gratuit\" for anon, \"Voir les plans\" for authed), then click the CTA and verify it unlocks (anon: +2 credits granted, overlay gone; authed: pricing/checkout reached). Also verify the chat-level paywall modal when /chat/execute returns paywall: true.",
+      "expected_output": "Per-feature evidence: FeatureLock in DOM with cost line matching label — N crédits, correct CTA per identity state, snapshot before/after clicking the CTA, localStorage identity transition for anon signup, /pricing navigation for authed upgrade, and paywall modal presence at 0 credits. Any feature showing a bare error instead of the lock, or a CTA that doesn't unlock/navigate, is reported as a bug.",
+      "files": []
+    }
+  ]
+}

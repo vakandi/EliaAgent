@@ -1,0 +1,23 @@
+# ── Docker Build Context Exclusions ──────────────────────────────────────────
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+tests/
+*.md
+!.env.example
+.env
+.env.*
+.git
+.gitignore
+docker-compose*.yml
+Dockerfile
+.dockerignore
+node_modules
+.DS_Store
+.vscode
+.idea
+*.egg-info

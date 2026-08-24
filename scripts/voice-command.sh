@@ -4,22 +4,11 @@
 
 set -euo pipefail
 
-# ============================================================
-# SCHEDULER DISABLE GUARD
-# If .scheduler_disabled exists, exit immediately without running.
-# Create this file to permanently disable all scheduled/interactive agent runs:
-#   touch ~/EliaAI/.scheduler_disabled
-# ============================================================
-if [[ -f "$HOME/EliaAI/.scheduler_disabled" ]]; then
-    echo "[GUARD] .scheduler_disabled found — agent disabled. Exiting."
-    exit 0
-fi
-
 # Configuration - dynamic path detection
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 AGENT_DIR="$(dirname "$SCRIPT_DIR")"
-TRIGGER_SCRIPT="${AGENT_DIR}/scripts/trigger_opencode_interactive.sh"
-PROMPT_FILE="${AGENT_DIR}/PROMPT.md"
+TRIGGER_SCRIPT="${AGENT_DIR}/subworkers/scripts/trigger_template.js"
+PROMPT_FILE="${AGENT_DIR}/subworkers/elia/PROMPT.md"
 AGENT_PAYLOADS_DIR="${AGENT_DIR}/.agent_payloads"
 
 # Colors for output
@@ -118,13 +107,13 @@ mkdir -p "$AGENT_PAYLOADS_DIR"
 
 # Check if trigger script exists
 if [[ ! -f "$TRIGGER_SCRIPT" ]]; then
-    error "trigger_opencode_interactive.sh not found at: $TRIGGER_SCRIPT"
+    error "trigger_template.js not found at: $TRIGGER_SCRIPT"
     exit 1
 fi
 
 # Check if trigger script is executable
 if [[ ! -x "$TRIGGER_SCRIPT" ]]; then
-    log "Making trigger_opencode_interactive.sh executable..."
+    log "Making trigger_template.js executable..."
     chmod +x "$TRIGGER_SCRIPT"
 fi
 
@@ -205,22 +194,26 @@ else
     log "ULW-LOOP mode is ENABLED by DEFAULT (no .ralph_mode file)"
 fi
 
-# Execute trigger script which respects ULW/ralph toggle
-# trigger_opencode_interactive.sh will check .ulw_mode and use appropriate loop
-# USE_PROXY is passed to trigger script via command line, not exported
-# proxychains4 handles proxy at library level - no env vars needed
-if [[ "$USE_PROXY" == "1" ]]; then
-    log "Proxy mode enabled (proxychains4)"
-fi
-
+# Execute via subworker server (FastAPI on 5656) — trigger elia main agent
 if [[ -n "${EXTRA_PROMPT_FILE:-}" ]]; then
     EXTRA_CONTENT=$(cat "$EXTRA_PROMPT_FILE")
-    "$TRIGGER_SCRIPT" "$EXTRA_CONTENT"
 else
-    "$TRIGGER_SCRIPT"
+    EXTRA_CONTENT=""
 fi
 
+# Read model override from ui_electron .opencode_model if present
+OPCODE_MODEL_FILE="${AGENT_DIR}/.opencode_model"
+if [[ -f "$OPCODE_MODEL_FILE" ]]; then
+    FILE_MODEL=$(tr -d '[:space:]' < "$OPCODE_MODEL_FILE")
+    [[ -n "$FILE_MODEL" ]] && MODEL="$FILE_MODEL"
+fi
+
+PAYLOAD=$(python3 -c 'import json,sys; print(json.dumps({"prompt": sys.argv[1] or "", "model": sys.argv[2]}))' "$EXTRA_CONTENT" "$MODEL")
+
+log "POST /trigger/elia model=$MODEL"
+RESPONSE=$(curl -s -X POST "http://127.0.0.1:5656/trigger/elia" -H "Content-Type: application/json" -d "$PAYLOAD")
 EXIT_CODE=$?
+log "Server response: $RESPONSE"
 
 echo ""
 echo "=========================================="

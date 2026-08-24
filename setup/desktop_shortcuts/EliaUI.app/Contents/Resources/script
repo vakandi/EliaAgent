@@ -2,93 +2,65 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-# =============================================================================
-# EliaUI Launcher (Platypus bundle script)
-#
-# Architecture:
-#   - Server session "opencode-serve" → opencode server (crash-isolated)
-#   - UI session "elia-ui" → Discord bot + Electron UI + codemem viewer
-#
-# The two-session design prevents UI session kills from cascading
-# to the opencode agent server.
-# =============================================================================
-
 # Configuration
 SCRIPT_DIR="$HOME/EliaAI/scripts"
 LOG_DIR="$HOME/EliaAI/logs"
-UI_SESSION="elia-ui"
-SERVER_SESSION="opencode-serve"
-
-# TMUX INSIDE TMUX GUARD
-if [[ -n "$TMUX" ]]; then
-    echo "[GUARD] Already inside tmux session ($TMUX) — skipping EliaUI launcher."
-    echo "[GUARD] To attach manually: tmux attach -t $UI_SESSION"
-    exit 0
-fi
+SESSION_NAME="elia"
 
 log() {
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     echo "[$timestamp] [EliaUI] $*" >&2
 }
 
-log "=== EliaUI Launcher (session-isolated) ==="
+log "=== EliaUI 4-Window Launcher ==="
 
+# Vérifier que tmux est installé
 if ! command -v tmux &>/dev/null; then
     log "ERROR: tmux not found in PATH"
     exit 1
 fi
 
+# Créer les dossiers de logs si nécessaire
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 
-# ── Server session: opencode-serve (crash-isolated from UI) ──────────────
-# Start the opencode server in its OWN session so killing the UI session
-# never kills the agent server.
-is_already_opencode_server() {
-    local port="${1:-4096}"
-    local pid
-    pid=$(lsof -ti :"$port" 2>/dev/null | head -1)
-    [[ -z "$pid" ]] && return 1
-    local process_name
-    process_name=$(ps -p "$pid" -o comm= 2>/dev/null || echo "")
-    # NOTE: macOS `ps -o comm=` returns the FULL PATH for node, so match substring.
-    [[ "$process_name" == *"opencode"* ]] || [[ "$process_name" == *"node"* ]] || return 1
-    return 0
-}
-
-if ! tmux has-session -t "$SERVER_SESSION" 2>/dev/null; then
-    if ! is_already_opencode_server 4096; then
-        log "[SERVER] Starting opencode server in dedicated session '$SERVER_SESSION'..."
-        tmux new-session -d -s "$SERVER_SESSION" -n "Server"
-        tmux send-keys -t "$SERVER_SESSION" "bash $SCRIPT_DIR/opencode-serve.sh 4096" Enter
-        sleep 2
-    fi
-fi
-
-# ── UI session: elia-ui (Discord + Electron only) ────────────────────────
-if tmux has-session -t "$UI_SESSION" 2>/dev/null; then
-    log "Session '$UI_SESSION' already exists — attaching..."
-    TMUX= tmux new-session -A -s "$UI_SESSION"
+# Vérifier si la session existe déjà
+if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+    log "Session '$SESSION_NAME' already exists - attaching..."
+    tmux attach -t "$SESSION_NAME"
     exit 0
 fi
 
-log "Creating new tmux session: $UI_SESSION"
+log "Creating new tmux session: $SESSION_NAME"
 
-# Window 0 — Discord bot (top pane) + Electron UI (bottom pane)
-tmux new-session -d -s "$UI_SESSION" -n "EliaAI"
-tmux split-window -v -t "$UI_SESSION":0
-sleep 0.5
-tmux send-keys -t "$UI_SESSION":0.0 "bash $SCRIPT_DIR/start_elias_discord.sh" Enter
-sleep 0.5
-tmux send-keys -t "$UI_SESSION":0.1 "cd ~/EliaAI/ui_electron && npm start" Enter
-sleep 0.5
+# Créer la session avec la première fenêtre (Window 0 = Elia-1: OpenCode Server)
+tmux new-session -d -s "$SESSION_NAME" -n "Elia-1-OpenCode"
 
-# Window 1 — CodeMem Viewer
-tmux new-window -t "$UI_SESSION" -n "CodeMem"
-tmux send-keys -t "$UI_SESSION:1" "bash $SCRIPT_DIR/codemem-viewer.sh" Enter
+# Configurer Window 0 - OpenCode Server (port 4096)
+log "Setting up Window 0: OpenCode Server (port 4096)"
+tmux send-keys -t "$SESSION_NAME:0" "bash $SCRIPT_DIR/opencode-serve.sh 4096" Enter
 sleep 0.5
 
-# Select first window and attach
-tmux select-window -t "$UI_SESSION:0"
-TMUX= tmux new-session -A -s "$UI_SESSION"
+# Créer Window 1 - CodeMem Viewer
+log "Creating Window 1: CodeMem Viewer"
+tmux new-window -t "$SESSION_NAME" -n "Elia-2-CodeMem"
+tmux send-keys -t "$SESSION_NAME:1" "bash $SCRIPT_DIR/codemem-viewer.sh" Enter
+sleep 0.5
+
+# Créer Window 2 - Agents
+log "Creating Window 2: Agents (start_agents.sh)"
+tmux new-window -t "$SESSION_NAME" -n "Elia-3-Agents"
+tmux send-keys -t "$SESSION_NAME:2" "bash $SCRIPT_DIR/start_agents.sh" Enter
+sleep 0.5
+
+# Créer Window 3 - UI
+log "Creating Window 3: UI (elia-ui.sh)"
+tmux new-window -t "$SESSION_NAME" -n "Elia-4-UI"
+tmux send-keys -t "$SESSION_NAME:3" "bash $SCRIPT_DIR/elia-ui.sh" Enter
+sleep 0.5
+
+# Sélectionner Window 0 et attacher
+log "Selecting Window 0 and attaching to session..."
+tmux select-window -t "$SESSION_NAME:0"
+tmux attach -t "$SESSION_NAME"
 
 log "=== EliaUI Launcher Complete ==="

@@ -120,6 +120,42 @@
       gap: 6px;
       margin-bottom: 2px;
     }
+    .main-badge {
+      font-family: 'Orbitron', monospace;
+      font-size: 8px;
+      font-weight: 700;
+      letter-spacing: 1px;
+      color: #ffd54f;
+      border: 1px solid rgba(255,213,79,0.5);
+      background: rgba(255,213,79,0.12);
+      border-radius: 3px;
+      padding: 1px 5px;
+      flex-shrink: 0;
+      line-height: 1.3;
+    }
+    .main-btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 18px;
+      height: 18px;
+      border-radius: 3px;
+      border: 1px solid rgba(255,213,79,0.4);
+      background: rgba(255,213,79,0.08);
+      color: rgba(255,213,79,0.85);
+      cursor: pointer;
+      font-size: 10px;
+      line-height: 1;
+      padding: 0;
+      flex-shrink: 0;
+      transition: all 0.2s ease;
+    }
+    .main-btn:hover {
+      background: rgba(255,213,79,0.2);
+      border-color: rgba(255,213,79,0.8);
+      color: #ffd54f;
+      box-shadow: 0 0 8px rgba(255,213,79,0.4);
+    }
     .start-btn {
       display: flex;
       align-items: center;
@@ -214,6 +250,13 @@
     .model-option.selected .model-dot {
       background: #ce93d8;
       box-shadow: 0 0 4px rgba(206,147,216,0.6);
+    }
+    .model-provider {
+      opacity: 0.7;
+      margin-left: 6px;
+      font-size: 8px;
+      color: #ce93d8;
+      letter-spacing: 0.5px;
     }
     .subworker-info {
       flex: 1;
@@ -603,6 +646,139 @@
       0%, 80%, 100% { opacity: 0.3; transform: scale(0.8); }
       40% { opacity: 1; transform: scale(1.1); }
     }
+    /* Terminal log panel */
+    .log-panel {
+      display: none;
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      z-index: 9999;
+      background: rgba(0,4,12,0.97);
+      flex-direction: column;
+    }
+    .log-panel.open { display: flex; }
+    .log-panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 20px;
+      border-bottom: 1px solid rgba(0,229,255,0.15);
+      flex-shrink: 0;
+    }
+    .log-panel-title {
+      font-family: 'Orbitron', monospace;
+      font-size: 13px;
+      font-weight: 600;
+      color: #00e5ff;
+      letter-spacing: 2px;
+    }
+    .log-panel-title span {
+      color: rgba(0,229,255,0.5);
+      font-size: 10px;
+      margin-left: 8px;
+    }
+    .log-panel-close {
+      background: rgba(255,23,68,0.15);
+      border: 1px solid rgba(255,23,68,0.4);
+      color: #ff1744;
+      font-family: 'Orbitron', monospace;
+      font-size: 10px;
+      font-weight: 600;
+      padding: 4px 14px;
+      border-radius: 3px;
+      cursor: pointer;
+      letter-spacing: 1px;
+      transition: all 0.2s ease;
+    }
+    .log-panel-close:hover {
+      background: rgba(255,23,68,0.3);
+      box-shadow: 0 0 10px rgba(255,23,68,0.4);
+    }
+    .log-panel-refresh {
+      background: rgba(0,229,255,0.08);
+      border: 1px solid rgba(0,229,255,0.3);
+      color: rgba(0,229,255,0.7);
+      font-family: 'Orbitron', monospace;
+      font-size: 10px;
+      font-weight: 600;
+      padding: 4px 14px;
+      border-radius: 3px;
+      cursor: pointer;
+      letter-spacing: 1px;
+      transition: all 0.2s ease;
+    }
+    .log-panel-refresh:hover {
+      background: rgba(0,229,255,0.2);
+      border-color: rgba(0,229,255,0.6);
+      color: #00e5ff;
+    }
+    .log-panel-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 12px 20px;
+      font-family: 'Share Tech Mono', monospace;
+      font-size: 12px;
+      line-height: 1.6;
+    }
+    .log-panel-body::-webkit-scrollbar { width: 5px; }
+    .log-panel-body::-webkit-scrollbar-track { background: rgba(0,229,255,0.03); }
+    .log-panel-body::-webkit-scrollbar-thumb { background: rgba(0,229,255,0.2); border-radius: 3px; }
+    .log-entry {
+      margin-bottom: 10px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid rgba(0,229,255,0.05);
+    }
+    .log-entry-meta {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 3px;
+    }
+    .log-role {
+      font-family: 'Orbitron', monospace;
+      font-size: 8px;
+      font-weight: 700;
+      letter-spacing: 1px;
+      padding: 2px 6px;
+      border-radius: 3px;
+      color: #fff;
+      text-transform: uppercase;
+    }
+    .log-role.user { background: rgba(0,230,118,0.4); }
+    .log-role.assistant { background: rgba(33,150,243,0.5); }
+    .log-role.system { background: rgba(255,152,0,0.4); }
+    .log-agent {
+      font-size: 10px;
+      color: rgba(0,229,255,0.5);
+    }
+    .log-time {
+      font-size: 9px;
+      color: rgba(0,229,255,0.3);
+    }
+    .log-text { color: rgba(0,229,255,0.8); white-space: pre-wrap; word-break: break-word; }
+    .log-reasoning { color: rgba(156,39,176,0.7); font-style: italic; white-space: pre-wrap; word-break: break-word; }
+    .log-tool { color: rgba(33,150,243,0.7); white-space: pre-wrap; word-break: break-word; }
+    .log-tool-name { color: #64b5f6; font-weight: 600; }
+    .log-loading {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      color: rgba(0,229,255,0.4);
+      font-family: 'Orbitron', monospace;
+      font-size: 13px;
+      letter-spacing: 2px;
+    }
+    .log-empty {
+      text-align: center;
+      color: rgba(0,229,255,0.3);
+      font-style: italic;
+      padding: 40px;
+    }
+    .log-error {
+      text-align: center;
+      color: rgba(255,23,68,0.6);
+      padding: 40px;
+    }
   </style>
 </head>
 <body>
@@ -625,6 +801,20 @@
       </div>
     </div>
   </div>
+
+  <!-- Terminal-style log panel (overlay) -->
+  <div class="log-panel" id="log-panel">
+    <div class="log-panel-header">
+      <div class="log-panel-title" id="log-panel-title">LOGS <span>loading...</span></div>
+      <div style="display:flex;gap:8px;">
+        <button class="log-panel-refresh" id="log-panel-refresh">REFRESH</button>
+        <button class="log-panel-close" id="log-panel-close">✕ CLOSE</button>
+      </div>
+    </div>
+    <div class="log-panel-body" id="log-panel-body">
+      <div class="log-loading">LOADING SESSION DATA...</div>
+    </div>
+  </div>
   <script>
     const grid = document.getElementById('subworker-grid');
     // Track open dropdown state: { cardId: 'agent_name' }
@@ -633,72 +823,19 @@
     const runsCache = {};
     // Track selected model per agent: { agentName: modelSlug }
     const modelSelections = {};
-    const DEFAULT_SUBWORKER_MODEL = 'opencode/big-pickle';
-    const MODEL_CHOICES = [
-      { runtime: 'opencode/big-pickle', display: 'Big Pickle' },
-      { runtime: 'opencode/nemotron-3.5-lightning-free', display: 'opencode/nemotron-3.5-lightning-free' },
-      { runtime: 'opencode/nemotron-3-ultra-free', display: 'opencode/nemotron-3-ultra-free' },
-      { runtime: 'opencode/hy3-free', display: 'opencode/hy3-free' },
-      { runtime: 'opencode/laguna-s-2.1-free', display: 'opencode/laguna-s-2.1-free' },
-      { runtime: 'opencode/mimo-v2.5-free', display: 'opencode/mimo-v2.5-free' },
-      { runtime: 'opencode/deepseek-v4-flash-free', display: 'opencode/deepseek-v4-flash-free' },
-      { runtime: 'google/gemini-2.5-flash-lite', display: 'google/gemini-2.5-flash-lite' },
-      { runtime: 'google/gemma-4-26b-a4b-it', display: 'google/gemma-4-26b-a4b-it' },
-      { runtime: 'google/gemma-4-31b-it', display: 'google/gemma-4-31b-it' },
-    ];
-    const MODEL_LABELS = Object.fromEntries(MODEL_CHOICES.map(choice => [choice.runtime, choice.display]));
-    const MODEL_ALIASES = {
-      'opencode/nemotron-3-lightning-free': 'opencode/nemotron-3.5-lightning-free',
-      'opencode/hy-free': 'opencode/hy3-free',
-      'opencode/laguna-free': 'opencode/laguna-s-2.1-free',
-      'opencode/north-code': 'opencode/big-pickle',
-      'google/gemini-2.5-flash-lite:free': 'google/gemini-2.5-flash-lite',
-      'google/gemma-4-26b-a4b-it:free': 'google/gemma-4-26b-a4b-it',
-      'google/gemma-4-31b-it:free': 'google/gemma-4-31b-it',
-    };
-
-    function normalizeModelId(model) {
-      if (!model) return DEFAULT_SUBWORKER_MODEL;
-      const aliased = MODEL_ALIASES[model] || model;
-      if (!aliased.includes('/')) {
-        if (aliased.startsWith('gemini-') || aliased.startsWith('gemma-')) {
-          return `google/${aliased}`;
-        }
-      }
-      return aliased;
-    }
-
-    function getModelLabel(model) {
-      const normalized = normalizeModelId(model);
-      return MODEL_LABELS[normalized] || normalized.split('/').pop();
-    }
 
     async function loadModelSelections() {
       try {
         const saved = await window.popupAPI.getModelSelections();
         if (saved && typeof saved === 'object') {
-          Object.entries(saved).forEach(([name, model]) => {
-            const normalized = normalizeModelId(model);
-            modelSelections[name] = normalized;
-            if (normalized !== model) {
-              window.popupAPI.saveModelSelection(name, normalized);
-            }
-          });
+          Object.assign(modelSelections, saved);
         }
       } catch (_) {}
     }
 
     function saveModelSelection(name, model) {
-      const normalized = normalizeModelId(model);
-      modelSelections[name] = normalized;
-      window.popupAPI.saveModelSelection(name, normalized);
-    }
-
-    function buildModelOptions(name, selectedModel) {
-      return MODEL_CHOICES.map(choice => {
-        const selectedCls = selectedModel === choice.runtime ? ' selected' : '';
-        return `<div class="model-option${selectedCls}" data-model="${choice.runtime}"><span class="model-dot"></span>${escHtml(choice.display)}</div>`;
-      }).join('');
+      modelSelections[name] = model;
+      window.popupAPI.saveModelSelection(name, model);
     }
 
     function renderSubworkers(workers) {
@@ -717,8 +854,6 @@
       }
       grid.innerHTML = '';
       workers.forEach((w, idx) => {
-        const selectedModel = normalizeModelId(modelSelections[w.name] || DEFAULT_SUBWORKER_MODEL);
-        modelSelections[w.name] = selectedModel;
         const wrap = document.createElement('div');
         wrap.className = 'subworker-card-wrap';
         wrap.dataset.agentName = w.name;
@@ -740,10 +875,21 @@
           <div class="subworker-info">
             <div class="subworker-name-row">
               <div class="subworker-name">${escHtml(w.label)}</div>
+              ${w.isMain ? '<span class="main-badge" title="Main agent">MAIN</span>' : ''}
+              <button class="main-btn" data-name="${w.name}" data-is-main="${w.isMain ? '1' : '0'}" title="${w.isMain ? 'Unset main agent (default: Elia)' : 'Set as main agent'}">${w.isMain ? '✕' : '★'}</button>
               <div class="model-select-wrap">
-                <div class="model-badge" data-name="${w.name}" title="Select model">⚡ ${escHtml(getModelLabel(selectedModel))}</div>
+                <div class="model-badge" data-name="${w.name}" title="Select model">⚡ ${(modelSelections[w.name] || 'opencode/big-pickle').split('/').pop()}</div>
                 <div class="model-dropdown" data-name="${w.name}">
-                  ${buildModelOptions(w.name, selectedModel)}
+                  <div class="model-option${(!modelSelections[w.name] || modelSelections[w.name] === 'opencode/big-pickle') ? ' selected' : ''}" data-model="opencode/big-pickle"><span class="model-dot"></span>big-pickle <span class="model-provider">opencode-zen</span></div>
+                  <div class="model-option${modelSelections[w.name] === 'opencode/nemotron-3.5-lightning-free' ? ' selected' : ''}" data-model="opencode/nemotron-3.5-lightning-free"><span class="model-dot"></span>nemotron-3.5-lightning <span class="model-provider">opencode-zen</span></div>
+                  <div class="model-option${modelSelections[w.name] === 'opencode/nemotron-3-ultra-free' ? ' selected' : ''}" data-model="opencode/nemotron-3-ultra-free"><span class="model-dot"></span>nemotron-3-ultra <span class="model-provider">opencode-zen</span></div>
+                  <div class="model-option${modelSelections[w.name] === 'opencode/hy3-free' ? ' selected' : ''}" data-model="opencode/hy3-free"><span class="model-dot"></span>hy3 <span class="model-provider">opencode-zen</span></div>
+                  <div class="model-option${modelSelections[w.name] === 'opencode/laguna-s-2.1-free' ? ' selected' : ''}" data-model="opencode/laguna-s-2.1-free"><span class="model-dot"></span>laguna-s-2.1 <span class="model-provider">opencode-zen</span></div>
+                  <div class="model-option${modelSelections[w.name] === 'opencode/mimo-v2.5-free' ? ' selected' : ''}" data-model="opencode/mimo-v2.5-free"><span class="model-dot"></span>mimo-v2.5 <span class="model-provider">opencode-zen</span></div>
+                  <div class="model-option${modelSelections[w.name] === 'opencode/deepseek-v4-flash-free' ? ' selected' : ''}" data-model="opencode/deepseek-v4-flash-free"><span class="model-dot"></span>deepseek-v4-flash <span class="model-provider">opencode-zen</span></div>
+                  <div class="model-option${modelSelections[w.name] === 'google/gemini-2.5-flash-lite' ? ' selected' : ''}" data-model="google/gemini-2.5-flash-lite"><span class="model-dot"></span>gemini-2.5-flash-lite <span class="model-provider">openrouter</span></div>
+                  <div class="model-option${modelSelections[w.name] === 'google/gemma-4-26b-a4b-it' ? ' selected' : ''}" data-model="google/gemma-4-26b-a4b-it"><span class="model-dot"></span>gemma-4-26b <span class="model-provider">openrouter</span></div>
+                  <div class="model-option${modelSelections[w.name] === 'google/gemma-4-31b-it' ? ' selected' : ''}" data-model="google/gemma-4-31b-it"><span class="model-dot"></span>gemma-4-31b <span class="model-provider">openrouter</span></div>
                 </div>
               </div>
               <button class="start-btn" data-name="${w.name}" title="Start agent">
@@ -780,11 +926,27 @@
         grid.appendChild(wrap);
       });
 
-      // LOGS button: opens latest per-run log
+      // LOGS button: opens inline terminal-style log panel
       document.querySelectorAll('.logs-btn-small').forEach(btn => {
         btn.addEventListener('click', function(e) {
           e.stopPropagation();
-          window.popupAPI.openSubworkerLogs(this.dataset.name);
+          openLogPanel(this.dataset.name);
+        });
+      });
+
+      // MAIN button: set/unset main agent
+      document.querySelectorAll('.main-btn').forEach(btn => {
+        btn.addEventListener('click', function(e) {
+          e.stopPropagation();
+          const name = this.dataset.name;
+          const isMain = this.dataset.isMain === '1';
+          const msg = isMain
+            ? `Unset ${name} as main agent? (defaults to Elia)`
+            : `Set ${name} as main agent? It gets full repo access.`;
+          if (confirm(msg)) {
+            window.popupAPI.setMainAgent(isMain ? '' : name);
+            window.electronAPI.send('get-subworkers');
+          }
         });
       });
 
@@ -824,7 +986,7 @@
         btn.addEventListener('click', function(e) {
           e.stopPropagation();
           const name = this.dataset.name;
-          const model = normalizeModelId(modelSelections[name] || DEFAULT_SUBWORKER_MODEL);
+          const model = modelSelections[name] || 'opencode/big-pickle';
           window.popupAPI.runSubworkerNow(name, model);
         });
       });
@@ -848,7 +1010,7 @@
       document.querySelectorAll('.model-option').forEach(opt => {
         opt.addEventListener('click', function(e) {
           e.stopPropagation();
-          const model = normalizeModelId(this.dataset.model);
+          const model = this.dataset.model;
           const dropdown = this.closest('.model-dropdown');
           const name = dropdown.dataset.name;
           const badge = dropdown.previousElementSibling;
@@ -856,7 +1018,7 @@
           dropdown.querySelectorAll('.model-option').forEach(o => o.classList.remove('selected'));
           this.classList.add('selected');
           // Update badge text
-          badge.textContent = '⚡ ' + getModelLabel(model);
+          badge.textContent = '⚡ ' + model.split('/').pop();
           // Store selection
           saveModelSelection(name, model);
           // Close dropdown
@@ -1062,6 +1224,96 @@
     document.getElementById('btn-close').addEventListener('click', () => {
       window.popupAPI?.close();
     });
+
+    // ── Terminal-style log panel ──
+    const SUBWORKER_SERVER_URL = 'http://localhost:5656';
+    const logPanel = document.getElementById('log-panel');
+    const logPanelTitle = document.getElementById('log-panel-title');
+    const logPanelBody = document.getElementById('log-panel-body');
+    const logPanelClose = document.getElementById('log-panel-close');
+    const logPanelRefresh = document.getElementById('log-panel-refresh');
+    let logPanelAgent = null;
+
+    function openLogPanel(name) {
+      logPanelAgent = name;
+      logPanelTitle.innerHTML = `LOGS <span>${escHtml(name)}</span>`;
+      logPanelBody.innerHTML = '<div class="log-loading">LOADING SESSION DATA...</div>';
+      logPanel.classList.add('open');
+      fetchSessionLogs(name);
+    }
+
+    function closeLogPanel() {
+      logPanel.classList.remove('open');
+      logPanelAgent = null;
+    }
+
+    logPanelClose.addEventListener('click', closeLogPanel);
+    logPanelRefresh.addEventListener('click', () => {
+      if (logPanelAgent) fetchSessionLogs(logPanelAgent);
+    });
+
+    async function fetchSessionLogs(name) {
+      try {
+        const resp = await fetch(`${SUBWORKER_SERVER_URL}/sessions/${encodeURIComponent(name)}?limit=30`);
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({ detail: `HTTP ${resp.status}` }));
+          logPanelBody.innerHTML = `<div class="log-error">${escHtml(err.detail || 'Failed to load logs')}</div>`;
+          return;
+        }
+        const data = await resp.json();
+        renderSessionLogs(data);
+      } catch (e) {
+        logPanelBody.innerHTML = `<div class="log-error">Connection failed: ${escHtml(e.message)}</div>`;
+      }
+    }
+
+    function renderSessionLogs(data) {
+      const messages = data.messages || [];
+      if (messages.length === 0) {
+        logPanelBody.innerHTML = '<div class="log-empty">No session data available</div>';
+        return;
+      }
+      let html = '';
+      for (const msg of messages) {
+        const info = msg.info || {};
+        const parts = msg.parts || [];
+        const role = info.role || 'unknown';
+        const agent = info.agent || '';
+        const roleCls = role === 'user' ? 'user' : role === 'assistant' ? 'assistant' : 'system';
+
+        let timeStr = '';
+        if (info.time_created) {
+          const d = new Date(info.time_created);
+          timeStr = d.toLocaleTimeString();
+        }
+
+        html += '<div class="log-entry">';
+        html += '<div class="log-entry-meta">';
+        html += `<span class="log-role ${roleCls}">${escHtml(role)}</span>`;
+        if (agent) html += `<span class="log-agent">${escHtml(agent)}</span>`;
+        if (timeStr) html += `<span class="log-time">${escHtml(timeStr)}</span>`;
+        html += '</div>';
+
+        for (const part of parts) {
+          const type = part.type || '';
+          if (type === 'text' && part.text) {
+            html += `<div class="log-text">${escHtml(part.text)}</div>`;
+          } else if (type === 'reasoning' && part.text) {
+            html += `<div class="log-reasoning">[thinking] ${escHtml(part.text)}</div>`;
+          } else if (type === 'tool') {
+            const toolName = part.tool || '?';
+            let toolText = `[tool: ${toolName}]`;
+            if (part.input) toolText += ` ${escHtml(String(part.input).substring(0, 200))}`;
+            if (part.output) toolText += ` → ${escHtml(String(part.output).substring(0, 200))}`;
+            html += `<div class="log-tool"><span class="log-tool-name">${escHtml(toolName)}</span> ${toolText}</div>`;
+          }
+        }
+        html += '</div>';
+      }
+      logPanelBody.innerHTML = html;
+      // Auto-scroll to bottom
+      logPanelBody.scrollTop = logPanelBody.scrollHeight;
+    }
   </script>
 </body>
 </html>

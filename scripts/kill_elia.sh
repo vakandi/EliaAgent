@@ -3,11 +3,11 @@
 # kill_elia.sh — Clean up EliaAI processes and tmux session
 #
 # Session name: elia-ui (matches EliaUI.command)
-# Previous bug: targeted "elia" which collided with opencode sessions
+# Previous bug: targeted "elia-dev" (from deprecated elia-ui-4win.sh)
 # =============================================================================
 
 PORT="${1:-4096}"
-SESSION="elia-ui"
+SESSION="elia-ui"  # FIXED: was "elia-dev", now matches EliaUI.command
 
 is_already_opencode_server() {
     local pid
@@ -16,11 +16,14 @@ is_already_opencode_server() {
 
     local process_name
     process_name=$(ps -p "$pid" -o comm= 2>/dev/null || echo "")
-    # Accept "opencode" binary OR "node" process (opencode runs on Node.js)
-    [[ "$process_name" == *"opencode"* ]] || [[ "$process_name" == "node" ]] || return 1
+    [[ "$process_name" == *"opencode"* ]] || return 1
 
-    echo "[kill_elia] Found existing opencode server on port $PORT (PID: $pid) — skipping kill" >&2
-    return 0
+    if nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
+        echo "[kill_elia] Found existing opencode server on port $PORT (PID: $pid) — skipping kill" >&2
+        return 0
+    fi
+
+    return 1
 }
 
 # ============================================================
@@ -50,6 +53,7 @@ if ! is_already_opencode_server; then
     fi
 
     # Kill EliaAI-specific child processes (scoped, not system-wide)
+    # Only kill processes started by EliaAI scripts, not arbitrary node/python
     pkill -f "opencode-serve.sh" 2>/dev/null || true
     pkill -f "start_elias_discord.sh" 2>/dev/null || true
     sleep 1

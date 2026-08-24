@@ -1493,25 +1493,13 @@ export const OpencodeMemPlugin = async ({
       filesModified: sessionContext.filesModified,
     });
 
-  /** Matches viewer feed chips + `buildProjectParams` base/agent convention. */
+  /** Use the agent name as-is from OpenCode config/events — no hardcoded map. */
   const normalizeOpenCodeAgentLabel = (raw) => {
     if (!raw) return "";
-    const s = String(raw)
-      // strip common zero-width chars that show up in OpenCode agent labels
+    return String(raw)
       .replace(/[\u200B-\u200D\uFEFF]/g, "")
       .trim()
       .toLowerCase();
-    if (!s) return "";
-    if (s.includes("gilfoyle")) return "gilfoyle";
-    if (s.includes("elia")) return "elia";
-    if (s.includes("setbon")) return "setbon";
-    if (s.includes("yourbrand-promoter")) return "yourbrand-promoter";
-    if (s.includes("yourco-promoter")) return "yourco-promoter";
-    if (s.includes("yourbrand")) return "yourbrand";
-    if (s.includes("yourco-agency") || s.includes("yourco agency")) return "yourco-agency";
-    if (s.includes("yourtool")) return "yourtool";
-    // Fallback: take first token (before spaces/dashes) to avoid long labels.
-    return s.split(/[\s-]+/)[0] || "";
   };
 
   const resolveAgentScope = () => {
@@ -2429,32 +2417,29 @@ export const OpencodeMemPlugin = async ({
       }
     },
     tool: {
-      "mem-status": tool({
+      // ── Per-agent tools (default) ──────────────────────────────────
+
+      "mem-stats": tool({
         description:
-          "Show codemem stats (global DB) and recent entries scoped to the current OpenCode agent/project when known",
+          "Show codemem stats for this agent/project (stats itself is DB-level, appended with scope info). Use mem-all-stats for raw global stats.",
         args: {},
         async execute() {
-          const stats = await runCli(["stats"]);
           const scope = resolveAgentScope();
-          const recent = await runCli(buildMemRecentCliArgs("5"));
-          const lines = [
-            `viewer: http://${viewerHost}:${viewerPort}`,
-            `log: ${logPath || "disabled"}`,
-            `recent query --project: ${scope || "(default: repo root / CODEMEM_PROJECT)"}`,
-          ];
-          if (stats.exitCode === 0 && stats.stdout.trim()) {
-            lines.push("", "stats (global database):", stats.stdout.trim());
+          const stats = await runCli(["stats"]);
+          const lines = [];
+          if (stats.exitCode === 0) {
+            lines.push(stats.stdout.trim() || "No stats yet.");
+          } else {
+            lines.push(`Failed to fetch stats: ${stats.stderr || stats.exitCode}`);
           }
-          if (recent.exitCode === 0 && recent.stdout.trim()) {
-            lines.push("", "recent (scoped):", recent.stdout.trim());
-          }
+          lines.push(`\nscope: ${scope || "(no agent — whole DB)"}`);
           return lines.join("\n");
         },
       }),
 
       "mem-recent": tool({
         description:
-          "Show recent codemem entries for the current session agent when known (same --project convention as inject/pack)",
+          "Show recent codemem entries for the current agent/project. Use mem-all-recent for all.",
         args: {
           limit: tool.schema.number().optional(),
         },
@@ -2468,8 +2453,69 @@ export const OpencodeMemPlugin = async ({
         },
       }),
 
-      "mem-stats": tool({
-        description: "Show codemem stats for the entire local database (not agent-filtered)",
+      "mem-status": tool({
+        description:
+          "Show stats (global DB) + recent entries scoped to the current agent/project.",
+        args: {},
+        async execute() {
+          const scope = resolveAgentScope();
+          const [statsResult, recentResult] = await Promise.all([
+            runCli(["stats"]),
+            runCli(buildMemRecentCliArgs("5")),
+          ]);
+          const lines = [
+            `viewer: http://${viewerHost}:${viewerPort}`,
+            `log: ${logPath || "disabled"}`,
+            `scope: ${scope || "(no agent — whole DB)"}`,
+          ];
+          if (statsResult.exitCode === 0 && statsResult.stdout.trim()) {
+            lines.push("", "stats (global DB):", statsResult.stdout.trim());
+          }
+          if (recentResult.exitCode === 0 && recentResult.stdout.trim()) {
+            lines.push("", "recent (scoped):", recentResult.stdout.trim());
+          }
+          return lines.join("\n");
+        },
+      }),
+
+      "mem-specificagent-stats": tool({
+        description:
+          "Alias for mem-stats — stats + scope info for current agent/project.",
+        args: {},
+        async execute() {
+          const scope = resolveAgentScope();
+          const stats = await runCli(["stats"]);
+          const lines = [];
+          if (stats.exitCode === 0) {
+            lines.push(stats.stdout.trim() || "No stats yet.");
+          } else {
+            lines.push(`Failed to fetch stats: ${stats.stderr || stats.exitCode}`);
+          }
+          lines.push(`\nscope: ${scope || "(no agent — whole DB)"}`);
+          return lines.join("\n");
+        },
+      }),
+
+      "mem-specificagent-recent": tool({
+        description:
+          "Alias for mem-recent — recent entries scoped to the current agent/project.",
+        args: {
+          limit: tool.schema.number().optional(),
+        },
+        async execute({ limit }) {
+          const safeLimit = Number.isFinite(limit) ? String(limit) : "5";
+          const recent = await runCli(buildMemRecentCliArgs(safeLimit));
+          if (recent.exitCode === 0) {
+            return recent.stdout.trim() || "No recent memories.";
+          }
+          return `Failed to fetch recent: ${recent.stderr || recent.exitCode}`;
+        },
+      }),
+
+      // ── Global / cross-agent tools ─────────────────────────────────
+
+      "mem-all-stats": tool({
+        description: "Show codemem stats for the entire database (all agents).",
         args: {},
         async execute() {
           const stats = await runCli(["stats"]);
@@ -2477,6 +2523,44 @@ export const OpencodeMemPlugin = async ({
             return stats.stdout.trim() || "No stats yet.";
           }
           return `Failed to fetch stats: ${stats.stderr || stats.exitCode}`;
+        },
+      }),
+
+      "mem-all-recent": tool({
+        description: "Show recent codemem entries for all agents/projects.",
+        args: {
+          limit: tool.schema.number().optional(),
+        },
+        async execute({ limit }) {
+          const safeLimit = Number.isFinite(limit) ? String(limit) : "5";
+          const recent = await runCli(["recent", "--limit", safeLimit]);
+          if (recent.exitCode === 0) {
+            return recent.stdout.trim() || "No recent memories.";
+          }
+          return `Failed to fetch recent: ${recent.stderr || recent.exitCode}`;
+        },
+      }),
+
+      "mem-all-status": tool({
+        description: "Show stats + recent entries for the entire database (all agents).",
+        args: {},
+        async execute() {
+          const [statsResult, recentResult] = await Promise.all([
+            runCli(["stats"]),
+            runCli(["recent", "--limit", "5"]),
+          ]);
+          const lines = [
+            `viewer: http://${viewerHost}:${viewerPort}`,
+            `log: ${logPath || "disabled"}`,
+            "scope: ALL agents (global database)",
+          ];
+          if (statsResult.exitCode === 0 && statsResult.stdout.trim()) {
+            lines.push("", "stats (global):", statsResult.stdout.trim());
+          }
+          if (recentResult.exitCode === 0 && recentResult.stdout.trim()) {
+            lines.push("", "recent (global):", recentResult.stdout.trim());
+          }
+          return lines.join("\n");
         },
       }),
     },

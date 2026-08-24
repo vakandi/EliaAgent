@@ -1,6 +1,6 @@
 # Chrome Extension Testing Guide
 
-This document describes the testing workflow for the Snapchat Auto Add Chrome extension, including how to load the extension, interact with it, register devices with the YourBrand backend, and access logs.
+This document describes the testing workflow for the Snapchat Auto Add Chrome extension, including how to load the extension, interact with it, register devices with the your-brand backend, and access logs.
 
 ## Table of Contents
 
@@ -26,9 +26,9 @@ This document describes the testing workflow for the Snapchat Auto Add Chrome ex
 
 ### Master Key
 
-Before testing, you need a valid master key from the YourBrand admin panel:
+Before testing, you need a valid master key from the your-brand admin panel:
 
-1. Go to: `https://[your-store].com/admin?section=channels`
+1. Go to: `https://your-brand.com/admin?section=channels`
 2. Click **Master Key** button
 3. Click **Régénérer** to generate a new key
 4. Copy the key (e.g., `tSinZmbOZu-Glet4wjJbM-HDNgUafmFXQ_r9sWfPAIw`)
@@ -44,7 +44,7 @@ The `agent-browser` tool supports loading Chrome extensions via the `--extension
 ```bash
 # Load the extension and open a blank page
 agent-browser --profile ~/.agent-browser-profile \
-  --extension "/path/to/chrome-extension" \
+  --extension "~/Documents/MultiSaasDeploy/snapchat_army/snapchat_ecommerce_chrome_extension" \
   open about:blank
 ```
 
@@ -56,7 +56,7 @@ agent-browser --profile ~/.agent-browser-profile \
 # Open Chrome with extension loaded via command line
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
   --remote-debugging-port=9222 \
-  --extension="/path/to/chrome-extension" \
+  --extension="~/Documents/MultiSaasDeploy/snapchat_army/snapchat_ecommerce_chrome_extension" \
   --user-data-dir=/tmp/chrome-with-ext \
   --no-first-run \
   --no-default-browser-check
@@ -136,7 +136,7 @@ agent-browser --profile ~/.agent-browser-profile snapshot
 4. **Fill in the Snapchat Account**:
    ```bash
    # Fill the Snapchat Account field (ref=e11)
-   agent-browser fill "ref=e11" "youragency.dev"
+   agent-browser fill "ref=e11" "your-agency.dev"
    ```
 
 5. **Click Register Button**:
@@ -172,7 +172,7 @@ Look for these entries in the logs:
 
 ```bash
 # Test the registration endpoint directly
-curl -X POST "https://[your-store].com/api/snapchat-ext/register" \
+curl -X POST "https://your-brand.com/api/snapchat-ext/register" \
   -H "Content-Type: application/json" \
   -H "X-Snapchat-Extension-Key: YOUR_MASTER_KEY" \
   -d '{
@@ -181,7 +181,7 @@ curl -X POST "https://[your-store].com/api/snapchat-ext/register" \
     "extension_version": "1.0.0",
     "browser": "chrome",
     "os": "MacIntel",
-    "snapchat_account_hint": "youragency.dev"
+    "snapchat_account_hint": "your-agency.dev"
   }'
 ```
 
@@ -248,7 +248,7 @@ Unfortunately, Chrome MV3 service workers cannot be accessed programmatically vi
 ### Registration Fails
 
 - Verify master key is valid (not expired)
-- Check network connectivity to `https://[your-store].com`
+- Check network connectivity to `https://your-brand.com`
 - Look at popup logs for error messages
 
 ### Service Worker Inactive
@@ -265,7 +265,7 @@ Unfortunately, Chrome MV3 service workers cannot be accessed programmatically vi
 
 ```bash
 agent-browser --profile ~/.agent-browser-profile \
-  --extension "/path/to/chrome-extension" \
+  --extension "~/Documents/MultiSaasDeploy/snapchat_army/snapchat_ecommerce_chrome_extension" \
   open about:blank
 ```
 
@@ -289,7 +289,7 @@ agent-browser open "chrome-extension://{EXTENSION_ID}/popup.html"
 ### Test API registration
 
 ```bash
-curl -X POST "https://[your-store].com/api/snapchat-ext/register" \
+curl -X POST "https://your-brand.com/api/snapchat-ext/register" \
   -H "Content-Type: application/json" \
   -H "X-Snapchat-Extension-Key: YOUR_KEY" \
   -d '{"device_id":"UUID","device_name":"Test","extension_version":"1.0.0","browser":"chrome","os":"MacIntel"}'

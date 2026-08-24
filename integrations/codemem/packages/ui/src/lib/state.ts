@@ -193,7 +193,7 @@ export type FeedFilter = (typeof FEED_FILTERS)[number];
 export const FEED_SCOPES = ["all", "mine", "theirs"] as const;
 export type FeedScope = (typeof FEED_SCOPES)[number];
 
-export const AGENT_FILTERS = ["all", "elia", "gilfoyle", "setbon", "yourbrand", "yourco-agency", "yourtool", "yourco-promoter", "yourbrand-promoter"] as const;
+export const AGENT_FILTERS = ["all", "elia", "gilfoyle", "setbon", "bene2luxe", "cobou-agency", "zovaboost", "cobou-promoter", "bene2luxe-promoter"] as const;
 export type AgentFilter = (typeof AGENT_FILTERS)[number];
 
 /* ── Mutable application state ─────────────────────────────── */

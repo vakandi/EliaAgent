@@ -140,9 +140,10 @@ EliaAI runs an AI agent (OpenCode) on a schedule and from the **Elia** overlay. 
 - [Proxy Switcher](#proxy-switcher)
 - [Elia UI (Electron)](#elia-ui-electron)
 - [Model selection (UI → cron)](#model-selection-ui--cron)
-- [Scheduled runs (cron or LaunchAgent)](#scheduled-runs-cron-or-launchagent)
+- [Scheduled runs (cron)](#scheduled-runs-cron)
 - [Manual & voice runs](#manual--voice-runs)
 - [Subagent System](#subagent-system)
+- [Subworker Server & ColimaBar (Menu Bar Control)](#subworker-server--colimabar-menu-bar-control)
 - [Key files & layout](#key-files--layout)
 - [Troubleshooting](#troubleshooting)
 - [Discord Integration](#discord-integration)
@@ -156,13 +157,15 @@ EliaAI runs an AI agent (OpenCode) on a schedule and from the **Elia** overlay. 
 
 | Part | Role |
 |------|------|
-| **Elia (ui_electron)** | Floating overlay: pick AI model (BigPickle / Kimi2.5 / MiniMax2.5), click orb to run voice dictate. |
-| **start_agents.sh** | Entry point for runs: `--model=...` and optional `--extra-prompt`. |
-| **trigger_opencode_interactive.sh** | What cron/voice/Telegram runs: uses `oh-my-opencode` for rich logging and ULW-Loop support. |
-| **.opencode_model** | One line: `big-pickle` \| `nvidia` \| `minimax`. Set by Elia when you change the model. |
-| **manage_cron.sh** | Install/uninstall/show the scheduled job (user or root crontab with `--sudo`). |
+| **Elia (ui_electron)** | Floating overlay: pick AI model, click orb to run voice dictate. |
+| **trigger_template.js** | Main agent (Elia) trigger for voice/UI: `node subworkers/scripts/trigger_template.js --agent elia`, uses `oh-my-opencode` for rich logging and ULW-Loop support. **Subworkers use the Docker server, NOT this script.** |
+| **Docker subworker server** | FastAPI on port 5656 (`subworkers/server/`). Schedules and runs all subworkers (Gilfoyle, Setbon, Picasso…) via APScheduler + `opencode serve` on port 4096. |
+| **model-selections.json** | `ui_electron/model-selections.json`: per-agent model choice (full `opencode/*` id). Auto-loaded by trigger_template.js. |
+| **.opencode_model** | One line: `big-pickle` \| `deepseek-v4-flash-free` \| `mimo-v2.5-free` \| `nemotron-3-ultra-free` (legacy short id, kept for backward compat). |
 
-Flow: **Elia model choice** → saved in UI and in **`.opencode_model`** → **cron/LaunchAgent** runs `trigger_opencode_interactive.sh` → script reads `.opencode_model` and uses **`oh-my-opencode run -a elia`** for rich logging.
+Flow: **Elia model choice** → saved in UI, in **`ui_electron/model-selections.json`** and in **`.opencode_model`** → **Docker subworker server** (port 5656) schedules subworkers via APScheduler; **voice/UI** triggers main agent via `trigger_template.js` → `oh-my-opencode run -a elia` for rich logging.
+
+> **Main agent**: Elia is the main agent (see `subworkers/main-agent.json`). The main agent runs with the **repo root** as workspace (the EliaAI repo root) instead of an isolated `subworkers/<name>/workspace`. You can change which subworker is main from the subworker popup (★ button / MAIN badge).
 
 ---
 
@@ -215,13 +218,13 @@ IP:PORT:USERNAME:PASSWORD
 
 Example:
 ```
-[proxy-ip:port:user:pass]
-[proxy-ip:port:user:pass]
+198.51.100.42:6495:user1:pass1
+198.51.100.99:6677:user1:pass2
 ```
 
 After use, history is appended:
 ```
-[proxy-ip:port:user:pass] |last:2026-03-24 01:17:42 |dur:0h 5m
+198.51.100.42:6495:user1:pass1 |last:2026-03-24 01:17:42 |dur:0h 5m
 ```
 
 ### Setup
@@ -273,9 +276,7 @@ Scripts automatically detect proxy via `.proxy_enabled` file or `USE_PROXY=1` fl
 touch ~/EliaAI/.proxy_enabled
 
 # Run with proxy (automatic)
-./start_agents.sh --extra-prompt="task"
-./manage_cron.sh install --proxy
-~/EliaAI/scripts/trigger_opencode_interactive.sh
+node ~/EliaAI/subworkers/scripts/trigger_template.js --agent elia
 ```
 
 **Manual usage with wrapper:**
@@ -322,7 +323,7 @@ To clear all history and start fresh:
 ```bash
 # Clear proxies.txt (keeps proxy list, removes history)
 cat > ~/EliaAI/setup/proxies.txt << 'EOF'
-[proxy-ip:port:user:pass]
+YOUR_PROXY_IP:PORT:USER:PASS
 YOUR_OTHER_PROXY:PORT:USER:PASS
 EOF
 
@@ -340,8 +341,8 @@ echo "start" > ~/.proxychains.current
 
 **In the UI:**
 
-- **Model badges:** BigPickle (red), Kimi2.5 (green), MiniMax2.5 (yellow). One selected at a time; selection is saved in the app and in **`.opencode_model`** so the 2h cron uses the same model.
-- **Orb click:** Starts voice dictate (Whisper → text → `start_agents.sh` with selected model and prompt).
+- **Model badges:** BigPickle (red), DeepSeek V4 Flash (blue), MIMO V2.5 (purple), Nemotron 3 Ultra (cyan). One selected at a time; selection is saved in the app, in **`.opencode_model`**, and in **`ui_electron/model-selections.json`** so cron/voice runs use the same model.
+- **Orb click:** Starts voice dictate (Whisper → text → `trigger_template.js` with selected model and prompt).
 - **Close button:** Hides the window (tray icon still available).
 
 Debug: from the repo root, `./ui_electron/run-debug.sh` then attach DevTools to the Electron window if needed.
@@ -350,70 +351,60 @@ Debug: from the repo root, `./ui_electron/run-debug.sh` then attach DevTools to 
 
 ## Model selection (UI → cron)
 
-- **In Elia:** Choosing a badge updates the UI and writes `EliaAI/.opencode_model` (one line: `big-pickle`, `nvidia`, or `minimax`).
-- **trigger_opencode_interactive.sh** (used by cron/LaunchAgent) reads `.opencode_model` if present and sets `OPENCODE_MODEL` accordingly. Uses `oh-my-opencode run` for rich timestamp logging. No need to reinstall cron when you change the model in the UI.
+- **In Elia:** Choosing a badge updates the UI, writes `EliaAI/.opencode_model` (one line short id) and `ui_electron/model-selections.json` (full `opencode/*` id).
+- **trigger_template.js** (used by voice/UI — main agent Elia only; **pas pour les subworkers**, qui passent par le Docker server) auto-loads the model from `model-selections.json` if `--model` is not passed. Uses `oh-my-opencode run` for rich timestamp logging.
 
 | UI badge   | `.opencode_model` | OpenCode model used                    |
 |------------|--------------------|----------------------------------------|
 | BigPickle  | `big-pickle`       | opencode/big-pickle                    |
-| Kimi2.5    | `nvidia`           | mistralai/mixtral-8x7b-instruct-v0.1  |
-| MiniMax2.5 | `minimax`          | opencode/minimax-m2.5-free            |
+| DeepSeek V4 Flash | `deepseek-v4-flash-free` | opencode/deepseek-v4-flash-free |
+| MIMO V2.5  | `mimo-v2.5-free`   | opencode/mimo-v2.5-free                |
+| Nemotron 3 Ultra | `nemotron-3-ultra-free` | opencode/nemotron-3-ultra-free    |
 
 ---
 
-## Scheduled runs (cron or LaunchAgent)
+## Scheduled runs (Docker subworker server)
 
-### Option A – Cron (manage_cron.sh)
+All subworker scheduling is handled by the **Docker subworker server** (`subworkers/server/`, port 5656). It uses APScheduler internally to run subworkers on their configured schedules.
 
-**User crontab (default):**
-
-```bash
-cd ~/EliaAI
-
-# Every 2 hours, 10:00–22:00
-./manage_cron.sh install --interval 2h --start 10 --end 22
-
-# Show current user cron
-./manage_cron.sh show
-```
-
-**If cron doesn't run on your Mac (e.g. permissions), use root crontab but run the job as your user:**
+**Start/stop:**
 
 ```bash
-./manage_cron.sh install --interval 2h --start 10 --end 22 --sudo
-# Uninstall: ./manage_cron.sh uninstall --sudo
-# Show root crontab: ./manage_cron.sh show --sudo
+cd ~/EliaAI/subworkers/server && docker compose up --build   # start
+docker compose down                                          # stop
+curl http://localhost:5656/health                            # health check
 ```
 
-Intervals: `20min`, `30min`, `1h`, `2h`, `3h`, `4h`. The cron job runs `trigger_opencode_interactive.sh`, which uses the model from **`.opencode_model`** (i.e. the last model you selected in Elia) and `oh-my-opencode run` for rich logging.
-
-### Option B – LaunchAgent (every 2 hours, no cron)
+**Configure schedules** in `subworkers/server/app/config/subworkers.json` — each subworker has a `schedule_type` (cron, interval, or manual) and `schedule` expression. Toggle enabled/disabled via ColimaBar menu bar or the API:
 
 ```bash
-./install_launchagent.sh
+curl -X POST http://localhost:5656/enable/refund-hunter     # enable
+curl -X POST http://localhost:5656/disable/refund-hunter    # disable
+curl -X POST http://localhost:5656/trigger/refund-hunter    # run now
 ```
 
-Uses `com.elia.mycroft-agent.plist`; runs `trigger_opencode_interactive.sh` at 10:00, 12:00, 14:00, 16:00, 18:00, 20:00. Same script, so it also respects `.opencode_model` and uses `oh-my-opencode run`.
+**Main agent (Elia)** voice/UI triggers still use `trigger_template.js` directly — not the Docker server.
 
 ---
 
 ## Manual & voice runs
 
-- **Manual (CLI):**  
-  `./start_agents.sh --model=big-pickle` (or `nvidia`, `minimax`) and optionally `--extra-prompt="..."`.
-- **Interactive (dictate-style, with real-time output):**  
-  `OPENCODE_MODEL=opencode/big-pickle ./trigger_opencode_interactive.sh` (or set `OPENCODE_MODEL` to the model you want).
-- **Voice from Elia:** Click the orb → dictate → transcription is sent to `start_agents.sh` with the **currently selected model** in the UI.
+- **Direct trigger (with real-time output):**  
+  `node subworkers/scripts/trigger_template.js --agent elia --prompt "task"` (model auto-loaded from `model-selections.json`, or pass `--model opencode/big-pickle`).
+- **Voice from Elia:** Click the orb → dictate → transcription is sent to `trigger_template.js` with the **currently selected model** in the UI.
+- **Subworker trigger:**  
+  `curl -X POST http://localhost:5656/trigger/<name>` (via Docker server)
 
 ---
 
 ## OpenCode Script Architecture
 
-### The Two Scripts
+### The Trigger
 
 | Script | Purpose | Status |
 |--------|---------|--------|
-| `trigger_opencode_interactive.sh` | **ACTIVE** - Used by cron, voice, Telegram | ✅ In use |
+| `subworkers/scripts/trigger_template.js` | **ACTIVE** - Déclencheur du main agent (Elia): cron, voice, UI (run-morning-routine / run-cron-manual). Uses `oh-my-opencode run` for rich logging and ULW-Loop support. | ✅ In use |
+| `subworkers/server/` (Docker) | **ACTIVE** - Système des **subworkers**: FastAPI port 5656 + `opencode serve` port 4096. Les subworkers (Gilfoyle, Setbon, Picasso…) sont lancés par ce système, PAS par trigger_template.js. | ✅ In use |
 
 ### What Calls What
 
@@ -422,29 +413,29 @@ Uses `com.elia.mycroft-agent.plist`; runs `trigger_opencode_interactive.sh` at 1
 │                    ENTRY POINTS                             │
 ├─────────────────────────────────────────────────────────────┤
 │                                                              │
-│  CRON/JOBS                                                   │
-│  └── manage_cron.sh                                          │
-│      └── cron_wrapper.sh                                      │
-│          └── trigger_opencode_interactive.sh  ← USED ✅      │
+│  VOICE (Elia)                                                │
+│  └── Click orb → trigger_template.js --agent elia  ← ✅    │
 │                                                              │
-│  VOICE (Elia)                                              │
-│  └── Click orb → start_agents.sh                            │
-│      └── trigger_opencode_interactive.sh  ← USED ✅         │
+│  UI (Elia overlay)                                           │
+│  └── run-morning-routine / run-cron-manual IPC               │
+│      └── node trigger_template.js --agent elia  ← ✅         │
 │                                                              │
-│  TELEGRAM                                                    │
-│  └── /extraprompt command                                    │
-│      └── trigger_opencode_interactive.sh  ← USED ✅        │
+│  SUBWORKERS (Gilfoyle, Setbon, Picasso…)                     │
+│  └── Docker subworker server (subworkers/server, port 5656)  │
+│      └── APScheduler → opencode serve (port 4096)            │
+│      └── PAS trigger_template.js                            │
 │                                                              │
-│  CLI MANUAL                                                  │
-│  └── ./start_agents.sh [args]                               │
-│      └── trigger_opencode_interactive.sh  ← USED ✅         │
+│  CLI (main agent)                                            │
+│  └── node subworkers/scripts/trigger_template.js --agent elia│
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
+> **Archived**: `scripts/trigger_morning.sh` and `scripts/trigger_opencode_interactive.sh` were the old shell triggers. They are preserved in `scripts/backup/` and are no longer called by any runtime entry point.
+
 ### oh-my-opencode Integration
 
-`trigger_opencode_interactive.sh` uses `oh-my-opencode run` which provides:
+`trigger_template.js` uses `oh-my-opencode run` which provides:
 
 1. **Rich timestamp logging** - Every line prefixed with `[HH:MM:SS]`
 2. **ULW-Loop support** - Unlimited iterative autonomous work
@@ -544,13 +535,13 @@ task(category="ecommerce-luxury", load_skills=["luxury-fashion-marketing-genius"
 |----------|------|--------|-----------------|
 | `backend-dev` | Oliver | APIs, databases, Docker, CI/CD | "The solution is straightforward." |
 | `frontend-dev` | James | React, UI/UX, animations | "It should make you want to click." |
-| `finance-ops` | William | Invoicing, payments, [Your Partner] | "Money follows when work is done well." |
+| `finance-ops` | William | Invoicing, payments, your-partner | "Money follows when work is done well." |
 | `marketing-social` | Victoria | TikTok, YouTube, Snapchat campaigns | "The best marketing doesn't feel like marketing." |
 | `sales-closing` | Charles | Lead generation, conversion, closing | "The deal isn't closed until it's signed." |
 | `hr-recruitment` | Elizabeth | Hiring, recruitment, employee management | "The best hires are the ones where you don't hesitate." |
 | `content-creation` | Marcus | Videos, thumbnails, scheduling, FFmpeg | "Content is king, but distribution is queen." |
-| `ecommerce-luxury` | Charlotte | [Your Brand] luxury fashion resale | "Luxury is in the details. And in authenticity." |
-| `partnership-yourpartner` | Alexander | [Partner Social] coordination, relationship management | "Strong partnership, strong business." |
+| `ecommerce-luxury` | Charlotte | Luxury e-commerce business | "Luxury is in the details. And in authenticity." |
+| `partnership-coordination` | Alexander | Partner coordination, relationship management | "Strong partnership, strong business." |
 | `operations-workflow` | Sebastian | Jira, workflows, multi-SaaS deployment | "A good system runs itself. A great system improves itself." |
 | `dm-customer-comms` | Catherine | WhatsApp, Telegram, Discord support | "Every message is an impression. Make it count." |
 | `snapchat-growth` | Ethan | Bot farms, account creation, ad campaigns | "In growth, speed beats perfection." |
@@ -563,8 +554,8 @@ Each subagent can be equipped with relevant skills for enhanced performance:
 | Skill | Best For |
 |-------|----------|
 | `coding-agent` | General coding tasks |
-| `master-sales` | Sales copywriting, campaigns for [Your Brand] |
-| `luxury-fashion-marketing-genius` | Luxury fashion marketing ([Your Brand]) |
+| `master-sales` | Sales copywriting, campaigns for your-brand |
+| `luxury-fashion-marketing-genius` | Luxury fashion marketing (your-brand) |
 | `frontend-ui-ux` | Design decisions, UI components |
 | `git-master` | Git operations, atomic commits |
 | `dev-browser` | Browser automation, web testing |
@@ -709,8 +700,8 @@ You are [Name], [Role description].
       "mode": "primary",
       "color": "#EC4899"
     },
-    "yourbrand": {
-      "description": "[Your Brand] - Luxury fashion resale",
+    "your-brand": {
+      "description": "your-brand - Luxury fashion resale",
       "mode": "primary"
     },
     "setbon": {
@@ -760,7 +751,7 @@ You are [Name], [Role description].
 **Solution in trigger scripts:**
 
 ```bash
-# In trigger_opencode_interactive.sh - use ZWJ character in agent name
+# In trigger_template.js - use ZWJ character in agent name
 oh-my-opencode run \
   -a "Sisyphus - Ultraworker" \
   --port 4096 \
@@ -789,7 +780,7 @@ opencode run \
 
 | Command | Use For |
 |---------|---------|
-| `oh-my-opencode run -a <agent>` | Subagents (yourbrand, setbon, gilfoyle, etc.) |
+| `oh-my-opencode run -a <agent>` | Subagents (your-agents, etc.) |
 | `opencode run --agent <agent>` | Primary agents only (sisyphus, prometheus, etc.) |
 
 **Why:** Direct `opencode` (v1.3.10) doesn't support categories/subagents - it shows:
@@ -807,9 +798,9 @@ oh-my-opencode run -a <agent> "<task/message>"
 
 # Available Subagents
 oh-my-opencode run -a setbon "Message pour Setbon"           # Marketing
-oh-my-opencode run -a yourbrand "Message pour [Your Brand]"      # Luxury e-commerce
-oh-my-opencode run -a your-agency "Message pour Your Agency"      # B2B digital
-oh-my-opencode run -a your-saas "Message pour Your SaaS"    # SMMPanel
+oh-my-opencode run -a your-agent "Your message"      # Luxury e-commerce
+oh-my-opencode run -a your-agent "Your message"      # B2B digital
+oh-my-opencode run -a zovaboost "Message pour ZovaBoost"    # SMMPanel
 oh-my-opencode run -a gilfoyle "Message pour Gilfoyle"       # Backend dev
 oh-my-opencode run -a picasso "Message pour Picasso"         # Frontend/UI
 oh-my-opencode run -a tiktok-youtube-auto "Message"          # TikTok/YouTube
@@ -831,28 +822,100 @@ oh-my-opencode run -a setbon "任务" --ulw-loop --completion-promise DONE --max
 
 ---
 
+## Subworker Server & ColimaBar (Menu Bar Control)
+
+The **Docker subworker server** (FastAPI) uses a centralized JSON config for scheduling. **ColimaBar** (a menu-bar app, source in `~/Documents/EliaTopBar`) gives you real-time control and monitoring of subworkers right from the menu bar.
+
+> 📄 Full deep-dive: [`docs/SUBWORKERS_COLIMABAR_CONNECTION.md`](../docs/SUBWORKERS_COLIMABAR_CONNECTION.md) — lifecycle, exact API contract, and failure modes.
+
+### How they connect
+
+```
+ColimaBar (menu bar)
+   │  WS ws://localhost:5656/ws   (live status, real-time events)
+   │  HTTP fallback GET /status   (5s polling when WS is down)
+   │  HTTP GET /server/health     (30s)
+   │  HTTP POST /trigger|/enable|/disable|/logs
+   ▼
+Docker container elia-subworker-srv  (FastAPI, port 5656, host network)
+   ▼
+opencode serve subprocess (http://127.0.0.1:4096) → subworker agents (PROMPT.md)
+```
+
+### What you can do from the menu bar
+
+| Menu item | Action |
+|-----------|--------|
+| ⚡ **Trigger Now** / Manual Run Subworker | `POST /trigger/{name}` — run a subworker immediately |
+| ▶️ **Enable** / ⏸️ **Disable** | `POST /enable/{name}` / `POST /disable/{name}` — toggle in `subworkers.json` |
+| 📋 **View Logs…** | `GET /logs/{name}?lines=50` — tail of the subworker's log file in a popover |
+| 🔄 **Reconnect** | Reconnect WebSocket to the server |
+| 🔗 **Change Server URL…** | Point ColimaBar at the FastAPI server base URL (persisted in `UserDefaults["subworkerServerURL"]`) |
+| 🚀 / ● / 🔴 header | Live server status in the "Subworker Server" section |
+| 🤖 **Active Agents** list | Per-agent dot (⚡ running / ● idle / 💥 error / ○ disabled) with submenu |
+
+### ⚠️ Server URL gotcha (phantom 8080)
+
+ColimaBar's **default** base URL is `http://localhost:8080` — but the **real server runs on port 5656**. On a fresh setup (no saved URL) the menu bar will show **Disconnected** with a red `circle.slash` icon until you set **🔗 Change Server URL… → `http://localhost:5656`**.
+
+### Start / stop the server
+
+The `EliaUI.command` launcher (`~/Desktop/EliaUI.command`) starts all three services in tmux — opencode server (`opencode-serve`), Docker subworker server (`subworker-srv`), and the UI + Discord bot (`elia-ui`):
+
+```bash
+# Manual control (equivalent to what the launcher does)
+cd ~/EliaAI/subworkers/server && docker compose up --build   # start server
+docker compose down                                          # stop server (container only)
+curl http://localhost:5656/health                            # health check
+```
+
+- Killing `EliaUI.command` does **NOT** stop Docker — tmux sessions are detached.
+- Container: `elia-subworker-srv`, `network_mode: host`, `restart: unless-stopped`.
+- Config: `subworkers/server/app/config/server.json` (port 5656) + `subworkers.json` (subworker definitions & schedules).
+
+### API quick reference
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/health` | Docker healthcheck |
+| GET | `/status` | All subworkers `{name, enabled, running, next_run, schedule_type}` |
+| GET | `/status/{name}` | Detailed status + schedule + agent_id + model |
+| POST | `/trigger/{name}` | Run now |
+| POST | `/enable/{name}` / `/disable/{name}` | Toggle enabled state |
+| GET | `/logs/{name}?lines=N` | Recent log lines |
+| GET | `/server/health` | OpenCode server subprocess state/pid/restarts |
+| POST | `/server/restart` | Restart OpenCode server subprocess |
+| WS | `/ws` | Live events: `initial_status`, `pong`, `subworker_completed`, `subworker_error` |
+
+> ⚠️ **Current limitation**: `lastError` / `lastCompleted` are only delivered over WebSocket events (`subworker_completed` / `subworker_error`), not in the HTTP `/status` payload. And the WS error event currently carries only the subworker `name`, so the menu bar shows "Unknown error".
+
+---
+
 ## Key files & layout
 
 ```
 EliaAI/
-├── .opencode_model          # One line: big-pickle | nvidia | minimax (set by Elia)
+├── .opencode_model          # One line: big-pickle | deepseek-v4-flash-free | mimo-v2.5-free | nemotron-3-ultra-free (set by Elia)
 ├── .omo_disabled           # Disable oh-my-opencode wrapper (raw opencode)
 ├── .ralph_mode             # Enable Ralph mode (50 iter) instead of ULW
-├── start_agents.sh          # Entry: --model=... --extra-prompt=... (voice/CLI)
-├── trigger_opencode.sh      # REMOVED: deprecated, replaced by trigger_opencode_interactive.sh
-├── trigger_opencode_interactive.sh  # ACTIVE: cron, voice, Telegram use this
-├── cron_wrapper.sh          # Wrapper: cron → trigger_opencode_interactive.sh
-├── manage_cron.sh           # install | uninstall | show [--sudo] [--interval 2h ...]
-├── install_launchagent.sh    # Install LaunchAgent (every 2h)
-├── com.elia.mycroft-agent.plist
 ├── config.json              # Elia/ntfy (optional; ui_electron may have its own)
 ├── ui_electron/             # Elia overlay app
 │   ├── src/main.js, preload.js, index.html
+│   ├── model-selections.json # Per-agent model choice (full opencode/* id)
 │   └── config.json
+├── subworkers/
+│   ├── main-agent.json      # Main agent designation ({"name":"elia"})
+│   ├── scripts/trigger_template.js  # ACTIVE trigger: main agent Elia (voice, UI) — PAS pour les subworkers
+│   ├── server/              # Docker subworker server (FastAPI port 5656)
+│   │   ├── docker-compose.yml
+│   │   ├── Dockerfile
+│   │   └── app/config/
+│   │       ├── server.json  # Server config (port, opencode URL)
+│   │       └── subworkers.json  # Subworker definitions & schedules
+│   └── elia/PROMPT.md       # Elia orchestrator prompt (main agent)
 ├── logs/
-│   ├── cron.log             # Cron wrapper output
-│   ├── opencode_interactive_*.log  # Main agent logs (rich format)
-│   └── launchd.log          # LaunchAgent runs
+│   ├── cron.log             # Main agent logs
+│   └── opencode_interactive_*.log  # Main agent logs (rich format)
 ├── context/                  # ⚠️ UPDATE THIS FOR YOURSELF - see setup guide below
 │   ├── business.md          # YOUR businesses, team, partners
 │   ├── jira-projects.md     # YOUR Jira project mappings
@@ -875,23 +938,22 @@ EliaAI/
 
 ## Troubleshooting
 
-- **Cron not firing on Mac**  
-  Use root crontab but run as your user:  
-  `./manage_cron.sh install --interval 2h --start 10 --end 22 --sudo`  
-  Uninstall with: `./manage_cron.sh uninstall --sudo`.
+- **Subworker not running**  
+  Check server health: `curl http://localhost:5656/health`  
+  Check subworker status: `curl http://localhost:5656/status`  
+  Restart server: `cd ~/EliaAI/subworkers/server && docker compose down && docker compose up --build`
 
 - **Scheduled job uses wrong model**  
   Ensure Elia has the desired model selected (so `.opencode_model` is updated). Check:  
   `cat ~/EliaAI/.opencode_model`  
-  **IMPORTANT**: Use ONLY free OpenCode models (big-pickle, minimax-m2.5-free). Do NOT use Claude/GPT/paid models.  
-  Cron/LaunchAgent do not need to be reinstalled when you change the model.
+  **IMPORTANT**: Use ONLY free OpenCode models (big-pickle, minimax-m2.5-free). Do NOT use Claude/GPT/paid models.
 
 - **Elia badges don't react**  
   Ensure the app was built/run after the latest fixes (mouse events and drag region). Use `./ui_electron/run-debug.sh` and DevTools if needed.
 
-- **Cron/LaunchAgent logs**  
-  - Cron: `tail -f EliaAI/logs/cron.log`  
-  - LaunchAgent: `tail -f EliaAI/logs/launchd.log`
+- **Logs**  
+  - Main agent: `tail -f EliaAI/logs/cron.log`  
+  - Subworker logs: `curl http://localhost:5656/logs/<name>?lines=50`
 
 ---
 
@@ -1008,7 +1070,7 @@ elia-discord-bot/
 
 ## Legacy / other backends
 
-EliaAI's **current** automation is: **Elia (Electron) + OpenCode + trigger_opencode_interactive.sh + oh-my-opencode + manage_cron.sh / LaunchAgent**, with model choice stored in **`.opencode_model`**.
+EliaAI's **current** automation is: **Elia (Electron) + OpenCode + subworkers/scripts/trigger_template.js (main agent) + Docker subworker server (subworkers, port 5656)**, with model choice stored in **`ui_electron/model-selections.json`** (and legacy `.opencode_model`).
 
 Older setups (Mycroft-style agent, `run_agent.sh`, `tasks_agent_job/`, Kiro / GitHub Copilot CLI / Gemini CLI) are not required for this flow. If you use them, see the rest of the docs in `setup/` (e.g. Kiro/Gemini/Copilot, MCP, PROMPT.md) and the scripts under `EliaAI/` and `tasks_agent_job/` as needed.
 
@@ -1206,7 +1268,7 @@ Please:
      * Set "fallbackModel": "opencode/big-pickle"
    - This ensures NO paid models (Claude, GPT, etc.) are ever used - only free OpenCode models
 
-2. Update context/business.md - Replace all references to "[YOUR NAME]", "[YOUR NAME]", "[Your Agency]", "[Your Brand]", "[Your Partner]", etc. with MY information:
+2. Update context/business.md - Replace all references to "your-name", "Your Name", "your-agency", "your-brand", "your-partner", etc. with MY information:
    - My name and profile
    - MY businesses (replace the examples with yours)
    - MY team members and partners
@@ -1238,15 +1300,15 @@ Please:
    - MY growth plans
 
 6. Update PROMPT.md:
-   - Replace "[YOUR NAME]" with MY name
-   - Replace "[YOUR NAME]" with MY surname
+   - Replace "your-name" with MY name
+   - Replace "YourName" with MY surname
    - Update business references to MY businesses
    - Update team members to MY team
    - Update communication channels to MY channels
    - Adjust personality to match MY preferences
 
 7. Update MORNING_PROMPT.md:
-   - Replace "[YOUR NAME]", "Rida", "Thomas", "Ali" team references with MY people
+   - Replace "your-name", "Rida", "Thomas", "Ali" team references with MY people
    - Update business tasks to MY businesses
    - Adjust the morning routine to match MY workflow
 
@@ -1268,7 +1330,7 @@ Please:
 9. Update the prompt_append in oh-my-opencode.json for EACH agent:
    - Find each category in the "categories" section
    - Update the prompt_append to say "**FIRST: Read your personality file at `/path/to/agents/[name].md`..."
-   - Replace "[YOUR NAME]", "[YOUR NAME]" with MY name in prompt_append text
+   - Replace "your-name", "YourName" with MY name in prompt_append text
    - Update business/tool references
    - ALSO ensure each agent in "agents" section has: "model": "opencode/big-pickle" AND "fallback_models": []
 
@@ -1331,7 +1393,7 @@ Key sections to update:
 
 ```
 Key sections to update:
-- MCP-CLI servers (YOUR servers, not [YOUR NAME]'s)
+- MCP-CLI servers (YOUR servers, not your-name's)
 - SSH hosts (YOUR actual servers)
 - Business Group JIDs (YOUR actual WhatsApp groups)
 - Individual Contacts (YOUR actual contacts)
@@ -1376,7 +1438,7 @@ Key sections to update:
 - Business references: YOUR businesses
 - Communication channels: YOUR actual groups
 - Team roles: YOUR team structure
-- All names: [YOUR NAME], Rida, Thomas, Ali → YOUR people
+- All names: your-name, Rida, Thomas, Ali → YOUR people
 ```
 
 #### 8. Update Global OpenCode AGENTS.md
@@ -1388,7 +1450,7 @@ This file sets the global personality for OpenCode. Find it at `~/.config/openco
 - Update personality description:
   - "You ARE Elia" - The ultimate assistant with master marketing skills, 
     master dev knowledge, and SaaS building expertise
-  - "Owner: [YOUR NAME]" → "Owner: [YOUR NAME]"
+  - "Owner: Your Name" → "Owner: [YOUR NAME]"
   - Update all business references to YOUR businesses
   - Update team references to YOUR team
   - Update communication channels to YOUR channels
@@ -1508,7 +1570,7 @@ elia-speak -x "Message"             # sexy (fallback)
 # python3 ~/EliaAI/setup/speak.py "Message" -x
 
 # MCP Servers - Source code available at:
-# https://github.com/yourusername/McpServers/settings/access
+# https://github.com/vakandi/McpServers/settings/access
 ```
 
 ---
@@ -1560,7 +1622,7 @@ Each SSH server has a `--blacklist` argument:
     "-y",
     "@fangjunjie/ssh-mcp-server",
     "--host",
-    "[server-ip]",
+    "YOUR.SERVER.IP",
     ...
     "--blacklist",
     "^docker\\s+(exec|run.*postgres|...),..."
@@ -1606,6 +1668,6 @@ After setup, verify:
 
 ---
 
-**Summary:** Pick the model in Elia; it's saved to `.opencode_model`. The 2h cron (or LaunchAgent) runs `trigger_opencode_interactive.sh` with `oh-my-opencode run` for rich logging. Use `manage_cron.sh install --interval 2h --sudo` if user cron doesn't run on your Mac.
+**Summary:** Pick the model in Elia; it's saved to `ui_electron/model-selections.json` and `.opencode_model`. The Docker subworker server (port 5656) schedules subworkers via APScheduler. The main agent (Elia) uses `trigger_template.js` for voice/UI triggers with `oh-my-opencode run` for rich logging. Use `docker compose up --build` in `subworkers/server/` to start the scheduler.
 
 **For YOUR setup**: Update the `context/` folder with YOUR business info, update `PROMPT.md` and `MORNING_PROMPT.md` with YOUR preferences, and customize the global `AGENTS.md` to set YOUR AI assistant's identity.

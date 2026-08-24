@@ -2,9 +2,10 @@
 name: elia-subworker-creator
 description: >-
   Create a new autonomous subworker in the EliaAI system. A subworker is an AI agent with its own personality
-  (stored in ~/.config/opencode/agents/), its own detailed prompt (in subworkers/<name>/PROMPT.md), a trigger
-  script, and an optional LaunchAgent plist for scheduling. This skill handles the FULL pipeline:
-  opencode.json registration → agent personality file → PROMPT.md → trigger script → plist → SUBWORKERS_SYSTEM.md update.
+  (stored in ~/.config/opencode/agents/), its own detailed prompt (in subworkers/<name>/PROMPT.md), and an
+  entry in the subworker server config (subworkers/server/app/config/subworkers.json) which schedules and
+  triggers it (Docker FastAPI on port 5656). This skill handles the FULL pipeline:
+  opencode.json registration → agent personality file → PROMPT.md → subworkers.json declaration → SUBWORKERS_SYSTEM.md update.
   Use this whenever the user says "create a subworker", "add a new agent", "make a promoter", "new sub-worker",
   "add subworker", or any request to create a scheduled autonomous agent for the EliaAI ecosystem.
   DO NOT attempt to create subworkers without this skill — the procedure has many interdependencies and
@@ -19,20 +20,37 @@ This session, multiple mistakes were made creating a subworker because the full 
 steps across 4 different locations. Forgetting even one step (like registering in `opencode.json`) silently
 breaks the subworker. This skill enforces the complete, verified pipeline.
 
-## Overview — The 8-Step Pipeline
+## Main Agent Designation (Elia as a Subworker)
+
+**New feature (August 2026):** Elia, the main agent, is now also a subworker — the **main** one. The logic and
+code are identical to any other subworker; only the designation differs ("main" title or not).
+
+- `subworkers/main-agent.json` = `{"name":"elia"}` designates the main agent (default `"elia"` if file missing).
+- The subworker popup (ui_electron) shows a **MAIN badge** + **★/✕ edit button** to set/unset which agent is main.
+- The subworker server (Docker FastAPI, port 5656) uses `workspace` + `prompt_file` from `subworkers.json`:
+  the main agent gets **repo root** as workspace (`~/EliaAI`) instead of `subworkers/<name>/workspace/`.
+- Elia's prompt lives at `subworkers/elia/PROMPT.md` (moved from repo root **without editing**) — the standard
+  subworker location, referenced via `prompt_file: PROMPT.md` in `subworkers.json`.
+
+**To create or designate a main agent:** same pipeline as any subworker, then ensure
+`subworkers/main-agent.json` names it. Default is Elia — no action needed for the standard setup.
+
+## Overview — The 6-Step Pipeline
 
 ```
 opencode.json (register agent)
   → ~/.config/opencode/agents/<name>.md (personality + YAML frontmatter)
     → subworkers/<name>/PROMPT.md (detailed workflow prompt)
-      → subworkers/scripts/trigger_<name>.sh → sources trigger_template.sh
-        → subworkers/plists/com.elia.<name>.plist (LaunchAgent)
-          → SUBWORKERS_SYSTEM.md (register in master doc)
-            → subworkers/<name>/.enabled (disabled by default)
-              → workspace/ dir auto-created with -d isolation
+      → subworkers/server/app/config/subworkers.json (declare + schedule)
+        → SUBWORKERS_SYSTEM.md (register in master doc)
+          → enable via subworkers.json "enabled": true
 ```
 
 Each step references files from previous steps. Doing them in order is critical.
+
+**Runtime:** the Docker FastAPI server (`elia-subworker-srv`, port 5656) reads `subworkers.json`,
+schedules each subworker, and triggers runs via `POST /trigger/{name}`. No trigger shell scripts,
+no LaunchAgent plists — scheduling lives in the server.
 
 ---
 
@@ -41,17 +59,16 @@ Each step references files from previous steps. Doing them in order is critical.
 **Before creating anything**, read these reference files to understand the conventions:
 
 ```bash
-cat /path/to/subworkers/SUBWORKERS_SYSTEM.md
-cat /path/to/opencode-config/opencode.json | python3 -c "import sys,json; d=json.load(sys.stdin); print(json.dumps(d.get('agent',{}), indent=2))"
-ls /path/to/agents/
-ls /path/to/subworkers/scripts/
-ls /path/to/subworkers/plists/
+cat ~/EliaAI/subworkers/SUBWORKERS_SYSTEM.md
+cat ~/.config/opencode/opencode.json | python3 -c "import sys,json; d=json.load(sys.stdin); print(json.dumps(d.get('agent',{}), indent=2))"
+ls ~/.config/opencode/agents/
+cat ~/EliaAI/subworkers/server/app/config/subworkers.json
 ```
 
 Also read 1-2 existing subworkers to match the style:
 ```bash
-cat /path/to/subworkers/youragency-promoter/PROMPT.md
-cat /path/to/subworkers/yourapp-telegram/PROMPT.md
+cat ~/EliaAI/subworkers/your-agency-promoter/PROMPT.md
+cat ~/EliaAI/subworkers/mirrorpay-telegram/PROMPT.md
 ```
 
 ---
@@ -61,16 +78,16 @@ cat /path/to/subworkers/yourapp-telegram/PROMPT.md
 Add the agent entry to `opencode.json`. The `name` MUST match what you use everywhere else.
 
 **Conventions:**
-- `name`: kebab-case, descriptive (e.g., `YourBrand-suppliers`, `yourapp-telegram`)
+- `name`: kebab-case, descriptive (e.g., `your-brand-suppliers`, `mirrorpay-telegram`)
 - `mode`: `primary` for scheduled autonomous agents, `subagent` for agents called by other agents
 - `color`: hex color for terminal display
 - `model`: `opencode/big-pickle` (default)
-- `prompt_append`: ALWAYS start with `"**FIRST: Read /path/to/subworkers/<name>/PROMPT.md pour ton workflow complet.**"`
+- `prompt_append`: ALWAYS start with `"**FIRST: Read ~/EliaAI/subworkers/<name>/PROMPT.md pour ton workflow complet.**"`
 
 ```python
 import json
 
-with open('/path/to/opencode-config/opencode.json') as f:
+with open('~/.config/opencode/opencode.json') as f:
     data = json.load(f)
 
 data['agent']['<name>'] = {
@@ -78,10 +95,10 @@ data['agent']['<name>'] = {
     "mode": "primary",
     "color": "#<hex-color>",
     "model": "opencode/big-pickle",
-    "prompt_append": "**FIRST: Read /path/to/subworkers/<name>/PROMPT.md pour ton workflow complet.**\n\nTu es <name>, <role description>."
+    "prompt_append": "**FIRST: Read ~/EliaAI/subworkers/<name>/PROMPT.md pour ton workflow complet.**\n\nTu es <name>, <role description>."
 }
 
-with open('/path/to/opencode-config/opencode.json', 'w') as f:
+with open('~/.config/opencode/opencode.json', 'w') as f:
     json.dump(data, f, indent=2)
     f.write('\n')
 ```
@@ -136,7 +153,7 @@ Tu es un [role] spécialisé en [domain]. [1-2 sentence identity].
 - ❌ [What to avoid]
 ```
 
-**Path:** `/path/to/agents/<name>.md`
+**Path:** `~/.config/opencode/agents/<name>.md`
 
 ---
 
@@ -144,7 +161,7 @@ Tu es un [role] spécialisé en [domain]. [1-2 sentence identity].
 
 Create the detailed workflow document. This is the MAIN file the agent reads at runtime.
 
-**Location:** `/path/to/subworkers/<name>/PROMPT.md`
+**Location:** `~/EliaAI/subworkers/<name>/PROMPT.md`
 
 **Required sections:**
 1. **SOURCE DE VÉRITÉ** — List all personality files to read first (from `~/.config/opencode/agents/`)
@@ -164,124 +181,75 @@ Create the detailed workflow document. This is the MAIN file the agent reads at 
 
 ---
 
-## Step 4: Create trigger script (subworkers/scripts/trigger_<name>.sh)
+## Step 4: Declare the subworker in subworkers.json (server schedule)
 
-The trigger script sources `trigger_template.sh`, which handles logging, PATH, .enabled gating,
-PROMPT.md loading, workspace isolation, loop mode, and proxy detection. You just set `AGENT_NAME`.
+Add an entry to `~/EliaAI/subworkers/server/app/config/subworkers.json`. The Docker
+FastAPI server (`elia-subworker-srv`, port 5656) reads this file, schedules the subworker, and
+runs it with `opencode run -d <workspace> -a <agent_id> <prompt_file>`.
+
+**Required fields per entry:**
+- `name`: must match the agent name (kebab-case)
+- `enabled`: `true`/`false` (serves as the on/off switch — no `.enabled` flag file anymore)
+- `schedule`: `{"type": "interval", "hours": [...], "minute": 0}` or a cron expression
+- `agent_id`: the opencode agent name (same as `name`)
+- `workspace`: working directory for the run. The **main agent** (`elia`) gets repo root
+  `~/EliaAI`; other subworkers use `~/EliaAI/subworkers/<name>/workspace/`
+- `prompt_file`: `PROMPT.md` (path relative to workspace)
+- `timeout_minutes`, `max_retries`, `mcp_servers`, `notify_discord`: optional per subworker
 
 **Template:**
-```bash
-#!/bin/zsh
-AGENT_NAME="<underscore_name>"
-source /path/to/subworkers/scripts/trigger_template.sh
-```
-
-Replace `<underscore_name>` with the agent name in underscore format (e.g., `yourapp_seo`, `YourBrand_suppliers`).
-The template derives the directory name and agent ID from this value (underscore → hyphen).
-
-**Workspace isolation:** The template sets `WORKSPACE_DIR="$SUBWORKER_DIR/workspace"` and passes
-`-d "$WORKSPACE_DIR"` to `oh-my-opencode run`. This constrains the agent's working directory.
-
-**Optional `workspace/opencode.json`:** A per-agent config override. Useful for model overrides.
-Create it only if needed:
 ```json
 {
-  "agent": {
-    "<agent-id>": {
-      "description": "Per-agent config for <agent-id>",
-      "mode": "primary"
-    }
-  }
+  "name": "<name>",
+  "enabled": false,
+  "schedule": { "type": "interval", "hours": [8], "minute": 0 },
+  "agent_id": "<name>",
+  "workspace": "~/EliaAI/subworkers/<name>/workspace",
+  "prompt_file": "PROMPT.md",
+  "timeout_minutes": 30,
+  "max_retries": 3,
+  "mcp_servers": [],
+  "notify_discord": false
 }
 ```
-Do NOT use `permissions` (plural) — the OpenCode schema only supports `permission` (singular, tool-level
-allow/deny/ask, no path-level globs). The workspace dir + PROMPT.md instruction are the isolation mechanism.
 
-**Make the script executable:**
-```bash
-chmod +x /path/to/subworkers/scripts/trigger_<name>.sh
-```
+**Trigger:** `POST http://127.0.0.1:5656/trigger/<name>` (the server replaces the old
+`trigger_<name>.sh` scripts). Status via `GET /status`, run logs via the server.
 
 ---
 
-## Step 5: Create LaunchAgent plist (subworkers/plists/com.elia.<name>.plist)
+## Step 5: Enable the subworker (subworkers.json "enabled": true)
 
-Creates a scheduled LaunchAgent. The plist runs the trigger script at the specified interval.
-
-**Template:**
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.elia.<name></string>
-
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/zsh</string>
-        <string>/path/to/subworkers/scripts/trigger_<name>.sh</string>
-    </array>
-
-    <key>RunAtLoad</key>
-    <false/>
-
-    <key>StartCalendarInterval</key>
-    <array>
-        <dict>
-            <key>Hour</key>
-            <integer>8</integer>
-            <key>Minute</key>
-            <integer>0</integer>
-        </dict>
-    </array>
-
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>/usr/local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-        <key>HOME</key>
-        <string>~/user</string>
-    </dict>
-
-    <key>WorkingDirectory</key>
-    <string>/path/to/EliaAI</string>
-
-    <key>StandardOutPath</key>
-    <string>/path/to/subworkers/logs/<name>.log</string>
-
-    <key>StandardErrorPath</key>
-    <string>/path/to/subworkers/logs/<name>.log</string>
-</dict>
-</plist>
-```
-
----
+New subworkers are created with `"enabled": false`. To activate one, set `"enabled": true` in
+`subworkers.json` and restart the server (`docker compose restart` in `subworkers/server/`).
+The server's scheduler starts the subworker on its schedule; manual trigger stays
+`POST /trigger/<name>` regardless of the schedule.
 
 ## Step 6: Update SUBWORKERS_SYSTEM.md
 
-Edit `/path/to/subworkers/SUBWORKERS_SYSTEM.md` to register the new subworker:
+Edit `~/EliaAI/subworkers/SUBWORKERS_SYSTEM.md` to register the new subworker:
 
 1. **Key Differences table** — Add a new column for the subworker with: Business, Focus, Platforms, Interval, Hours, Max output
-2. **Directory Structure** — Add the new folder, script, plist, and log entries
+2. **Directory Structure** — Add the new folder and log entries
 
 **⚠️ NEVER overwrite SUBWORKERS_SYSTEM.md — always edit it in place.** Use the `edit` tool
 to add insertions to the existing sections.
 
 ---
 
-## Step 7: Create .enabled flag (disabled by default)
+## Step 7: Verify the server picks it up
 
-The subworker is disabled by default. To enable it later, create the `.enabled` flag:
+The subworker is disabled by default (`"enabled": false`). After declaring it in `subworkers.json`:
 
 ```bash
-# Disabled by default (skip this in the initial creation)
-# touch /path/to/subworkers/<name>/.enabled
+# Server must be running (Docker container elia-subworker-srv, port 5656)
+docker ps | grep elia-subworker-srv
+curl -s http://127.0.0.1:5656/status | python3 -m json.tool | grep -A5 '"<name>"' || true
 ```
 
-Only create `.enabled` if the user explicitly asks to activate the subworker. By default,
-the trigger script checks for `.enabled` and skips if absent.
+Only set `"enabled": true` (and restart the server) if the user explicitly asks to activate
+the subworker. Manual trigger works regardless of the schedule:
+`curl -s -X POST http://127.0.0.1:5656/trigger/<name>`
 
 ---
 
@@ -290,15 +258,16 @@ the trigger script checks for `.enabled` and skips if absent.
 | Mistake | Consequence | Correct |
 |---------|-------------|---------|
 | Creating `personality.md` in subworker/ folder | Wrong location, agent won't find it | Put in `~/.config/opencode/agents/<name>.md` |
-| Forgetting to register in `opencode.json` | `oh-my-opencode run -a <name>` fails silently | Register BEFORE creating other files |
+| Forgetting to register in `opencode.json` | `opencode run -a <name>` fails silently | Register BEFORE creating other files |
 | Overwriting `SUBWORKERS_SYSTEM.md` | Destroys existing subworker docs | Use `edit` tool to modify in place |
 | Wrong agent name in `prompt_append` | Agent reads wrong PROMPT.md | Verify name matches exactly |
-| Not making trigger script executable | Plist runs but script fails silently | `chmod +x` the script |
+| Not declaring in `subworkers.json` | Server never schedules the subworker | Add entry with `workspace` + `prompt_file` |
 | Referencing personality.md in PROMPT.md | File doesn't exist at that path | Reference `~/.config/opencode/agents/<name>.md` |
 | Skipping any of the 7 steps | Subworker silently broken | Run through all 7 steps in order |
 | Creating agent file in subworkers/ | Not registered in opencode.json | Agent files go in `~/.config/opencode/agents/` |
 | Using `permissions` (plural) in workspace/opencode.json | ConfigInvalidError, agent won't launch | Use `permission` (singular, tool-level) or omit entirely |
 | Forgetting workspace/opencode.json has no path-level security | Agent CAN read/write outside workspace | Workspace isolation = `-d` flag + PROMPT.md instruction, not config |
+| Using old `trigger_<name>.sh` / plist pipeline | Duplicates scheduling outside the server | Declare in `subworkers.json`; server schedules + triggers |
 
 ## Verification Checklist
 
@@ -308,24 +277,20 @@ Before saying the subworker is ready, verify ALL of these:
 [x] Step 1: opencode.json has agent entry with prompt_append
 [x] Step 2: ~/.config/opencode/agents/<name>.md exists with YAML frontmatter
 [x] Step 3: subworkers/<name>/PROMPT.md exists
-[x] Step 4: subworkers/scripts/trigger_<name>.sh exists, is executable, sources trigger_template.sh
-[x] Step 5: subworkers/plists/com.elia.<name>.plist exists
-[x] Step 6: SUBWORKERS_SYSTEM.md updated with new subworker
-[x] Step 7: No .enabled flag (disabled by default — user enables manually)
-[x] Step 8: subworkers/<name>/workspace/ dir exists (auto-created by trigger_template.sh)
+[x] Step 4: subworkers/server/app/config/subworkers.json has the entry (workspace + prompt_file + schedule)
+[x] Step 5: SUBWORKERS_SYSTEM.md updated with new subworker
+[x] Step 6: subworkers.json "enabled": false (disabled by default — user enables manually)
+[x] Step 7: Docker server elia-subworker-srv is running (port 5656) and /status lists the subworker
 ```
 
-**Config validation:** Before declaring a subworker ready, run a dry trigger to confirm the
-`workspace/opencode.json` (if present) has no invalid keys. The `permission` key (singular) is
-tool-level only (allow/deny/ask per tool) — path-level globs are not supported.
+**Config validation:** Before declaring a subworker ready, verify the entry with the server:
 
 ```bash
-# Dry test (set .enabled first, then remove it)
-touch /path/to/subworkers/<name>/.enabled
-bash /path/to/subworkers/scripts/trigger_<name>.sh 2>&1 &
-sleep 5 && kill %1 2>/dev/null
-# Check the run log for ConfigInvalidError
-cat /path/to/subworkers/logs/runs/<underscore_name>/$(ls -t /path/to/subworkers/logs/runs/<underscore_name>/ | head -1)
+# Server must be running (Docker container elia-subworker-srv, port 5656)
+docker ps | grep elia-subworker-srv
+curl -s http://127.0.0.1:5656/status | python3 -m json.tool | grep -A5 '"<name>"' || true
+# Manual trigger
+curl -s -X POST http://127.0.0.1:5656/trigger/<name>
 ```
 
 Use this checklist in your response to confirm completion.

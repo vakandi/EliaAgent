@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch YourApp blog posts from Directus.
+"""Fetch your-saas blog posts from Directus.
 
 Usage:
     python3 scripts/fetch_blog_posts.py                            # list posts without images
@@ -19,7 +19,7 @@ import urllib.parse
 import urllib.request
 import urllib.error
 
-DIRECTUS_URL = os.environ.get("DIRECTUS_URL", "https://dash.[your-app].com")
+DIRECTUS_URL = os.environ.get("DIRECTUS_URL", "https://dash.your-saas.com")
 ADMIN_TOKEN = os.environ.get(
     "DIRECTUS_ADMIN_TOKEN",
     "sp-admin-token-2026-190c1875aec049db",

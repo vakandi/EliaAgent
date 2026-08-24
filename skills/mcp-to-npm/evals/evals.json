@@ -1,0 +1,23 @@
+{
+  "skill_name": "mcp-to-npm",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "I have a Python MCP server using FastMCP at /tmp/my-mcp/server.py. It uses 'mcp[cli]' and 'pillow' as dependencies. I need it wrapped as an npm package called 'my-mcp-server' so anyone can just run 'npx my-mcp-server' and it works. No Swift compilation needed, it's pure Python. Publish it to npm.",
+      "expected_output": "Complete npm package with Node.js bin launcher, postinstall.js, package.json with publishConfig, .npmignore, updated README with npx/Cursor/Claude Desktop config snippets. Package published to npm.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Take this MCP server directory at /Users/me/projects/image-mcp/ and make it installable via npx. It's a Python FastMCP server with a Swift helper that needs compilation on macOS. Package name should be '@myorg/image-mcp'. It has pillow and mcp[cli] as Python deps.",
+      "expected_output": "npm package with Swift compilation in both bin launcher and postinstall, Python dep auto-install, scoped package name handled correctly, publishConfig set to public.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "I built a Node.js MCP server (not Python) using @modelcontextprotocol/sdk. It's at ./server/index.js and only needs 'npm install' for its own deps. Wrap it so people can npx it. Package name: 'mcp-tools'",
+      "expected_output": "Simplified wrapper — no Python checks, just Node.js spawn. postinstall runs npm install in the package dir. bin launcher finds and runs the Node entry point.",
+      "files": []
+    }
+  ]
+}

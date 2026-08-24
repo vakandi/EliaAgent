@@ -1,0 +1,23 @@
+{
+  "skill_name": "readme-enhancer",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "This README looks terrible. Can you make it look professional with a nice banner and badges? @README.md",
+      "expected_output": "Enhanced README with generated banner image, shields.io badges, reorganized sections, and professional formatting",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "I just renamed my repo to mcp-apple-image-playground and need to update the README with a new header image that reflects what the project does",
+      "expected_output": "New banner image generated and README updated with the new banner and refreshed content",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "spruce up the docs, add some shields.io badges and make it look like those popular open source repos",
+      "expected_output": "README enhanced with appropriate shields.io badges, better structure, and polished visual hierarchy",
+      "files": []
+    }
+  ]
+}
