@@ -1,6 +1,6 @@
 {
-  "your-seo-agent": "opencode/big-pickle",
-  "your-community-agent": "opencode/mimo-v2.5-free",
-  "your-promoter-agent": "opencode/big-pickle",
-  "elia": "opencode/big-pickle"
+  "elia": "opencode/big-pickle",
+  "mirorpay-community-organic": "opencode/mimo-v2.5-free",
+  "mirorpay-seo": "opencode/big-pickle",
+  "refund-hunter": "opencode/x-preview-f-free"
 }
