@@ -82,12 +82,14 @@ class HealthManager:
         work_dir: str | None = None,
         opencode_bin: str = "opencode",
         pid_dir: str | None = None,
+        manage_process: bool = True,
     ) -> None:
         self._port = port
         self._host = host
         self._work_dir = work_dir
         self._opencode_bin = opencode_bin
         self._pid_dir = pid_dir or str(Path.cwd())
+        self._manage_process = manage_process
 
         self._process: asyncio.subprocess.Process | None = None
         self._state = ServerState.STOPPED
@@ -292,13 +294,17 @@ class HealthManager:
 
         start = time.monotonic()
 
-        if self._process and self._process.returncode is None:
-            result["process_alive"] = True
+        if self._manage_process:
+            if self._process and self._process.returncode is None:
+                result["process_alive"] = True
+            else:
+                result["details"] = "process not running"
+                result["response_time_ms"] = round((time.monotonic() - start) * 1000, 2)
+                await self._apply_health_result(result)
+                return result
         else:
-            result["details"] = "process not running"
-            result["response_time_ms"] = round((time.monotonic() - start) * 1000, 2)
-            await self._apply_health_result(result)
-            return result
+            # External server — process ownership is unknown; port + HTTP decide.
+            result["process_alive"] = True
 
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -388,6 +394,14 @@ class HealthManager:
         await self.start()
         self._monitor_task = asyncio.create_task(self._monitor_loop())
 
+    async def start_external_monitor(self) -> None:
+        """Track an externally managed OpenCode server (no subprocess).
+
+        Used in Docker where opencode runs on the host via opencode-serve.sh.
+        """
+        self._state = ServerState.RUNNING
+        self._monitor_task = asyncio.create_task(self._monitor_loop())
+
     async def _monitor_loop(self) -> None:
         log.info("health.monitor_started", interval=HEALTH_POLL_INTERVAL)
         monitor_errors = 0
@@ -399,7 +413,7 @@ class HealthManager:
                 await asyncio.sleep(interval)
                 monitor_errors = 0
 
-                if self._process and self._process.returncode is not None:
+                if self._manage_process and self._process and self._process.returncode is not None:
                     log.warning(
                         "health.process_died",
                         returncode=self._process.returncode,

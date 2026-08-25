@@ -76,6 +76,7 @@ class SubworkerConfig(BaseModel):
         description="OpenCode agent ID (matches ~/.config/opencode/agents/<id>.md)",
     )
     model: Optional[str] = Field(default=None, description="Override model for this subworker")
+    variant: Optional[str] = Field(default=None, description="Reasoning effort variant (low/medium/high/max) when the model supports it")
     max_retries: int = Field(3, ge=0, le=10)
     timeout_minutes: int = Field(30, ge=1, le=120)
     proxy_enabled: bool = False

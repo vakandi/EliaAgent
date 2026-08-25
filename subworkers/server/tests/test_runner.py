@@ -122,17 +122,25 @@ def _build_mock_client(
 # ── Test: read prompt ──────────────────────────────────────────────────
 
 class TestReadPrompt:
-    def test_short_prompt_when_agent_id(self, runner: SubworkerRunner) -> None:
+    def test_full_prompt_even_with_agent_id(self, runner: SubworkerRunner) -> None:
         prompt = runner._read_prompt()
-        assert "test-worker" in prompt
-        assert "DONE" in prompt
-        assert "Do something useful" not in prompt
+        assert "Do something useful" in prompt
+        assert "Execute the test-worker subworker task" not in prompt
 
     def test_reads_prompt_file_when_no_agent(self, subworker_config: SubworkerConfig) -> None:
         subworker_config.agent_id = None
         runner = SubworkerRunner(config=subworker_config)
         prompt = runner._read_prompt()
         assert "Do something useful" in prompt
+
+    def test_prompt_next_to_workspace(self, subworker_config: SubworkerConfig, tmp_workspace: Path) -> None:
+        (tmp_workspace / "PROMPT.md").unlink()
+        root_prompt = tmp_workspace.parent / "PROMPT.md"
+        root_prompt.write_text("Root-level instructions\n")
+        runner = SubworkerRunner(config=subworker_config)
+        prompt = runner._read_prompt()
+        assert "Root-level instructions" in prompt
+        root_prompt.unlink()
 
     def test_fallback_when_missing(self, subworker_config: SubworkerConfig, tmp_path: Path) -> None:
         subworker_config.workspace = str(tmp_path / "nonexistent")

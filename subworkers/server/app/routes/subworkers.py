@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from app.config.manager import ConfigManager
 import structlog
 
+from app.routes.websocket import ws_manager
 from app.services.scheduler import SubworkerScheduler
 
 logger = structlog.get_logger(__name__)
@@ -29,6 +30,9 @@ class SubworkerStatus(BaseModel):
     running: bool
     next_run: str | None = None
     schedule_type: str | None = None
+    schedule: dict[str, Any] | None = None
+    model: str | None = None
+    variant: str | None = None
 
 
 class SubworkerDetail(BaseModel):
@@ -41,6 +45,7 @@ class SubworkerDetail(BaseModel):
     timeout_minutes: int
     max_retries: int
     model: str | None = None
+    variant: str | None = None
 
 
 class StatusResponse(BaseModel):
@@ -117,6 +122,9 @@ async def get_all_status() -> StatusResponse:
             running=sw.name in running_names,
             next_run=next_run.isoformat() if next_run else None,
             schedule_type=sw.schedule.type.value if sw.schedule else None,
+            schedule=sw.schedule.model_dump() if sw.schedule else None,
+            model=sw.model,
+            variant=sw.variant,
         ))
 
     return StatusResponse(
@@ -156,12 +164,14 @@ class TriggerRequest(BaseModel):
     """Optional prompt/model override for a manual trigger."""
     prompt: str | None = None
     model: str | None = None
+    variant: str | None = None
 
 
 class UpdateSubworkerRequest(BaseModel):
     """Editable fields for a subworker config."""
     agent_id: str | None = Field(default=None, description="OpenCode agent ID")
     model: str | None = Field(default=None, description="Model override (e.g. 'big-pickle')")
+    variant: str | None = Field(default=None, description="Reasoning effort variant (low/medium/high/max)")
     timeout_minutes: int | None = Field(default=None, ge=1, le=120)
     max_retries: int | None = Field(default=None, ge=0, le=10)
     schedule: dict[str, Any] | None = Field(
@@ -192,8 +202,10 @@ async def trigger_subworker(name: str, body: TriggerRequest | None = None) -> Tr
         name,
         prompt=body.prompt if body else None,
         model=body.model if body else None,
+        variant=body.variant if body else None,
     )
 
+    await ws_manager.broadcast_status_update()
     if result.get("status") == "error":
         return TriggerResponse(
             status="error",
@@ -225,6 +237,7 @@ async def enable_subworker(name: str) -> EnableResponse:
     scheduler.add_subworker(updated)
 
     logger.info("subworker.enabled name=%s", name)
+    await ws_manager.broadcast_status_update()
     return EnableResponse(status="enabled", name=name, enabled=True)
 
 
@@ -245,6 +258,7 @@ async def disable_subworker(name: str) -> EnableResponse:
     scheduler.add_subworker(updated)
 
     logger.info("subworker.disabled name=%s", name)
+    await ws_manager.broadcast_status_update()
     return EnableResponse(status="disabled", name=name, enabled=False)
 
 
@@ -266,6 +280,8 @@ async def update_subworker(name: str, body: UpdateSubworkerRequest) -> Subworker
         updates["agent_id"] = body.agent_id
     if body.model is not None:
         updates["model"] = body.model
+    if body.variant is not None:
+        updates["variant"] = body.variant
     if body.timeout_minutes is not None:
         updates["timeout_minutes"] = body.timeout_minutes
     if body.max_retries is not None:
@@ -296,6 +312,7 @@ async def update_subworker(name: str, body: UpdateSubworkerRequest) -> Subworker
     next_run = scheduler.get_next_run(name)
 
     logger.info("subworker.updated name=%s fields=%s", name, list(updates.keys()))
+    await ws_manager.broadcast_status_update()
     return SubworkerDetail(
         name=updated.name,
         enabled=updated.enabled,
@@ -306,6 +323,7 @@ async def update_subworker(name: str, body: UpdateSubworkerRequest) -> Subworker
         timeout_minutes=updated.timeout_minutes,
         max_retries=updated.max_retries,
         model=updated.model,
+        variant=updated.variant,
     )
 
 
@@ -393,6 +411,7 @@ class SessionMessageInfo(BaseModel):
     role: str | None = None
     agent: str | None = None
     model: str | None = None
+    variant: str | None = None
     time_created: int | None = None
 
 
@@ -441,20 +460,27 @@ async def get_subworker_sessions(
 
     server_url = os.environ.get("OPENCODE_SERVER_URL", "http://host.docker.internal:4096")
 
-    if not session_id:
-        session_id = scheduler.get_last_session_id(name)
-
     async with OpenCodeClient(server_url, default_timeout=10.0) as client:
         if not session_id:
+            # Newest session in the agent's workspace wins — the scheduler
+            # state can be stale after container restarts.
+            ws_dir = _effective_workspace(sw)
             all_sessions = await client.list_sessions(limit=2000)
             matching = [
                 s for s in all_sessions
                 if s.get("agent") == sw.agent_id
-                or (sw.workspace and s.get("directory", "").startswith(sw.workspace))
+                or s.get("directory", "").startswith(ws_dir)
                 or _title_matches_subworker(s, sw)
             ]
             if matching:
-                session_id = matching[-1].get("id")
+                matching.sort(
+                    key=lambda x: (x.get("time") or {}).get("created", 0) or 0,
+                    reverse=True,
+                )
+                session_id = matching[0].get("id")
+
+        if not session_id:
+            session_id = scheduler.get_last_session_id(name)
 
         if not session_id:
             return SessionResponse(name=name, session_id=None, messages=[], total_messages=0)
@@ -466,21 +492,36 @@ async def get_subworker_sessions(
         info_raw = msg.get("info", {})
         parts_raw = msg.get("parts", [])
 
+        raw_model = info_raw.get("model")
+        if isinstance(raw_model, dict):
+            msg_model = raw_model.get("modelID")
+            msg_variant = raw_model.get("variant")
+        else:
+            # assistant messages carry flat modelID/variant fields
+            msg_model = info_raw.get("modelID")
+            msg_variant = info_raw.get("variant")
         info = SessionMessageInfo(
             role=info_raw.get("role"),
             agent=info_raw.get("agent"),
-            model=(info_raw.get("model") or {}).get("modelID"),
+            model=msg_model,
+            variant=msg_variant if isinstance(msg_variant, str) else None,
             time_created=(info_raw.get("time") or {}).get("created"),
         )
 
         parts: list[SessionMessagePart] = []
         for p in parts_raw:
+            # OpenCode nests tool payload under state: {status, input, output, ...}
+            state = p.get("state") if isinstance(p.get("state"), dict) else {}
+            tool_input = state.get("input", p.get("input"))
+            tool_output = state.get("output", p.get("output"))
+            if isinstance(tool_output, str) and len(tool_output) > 8000:
+                tool_output = tool_output[:8000] + "\n… (truncated)"
             parts.append(SessionMessagePart(
                 type=p.get("type", "unknown"),
                 text=p.get("text"),
                 tool=p.get("tool"),
-                input=p.get("input") if isinstance(p.get("input"), dict) else None,
-                output=p.get("output") if isinstance(p.get("output"), str) else None,
+                input=tool_input if isinstance(tool_input, dict) else None,
+                output=tool_output if isinstance(tool_output, str) else None,
             ))
 
         messages.append(SessionMessage(info=info, parts=parts))
@@ -507,6 +548,32 @@ class SessionListResponse(BaseModel):
     sessions: list[SessionListItem]
 
 
+
+def _effective_workspace(sw) -> str:
+    """HOST-side workspace for a subworker — mirrors SubworkerRunner logic,
+    including the /data → OPENCODE_WORKSPACE mapping (config stores
+    container paths; opencode sessions carry host paths)."""
+    import os as _os
+
+    root = _os.environ.get("OPENCODE_WORKSPACE") or str(Path.home() / "EliaAI")
+    workspace = sw.workspace
+    if not workspace:
+        try:
+            main_file = _main_agent_file()
+            if main_file.exists():
+                data = __import__("json").loads(main_file.read_text())
+                if isinstance(data, dict) and data.get("name") == sw.agent_id:
+                    return root
+        except Exception:
+            pass
+        workspace = f"/data/subworkers/{sw.name}/workspace"
+    if root and workspace.startswith("/data/"):
+        workspace = workspace.replace("/data/", f"{root}/", 1)
+    elif root and workspace == "/data":
+        workspace = root
+    return workspace
+
+
 @router.get("/sessions/{name}/list", response_model=SessionListResponse)
 async def list_subworker_sessions(name: str) -> SessionListResponse:
     config = _get_config()
@@ -526,13 +593,13 @@ async def list_subworker_sessions(name: str) -> SessionListResponse:
     except (OpenCodeConnectionError, Exception):
         return SessionListResponse(name=name, sessions=[])
 
+    ws_dir = _effective_workspace(sw)
     matching = [
         s for s in all_sessions
         if s.get("agent") == sw.agent_id
-        or (sw.workspace and s.get("directory", "").startswith(sw.workspace))
+        or s.get("directory", "").startswith(ws_dir)
         or _title_matches_subworker(s, sw)
     ]
-
     items = []
     for s in sorted(matching, key=lambda x: x.get("time", {}).get("created", 0) or 0, reverse=True):
         items.append(SessionListItem(
@@ -549,7 +616,77 @@ async def list_subworker_sessions(name: str) -> SessionListResponse:
 
 # ── Main Agent Management ────────────────────────────────────────────────
 
-MAIN_AGENT_FILE = Path(__file__).resolve().parent.parent / "config" / "main-agent.json"
+# Favorites surface first in UI model lists; everything else follows.
+FAVORITE_MODELS = [
+    "opencode/x-preview-f-free",
+    "opencode/big-pickle",
+    "opencode/nemotron-3.5-lightning-free",
+    "opencode/nemotron-3-ultra-free",
+    "opencode/hy3-free",
+    "opencode/laguna-s-2.1-free",
+    "opencode/mimo-v2.5-free",
+    "opencode/deepseek-v4-flash-free",
+    "google/gemini-2.5-flash-lite",
+    "google/gemma-4-26b-a4b-it",
+    "google/gemma-4-31b-it",
+]
+
+
+class ModelOption(BaseModel):
+    id: str
+    name: str
+    provider: str
+    reasoning: bool = False
+    variants: list[str] = []
+
+
+class ModelsResponse(BaseModel):
+    models: list[ModelOption]
+    total: int
+
+
+@router.get("/models", response_model=ModelsResponse)
+async def list_models() -> ModelsResponse:
+    """All models from connected OpenCode providers, favorites first."""
+    import os
+
+    from app.utils.opencode_client import OpenCodeClient
+
+    server_url = os.environ.get("OPENCODE_SERVER_URL", "http://127.0.0.1:4096")
+    async with OpenCodeClient(server_url, default_timeout=30.0) as client:
+        raw = await client.list_models()
+
+    connected = set(raw.get("connected") or [])
+    options: list[ModelOption] = []
+    for provider in raw.get("all", []):
+        pid = provider.get("id", "")
+        if connected and pid not in connected:
+            continue
+        for mid, m in (provider.get("models") or {}).items():
+            variants = sorted((m.get("variants") or {}).keys())
+            options.append(
+                ModelOption(
+                    id=f"{pid}/{mid}",
+                    name=m.get("name") or mid,
+                    provider=pid,
+                    reasoning=bool((m.get("capabilities") or {}).get("reasoning")),
+                    variants=variants,
+                )
+            )
+
+    by_id = {o.id: o for o in options}
+    ordered = [by_id.pop(fid) for fid in FAVORITE_MODELS if fid in by_id]
+    ordered.extend(sorted(by_id.values(), key=lambda o: o.id.lower()))
+    return ModelsResponse(models=ordered, total=len(ordered))
+
+
+def _main_agent_file() -> Path:
+    # Must match SubworkerRunner._read_main_agent_name(): bind-mounted
+    # subworkers dir in Docker, repo fallback for local dev.
+    data_path = Path("/data/subworkers/main-agent.json")
+    if data_path.parent.is_dir():
+        return data_path
+    return Path.home() / "EliaAI" / "subworkers" / "main-agent.json"
 
 
 class MainAgentResponse(BaseModel):
@@ -563,8 +700,9 @@ class MainAgentSetRequest(BaseModel):
 @router.get("/main-agent", response_model=MainAgentResponse)
 async def get_main_agent() -> MainAgentResponse:
     try:
-        if MAIN_AGENT_FILE.exists():
-            data = __import__("json").loads(MAIN_AGENT_FILE.read_text())
+        main_file = _main_agent_file()
+        if main_file.exists():
+            data = __import__("json").loads(main_file.read_text())
             if isinstance(data, dict) and data.get("name"):
                 return MainAgentResponse(name=data["name"])
     except Exception:
@@ -574,5 +712,6 @@ async def get_main_agent() -> MainAgentResponse:
 
 @router.post("/main-agent", response_model=MainAgentResponse)
 async def set_main_agent(body: MainAgentSetRequest) -> MainAgentResponse:
-    MAIN_AGENT_FILE.write_text(__import__("json").dumps({"name": body.name}, indent=2) + "\n")
+    _main_agent_file().write_text(__import__("json").dumps({"name": body.name}, indent=2) + "\n")
+    await ws_manager.broadcast_status_update()
     return MainAgentResponse(name=body.name)
