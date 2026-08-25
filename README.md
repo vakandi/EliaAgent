@@ -1,643 +1,258 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/EliaAI-v6.0-8B5CF6?style=for-the-badge&logo=OpenAI&logoColor=white&labelColor=1E1B4B" alt="EliaAI v6.0">
+  <img src="assets/banner.png" alt="EliaAgent Subworkers — Autonomous AI agent fleet" width="100%">
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/OpenCode-big--pickle-FF6B6B?style=flat&logo=openai" alt="OpenCode">
-  <img src="https://img.shields.io/badge/Status-Production%20Ready-22C55E?style=flat" alt="Status">
-  <img src="https://img.shields.io/badge/Memory-9.3GB%20%7C%203400%2B%20Sessions-8B5CF6?style=flat" alt="Memory">
-  <img src="https://img.shields.io/badge/Subagents-13%20Specialized-3B82F6?style=flat" alt="Subagents">
-  <img src="https://img.shields.io/badge/UI-Electron%20Overlay-F59E0B?style=flat&logo=electron" alt="Electron UI">
-  <img src="https://img.shields.io/badge/Voice-Whisper%20Dictation-EC4899?style=flat" alt="Voice">
-  <img src="https://img.shields.io/badge/License-MIT-10B981?style=flat" alt="License">
-</p>
-
-<h1 align="center">🧠 EliaAI — The Self-Improving AI Agent</h1>
-
-<p align="center">
-  <strong>An autonomous AI agent that remembers everything, gets smarter with every session,</strong><br>
-  and orchestrates 13 specialized subagents to run your digital life — from code to marketing to operations.
+  <strong>A fleet of autonomous AI agents that runs your digital life 24/7.</strong><br>
+  Scheduled · Monitored · Self-healing · Unlimited tokens
 </p>
 
 <p align="center">
-  <code>Voice dictate → Model selection → Autonomous execution → Persistent memory → Smarter tomorrow</code>
+  <a href="#-quick-start"><img src="https://img.shields.io/badge/install-2_commands-22C55E?style=flat-square" alt="Quick Start"></a>
+  <img src="https://img.shields.io/badge/platform-macOS_|_Linux-lightgrey?style=flat-square" alt="Platform">
+  <img src="https://img.shields.io/badge/Docker-FastAPI-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
+  <img src="https://img.shields.io/badge/RAM-4GB_≈_thousands_of_sessions-8B5CF6?style=flat-square" alt="RAM">
+  <img src="https://img.shields.io/badge/license-MIT-10B981?style=flat-square" alt="License">
 </p>
 
 ---
 
-<p align="center">
-  <img src="https://i.imgur.com/qDhWtkl.png" alt="EliaAI Main Interface" width="700">
-</p>
-<p align="center"><em>The EliaAI floating overlay — model selection, voice control, cron scheduling, and status monitoring.</em></p>
+## ⚡ Why This Exists
+
+One AI agent is an assistant. A **fleet** is an employee base.
+
+EliaAgent turns OpenCode into a **self-managed fleet of autonomous subworkers** — each with its own personality, workspace, schedule and memory — driven by a Python FastAPI server in Docker:
+
+| | What you get |
+|--|--|
+| 🕐 **Schedules, not prompts** | Every hour from 9h to 18h, weekdays only, weekends off, cron expressions — set it and forget it |
+| 🐳 **4 GB RAM ≈ thousands of sessions** | The Docker runtime isolates and contains OpenCode's known memory leaks that previously caused CPU/RAM blowups |
+| ♻️ **Self-healing runs** | Provider outage mid-task? The server detects the transient error, waits a randomized delay, nudges the same session with *"continue the tasks"* — work resumes where it stopped |
+| 🔁 **Exponential-backoff retries** | Crashed or timed-out runs retry automatically; session state survives full container nukes |
+| 📡 **Realtime everything** | REST API + WebSocket events — live status, streaming logs, reasoning, tool calls |
+| 🖥️ **First-class clients** | [EliaTopBar](https://github.com/vakandi/Elia-Topbar) (macOS menu bar) & [EliaAndroidApp](https://github.com/vakandi/EliaAndroidApp) (mobile) |
+| 🌍 **Remote access** | Built-in Cloudflare Tunnel wizard — reach your fleet from anywhere, protected by a shared auth token |
+| ∞ **Unlimited tokens** | Free OpenCode Zen models + rotating residential proxies = effectively unlimited autonomous work (see [Proxy Rotation](#-unlimited-tokens--proxy-rotation)) |
+
+> 💡 The flagship proof: `refund-hunter` has been hunting e-commerce refund policies **every day for months**, writing reports to Google Docs and handing off state to its next shift — without a single human prompt.
 
 ---
 
-## ✨ The Breakthrough: Persistent Memory
-
-**EliaAI's most powerful feature: the agent remembers everything and gets smarter with every session.**
-
-Unlike traditional AI agents that start from scratch on each interaction, EliaAI uses a **persistent memory system (codemem)** that captures every session, every decision, every fix, and every discovery — then feeds it back into future sessions.
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            CODEMEM LOOP                                      │
-│                                                                              │
-│     ┌──────────────┐          ┌──────────────────┐          ┌────────────┐ │
-│     │  Agent        │  ──→    │  Captures         │  ──→    │  SQLite DB  │ │
-│     │  Session      │         │  decisions, bugs, │         │  (1.3 GB)   │ │
-│     └──────┬───────┘         │  discoveries      │         └──────┬─────┘ │
-│            │                  └──────────────────┘                │        │
-│            │              ┌──────────────────────┐               │        │
-│            └──────────────│  Next run loads      │ ←─────────────┘        │
-│                           │  relevant past       │                        │
-│                           │  context → avoids    │                        │
-│                           │  mistakes, builds    │                        │
-│                           │  on previous work    │                        │
-│                           └──────────────────────┘                        │
-│                                                                              │
-│              🔁 Loop repeats — agent gets smarter every session              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### 🖥️ Memory Viewer Dashboard
-
-Monitor your agent's memory in real-time: session history, health metrics, and sync status.
-
-![Codemem Sync Viewer](screenshots/codemem-sync-viewer.png)
-
-*The codemem dashboard showing per-agent memory, health status, database size, and sync/team management.*
-
-Key dashboard features:
-
-| Feature | Description |
-|---------|-------------|
-| **Per-agent memory scoping** | Each subagent (Gilfoyle, Setbon, Picasso, etc.) has its own indexed history — no context pollution |
-| **Automatic context injection** | On each run, relevant past sessions, decisions, and bug fixes are loaded automatically |
-| **Hybrid search** | Combines semantic (embedding) + keyword search for maximum relevance |
-| **Sync across devices** | Multiple machines share memory via the team sync system |
-| **Handoff continuity** | Session summaries preserve context across task switches and agent changes |
-
-### 📊 Track Record
-
-| Metric | Value | Impact |
-|--------|-------|--------|
-| **Total sessions indexed** | 3,400+ | Years of accumulated experience |
-| **Database size** | 1.3 GB | Deep knowledge across domains |
-| **Active subagents** | 15+ | Specialists for every task |
-| **Self-improvement** | Every session | Never makes the same mistake twice |
-
-### 🧠 What the Agent Remembers
-
-| Capability | Why It Matters |
-|------------|---------------|
-| **Bug fixes & root causes** | Never makes the same mistake twice |
-| **Business decisions** | Remembers why certain choices were made |
-| **User preferences** | Adapts to your communication style and workflow |
-| **Discovered solutions** | Reuses past solutions instead of reinventing |
-| **Project context** | Understands the full scope of each project |
-| **Dependencies & gotchas** | Remembers which versions work and which break |
-
-> 💡 **The memory system is what makes EliaAI not just an AI assistant, but a continuously improving digital colleague that learns from experience.**
-
----
-
-## 👥 Team Mode — Multi-Agent Collaboration
-
-**Team Mode lets multiple AI agents work together in real-time, talking to each other via a shared mailbox.** Not simple delegation — actual bidirectional communication where agents share findings, debate solutions, and coordinate.
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           TEAM MODE                                         │
-│                                                                             │
-│  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐            │
-│  │  Lead    │ ◄──│ Member A │ ◄──│ Member B │ ◄──│ Member C │            │
-│  │ (Orch.)  │ ──►│ (Backend)│ ──►│ (Frontend│ ──►│ (Marketing)│           │
-│  └────┬─────┘    └──────────┘    └──────────┘    └──────────┘            │
-│       │                                                                     │
-│       ▼                                                                     │
-│  ┌─────────────────────────────────────────────────────────────────┐       │
-│  │  Shared Mailbox: messages, tasks, findings, decisions           │       │
-│  └─────────────────────────────────────────────────────────────────┘       │
-│                                                                             │
-│  🔁 Agents talk to EACH OTHER — not just to the user                      │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Key Features
-
-| Feature | Description |
-|---------|-------------|
-| **Any session** | Team Mode works in any OpenCode session — just type `/team-mode` or mention agents with `@agent-name` |
-| **Custom agents** | Use your own custom agents as team members — not just built-in ones |
-| **Bidirectional** | Agents send messages to each other, share findings, and debate approaches |
-| **Task assignment** | Lead creates tasks, assigns to specific members, monitors progress |
-| **Subworker integration** | Complex subworker tasks can be broken into team subtasks for parallel execution |
-
-### Usage
+## 🚀 Quick Start
 
 ```bash
-# Start a team with custom agents
-@team-mode assemble @gilfoyle @picasso @setbon
+git clone https://github.com/vakandi/EliaAgent.git
+cd EliaAgent/subworkers
 
-# Or use the team-mode skill
-/team-mode
-
-# Create a team with mixed agents
-team_create(
-  name="my-project-team",
-  members=[
-    {name: "lead", kind: "category", category: "deep"},
-    {name: "gilfoyle", kind: "subagent_type", subagent_type: "gilfoyle"},
-    {name: "picasso", kind: "subagent_type", subagent_type: "picasso"}
-  ]
-)
+./install_subworkers.sh    # prerequisites + config + Docker image
+./start_subworkers.sh      # opencode server + Docker stack + UI in tmux
 ```
 
-### Use Cases
+Health check:
 
-| Scenario | Team Composition |
-|----------|-----------------|
-| **Full-stack feature** | Backend + Frontend + QA agents working in parallel |
-| **Code review** | Multiple reviewers examining different aspects simultaneously |
-| **Complex subworker tasks** | Break a heavy subworker task into team subtasks |
-| **Debugging** | Multiple agents investigating different hypotheses |
-| **Marketing campaign** | Copywriter + Designer + SEO agents coordinating |
+```bash
+curl http://localhost:5656/health
+# {"status":"ok","timestamp":"...","uptime":...}
+```
 
-> 💡 **Team Mode is the bridge between single-agent and multi-agent workflows.** Use it when a task needs multiple perspectives or when you want agents to collaborate rather than just execute.
+Then install a client to control the fleet: **[EliaTopBar](https://github.com/vakandi/Elia-Topbar)** (menu bar: trigger, enable/disable, edit schedules with a visual picker, live log viewer per agent).
+
+### Requirements
+
+| Requirement | Notes |
+|-------------|-------|
+| macOS (Colima) or Linux (Docker) | 4 GB RAM allocated is plenty |
+| [OpenCode](https://opencode.ai) | The agent engine — free Zen models, no paid APIs |
+| tmux | For the launcher sessions |
+| Optional: Discord bot | One panel of the default layout |
+
+---
+
+## 🤖 How to Add a Subworker
+
+This is the core skill of the system. Three files, zero code.
+
+### 1. Create the agent folder
+
+```bash
+mkdir -p subworkers/<agent-id>/workspace
+touch subworkers/<agent-id>/.enabled        # gate file — presence = active
+```
+
+Write `subworkers/<agent-id>/PROMPT.md` — the task instructions injected on every run:
+
+```markdown
+# My Agent — PROMPT.md
+
+## Workspace Constraint
+You MUST only read and write files inside your workspace/ folder.
+All system paths outside workspace/ are blocked.
+
+## Handoff
+At the START of every run, read workspace/HANDOFF_NEXT_SESSION.md.
+At the END, overwrite it so the next run picks up seamlessly.
+
+## Completion Marker (MANDATORY)
+When you build your todo list, ALWAYS include this final task:
+"Output <promise>DONE</promise> to signal successful completion".
+Only output it as the very last line, after ALL tasks are verified.
+The subworker server uses this marker to detect success.
+```
+
+### 2. Register the personality
+
+Create `~/.config/opencode/agents/<agent-id>.md` with YAML frontmatter:
+
+```yaml
+---
+name: <agent-id>
+slug: <agent-id>
+description: What this agent does every day
+mode: all                  # "all" = visible everywhere + callable by the server
+model: opencode/big-pickle
+temperature: 0.3
+tools:
+  read: true
+  write: true
+  edit: true
+  bash: true
+  glob: true
+  grep: true
+  webfetch: true
+  websearch: true
+---
+```
+
+Below the frontmatter: persona, workflow, rules. The host OpenCode server loads it at session creation.
+
+### 3. Declare the schedule
+
+Add an entry to `subworkers/server/app/config/subworkers.json`:
+
+```json
+{
+  "name": "my-agent",
+  "enabled": true,
+  "schedule": {
+    "type": "interval",
+    "hours": [9, 10, 11, 12, 13, 14, 15, 16, 17],
+    "minute": 0,
+    "days": [1, 2, 3, 4, 5]
+  },
+  "agent_id": "my-agent",
+  "max_retries": 3,
+  "timeout_minutes": 30
+}
+```
+
+`days` follows cron convention (`0=Sunday…6=Saturday`) — `[1,2,3,4,5]` = **weekdays only**, `[0,6]` = weekends only, omit for every day. Cron expressions work too: `"type": "cron", "expression": "0 9-17 * * 1-5"`.
+
+The server hot-reloads this file — no restart needed:
+
+```bash
+curl -X POST http://localhost:5656/config/reload
+```
+
+> 📄 Deep dive (architecture, API contract, failure modes): [`subworkers/SUBWORKERS_SYSTEM.md`](subworkers/SUBWORKERS_SYSTEM.md)
 
 ---
 
 ## 🏗️ Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         ELIA — SYSTEM ARCHITECTURE                          │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────┐       │
-│  │                   USER INTERFACES                               │       │
-│  │  ┌────────────┐  ┌──────────┐  ┌────────────┐  ┌─────────────┐ │       │
-│  │  │  Elia UI   │  │   CLI    │  │  Discord   │  │  Telegram   │ │       │
-│  │  │ (Electron) │  │ (Manual) │  │   Bot      │  │   Bot       │ │       │
-│  │  └─────┬──────┘  └────┬─────┘  └──────┬─────┘  └──────┬──────┘ │       │
-│  └────────┼──────────────┼───────────────┼───────────────┼────────┘       │
-│           │              │               │               │                 │
-│           └──────────────┴───────┬───────┴───────────────┘                 │
-│                                  ▼                                         │
-│                   ┌──────────────────────────┐                             │
-│                   │   start_agents.sh        │                             │
-│                   │   trigger_opencode_      │                             │
-│                   │   interactive.sh         │                             │
-│                   └────────────┬─────────────┘                             │
-│                                ▼                                           │
-│                   ┌──────────────────────────┐                             │
-│                   │     oh-my-opencode       │                             │
-│                   │  Rich logging · ULW/Ralph│                             │
-│                   └────────────┬─────────────┘                             │
-│                                ▼                                           │
-│                   ┌──────────────────────────┐                             │
-│                   │        OpenCode          │                             │
-│                   │   AI Agent Engine        │                             │
-│                   └────────────┬─────────────┘                             │
-│                                │                                           │
-│           ┌────────────────────┼────────────────────┐                      │
-│           ▼                    ▼                    ▼                      │
-│  ┌─────────────────┐  ┌──────────────────┐  ┌──────────────────┐          │
-│  │  13 Specialized │  │   Persistent     │  │  Proxy Rotation  │          │
-│  │   Subagents     │  │   Memory (SQLite)│  │  (Auto/Manual)   │          │
-│  └─────────────────┘  └──────────────────┘  └──────────────────┘          │
-│                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────┐       │
-│  │                  SCHEDULING & AUTOMATION                        │       │
-│  │  ┌────────────┐  ┌────────────────┐  ┌──────────────────────┐ │       │
-│  │  │   Cron     │  │  LaunchAgent   │  │  Morning Routine     │ │       │
-│  │  │ (manage_   │  │  (macOS)       │  │  (Automated Briefing)│ │       │
-│  │  │  cron.sh)  │  │                │  │                      │ │       │
-│  │  └────────────┘  └────────────────┘  └──────────────────────┘ │       │
-│  └─────────────────────────────────────────────────────────────────┘       │
-│                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────┐       │
-│  │                   TELEMETRY & OBSERVABILITY                    │       │
-│  │  ┌────────────┐  ┌────────────────┐  ┌────────────────────────┐│       │
-│  │  │  Langfuse  │  │  Session Logs  │  │  OpenTelemetry Tracing ││       │
-│  │  │ Dashboard  │  │  (oh-my-opencode)│  │                       ││       │
-│  │  └────────────┘  └────────────────┘  └────────────────────────┘│       │
-│  └─────────────────────────────────────────────────────────────────┘       │
-└─────────────────────────────────────────────────────────────────────────────┘
+ EliaTopBar / EliaAndroidApp / Electron UI          ← realtime clients
+        │  WebSocket /ws + REST :5656
+        ▼
+ ┌────────────────────────────────────────────┐
+ │  elia-subworker-srv (Docker, FastAPI)      │
+ │  ├── APScheduler ← subworkers.json         │
+ │  ├── SubworkerRunner                       │
+ │  │     ├── provider-error auto-recovery    │
+ │  │     ├── retries + exponential backoff   │
+ │  │     └── HealthManager (auto-restart)    │
+ │  └── SessionMonitor (2s polling)           │
+ └──────────────┬─────────────────────────────┘
+                │ HTTP (host network)
+                ▼
+      opencode serve :4096  (HOST process)
+                │
+    ┌───────────┼───────────┐
+    ▼           ▼           ▼
+ agent A    agent B    agent N      ← personalities + PROMPT.md
+ workspace/ workspace/ workspace/  ← isolated file I/O
 ```
+
+### Run lifecycle
+
+1. APScheduler fires → runner checks OpenCode health
+2. Session created in the agent's isolated workspace (`x-opencode-directory` header)
+3. PROMPT.md sent as the user message → agent works (streamed live over WS)
+4. Completion = session idle **and** `<promise>DONE</promise>` marker in output
+5. Transient provider errors → random wait → *"continue the tasks"* re-injected into the same session (up to 3×)
+6. Failure → exponential backoff retries; alerts via macOS beep / ntfy.sh
 
 ---
 
-## 🎯 Key Features
+## 🔌 API Quick Reference
 
-| Feature | Details | Impact |
-|---------|---------|--------|
-| **🧠 Persistent Memory** | SQLite-backed, hybrid search (semantic + keyword), per-agent scoping | Never repeats mistakes, builds on past knowledge |
-| **📡 Sync Across Devices** | Shared memory via team sync — multiple machines share the same knowledge base | Consistent context everywhere |
-| **🔄 Handoff Continuity** | Session summaries preserve context across task switches and agent changes | No context loss between sessions |
-| **🎤 Voice Control** | Whisper dictation via Elia UI orb click | Hands-free operation |
-| **🔄 Automatic Scheduling** | Cron / LaunchAgent with configurable intervals (20min–4h) | 24/7 autonomous operation |
-| **🔀 Proxy Rotation** | Auto/manual proxy switching with health checks and history | Bypass geo-restrictions, avoid rate limits |
-| **🧩 13 Subagents** | Specialists for backend, frontend, marketing, sales, content, ops, etc. | Domain expertise for every task |
-| **🎨 Model Selection** | BigPickle (200K ctx), Kimi2.5 (128K), MiniMax2.5 (1M ctx) | Flexibility for any task size |
-| **🔁 ULW/Ralph Loops** | Unlimited iterations / 50-iteration max autonomous work loops | Self-directed task completion |
-| **💬 Discord Integration** | Chat with Elia via `@elia_bot` with persistent sessions | Access from any device |
-| **📊 Langfuse Telemetry** | OpenTelemetry tracing, cost tracking, performance metrics | Full observability |
-| **🌅 Morning Briefing** | Automated daily reports via Telegram/WhatsApp | Start informed |
-| **👥 Team Mode** | Multi-agent collaboration with shared mailbox, bidirectional communication | Complex tasks as team projects |
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/health` | Server healthcheck |
+| GET | `/status` | All subworkers `{name, enabled, running, next_run, schedule}` |
+| PUT | `/status/{name}` | Edit config — schedule (hours/minute/**days**), model, variant, timeouts |
+| POST | `/trigger/{name}` | Run now (optional `{prompt, model}` body) |
+| POST | `/enable/{name}` · `/disable/{name}` | Toggle |
+| GET | `/logs/{name}?lines=N` | Recent run-log lines |
+| GET | `/sessions/{name}?limit=N` | Full session messages (reasoning, tools, text) |
+| GET | `/models` | Model catalog (OpenCode Zen favorites first) |
+| GET/POST | `/main-agent` | Read/set the MAIN agent |
+| GET | `/server/health` · POST `/server/restart` | OpenCode subprocess control |
+| WS | `/ws` | Live events: `initial_status`, `subworker_started`, `run_log`, `subworker_completed`, `subworker_error` |
 
----
-
-## 🧩 The Subagent System
-
-EliaAI orchestrates **13 specialized subagents**, each with a unique personality, domain expertise, and signature style.
-
-| Category | Name | Role | Signature Phrase |
-|----------|:----:|------|-----------------|
-| **Backend** | 🛠️ Oliver | APIs, databases, Docker, CI/CD | *"The solution is straightforward."* |
-| **Frontend** | 🎨 James | React, UI/UX, animations | *"It should make you want to click."* |
-| **Finance** | 💰 William | Invoicing, payments, [Your Partner] | *"Money follows when work is done well."* |
-| **Marketing** | 📢 Victoria | TikTok, YouTube, Snapchat campaigns | *"The best marketing doesn't feel like marketing."* |
-| **Sales** | 🤝 Charles | Lead generation, conversion, closing | *"The deal isn't closed until it's signed."* |
-| **HR** | 👥 Elizabeth | Hiring, recruitment, employee management | *"The best hires are the ones where you don't hesitate."* |
-| **Content** | 🎬 Marcus | Videos, thumbnails, scheduling, FFmpeg | *"Content is king, but distribution is queen."* |
-| **E-commerce** | 👗 Charlotte | Luxury fashion resale | *"Luxury is in the details. And in authenticity."* |
-| **Partnerships** | 🤝 Alexander | MayaKech coordination, relationship mgmt | *"Strong partnership, strong business."* |
-| **Operations** | ⚙️ Sebastian | Jira, workflows, multi-SaaS deployment | *"A good system runs itself. A great system improves itself."* |
-| **Customer Comms** | 💬 Catherine | WhatsApp, Telegram, Discord support | *"Every message is an impression. Make it count."* |
-| **Growth** | 🚀 Ethan | Bot farms, account creation, ad campaigns | *"In growth, speed beats perfection."* |
-| **Automation** | 🤖 Eleanor | TikTok/YouTube automation, Python/FastAPI | *"Work smart, automate the rest."* |
-
-### How Subagents Work
-
-```
-User Request
-     │
-     ▼
-┌─────────────────┐     ┌────────────────────┐
-│  Sisyphus       │ ──→ │  Delegates to      │
-│  (Orchestrator) │     │  best subagent     │
-└─────────────────┘     └─────────┬──────────┘
-                                  │
-              ┌───────────────────┼───────────────────┐
-              ▼                   ▼                   ▼
-     ┌────────────────┐ ┌────────────────┐ ┌────────────────┐
-     │  Oliver        │ │  James         │ │  Victoria      │
-     │  (Backend)     │ │  (Frontend)    │ │  (Marketing)   │
-     └────────────────┘ └────────────────┘ └────────────────┘
-              │                   │                   │
-              └───────────────────┼───────────────────┘
-                                  ▼
-                      ┌────────────────────┐
-                      │  Result returned   │
-                      │  to user           │
-                      └────────────────────┘
-```
-
-**Invocation methods:**
-- `/ulw-loop` — Unlimited autonomous iterations
-- `/ralph-loop` — 50 iterations max
-- `task(category="backend-dev", prompt="...")` — Direct delegation
+Auth: shared token via `ELIA_AUTH_TOKEN` (server `.env`) — send as `Authorization: Bearer <token>`.
 
 ---
 
-## 🚀 Quick Start
+## ∞ Unlimited Tokens — Proxy Rotation
 
-### Prerequisites
-
-| Requirement | Version | Notes |
-|-------------|---------|-------|
-| **OpenCode** | Latest | AI agent engine |
-| **Node.js** | 18+ | For Elia UI Electron app |
-| **Whisper** | Any | Voice dictation (optional) |
-
-### 1. Clone
+Free OpenCode Zen models have rate limits. Residential proxies make them effectively disappear: rotate IP, keep working.
 
 ```bash
-git clone https://github.com/user/EliaAgent.git
-cd EliaAgent
+# In ~/.zshrc:
+alias sp='bash ~/EliaAgent/setup/switch-proxy.sh'           # auto: oldest unused proxy
+alias spm='bash ~/EliaAgent/setup/switch-proxy.sh --manual' # manual pick
+alias elia='~/EliaAgent/setup/opencode-proxy.sh'            # proxied interactive agent
+
+sp      # rotates, health-checks, verifies your new IP
+elia    # unlimited-token agent session through the current proxy
 ```
 
-### 2. Launch the UI
-
-```bash
-cd ui_electron
-npm install
-npm start
-```
-
-### 3. Select a Model
-
-| Badge | Model | Context Window | Best For |
-|-------|-------|:-------------:|:--------:|
-| 🔴 **BigPickle** | `opencode/big-pickle` | 200K | General tasks, coding |
-| 🟢 **Kimi2.5** | `mistralai/mixtral-8x7b` | 128K | Fast responses |
-| 🟡 **MiniMax2.5** | `opencode/minimax-m2.5-free` | **1M** | Large context, documents |
-
-### 4. Run Your First Task
-
-**Voice:** Click the orb → dictate → agent runs with selected model.
-
-**Manual CLI:**
-```bash
-./start_agents.sh --model=big-pickle --extra-prompt="Analyze my current project structure"
-```
-
-**Scheduled:**
-```bash
-./manage_cron.sh install --interval 2h --start 10 --end 22
-```
+- Proxies live in `setup/proxies.txt` (`IP:PORT:USER:PASS` per line — bring your own)
+- Health check before switching; dead proxies skipped automatically
+- Usage history tracked per proxy
+- Scripts detect `.proxy_enabled` and apply `HTTP_PROXY` locally — no global pollution
 
 ---
 
-## 🎮 Usage Modes
+## 🧠 Persistent Memory (codemem)
 
-### 🎤 Voice (Elia UI)
-
-Click the central orb → Whisper transcribes your voice → prompt is sent to `start_agents.sh` with the currently selected model.
-
-### ⌨️ CLI Manual
-
-```bash
-# Basic run
-./start_agents.sh --model=big-pickle
-
-# With specific task
-./start_agents.sh --model=big-pickle --extra-prompt="Review my Jira tickets and suggest priorities"
-
-# Interactive with rich logging
-OPENCODE_MODEL=opencode/big-pickle ./trigger_opencode_interactive.sh
-```
-
-### ⏰ Scheduled (Cron)
-
-```bash
-./manage_cron.sh install --interval 2h --start 10 --end 22
-./manage_cron.sh install --interval 30min
-./manage_cron.sh show
-./manage_cron.sh uninstall
-```
-
-### 🍎 Scheduled (LaunchAgent — macOS)
-
-```bash
-./install_launchagent.sh
-```
-
-### 💬 Discord Bot
-
-```bash
-cd integrations/elia-discord-bot
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-python bot.py
-```
-
----
-
-## 🔄 Self-Improvement Cycle
-
-```
-  🔵 Session Runs
-     │
-     ▼
-  📝 Key Insights Captured
-     │
-     ▼
-  💾 Indexed in SQLite (per-agent, full-text + semantic search)
-     │
-     ▼
-  🚀 Next Session Loads Relevant Memory
-     │
-     ▼
-  🧠 Agent Gets Smarter — knows more, fewer mistakes, works faster
-     │
-     └─── 🔁 Loop repeats indefinitely
-```
-
-**3,400+ sessions and counting.**
-
----
-
-## 📋 Session Continuity & Memory Management
-
-### Session Continuity Commands (Start of Every Session)
-
-To ensure the agent never repeats work or loses context, each session starts with these verification steps:
-
-```bash
-session_list(limit=20, from_date="YYYY-MM-DD")          # Check recent runs
-session_search(query="topic name", limit=10)             # Find relevant discussions
-session_read(session_id="ses_abc123", include_todos=true) # Read specific session
-```
-
-This workflow prevents duplicate work and ensures every session builds on past results rather than starting from scratch.
-
-### 🛡️ Compaction Protection Protocol
-
-OpenCode compacts context every 20–30 actions, which can cause the agent to forget what it was doing. EliaAI's memory system is hardened against this through several safeguards:
-
-**Survival Checklist (used by the agent at every session start):**
-1. **Restate the task** — Begin each response with one sentence restating the current task. If you can't formulate it, you've lost context — re-read the last user message immediately.
-2. **Read the last message** — Before any action, verify you know exactly what was asked.
-3. **Check scope** — Is this file/change explicitly in the scope of the request?
-4. **Verify before proceeding** — Confirm the result of the last action before moving to the next.
-5. **One task at a time** — New message = new task. Never continue old work in parallel.
-
-**For the user — when the agent seems to "forget":**
-- Simply repeat the instruction or reference the previous message
-- The memory system will reload relevant context from the codemem database
-- The agent automatically re-reads session history to recover continuity
-
-### How Memory Survives Compaction
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     MEMORY PERSISTENCE LAYER                      │
-│                                                                  │
-│  ┌──────────────┐    ┌─────────────────┐    ┌───────────────┐  │
-│  │  Context     │ →  │  codemem DB     │ →  │  Reload on    │  │
-│  │  Captured    │    │  (SQLite, 1.3GB)│    │  Next Session │  │
-│  └──────────────┘    └─────────────────┘    └───────────────┘  │
-│                                                                  │
-│  Even if agent's working memory (context) is compacted,          │
-│  the codemem database preserves all decisions, bugs, and         │
-│  discoveries for the next session to reload automatically.       │
-└─────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 🔧 Configuration
-
-### Model Selection Flow
-
-```
-Elia UI (click badge) → saves to .opencode_model → cron/LaunchAgent reads it → uses same model
-```
-
-| UI Badge | `.opencode_model` | Model Used |
-|----------|:-----------------:|:----------:|
-| 🔴 BigPickle | `big-pickle` | `opencode/big-pickle` |
-| 🟢 Kimi2.5 | `nvidia` | `mistralai/mixtral-8x7b-instruct-v0.1` |
-| 🟡 MiniMax2.5 | `minimax` | `opencode/minimax-m2.5-free` |
-
-### Proxy System
-
-```bash
-sp    # Auto mode — picks oldest unused proxy
-spm   # Manual mode — show list, you pick
-```
-
-| Feature | Description |
-|---------|-------------|
-| **Auto mode** | Picks least recently used proxy |
-| **Health check** | Tests each proxy before selecting |
-| **History tracking** | Records usage timestamps and duration |
-| **IP verification** | Shows new IP via ipify.org |
-
-### Oh-My-OpenCode
-
-```bash
-touch .omo_disabled     # Use raw opencode instead
-touch .ralph_mode       # 50-iteration limit instead of unlimited
-```
-
----
-
-## 🗂️ Project Structure
-
-```
-EliaAgent/
-├── .opencode_model           # Current model selection
-├── start_agents.sh           # Entry point for all runs
-├── trigger_opencode_interactive.sh  # Main execution script
-├── manage_cron.sh            # Cron install/uninstall/show
-├── install_launchagent.sh    # macOS LaunchAgent setup
-│
-├── ui_electron/              # 🖥️ Elia floating overlay
-│   ├── src/
-│   │   ├── main.js
-│   │   ├── preload.js
-│   │   └── index.html
-│   └── config.json
-│
-├── context/                  # 📄 Agent knowledge base
-│   ├── business.md
-│   ├── MEMORY.md
-│   ├── TOOLS.md
-│   └── jira-projects.md
-│
-├── integrations/             # 🔗 Third-party integrations
-│   └── elia-discord-bot/
-│
-├── scripts/                  # 🔧 Automation scripts
-├── setup/                    # ⚙️ Proxy & configuration
-├── memory/                   # 💾 Persistent memory storage
-├── brain/                    # 🧠 Agent brain configurations
-│
-├── PROMPT.md                 # Default system prompt
-├── MORNING_PROMPT.md         # Morning briefing prompt
-└── logs/                     # 📝 Execution logs
-```
-
----
-
-## 🛠️ Configuration Importante
-
-**This system uses ONLY free OpenCode models.** No Claude, GPT, or paid models.
-
-```json
-{
-  "model_fallback": false,
-  "default_run_agent": "sisyphus",
-  "agents": {
-    "sisyphus": { "model": "opencode/big-pickle", "fallback_models": [] },
-    "oliver-backend": { "model": "opencode/big-pickle", "fallback_models": [] }
-  }
-}
-```
-
----
-
-## 📡 Telemetry (Langfuse)
-
-```bash
-export LANGFUSE_PUBLIC_KEY="pk-lf-..."
-export LANGFUSE_SECRET_KEY="sk-lf-..."
-export LANGFUSE_BASEURL="https://cloud.langfuse.com"
-```
-
-| Feature | Description |
-|---------|-------------|
-| **Session traces** | Every AI interaction, tool execution, timing |
-| **Cost tracking** | Token usage and associated costs |
-| **Visual dashboard** | Traces, spans, and metrics at Langfuse Cloud |
+Every session feeds a per-agent SQLite memory: decisions, bug fixes, discoveries. The next run loads relevant context automatically — agents get smarter every day and never repeat mistakes. 3,400+ sessions indexed across the production fleet.
 
 ---
 
 ## ❓ Troubleshooting
 
-| Problem | Likely Cause | Solution |
-|---------|-------------|----------|
-| **Cron not firing** | macOS permissions | `./manage_cron.sh install --sudo` |
-| **Wrong model** | `.opencode_model` outdated | Select model in Elia UI |
-| **UI unresponsive** | Badges not rendering | `./ui_electron/run-debug.sh` |
-| **Voice not working** | Whisper missing | Check microphone permissions |
-| **Proxy not routing** | SIP blocking | Use HTTP_PROXY env vars |
-| **Discord bot offline** | Token expired | Regenerate in Discord portal |
-| **Agent forgets context** | Compaction cycle | Re-state the task — memory system reloads on next cycle |
-
----
-
-## 🧰 Tech Stack
-
-| Layer | Technology |
-|-------|-----------|
-| **Agent Engine** | OpenCode |
-| **UI** | Electron (Node.js) |
-| **Voice** | Whisper (speech-to-text) |
-| **Memory** | SQLite with embedding + keyword search |
-| **Memory Dashboard** | Codemem Sync Viewer |
-| **Scheduling** | Cron / macOS LaunchAgent |
-| **Logging** | oh-my-opencode |
-| **Telemetry** | Langfuse (OpenTelemetry) |
-| **Integration** | Discord.py, Python |
-| **Proxy** | HTTP_PROXY env vars, auto-rotation |
-
----
-
-## 🖥️ Companion Repos
-
-EliaAI has dedicated repos for UI, mobile and system management:
-
-| Repo | Description | Link |
-|------|-------------|------|
-| **EliaTopBar** | macOS menu-bar app (native Swift) — full realtime subworker dashboard & management over WebSocket: live agent states, chat/session viewer with streaming output, trigger / enable / disable, model + variant switching, server health — plus voice control and cron scheduling | [github.com/vakandi/Elia-Topbar](https://github.com/vakandi/Elia-Topbar) |
-| **EliaAndroidApp** | Mobile command center (Android today, iOS-ready via Expo / React Native) — realtime fleet dashboard, chat streams with markdown rendering, schedule calendar projecting interval & cron runs, LAN discovery, run notifications | [github.com/vakandi/EliaAndroidApp](https://github.com/vakandi/EliaAndroidApp) |
-| **Elia-OC** | OpenCode session management UI — view, search, and manage all agent sessions in a clean interface | [github.com/vakandi/Elia-OC](https://github.com/vakandi/Elia-OC) |
-
-### 🌍 Access Your Subworkers From Anywhere
-
-Both clients ship a built-in **Cloudflare Tunnel** wizard: a one-time setup from your local
-network creates a free custom-domain tunnel (`https://your.domain`) straight into the subworker
-server — TLS end-to-end, no ports opened, no VPS required, and the connector survives every
-restart automatically. Prefer always-on hosting? Deploy the same stack on a VPS. Either way,
-your agents are reachable **anywhere, anytime**, protected by a shared auth token.
-
-For the best experience, install **EliaTopBar** alongside EliaAI — it gives you instant access to model switching, voice dictation, and cron controls without opening a terminal.
+| Problem | Fix |
+|---------|-----|
+| Client shows *Disconnected* | Server URL must be `http://localhost:5656` (not 8080) |
+| Schedule didn't fire | Check entry in `subworkers.json` (`enabled: true`) then `POST /config/reload` |
+| Container down | `cd subworkers/server && docker-compose up -d --build` |
+| OpenCode server dead | `POST /server/restart` or restart via launcher |
+| Auth errors (401) | Match `ELIA_AUTH_TOKEN` between server `.env` and client |
+| Missed runs while laptop slept | Harmless — next slot fires when awake |
 
 ---
 
 ## 📄 License
 
-**MIT** — Free to use, modify, and distribute.
-
----
-
-<p align="center">
-  <sub>Built with ❤️ by <strong>YourName YourSurname</strong> · © 2026</sub>
-  <br>
-  <sub><em>"The agent that remembers everything and gets smarter every session."</em></sub>
-</p>
+MIT — see [LICENSE](LICENSE).
