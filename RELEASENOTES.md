@@ -30,6 +30,26 @@ plus secure remote access from anywhere.
 
 ---
 
+## Version: v6.0.2 (August 25, 2026)
+
+### 🐛 Critical Fix: Subworkers Were Running With a Placeholder Prompt
+
+**Every scheduled subworker run sent a generic placeholder instead of the agent's real `PROMPT.md`.** The runner had a shortcut: when an `agent_id` was configured (the case for all subworkers), it skipped reading `PROMPT.md` and sent a one-line "Execute the <name> subworker task" instruction. Agents were effectively running on their personality file alone — no workspace constraints, no handoff protocol, no task-specific business logic.
+
+**Fix**
+- `PROMPT.md` is now **always loaded and sent as the user message**, regardless of `agent_id`
+- Robust path resolution: `workspace/prompt_file` → subworker root (`PROMPT.md` next to `workspace/`) → `/data/subworkers/<name>/` container layout
+- Placeholder only remains as last-resort fallback when no prompt file exists anywhere (logged loudly)
+- Tests updated to lock the correct behavior + new test for the root-level layout
+
+**Also in this sync**
+- Cloudflare Tunnel management routes (`/tunnel/*`) + tunnel manager service — setup wizard backend for the EliaTopBar/EliaAndroidApp remote-access feature
+- Reasoning-variant support end-to-end: config → runner → OpenCode `send_message(variant=...)`
+- Progress streamer now starts before the blocking `send_message` call (realtime logs during long runs)
+- `GET /models` catalog endpoint for UI model pickers
+
+---
+
 ## Version: v6.0.1 (August 25, 2026)
 
 ### 🖥️ UI Electron Sync & WebSocket Fix

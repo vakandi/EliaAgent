@@ -45,6 +45,7 @@ class SubworkerScheduler:
         self._last_session_ids: dict[str, str] = {}
         self._last_run_results: dict[str, dict[str, Any]] = {}
         self._callbacks: list[Callable[[str, str], Coroutine[Any, Any, None]]] = []
+        self._start_callbacks: list[Callable[[str], Coroutine[Any, Any, None]]] = []
         self._state_file = Path(state_file) if state_file else None
         self._load_state()
 
@@ -117,6 +118,7 @@ class SubworkerScheduler:
         name: str,
         prompt: str | None = None,
         model: str | None = None,
+        variant: str | None = None,
     ) -> dict[str, Any]:
         """Manually trigger a subworker immediately (outside schedule)."""
         config = self._configs.get(name)
@@ -126,7 +128,7 @@ class SubworkerScheduler:
         if name in self._running and not self._running[name].done():
             return {"status": "error", "message": f"Subworker '{name}' is already running"}
 
-        task = asyncio.create_task(self._execute(config, prompt, model))
+        task = asyncio.create_task(self._execute(config, prompt, model, variant))
         self._running[name] = task
         return {"status": "triggered", "name": name}
 
@@ -219,6 +221,10 @@ class SubworkerScheduler:
         """Register callback(name, status) for run completion."""
         self._callbacks.append(callback)
 
+    def on_run_start(self, callback: Callable[[str], Coroutine[Any, Any, None]]) -> None:
+        """Register callback(name) fired when a run begins."""
+        self._start_callbacks.append(callback)
+
     # ── Private ───────────────────────────────────────────────────────────
 
     def _load_state(self) -> None:
@@ -257,12 +263,14 @@ class SubworkerScheduler:
         config: SubworkerConfig,
         prompt: str | None = None,
         model: str | None = None,
+        variant: str | None = None,
     ) -> None:
         """Run a subworker and handle completion."""
         name = config.name
         log.info("scheduler.run_start name=%s", name)
+        await self._fire_start_callbacks(name)
         try:
-            result = await self._run_fn(config, prompt, model)
+            result = await self._run_fn(config, prompt, model, variant)
             if hasattr(result, "session_id") and result.session_id:
                 self._last_session_ids[name] = result.session_id
             if hasattr(result, "stdout"):
@@ -290,6 +298,13 @@ class SubworkerScheduler:
                 await cb(name, status)
             except Exception:
                 log.exception("scheduler.callback_error name=%s", name)
+
+    async def _fire_start_callbacks(self, name: str) -> None:
+        for cb in self._start_callbacks:
+            try:
+                await cb(name)
+            except Exception:
+                log.exception("scheduler.start_callback_error name=%s", name)
 
     def _build_trigger(self, config: SubworkerConfig) -> CronTrigger:
         """Convert a Schedule config to an APScheduler CronTrigger."""

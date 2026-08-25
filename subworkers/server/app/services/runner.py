@@ -102,6 +102,7 @@ class SubworkerRunner:
         health_check_fn: Callable[[], Coroutine[Any, Any, bool]] | None = None,
         prompt_override: str | None = None,
         model_override: str | None = None,
+        variant_override: str | None = None,
     ) -> None:
         self._config = config
         self._opencode_bin = opencode_bin
@@ -109,6 +110,7 @@ class SubworkerRunner:
         self._health_check = health_check_fn
         self._prompt_override = prompt_override
         self._model_override = model_override
+        self._variant_override = variant_override
         self._callbacks: list[RunCallback] = []
 
     # ── Public API ───────────────────────────────────────────────────────
@@ -206,6 +208,7 @@ class SubworkerRunner:
         attempt = RunAttempt(attempt_number=attempt_num)
         prompt = self._read_prompt()
         model = self._model_override or self._config.model
+        variant = self._variant_override or self._config.variant
         server_url = os.environ.get("OPENCODE_SERVER_URL", "http://127.0.0.1:4096")
         timeout = self._config.timeout_minutes * 60
 
@@ -216,7 +219,10 @@ class SubworkerRunner:
             async with OpenCodeClient(server_url, default_timeout=timeout) as client:
                 if session_id:
                     log.info("runner.recover session=%s subworker=%s", session_id, self._config.name)
-                    await client.send_message(session_id, content=prompt, model=model, timeout=timeout)
+                    await client.send_message(
+                        session_id, content=prompt, model=model, variant=variant,
+                        agent=self._config.agent_id, timeout=timeout,
+                    )
                 else:
                     openworkspace = os.environ.get("OPENCODE_WORKSPACE", "")
                     workspace = self._config.workspace
@@ -250,10 +256,20 @@ class SubworkerRunner:
                     session_id = sess.get("id") or ""
                     if not session_id:
                         raise OpenCodeSessionError("No session ID returned from create_session")
-                    await client.send_message(session_id, content=prompt, model=model, timeout=timeout)
+                    # NOTE: send_message blocks until the agent finishes —
+                    # the progress streamer MUST start before it.
+                    stream_task = asyncio.create_task(
+                        self._stream_progress(session_id, directory)
+                    )
+                    try:
+                        await client.send_message(
+                        session_id, content=prompt, model=model, variant=variant,
+                        agent=self._config.agent_id, timeout=timeout,
+                    )
+                    finally:
+                        stream_task.cancel()
 
                 attempt.session_id = session_id
-                await client.wait_for_response(session_id, timeout=timeout)
                 messages = await client.list_messages(session_id)
                 attempt.stdout = OpenCodeClient.extract_assistant_text(messages)
                 attempt.exit_code = 0
@@ -328,32 +344,95 @@ class SubworkerRunner:
     def _read_prompt(self) -> str:
         """Read the prompt from the subworker's PROMPT.md file.
 
-        When agent_id is set, the agent already has its personality loaded
-        from the agent file (e.g. ~/.config/opencode/agents/elia.md).
-        Sending the full PROMPT.md as a user message creates redundancy and
-        confuses the agent.  Instead, send a concise task instruction.
+        PROMPT.md IS the task instructions (workspace constraints, handoff
+        protocol, business logic) — it MUST be sent as the user message on
+        every run. The agent personality file (~/.config/opencode/agents/
+        <id>.md) only carries identity/workflow and does NOT replace it.
+
+        Resolution order:
+          1. ``prompt_override`` (manual trigger body)
+          2. ``<workspace>/<prompt_file>``              (as configured / legacy)
+          3. ``<workspace>/../<prompt_file>``           (standard: next to workspace/)
+          4. ``/data/subworkers/<name>/<prompt_file>``  (container layout)
         """
         if self._prompt_override:
             return self._prompt_override
-        # When agent_id is set, agent already has its system prompt.
-        # Send a short task instruction instead of the full PROMPT.md.
-        if self._config.agent_id:
-            task_prompt = (
-                f"Execute the {self._config.name} subworker task.\n"
-                "Read your instructions from your agent definition and "
-                "complete the scheduled work. Check for pending tasks, "
-                "process any queued work, and report status when done.\n"
-                "Output <promise>DONE</promise> when complete."
-            )
-            log.info("runner.task_prompt subworker=%s agent_id=%s (short prompt, agent has system prompt)",
-                     self._config.name, self._config.agent_id)
-            return task_prompt
+
         workspace = Path(self._config.workspace or ".")
-        prompt_path = workspace / self._config.prompt_file
-        if prompt_path.exists():
-            return prompt_path.read_text(encoding="utf-8").strip()
-        log.warning("runner.prompt_missing subworker=%s path=%s", self._config.name, str(prompt_path))
-        return f"Run the {self._config.name} subworker task."
+        candidates = [
+            workspace / self._config.prompt_file,
+            workspace.parent / self._config.prompt_file,
+            Path("/data/subworkers") / self._config.name / self._config.prompt_file,
+        ]
+        checked: list[str] = []
+        for candidate in candidates:
+            key = str(candidate)
+            if key in checked:
+                continue
+            checked.append(key)
+            try:
+                if candidate.exists():
+                    text = candidate.read_text(encoding="utf-8").strip()
+                    if text:
+                        log.info("runner.prompt_loaded subworker=%s path=%s chars=%d",
+                                 self._config.name, key, len(text))
+                        return text
+            except OSError as exc:
+                log.warning("runner.prompt_read_error subworker=%s path=%s error=%s",
+                            self._config.name, key, exc)
+
+        log.warning("runner.prompt_missing subworker=%s checked=%s", self._config.name, checked)
+        return (
+            f"Execute the {self._config.name} subworker task.\n"
+            "Your PROMPT.md could not be located by the runner. Read your "
+            "agent definition plus any handoff/state files in your workspace, "
+            "complete the scheduled work, and report status when done.\n"
+            "Output <promise>DONE</promise> when complete."
+        )
+
+    async def _stream_progress(self, session_id: str, directory: str) -> None:
+        """Stream live agent output over WS while the run executes.
+
+        Subscribes to the opencode SSE event stream scoped to the run's
+        workspace and forwards text deltas as ``run_log`` WS events, so
+        clients get realtime logs without polling HTTP.
+        """
+        import json as _json
+        import os as _os
+        from urllib.parse import quote
+
+        import httpx
+
+        from app.routes.websocket import ws_manager
+
+        name = self._config.name
+        server_url = _os.environ.get("OPENCODE_SERVER_URL", "http://127.0.0.1:4096")
+        url = f"{server_url}/event?directory={quote(directory)}"
+
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("GET", url) as resp:
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        try:
+                            evt = _json.loads(line[5:].strip())
+                        except Exception:
+                            continue
+                        if evt.get("type") != "message.part.delta":
+                            continue
+                        props = evt.get("properties") or {}
+                        if props.get("sessionID") != session_id:
+                            continue
+                        if props.get("field") not in (None, "text"):
+                            continue
+                        delta = props.get("delta") or ""
+                        if delta:
+                            await ws_manager.broadcast_run_log(name, delta)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("runner.stream_error subworker=%s error=%s", name, exc)
 
     def _validate_run(self, attempt: RunAttempt) -> dict[str, Any]:
         """Validate a completed run (exit code 0).

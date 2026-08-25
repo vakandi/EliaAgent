@@ -97,6 +97,7 @@ class OpenCodeClient:
         json: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
         timeout: float | None = None,
+        headers: dict[str, str] | None = None,
     ) -> Any:
         """Execute an HTTP request with error mapping."""
         client = self._ensure_client()
@@ -107,6 +108,7 @@ class OpenCodeClient:
                 json=json,
                 params=params,
                 timeout=timeout or self._default_timeout,
+                headers=headers,
             )
         except httpx.ConnectError as exc:
             raise OpenCodeConnectionError(f"Cannot connect to OpenCode at {self._base_url}: {exc}") from exc
@@ -214,7 +216,14 @@ class OpenCodeClient:
         payload: dict[str, Any] = {"directory": directory}
         if agent_id:
             payload["agent"] = agent_id
-        return await self._request("POST", "/session", json=payload)
+        # OpenCode ignores body.directory — only this undocumented header
+        # sets the session cwd. Without it every session lands in the server CWD.
+        return await self._request(
+            "POST",
+            "/session",
+            json=payload,
+            headers={"x-opencode-directory": directory},
+        )
 
     async def delete_session(self, session_id: str) -> dict[str, Any]:
         """Delete/close a session (verified: DELETE /session/{id} → true)."""
@@ -226,31 +235,54 @@ class OpenCodeClient:
         content: str,
         *,
         model: str | None = None,
+        variant: str | None = None,
+        agent: str | None = None,
         timeout: float = 30.0,
     ) -> dict[str, Any]:
         """Send a user message to a session.
 
         This is the call that starts the agent working. Verified payload::
 
-            {"model": {"modelID": "big-pickle", "providerID": "opencode"},
+            {"agent": "my-agent",
+             "model": {"modelID": "big-pickle", "providerID": "opencode"},
              "parts": [{"type": "text", "text": content}]}
 
         Args:
             session_id: Target session ID.
             content: Message text (typically the prompt).
             model: Model string (e.g. ``"big-pickle"``).
+            variant: Reasoning effort variant (low/medium/high/max) for models
+                that expose one — sent as the top-level ``variant`` field of
+                the prompt body (see opencode PromptInput schema).
+            agent: Agent that executes this prompt. ⚠️ MUST be set on every
+                message — the agent is a property of the PROMPT INPUT, not of
+                the session; omitting it lets oh-my-opencode's default
+                (Sisyphus) take over the run.
             timeout: Request timeout in seconds.
         """
         payload: dict[str, Any] = {"parts": [{"type": "text", "text": content}]}
+        if agent:
+            payload["agent"] = agent
         model_payload = self._model_payload(model)
         if model_payload:
             payload["model"] = model_payload
+        if variant:
+            payload["variant"] = variant
         return await self._request(
             "POST",
             f"/session/{session_id}/message",
             json=payload,
             timeout=timeout,
         )
+
+    async def list_models(self) -> dict[str, Any]:
+        """Fetch provider/model catalog from the OpenCode server.
+
+        Returns the raw ``GET /provider`` payload: ``all`` (provider list with
+        nested ``models`` dicts), ``connected`` (provider ids with credentials),
+        ``default``.
+        """
+        return await self._request("GET", "/provider", timeout=30.0)
 
     async def list_messages(
         self,

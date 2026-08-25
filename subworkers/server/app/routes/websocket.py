@@ -23,6 +23,11 @@ class ConnectionManager:
 
     def __init__(self) -> None:
         self._connections: list[WebSocket] = []
+        self._status_provider: Any = None
+
+    def set_status_provider(self, provider: Any) -> None:
+        """Register a callable returning the full subworker status list."""
+        self._status_provider = provider
 
     @property
     def count(self) -> int:
@@ -44,14 +49,36 @@ class ConnectionManager:
         """Return an async callable(name, status) for scheduler on_run_complete."""
         return self._on_run_complete
 
+    def as_start_callback(self):
+        """Return an async callable(name) for scheduler on_run_start."""
+        return self._on_run_start
+
+    async def _on_run_start(self, name: str) -> None:
+        """Scheduler callback — broadcasts run start so clients can show live state."""
+        await self.broadcast({"event": "subworker_started", "name": name})
+        await self.broadcast_status_update()
+        logger.info("ws.broadcast event=subworker_started name=%s", name)
+
     async def _on_run_complete(self, name: str, status: str) -> None:
         """Scheduler callback — broadcasts subworker completion to all clients."""
-        event: dict[str, Any] = {
-            "event": f"subworker_{status}",
-            "name": name,
-        }
-        await self.broadcast(event)
-        logger.info("ws.broadcast event=%s name=%s", event["event"], name)
+        await self.broadcast({"event": f"subworker_{status}", "name": name})
+        await self.broadcast_status_update()
+        logger.info("ws.broadcast event=subworker_%s name=%s", status, name)
+
+    async def broadcast_status_update(self) -> None:
+        """Push a full status snapshot so clients drop their HTTP polling."""
+        if not self._status_provider:
+            return
+        try:
+            subs = self._status_provider()
+            if subs is not None:
+                await self.broadcast({"event": "status_update", "subworkers": subs})
+        except Exception as exc:
+            logger.warning("ws.status_update_failed error=%s", exc)
+
+    async def broadcast_run_log(self, name: str, text: str) -> None:
+        """Stream incremental agent output to clients (hover log popovers)."""
+        await self.broadcast({"event": "run_log", "name": name, "text": text})
 
     async def broadcast(self, event: dict[str, Any]) -> None:
         """Send a JSON event to all connected clients.
@@ -73,10 +100,11 @@ class ConnectionManager:
 
         Imports lazily to avoid circular dependencies.
         """
-        from app.main import get_config_manager, get_scheduler
+        from app.main import get_config_manager, get_health_manager, get_scheduler
 
         config = get_config_manager()
         scheduler = get_scheduler()
+        health = get_health_manager()
 
         scheduler_status = scheduler.get_status()
         running_names = set(scheduler.get_running())
@@ -90,12 +118,15 @@ class ConnectionManager:
                 "running": sw.name in running_names,
                 "next_run": next_run.isoformat() if next_run else None,
                 "schedule_type": sw.schedule.type.value if sw.schedule else None,
+                "model": sw.model,
+                "variant": sw.variant,
             })
 
         return {
             "event": "initial_status",
             "scheduler_running": scheduler_status["scheduler_running"],
             "total": len(subworkers),
+            "opencode_health": health.health_status.value if health else "unknown",
             "subworkers": subworkers,
         }
 
@@ -121,6 +152,10 @@ async def websocket_endpoint(ws: WebSocket) -> None:
     On state change: broadcasts event to all connected clients.
     On disconnect: cleans up connection gracefully.
     """
+    from app.core.auth import ws_require_token
+
+    if not await ws_require_token(ws):
+        return
     await ws_manager.connect(ws)
     try:
         # ── Send initial status snapshot ──

@@ -11,14 +11,16 @@ from pathlib import Path
 from typing import AsyncGenerator
 
 import structlog
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.config.manager import ConfigManager
 from app.config.models import SubworkerConfig
+from app.core.auth import require_token
 from app.routes.subworkers import router as subworker_router
 from app.routes.server import router as server_router
+from app.routes.tunnel import router as tunnel_router
 from app.routes.websocket import router as ws_router
 from app.services.health_manager import DEFAULT_HOST, DEFAULT_PORT, HealthManager
 from app.services.runner import SubworkerRunner
@@ -87,6 +89,7 @@ async def _run_subworker(
     config: SubworkerConfig,
     prompt: str | None = None,
     model: str | None = None,
+    variant: str | None = None,
 ) -> "SubworkerRunner.RunResult":
     """Run a subworker and return the RunResult.
 
@@ -98,6 +101,7 @@ async def _run_subworker(
         log_dir=Path(os.getenv("LOG_DIR", str(_SUBWORKERS_DIR / "logs"))),
         prompt_override=prompt,
         model_override=model,
+        variant_override=variant,
     )
     result = await runner.run_subworker()
     if not result.success:
@@ -129,10 +133,26 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # Health manager — tracks the already-running OpenCode server (4096).
     # We do NOT start it: the server is managed by opencode-serve.sh.
+    # Host must come from OPENCODE_SERVER_URL: inside the bridged container
+    # 127.0.0.1 is the container itself, not the host where opencode runs.
+    from urllib.parse import urlparse
+
+    _opencode_url = urlparse(os.getenv("OPENCODE_SERVER_URL", "http://127.0.0.1:4096"))
     _health_manager = HealthManager(
-        port=4096,
+        port=_opencode_url.port or 4096,
+        host=_opencode_url.hostname or "127.0.0.1",
         work_dir=str(_SUBWORKERS_DIR),
+        manage_process=False,
     )
+
+    from app.routes.websocket import ws_manager as _ws_mgr
+
+    async def _on_health_change(old, new, check_result):
+        # Push immediately so clients flip their server-down icon in realtime.
+        await _ws_mgr.broadcast_status_update()
+
+    _health_manager.on_health_change(_on_health_change)
+    await _health_manager.start_external_monitor()
 
     # Scheduler — one job per subworker, manual triggers supported.
     # state_file lives in LOG_DIR (bind-mounted) so it survives docker nuke.
@@ -143,11 +163,51 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
     for sw in _config_manager.subworkers:
         _scheduler.add_subworker(sw)
+
+    # WS live events — without these registrations the server never
+    # broadcasts anything after the initial snapshot.
+    from app.routes.websocket import ws_manager
+
+    def _status_snapshot() -> dict[str, Any] | None:
+        running_names = set(_scheduler.get_running())
+        return {
+            "opencode_health": _health_manager.health_status.value
+            if _health_manager else "unknown",
+            "subworkers": [
+                {
+                    "name": sw.name,
+                    "enabled": sw.enabled,
+                    "running": sw.name in running_names,
+                    "schedule_type": sw.schedule.type.value if sw.schedule else None,
+                    "schedule": sw.schedule.model_dump() if sw.schedule else None,
+                    "model": sw.model,
+                    "variant": sw.variant,
+                }
+                for sw in _config_manager.subworkers
+            ],
+        }
+
+    ws_manager.set_status_provider(_status_snapshot)
+    _scheduler.on_run_complete(ws_manager.as_callback())
+    _scheduler.on_run_start(ws_manager.as_start_callback())
+
     await _scheduler.start()
     logger.info(
         "scheduler.started",
         job_count=len(_config_manager.subworkers),
     )
+
+    # Tunnel permanence — a previously configured tunnel must survive any
+    # docker restart / down-up cycle: bring cloudflared back automatically.
+    try:
+        from app.routes.tunnel import _manager as _tunnel_manager
+
+        _tunnel_state = _tunnel_manager.load_state() or {}
+        if _tunnel_state.get("tunnel_token"):
+            await _tunnel_manager.start()
+            logger.info("tunnel.autostart", domain=_tunnel_state.get("domain"))
+    except Exception as exc:
+        logger.warning("tunnel.autostart_failed", error=str(exc))
 
     yield  # ── server is running ──
 
@@ -167,8 +227,12 @@ app = FastAPI(
 
 # ── Register Routers ────────────────────────────────────────────────────────
 
-app.include_router(subworker_router)
-app.include_router(server_router)
+# Auth is applied per-router (NOT globally): a global dependency also runs on
+# WebSocket routes where header-security resolution crashes the handshake.
+# /health is registered directly on the app and stays open for Docker.
+app.include_router(subworker_router, dependencies=[Depends(require_token)])
+app.include_router(server_router, dependencies=[Depends(require_token)])
+app.include_router(tunnel_router, dependencies=[Depends(require_token)])
 app.include_router(ws_router)
 
 # CORS: localhost only
