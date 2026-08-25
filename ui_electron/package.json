@@ -13,6 +13,7 @@
   "dependencies": {
     "dotenv": "^17.4.2",
     "electron": "^33.0.0",
-    "node-fetch": "^2.7.0"
+    "node-fetch": "^2.7.0",
+    "ws": "^8.21.3"
   }
 }

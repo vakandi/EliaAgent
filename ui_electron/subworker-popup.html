@@ -823,6 +823,12 @@
     const runsCache = {};
     // Track selected model per agent: { agentName: modelSlug }
     const modelSelections = {};
+    // Selected reasoning variant per agent: { agentName: 'low'|'medium'|... }
+    const modelVariants = {};
+    // Full catalog from GET /models (favorites first, server-sorted)
+    let allModels = [];
+    // Two-step selection state: { agentName: modelId } while picking thinking level
+    const pendingModel = {};
 
     async function loadModelSelections() {
       try {
@@ -831,11 +837,62 @@
           Object.assign(modelSelections, saved);
         }
       } catch (_) {}
+      try {
+        const resp = await fetch(`${SUBWORKER_SERVER_URL}/models`);
+        if (resp.ok) {
+          const data = await resp.json();
+          allModels = data.models || [];
+        }
+      } catch (_) {}
     }
 
     function saveModelSelection(name, model) {
       modelSelections[name] = model;
       window.popupAPI.saveModelSelection(name, model);
+    }
+
+    function applyModelSelection(name, model, variant) {
+      modelSelections[name] = model;
+      modelVariants[name] = variant || '';
+      window.popupAPI.saveModelSelection(name, model);
+      const dd = document.querySelector(`.model-dropdown[data-name="${name}"]`);
+      const badge = dd ? dd.previousElementSibling : null;
+      if (badge) {
+        badge.textContent = '⚡ ' + model.split('/').pop() + (variant ? ` (${variant})` : '');
+      }
+      fetch(`${SUBWORKER_SERVER_URL}/status/${encodeURIComponent(name)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model, variant: variant || null })
+      }).catch(err => console.error('Model persist failed:', err.message));
+    }
+
+    function renderModelOptions(name) {
+      const dd = document.querySelector(`.model-dropdown[data-name="${name}"]`);
+      if (!dd) return;
+      const current = modelSelections[name] || 'opencode/big-pickle';
+      const currentVariant = modelVariants[name] || '';
+      const pending = pendingModel[name];
+
+      if (pending) {
+        const m = allModels.find(x => x.id === pending);
+        const variants = m ? (m.variants || []) : [];
+        let html = `<div class="model-option back-option" data-back="1">← ${escHtml(m ? m.name : pending)}</div>`;
+        html += `<div class="model-option${!currentVariant ? ' selected' : ''}" data-variant=""><span class="model-dot"></span>no extra thinking</div>`;
+        for (const v of variants) {
+          html += `<div class="model-option${currentVariant === v ? ' selected' : ''}" data-variant="${escHtml(v)}"><span class="model-dot"></span>thinking: ${escHtml(v)}</div>`;
+        }
+        dd.innerHTML = html;
+        return;
+      }
+
+      let html = '';
+      for (const m of allModels) {
+        const sel = current === m.id ? ' selected' : '';
+        const varTag = sel && currentVariant ? ` <span class="model-provider">${escHtml(currentVariant)}</span>` : '';
+        html += `<div class="model-option${sel}" data-model="${escHtml(m.id)}"><span class="model-dot"></span>${escHtml(m.name)} <span class="model-provider">${escHtml(m.provider)}</span>${varTag}</div>`;
+      }
+      dd.innerHTML = html || '<div class="model-option">no models (server offline)</div>';
     }
 
     function renderSubworkers(workers) {
@@ -871,6 +928,12 @@
         const nextRun = getNextRun(w.schedule);
         const enabledCls = w.enabled ? ' enabled' : '';
 
+        if (w.model) modelSelections[w.name] = w.model;
+        if (w.variant) modelVariants[w.name] = w.variant;
+        const curModel = modelSelections[w.name] || 'opencode/big-pickle';
+        const curVariant = modelVariants[w.name] || '';
+        const badgeText = curModel.split('/').pop() + (curVariant ? ` (${curVariant})` : '');
+
         card.innerHTML = `
           <div class="subworker-info">
             <div class="subworker-name-row">
@@ -878,19 +941,8 @@
               ${w.isMain ? '<span class="main-badge" title="Main agent">MAIN</span>' : ''}
               <button class="main-btn" data-name="${w.name}" data-is-main="${w.isMain ? '1' : '0'}" title="${w.isMain ? 'Unset main agent (default: Elia)' : 'Set as main agent'}">${w.isMain ? '✕' : '★'}</button>
               <div class="model-select-wrap">
-                <div class="model-badge" data-name="${w.name}" title="Select model">⚡ ${(modelSelections[w.name] || 'opencode/big-pickle').split('/').pop()}</div>
-                <div class="model-dropdown" data-name="${w.name}">
-                  <div class="model-option${(!modelSelections[w.name] || modelSelections[w.name] === 'opencode/big-pickle') ? ' selected' : ''}" data-model="opencode/big-pickle"><span class="model-dot"></span>big-pickle <span class="model-provider">opencode-zen</span></div>
-                  <div class="model-option${modelSelections[w.name] === 'opencode/nemotron-3.5-lightning-free' ? ' selected' : ''}" data-model="opencode/nemotron-3.5-lightning-free"><span class="model-dot"></span>nemotron-3.5-lightning <span class="model-provider">opencode-zen</span></div>
-                  <div class="model-option${modelSelections[w.name] === 'opencode/nemotron-3-ultra-free' ? ' selected' : ''}" data-model="opencode/nemotron-3-ultra-free"><span class="model-dot"></span>nemotron-3-ultra <span class="model-provider">opencode-zen</span></div>
-                  <div class="model-option${modelSelections[w.name] === 'opencode/hy3-free' ? ' selected' : ''}" data-model="opencode/hy3-free"><span class="model-dot"></span>hy3 <span class="model-provider">opencode-zen</span></div>
-                  <div class="model-option${modelSelections[w.name] === 'opencode/laguna-s-2.1-free' ? ' selected' : ''}" data-model="opencode/laguna-s-2.1-free"><span class="model-dot"></span>laguna-s-2.1 <span class="model-provider">opencode-zen</span></div>
-                  <div class="model-option${modelSelections[w.name] === 'opencode/mimo-v2.5-free' ? ' selected' : ''}" data-model="opencode/mimo-v2.5-free"><span class="model-dot"></span>mimo-v2.5 <span class="model-provider">opencode-zen</span></div>
-                  <div class="model-option${modelSelections[w.name] === 'opencode/deepseek-v4-flash-free' ? ' selected' : ''}" data-model="opencode/deepseek-v4-flash-free"><span class="model-dot"></span>deepseek-v4-flash <span class="model-provider">opencode-zen</span></div>
-                  <div class="model-option${modelSelections[w.name] === 'google/gemini-2.5-flash-lite' ? ' selected' : ''}" data-model="google/gemini-2.5-flash-lite"><span class="model-dot"></span>gemini-2.5-flash-lite <span class="model-provider">openrouter</span></div>
-                  <div class="model-option${modelSelections[w.name] === 'google/gemma-4-26b-a4b-it' ? ' selected' : ''}" data-model="google/gemma-4-26b-a4b-it"><span class="model-dot"></span>gemma-4-26b <span class="model-provider">openrouter</span></div>
-                  <div class="model-option${modelSelections[w.name] === 'google/gemma-4-31b-it' ? ' selected' : ''}" data-model="google/gemma-4-31b-it"><span class="model-dot"></span>gemma-4-31b <span class="model-provider">openrouter</span></div>
-                </div>
+                <div class="model-badge" data-name="${w.name}" title="Select model">⚡ ${escHtml(badgeText)}</div>
+                <div class="model-dropdown" data-name="${w.name}"></div>
               </div>
               <button class="start-btn" data-name="${w.name}" title="Start agent">
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -991,7 +1043,7 @@
         });
       });
 
-      // Model badge: toggle dropdown
+      // Model badge: lazy-render options then toggle dropdown
       document.querySelectorAll('.model-badge').forEach(badge => {
         badge.addEventListener('click', function(e) {
           e.stopPropagation();
@@ -1002,35 +1054,55 @@
           document.querySelectorAll('.model-dropdown.open').forEach(dd => {
             if (dd !== dropdown) dd.classList.remove('open');
           });
+          if (!dropdown.classList.contains('open')) {
+            delete pendingModel[name];
+            renderModelOptions(name);
+          }
           dropdown.classList.toggle('open');
         });
       });
-
-      // Model option: select model
-      document.querySelectorAll('.model-option').forEach(opt => {
-        opt.addEventListener('click', function(e) {
-          e.stopPropagation();
-          const model = this.dataset.model;
-          const dropdown = this.closest('.model-dropdown');
-          const name = dropdown.dataset.name;
-          const badge = dropdown.previousElementSibling;
-          // Update selection visuals
-          dropdown.querySelectorAll('.model-option').forEach(o => o.classList.remove('selected'));
-          this.classList.add('selected');
-          // Update badge text
-          badge.textContent = '⚡ ' + model.split('/').pop();
-          // Store selection
-          saveModelSelection(name, model);
-          // Close dropdown
-          dropdown.classList.remove('open');
-        });
-      });
-
-      // Close model dropdown when clicking elsewhere
-      document.addEventListener('click', () => {
-        document.querySelectorAll('.model-dropdown.open').forEach(dd => dd.classList.remove('open'));
-      });
     }
+
+    // Delegated: model option clicks (options are re-rendered dynamically)
+    document.addEventListener('click', function(e) {
+      const opt = e.target.closest('.model-option');
+      if (!opt) return;
+      const dd = opt.closest('.model-dropdown');
+      if (!dd || !dd.classList.contains('open')) return;
+      e.stopPropagation();
+      const name = dd.dataset.name;
+
+      if (opt.dataset.back) {
+        delete pendingModel[name];
+        renderModelOptions(name);
+        return;
+      }
+      if (opt.dataset.model) {
+        const model = opt.dataset.model;
+        const m = allModels.find(x => x.id === model);
+        if (m && (m.variants || []).length > 0) {
+          pendingModel[name] = model;
+          renderModelOptions(name);
+        } else {
+          applyModelSelection(name, model, '');
+          dd.classList.remove('open');
+        }
+        return;
+      }
+      if (opt.dataset.variant !== undefined) {
+        const model = pendingModel[name];
+        if (!model) return;
+        applyModelSelection(name, model, opt.dataset.variant);
+        delete pendingModel[name];
+        dd.classList.remove('open');
+      }
+    });
+
+    // Close model dropdown when clicking elsewhere
+    document.addEventListener('click', (e) => {
+      if (e.target.closest('.model-dropdown') || e.target.closest('.model-badge')) return;
+      document.querySelectorAll('.model-dropdown.open').forEach(dd => dd.classList.remove('open'));
+    });
 
     function toggleDropdown(name, chevronBtn) {
       const wrap = chevronBtn.closest('.subworker-card-wrap');

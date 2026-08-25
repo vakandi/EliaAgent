@@ -4,6 +4,7 @@ const fs = require('fs');
 const http = require('http');
 const https = require('https');
 const { execSync, spawn } = require('child_process');
+const WebSocket = require('ws');
 
 const envPath = path.join(__dirname, '..', '..', '.env');
 if (fs.existsSync(envPath)) {
@@ -166,6 +167,7 @@ function createWindow() {
     mainWindow.webContents.send('config-updated', config);
     startNtfyStream();
     startAgentStatusPolling();
+    startSubworkerWebSocket();
     setTimeout(() => mainWindow?.setBounds(getDefaultBounds()), 150);
     mainWindow.setIgnoreMouseEvents(false, { forward: true });
   });
@@ -205,13 +207,137 @@ function getAgentStatus() {
   }
 }
 
-function startAgentStatusPolling() {
-  if (agentStatusInterval) clearInterval(agentStatusInterval);
-  function send() {
-    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('agent-status', getAgentStatus());
+function sendAgentStatus(status) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('agent-status', status || getAgentStatus());
   }
-  send();
-  agentStatusInterval = setInterval(send, 2000);
+}
+
+function startAgentStatusPolling() {
+  // Live elapsed counter only while the main agent runs — computed locally,
+  // zero HTTP. State changes arrive via the subworker WebSocket.
+  if (agentStatusInterval) clearInterval(agentStatusInterval);
+  agentStatusInterval = setInterval(() => {
+    if (_mainAgentRunning) sendAgentStatus();
+  }, 1000);
+}
+
+// ── Subworker WebSocket (realtime — replaces HTTP polling) ──────────
+let subworkerWS = null;
+let wsReconnectDelay = 1000;
+const wsSubworkerCache = new Map();   // name -> {enabled, running, model, variant}
+let _descCache = null;
+
+function getDescCache() {
+  if (_descCache) return _descCache;
+  _descCache = {};
+  try {
+    for (const sw of fs.readdirSync(subworkersRoot)) {
+      const promptPath = path.join(subworkersRoot, sw, 'PROMPT.md');
+      let description = '';
+      try {
+        description = fs.readFileSync(promptPath, 'utf8').split('\n')[0].replace(/^#\s*/, '').trim();
+      } catch (e) {}
+      _descCache[sw] = { description, path: path.join(subworkersRoot, sw) };
+    }
+  } catch (e) {}
+  return _descCache;
+}
+
+function buildSubworkerList() {
+  const mainAgentName = getMainAgentName();
+  const desc = getDescCache();
+  const results = [];
+  for (const [name, st] of wsSubworkerCache) {
+    results.push({
+      name,
+      label: name.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
+      description: desc[name]?.description || '',
+      path: desc[name]?.path || path.join(subworkersRoot, name),
+      enabled: st.enabled !== false,
+      running: st.running || false,
+      isMain: name === mainAgentName,
+      schedule: st.schedule || null,
+      model: st.model || null,
+      variant: st.variant || null
+    });
+  }
+  results.sort((a, b) => a.name.localeCompare(b.name));
+  return results;
+}
+
+function pushSubworkerList() {
+  if (subworkerPopup && !subworkerPopup.isDestroyed()) {
+    subworkerPopup.webContents.send('subworkers-list', buildSubworkerList());
+  }
+}
+
+function updateMainAgentFromCache() {
+  const st = wsSubworkerCache.get(getMainAgentName());
+  const running = st ? (st.running || false) : false;
+  if (running && !_mainAgentRunning) _mainAgentStartedAt = Date.now();
+  else if (!running) _mainAgentStartedAt = 0;
+  _mainAgentRunning = running;
+  sendAgentStatus();
+}
+
+function applyWsSnapshot(d) {
+  for (const sw of (d.subworkers || [])) {
+    const prev = wsSubworkerCache.get(sw.name) || {};
+    wsSubworkerCache.set(sw.name, {
+      ...prev,
+      enabled: sw.enabled,
+      running: sw.running,
+      model: sw.model,
+      variant: sw.variant,
+      schedule: sw.schedule || prev.schedule || null
+    });
+  }
+  pushSubworkerList();
+  updateMainAgentFromCache();
+}
+
+function startSubworkerWebSocket() {
+  const connect = () => {
+    try {
+      subworkerWS = new WebSocket('ws://127.0.0.1:5656/ws');
+    } catch (e) {
+      console.error('WS unsupported:', e.message);
+      return;
+    }
+    subworkerWS.on('open', () => { wsReconnectDelay = 1000; });
+    subworkerWS.on('message', (raw) => {
+      let d;
+      try { d = JSON.parse(raw.toString()); } catch { return; }
+      switch (d.event) {
+        case 'initial_status':
+        case 'status_update':
+          applyWsSnapshot(d);
+          break;
+        case 'subworker_started': {
+          const st = wsSubworkerCache.get(d.name);
+          if (st) st.running = true;
+          pushSubworkerList();
+          updateMainAgentFromCache();
+          break;
+        }
+        case 'subworker_completed':
+        case 'subworker_error': {
+          const st = wsSubworkerCache.get(d.name);
+          if (st) st.running = false;
+          pushSubworkerList();
+          updateMainAgentFromCache();
+          break;
+        }
+      }
+    });
+    subworkerWS.on('close', () => {
+      setTimeout(connect, wsReconnectDelay);
+      wsReconnectDelay = Math.min(wsReconnectDelay * 2, 15000);
+    });
+    subworkerWS.on('error', () => {});
+  };
+  connect();
 }
 
 // ── Subworker status ─────────────────────────────────────────
@@ -311,7 +437,9 @@ function getSubworkerStatus() {
         enabled: sw.enabled !== false,
         running: sw.running || false,
         isMain: sw.name === mainAgentName,
-        schedule: sw.schedule || null
+        schedule: sw.schedule || null,
+        model: sw.model || null,
+        variant: sw.variant || null
       });
     }
     results.sort((a, b) => a.name.localeCompare(b.name));
@@ -407,12 +535,13 @@ ipcMain.on('set-selected-model', (event, model) => {
 // Persist selected model for cron/trigger (Elia choice = cron job model)
 const opencodeModelPath = path.join(EliaAIRoot, '.opencode_model');
 const MODEL_SHORT_MAP = {
+  'opencode/x-preview-f-free': 'x-preview-f-free',
   'opencode/big-pickle': 'big-pickle',
   'opencode/deepseek-v4-flash-free': 'deepseek-v4-flash-free',
   'opencode/mimo-v2.5-free': 'mimo-v2.5-free',
   'opencode/nemotron-3-ultra-free': 'nemotron-3-ultra-free'
 };
-const SAFE_MODELS = ['big-pickle', 'deepseek-v4-flash-free', 'mimo-v2.5-free', 'nemotron-3-ultra-free', 'minimax', 'nvidia', 'deepseek', 'mimo', 'nemotron'];
+const SAFE_MODELS = ['x-preview-f-free', 'big-pickle', 'deepseek-v4-flash-free', 'mimo-v2.5-free', 'nemotron-3-ultra-free', 'minimax', 'nvidia', 'deepseek', 'mimo', 'nemotron'];
 function writeModelForCron(model) {
   if (!model || typeof model !== 'string') return;
   const short = MODEL_SHORT_MAP[model] || model;
@@ -530,7 +659,7 @@ ipcMain.on('save-subworker-schedule', (event, { agentName, scheduleConfig }) => 
 
 // Get subworker list
 ipcMain.on('get-subworkers', (event) => {
-  const workers = getSubworkerStatus();
+  const workers = wsSubworkerCache.size > 0 ? buildSubworkerList() : getSubworkerStatus();
   event.reply('subworkers-list', workers);
 });
 
@@ -636,7 +765,7 @@ ipcMain.on('open-logs-terminal', () => {
   const path = require('path');
   
   // Find latest opencode_interactive log file
-  const logsDir = path.join(path.dirname(path.dirname(__dirname)), 'logs');
+  const logsDir = path.join(EliaAIRoot, 'logs');
   let latestLog = null;
   let latestTime = 0;
   
@@ -655,7 +784,7 @@ ipcMain.on('open-logs-terminal', () => {
   } catch (e) {}
   
   // Fallback to cron.log if no opencode log found
-  const logFile = latestLog || path.join(path.dirname(path.dirname(__dirname)), 'logs', 'cron.log');
+  const logFile = latestLog || path.join(EliaAIRoot, 'logs', 'cron.log');
   // Show whole file + follow in realtime
   const cmd = 'tail -n 5000 -f ' + logFile;
   
@@ -922,7 +1051,7 @@ ipcMain.on('execute-elia-command', () => {
               const user = parts[3];
               const pass = parts[4];
               const proxyUrl = `http://${user}:${pass}@${ip}:${port}`;
-              cmd = `cd ~/EliaAI && env HTTP_PROXY="${proxyUrl}" HTTPS_PROXY="${proxyUrl}" http_proxy="${proxyUrl}" https_proxy="${proxyUrl}" ELIA_MODEL=${rawModel} ~/Documents/dictate.command`;
+              cmd = `cd ${EliaAIRoot} && env HTTP_PROXY="${proxyUrl}" HTTPS_PROXY="${proxyUrl}" http_proxy="${proxyUrl}" https_proxy="${proxyUrl}" ELIA_MODEL=${rawModel} ${path.join(EliaAIRoot, 'scripts', 'dictate.command')}`;
             }
           }
         } catch (e) {
@@ -931,7 +1060,7 @@ ipcMain.on('execute-elia-command', () => {
       }
 
       if (!cmd) {
-        cmd = `cd ~/EliaAI && ELIA_MODEL=${rawModel} ~/Documents/dictate.command`;
+        cmd = `cd ${EliaAIRoot} && ELIA_MODEL=${rawModel} ${path.join(EliaAIRoot, 'scripts', 'dictate.command')}`;
       }
 
       const script = [
@@ -968,7 +1097,7 @@ ipcMain.on('execute-mini-orb', () => {
           const user = parts[3];
           const pass = parts[4];
           const proxyUrl = `http://${user}:${pass}@${ip}:${port}`;
-          cmd = `env HTTP_PROXY="${proxyUrl}" HTTPS_PROXY="${proxyUrl}" http_proxy="${proxyUrl}" https_proxy="${proxyUrl}" ~/EliaAI/scripts/voice-command-only.sh`;
+          cmd = `env HTTP_PROXY="${proxyUrl}" HTTPS_PROXY="${proxyUrl}" http_proxy="${proxyUrl}" https_proxy="${proxyUrl}" ${path.join(EliaAIRoot, 'scripts', 'voice-command-only.sh')}`;
         }
       }
     } catch (e) {
@@ -977,7 +1106,7 @@ ipcMain.on('execute-mini-orb', () => {
   }
   
   if (!cmd) {
-    cmd = '~/EliaAI/scripts/voice-command-only.sh';
+    cmd = `${path.join(EliaAIRoot, 'scripts', 'voice-command-only.sh')}`;
   }
   
   const script = [
@@ -1182,6 +1311,7 @@ function updateTrayMenu() {
   const cronSettings = getCurrentCronSettings();
   
   const models = [
+    { id: 'x-preview-f-free', label: 'Ox Alpha Free (Unlimited)' },
     { id: 'big-pickle', label: 'Big Pickle' },
     { id: 'deepseek-v4-flash-free', label: 'DeepSeek V4 Flash' },
     { id: 'mimo-v2.5-free', label: 'MIMO V2.5' },
@@ -1379,7 +1509,7 @@ function saveTraySettings() {
 }
 
 function createTray() {
-  const iconPath = path.join(path.dirname(path.dirname(__dirname)), 'ui_electron', 'imgs', 'electronui.png');
+  const iconPath = path.join(__dirname, '..', 'imgs', 'electronui.png');
   let trayIcon = nativeImage.createFromPath(iconPath);
   if (trayIcon.isEmpty()) {
     trayIcon = nativeImage.createEmpty();
@@ -1442,7 +1572,7 @@ function runMorningSpeak() {
   const fs = require('fs');
   const path = require('path');
   
-  const eliaAI = path.join(path.dirname(path.dirname(__dirname)));
+  const eliaAI = EliaAIRoot;
   const promptFile = path.join(eliaAI, '.morning_briefing_prompt.txt');
   
   const morningPrompt = `MORNING BRIEFING - COMPREHENSIVE DAILY UPDATE:
@@ -1460,9 +1590,9 @@ SPEAK AT THESE MOMENTS:
 MUST DO:
 1. CHECK GOOGLE CALENDAR: Use gws-workspace list-events to get today's meetings and events
 2. CHECK TELEGRAM: Read recent messages from Watson IA group (chat ID: -5148361692)
-3. CHECK WHATSAPP: Read your main business group and team group
-4. CHECK JIRA: Get pending tickets for your projects
-5. CHECK MEMORY FILES: Read ~/EliaAI/memory/*.md for important context
+3. CHECK WHATSAPP: Read B2LUXE BUSINESS (120363408208578679@g.us) and COBOU PowerRangers (120363420711538035@g.us)
+4. CHECK JIRA: Get pending tickets for BEN, COBOUAGENC, ZOVAPANEL, TIKYT
+5. CHECK MEMORY FILES: Read EliaAI/memory/*.md for important context
 6. GATHER BUSINESS UPDATES: Status of all 8 businesses
 7. IDENTIFY ACTION ITEMS: What needs Wael's attention today?
 8. IDENTIFY WAITING ON: What are team members waiting for?

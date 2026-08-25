@@ -30,6 +30,53 @@ plus secure remote access from anywhere.
 
 ---
 
+## Version: v6.0.1 (August 25, 2026)
+
+### 🖥️ UI Electron Sync & WebSocket Fix
+
+**Bug Fixes**
+- Fixed `WebSocket is not defined` crash: the Electron main process now uses the `ws` package for the realtime subworker connection (`ws://127.0.0.1:5656/ws`) with exponential-backoff reconnect
+
+**New Features**
+- Subworker popup: full model catalog fetched from `GET /models`, two-step selection (model → thinking variant), persisted per agent via `PUT /status/{name}`
+- Scheduler-disable guard in desktop shortcuts (`touch ~/EliaAI/.scheduler_disabled` kills all scheduled runs)
+
+**Cleanup**
+- Removed hardcoded personal paths → relative paths via `EliaAIRoot`
+- Removed stale `EliaUI.app` binary bundle from desktop shortcuts
+- New UI assets (icons, tray images)
+
+---
+
+## Version: v6.0.0 (August 24, 2026)
+
+### 🐳 Subworkers System v4 — Dockerized, Deployable Anywhere
+
+**The subworker system was completely rebuilt.** The old launchd + bash/Node.js trigger stack (v3) is replaced by a **Python FastAPI server running in Docker** — deployable on any Mac or VPS.
+
+| | Old (v3) | New (v4) |
+|--|----------|----------|
+| Scheduling | 14 launchd plists | `subworkers.json` + APScheduler (hot-reloaded) |
+| Runtime | Shell + Node.js triggers | Python FastAPI in Docker (port 5656) |
+| Completion detection | Log-file EOF marker parsing | Multi-layer API + process polling |
+| Error handling | None | ErrorParser (10 error types) + exponential backoff retries |
+| Alerts | None | macOS beep + Electron + ntfy.sh |
+| Status view | 14 separate log files | REST API + WebSocket realtime |
+
+**Why it matters:** OpenCode has known memory leaks that previously caused real CPU/RAM blowups when many agents ran concurrently. The Docker server isolates and contains that — **thousands of sessions on only 4 GB of RAM**, with Colima handling Docker resource management on macOS and HealthManager auto-recovering crashed OpenCode server processes.
+
+**Highlights**
+- Runs drive the host OpenCode server over its HTTP API (`POST /session` + `/message`) — no CLI spawned inside the container
+- Session persistence survives full Docker nukes (`scheduler_state.json` bind-mounted to host)
+- Main-agent-as-subworker: Elia is managed like any other agent via `GET/POST /main-agent`
+- Full control from EliaTopBar / EliaUI over REST + WebSocket (`/ws`)
+- Team Mode cleanup: all upstream/team-specific references scrubbed for public release
+- Docs: companion clients ([EliaTopBar](https://github.com/vakandi/Elia-Topbar), [EliaAndroidApp](https://github.com/vakandi/EliaAndroidApp)) & Cloudflare Tunnel remote access
+
+**Docs:** See `subworkers/SUBWORKERS_SYSTEM.md` (v4.0) for the full architecture; `subworkers/SUBWORKERS_SYSTEM_OLD.md` keeps the legacy v3 reference.
+
+---
+
 ## Version: v5.0.1 (July 12, 2026)
 
 ### 🛡️ Subworker Premature Completion Fix — 10 Critical Bugfixes

@@ -32,3 +32,6 @@ __pycache__/
 .DS_Store
 .omo/
 setup/oh-my-openagent/packages/shared-skills/upstreams/
+
+# Heavy demo GIFs (kept local only)
+ui_electron/*.gif
