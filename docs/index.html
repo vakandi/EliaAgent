@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EliaAgent — A fleet of autonomous AI agents that runs your digital life 24/7</title>
+<meta name="description" content="EliaAgent turns OpenCode into a self-managed fleet of autonomous subworkers — each with its own personality, workspace, schedule and memory. Scheduled, monitored, self-healing, unlimited tokens.">
+<meta property="og:title" content="EliaAgent — Autonomous AI Agent Fleet">
+<meta property="og:description" content="Scheduled · Monitored · Self-healing · Unlimited tokens. Turn OpenCode into a self-managed fleet of autonomous subworkers.">
+<meta property="og:image" content="banner.png">
+<meta property="og:url" content="https://vakandi.github.io/EliaAgent/">
+<meta name="twitter:card" content="summary_large_image">
+<style>
+  :root {
+    --bg: #0a0e14;
+    --bg-card: #11161f;
+    --border: #1f2937;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #8b5cf6;
+    --accent2: #22d3ee;
+    --green: #22c55e;
+    --orange: #f0883e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+  }
+  a { color: var(--accent2); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .container { max-width: 1040px; margin: 0 auto; padding: 0 24px; }
+
+  header {
+    padding: 64px 0 44px; text-align: center;
+    background: radial-gradient(ellipse 80% 60% at 50% -10%, rgba(139, 92, 246, 0.16), transparent),
+                radial-gradient(ellipse 50% 40% at 80% 10%, rgba(34, 211, 238, 0.08), transparent);
+  }
+  header img.banner { max-width: 760px; width: 100%; border-radius: 14px; box-shadow: 0 12px 48px rgba(139,92,246,.22); }
+  header h1 { font-size: 2.6rem; margin: 30px 0 10px; letter-spacing: -0.02em; }
+  header h1 .grad {
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  header p.tagline { color: var(--muted); font-size: 1.18rem; max-width: 680px; margin: 0 auto; }
+  header p.sub { color: var(--muted); font-size: .95rem; margin-top: 6px; letter-spacing: .04em; }
+  .badges { margin-top: 20px; display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
+  .badges img { height: 20px; }
+  .cta { margin-top: 30px; display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+  .btn {
+    display: inline-block; padding: 12px 26px; border-radius: 10px;
+    font-weight: 600; font-size: 1rem; transition: transform .15s ease, box-shadow .15s ease;
+  }
+  .btn:hover { transform: translateY(-2px); text-decoration: none; }
+  .btn-primary {
+    background: linear-gradient(90deg, var(--accent), #6d4ae0); color: #fff;
+    box-shadow: 0 4px 20px rgba(139, 92, 246, 0.35);
+  }
+  .btn-secondary { background: var(--bg-card); color: var(--text); border: 1px solid var(--border); }
+
+  section { padding: 52px 0; }
+  section h2 { font-size: 1.7rem; margin-bottom: 10px; text-align: center; }
+  section p.lead { text-align: center; color: var(--muted); max-width: 720px; margin: 0 auto 32px; font-size: 1.02rem; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 18px; }
+  .card {
+    background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 22px; transition: border-color .2s ease, transform .2s ease;
+  }
+  .card:hover { border-color: var(--accent); transform: translateY(-2px); }
+  .card h3 { font-size: 1.02rem; margin-bottom: 8px; }
+  .card p { color: var(--muted); font-size: .92rem; }
+  .card.wide { grid-column: span 2; }
+  @media (max-width: 700px) { .card.wide { grid-column: span 1; } }
+
+  .proof {
+    margin-top: 26px; background: linear-gradient(135deg, rgba(34,197,94,.08), rgba(139,92,246,.08));
+    border: 1px solid rgba(34,197,94,.25); border-radius: 12px; padding: 20px 24px; text-align: center;
+  }
+  .proof strong { color: var(--green); }
+
+  pre.cmd, pre.arch {
+    background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 20px 24px; overflow-x: auto; font-family: "SF Mono", Menlo, monospace; font-size: .87rem;
+  }
+  pre.cmd { color: var(--green); line-height: 1.7; }
+  pre.cmd .c { color: var(--muted); }
+  pre.arch { color: var(--muted); font-size: .78rem; line-height: 1.5; }
+
+  .steps { counter-reset: step; }
+  .step {
+    background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 22px 24px; margin-bottom: 16px; position: relative; padding-left: 66px;
+  }
+  .step::before {
+    counter-increment: step; content: counter(step);
+    position: absolute; left: 20px; top: 22px;
+    width: 32px; height: 32px; border-radius: 50%;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700; color: #fff; font-size: .95rem;
+  }
+  .step h3 { font-size: 1.05rem; margin-bottom: 8px; }
+  .step p { color: var(--muted); font-size: .92rem; margin-bottom: 10px; }
+  .step pre {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px 16px; overflow-x: auto; font-family: "SF Mono", Menlo, monospace;
+    font-size: .8rem; color: var(--accent2); line-height: 1.6;
+  }
+
+  table { width: 100%; border-collapse: collapse; background: var(--bg-card); border-radius: 12px; overflow: hidden; }
+  th, td { padding: 11px 16px; text-align: left; border-bottom: 1px solid var(--border); font-size: .9rem; }
+  th { background: rgba(139, 92, 246, 0.12); color: var(--text); }
+  td { color: var(--muted); }
+  td code, .card code, .step code {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 5px;
+    padding: 1px 6px; font-size: .85em; font-family: "SF Mono", Menlo, monospace; color: var(--accent2);
+  }
+  .table-wrap { overflow-x: auto; border-radius: 12px; border: 1px solid var(--border); }
+
+  .clients { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 18px; }
+  .client {
+    background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 24px; text-align: center; transition: border-color .2s ease;
+  }
+  .client:hover { border-color: var(--accent2); }
+  .client .icon { font-size: 2rem; margin-bottom: 10px; }
+  .client h3 { font-size: 1.05rem; margin-bottom: 6px; }
+  .client p { color: var(--muted); font-size: .9rem; margin-bottom: 12px; }
+
+  footer { border-top: 1px solid var(--border); padding: 34px 0; text-align: center; color: var(--muted); font-size: .9rem; }
+  footer .heart { color: var(--accent); }
+  footer a { margin: 0 10px; }
+</style>
+</head>
+<body>
+
+<header class="container">
+  <img class="banner" src="banner.png" alt="EliaAgent — Autonomous AI agent fleet">
+  <h1>Elia<span class="grad">Agent</span></h1>
+  <p class="tagline">A fleet of autonomous AI agents that runs your digital life 24/7.</p>
+  <p class="sub">SCHEDULED · MONITORED · SELF-HEALING · UNLIMITED TOKENS</p>
+  <div class="badges">
+    <img src="https://img.shields.io/badge/install-2_commands-22C55E?style=flat-square" alt="Quick Start">
+    <img src="https://img.shields.io/badge/platform-macOS_%7C_Linux-lightgrey?style=flat-square" alt="Platform">
+    <img src="https://img.shields.io/badge/Docker-FastAPI-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
+    <img src="https://img.shields.io/badge/RAM-4GB_%E2%89%88_thousands_of_sessions-8B5CF6?style=flat-square" alt="RAM">
+    <img src="https://img.shields.io/badge/license-MIT-10B981?style=flat-square" alt="License">
+  </div>
+  <div class="cta">
+    <a class="btn btn-primary" href="https://github.com/vakandi/EliaAgent">⭐ View on GitHub</a>
+    <a class="btn btn-secondary" href="#quick-start">⚡ Quick Start — 2 commands</a>
+  </div>
+</header>
+
+<section class="container">
+  <h2>⚡ Why This Exists</h2>
+  <p class="lead">One AI agent is an assistant. A <strong style="color:var(--text)">fleet</strong> is an employee base.
+  EliaAgent turns <a href="https://opencode.ai">OpenCode</a> into a self-managed fleet of autonomous subworkers —
+  each with its own personality, workspace, schedule and memory — driven by a Python FastAPI server in Docker.</p>
+  <div class="grid">
+    <div class="card"><h3>🕐 Schedules, not prompts</h3><p>Every hour from 9h to 18h, weekdays only, weekends off, cron expressions — set it and forget it.</p></div>
+    <div class="card"><h3>🐳 4 GB RAM ≈ thousands of sessions</h3><p>The Docker runtime isolates and contains OpenCode's known memory leaks that previously caused CPU/RAM blowups.</p></div>
+    <div class="card"><h3>♻️ Self-healing runs</h3><p>Provider outage mid-task? The server detects it, waits a randomized delay, nudges the same session with <em>"continue the tasks"</em> — work resumes where it stopped.</p></div>
+    <div class="card"><h3>🔁 Exponential-backoff retries</h3><p>Crashed or timed-out runs retry automatically; session state survives full container nukes.</p></div>
+    <div class="card"><h3>📡 Realtime everything</h3><p>REST API + WebSocket events — live status, streaming logs, reasoning, tool calls.</p></div>
+    <div class="card"><h3>🌍 Remote access</h3><p>Built-in Cloudflare Tunnel wizard — reach your fleet from anywhere, protected by a shared auth token.</p></div>
+    <div class="card wide"><h3>∞ Unlimited tokens</h3><p>Free OpenCode Zen models + rotating residential proxies = effectively unlimited autonomous work. Rotate IP, keep working — dead proxies are health-checked and skipped automatically.</p></div>
+    <div class="card wide"><h3>🧠 Persistent memory (codemem)</h3><p>Every session feeds a per-agent SQLite memory: decisions, bug fixes, discoveries. The next run loads relevant context automatically — 3,400+ sessions indexed across the production fleet.</p></div>
+  </div>
+  <div class="proof">
+    💡 <strong>Flagship proof:</strong> <code>refund-hunter</code> has been hunting e-commerce refund policies
+    <strong>every day for months</strong>, writing reports to Google Docs and handing off state to its next shift —
+    without a single human prompt.
+  </div>
+</section>
+
+<section class="container" id="quick-start">
+  <h2>🚀 Quick Start</h2>
+  <p class="lead">Two commands. Prerequisites, config, Docker image, opencode server, tmux UI — all handled.</p>
+  <pre class="cmd">git clone https://github.com/vakandi/EliaAgent.git
+cd EliaAgent/subworkers
+
+./install_subworkers.sh    <span class="c"># prerequisites + config + Docker image</span>
+./start_subworkers.sh      <span class="c"># opencode server + Docker stack + UI in tmux</span></pre>
+  <p class="lead" style="margin-top:22px; margin-bottom:12px;">Health check:</p>
+  <pre class="cmd">curl http://localhost:5656/health
+<span class="c"># {"status":"ok","timestamp":"...","uptime":...}</span></pre>
+  <p class="lead" style="margin-top:22px;">Then install a client to control the fleet:</p>
+  <div class="clients">
+    <div class="client">
+      <div class="icon">🖥️</div>
+      <h3>EliaTopBar</h3>
+      <p>macOS menu bar — trigger, enable/disable, visual schedule picker, live log viewer per agent.</p>
+      <a href="https://github.com/vakandi/Elia-Topbar">GitHub →</a>
+    </div>
+    <div class="client">
+      <div class="icon">📱</div>
+      <h3>EliaAndroidApp</h3>
+      <p>Your fleet in your pocket — monitor and control agents from mobile.</p>
+      <a href="https://github.com/vakandi/EliaAndroidApp">GitHub →</a>
+    </div>
+  </div>
+</section>
+
+<section class="container">
+  <h2>🤖 How to Add a Subworker</h2>
+  <p class="lead">The core skill of the system. Three files, zero code.</p>
+  <div class="steps">
+    <div class="step">
+      <h3>Create the agent folder</h3>
+      <p>A workspace for isolated file I/O and a <code>.enabled</code> gate file — presence = active.</p>
+      <pre>mkdir -p subworkers/&lt;agent-id&gt;/workspace
+touch subworkers/&lt;agent-id&gt;/.enabled</pre>
+      <p style="margin-top:10px;">Write <code>PROMPT.md</code> — the task instructions injected on every run: workspace constraint,
+      handoff protocol (<code>HANDOFF_NEXT_SESSION.md</code> read at start, overwritten at end) and the mandatory
+      <code>&lt;promise&gt;DONE&lt;/promise&gt;</code> completion marker the server uses to detect success.</p>
+    </div>
+    <div class="step">
+      <h3>Register the personality</h3>
+      <p>Create <code>~/.config/opencode/agents/&lt;agent-id&gt;.md</code> with YAML frontmatter — name, description,
+      model (<code>opencode/big-pickle</code>…), temperature, tool permissions. Below the frontmatter: persona, workflow, rules.
+      The host OpenCode server loads it at session creation.</p>
+    </div>
+    <div class="step">
+      <h3>Declare the schedule</h3>
+      <p>Add an entry to <code>subworkers/server/app/config/subworkers.json</code> — hours, minute, days (cron convention:
+      <code>[1,2,3,4,5]</code> = weekdays only) or a cron expression. Max retries and timeout per agent.
+      The server hot-reloads the file — no restart needed:</p>
+      <pre>curl -X POST http://localhost:5656/config/reload</pre>
+    </div>
+  </div>
+  <p class="lead" style="margin-top:18px;">📄 Deep dive: <a href="https://github.com/vakandi/EliaAgent/blob/main/subworkers/SUBWORKERS_SYSTEM.md">SUBWORKERS_SYSTEM.md</a> — architecture, API contract, failure modes.</p>
+</section>
+
+<section class="container">
+  <h2>🏗️ Architecture</h2>
+  <pre class="arch">
+ EliaTopBar / EliaAndroidApp / Electron UI          ← realtime clients
+        │  WebSocket /ws + REST :5656
+        ▼
+ ┌────────────────────────────────────────────┐
+ │  elia-subworker-srv (Docker, FastAPI)      │
+ │  ├── APScheduler ← subworkers.json         │
+ │  ├── SubworkerRunner                       │
+ │  │     ├── provider-error auto-recovery    │
+ │  │     ├── retries + exponential backoff   │
+ │  │     └── HealthManager (auto-restart)    │
+ │  └── SessionMonitor (2s polling)           │
+ └──────────────┬─────────────────────────────┘
+                │ HTTP (host network)
+                ▼
+      opencode serve :4096  (HOST process)
+                │
+    ┌───────────┼───────────┐
+    ▼           ▼           ▼
+ agent A    agent B    agent N      ← personalities + PROMPT.md
+ workspace/ workspace/ workspace/  ← isolated file I/O</pre>
+  <p class="lead" style="margin-top:20px; margin-bottom:12px;"><strong style="color:var(--text)">Run lifecycle:</strong>
+  APScheduler fires → isolated session created → PROMPT.md sent → agent works (streamed live over WS) →
+  completion = idle + <code>&lt;promise&gt;DONE&lt;/promise&gt;</code> → transient errors auto-recovered →
+  failures retried with exponential backoff → alerts via macOS beep / ntfy.sh.</p>
+</section>
+
+<section class="container">
+  <h2>🔌 API Quick Reference</h2>
+  <p class="lead">Auth: shared token via <code>ELIA_AUTH_TOKEN</code> — send as <code>Authorization: Bearer &lt;token&gt;</code>.</p>
+  <div class="table-wrap">
+  <table>
+    <tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
+    <tr><td>GET</td><td><code>/health</code></td><td>Server healthcheck</td></tr>
+    <tr><td>GET</td><td><code>/status</code></td><td>All subworkers <code>{name, enabled, running, next_run, schedule}</code></td></tr>
+    <tr><td>PUT</td><td><code>/status/{name}</code></td><td>Edit config — schedule (hours/minute/days), model, variant, timeouts</td></tr>
+    <tr><td>POST</td><td><code>/trigger/{name}</code></td><td>Run now (optional <code>{prompt, model}</code> body)</td></tr>
+    <tr><td>POST</td><td><code>/enable/{name}</code> · <code>/disable/{name}</code></td><td>Toggle</td></tr>
+    <tr><td>GET</td><td><code>/logs/{name}?lines=N</code></td><td>Recent run-log lines</td></tr>
+    <tr><td>GET</td><td><code>/sessions/{name}?limit=N</code></td><td>Full session messages (reasoning, tools, text)</td></tr>
+    <tr><td>GET</td><td><code>/models</code></td><td>Model catalog (OpenCode Zen favorites first)</td></tr>
+    <tr><td>GET/POST</td><td><code>/main-agent</code></td><td>Read/set the MAIN agent</td></tr>
+    <tr><td>GET/POST</td><td><code>/server/health</code> · <code>/server/restart</code></td><td>OpenCode subprocess control</td></tr>
+    <tr><td>WS</td><td><code>/ws</code></td><td>Live events: <code>initial_status</code>, <code>subworker_started</code>, <code>run_log</code>, <code>subworker_completed</code>, <code>subworker_error</code></td></tr>
+  </table>
+  </div>
+</section>
+
+<section class="container">
+  <h2>❓ Troubleshooting</h2>
+  <div class="table-wrap">
+  <table>
+    <tr><th>Problem</th><th>Fix</th></tr>
+    <tr><td>Client shows <em>Disconnected</em></td><td>Server URL must be <code>http://localhost:5656</code> (not 8080)</td></tr>
+    <tr><td>Schedule didn't fire</td><td>Check entry in <code>subworkers.json</code> (<code>enabled: true</code>) then <code>POST /config/reload</code></td></tr>
+    <tr><td>Container down</td><td><code>cd subworkers/server && docker-compose up -d --build</code></td></tr>
+    <tr><td>OpenCode server dead</td><td><code>POST /server/restart</code> or restart via launcher</td></tr>
+    <tr><td>Auth errors (401)</td><td>Match <code>ELIA_AUTH_TOKEN</code> between server <code>.env</code> and client</td></tr>
+    <tr><td>Missed runs while laptop slept</td><td>Harmless — next slot fires when awake</td></tr>
+  </table>
+  </div>
+</section>
+
+<footer>
+  <div class="container">
+    <p>Built with <span class="heart">♥</span> for autonomous work ·
+    <a href="https://github.com/vakandi/EliaAgent">GitHub</a> ·
+    <a href="https://github.com/vakandi/Elia-Topbar">EliaTopBar</a> ·
+    <a href="https://github.com/vakandi/EliaAndroidApp">EliaAndroidApp</a></p>
+    <p style="margin-top:8px;">MIT License</p>
+  </div>
+</footer>
+
+</body>
+</html>
