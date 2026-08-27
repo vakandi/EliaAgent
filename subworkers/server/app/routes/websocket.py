@@ -80,6 +80,10 @@ class ConnectionManager:
         """Stream incremental agent output to clients (hover log popovers)."""
         await self.broadcast({"event": "run_log", "name": name, "text": text, "field": field})
 
+    async def broadcast_run_banner(self, name: str, banner: dict[str, Any]) -> None:
+        """Stream a system banner (reinjection, idle, etc.) — rendered as a big banner, not a chat bubble."""
+        await self.broadcast({"event": "run_banner", "name": name, "banner": banner})
+
     async def broadcast(self, event: dict[str, Any]) -> None:
         """Send a JSON event to all connected clients.
 

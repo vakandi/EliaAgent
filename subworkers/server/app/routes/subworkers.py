@@ -462,12 +462,13 @@ async def get_subworker_sessions(
 
     server_url = os.environ.get("OPENCODE_SERVER_URL", "http://127.0.0.1:5655")
 
-    async with OpenCodeClient(server_url, default_timeout=10.0) as client:
+    async with OpenCodeClient(server_url, default_timeout=30.0) as client:
         if not session_id:
-            # Newest session in the agent's workspace wins — the scheduler
-            # state can be stale after container restarts.
             ws_dir = _effective_workspace(sw)
-            all_sessions = await client.list_sessions(limit=2000)
+            try:
+                all_sessions = await client.list_sessions(limit=200)
+            except Exception:
+                all_sessions = []
             matching = [
                 s for s in all_sessions
                 if s.get("agent") == sw.agent_id
@@ -557,7 +558,7 @@ def _effective_workspace(sw) -> str:
     container paths; opencode sessions carry host paths)."""
     import os as _os
 
-    root = _os.environ.get("OPENCODE_WORKSPACE") or str(__import__("pathlib").Path.home() / "EliaAI")
+    root = _os.environ.get("OPENCODE_WORKSPACE", str(Path.home() / "EliaAI"))
     workspace = sw.workspace
     if not workspace:
         try:
@@ -589,11 +590,22 @@ async def list_subworker_sessions(name: str) -> SessionListResponse:
 
     server_url = os.environ.get("OPENCODE_SERVER_URL", "http://127.0.0.1:5655")
 
+    from app.main import get_scheduler
+    scheduler_sid = None
+    running_sid = None
     try:
-        async with OpenCodeClient(server_url, default_timeout=10.0) as client:
-            all_sessions = await client.list_sessions(limit=2000)
-    except (OpenCodeConnectionError, Exception):
-        return SessionListResponse(name=name, sessions=[])
+        scheduler_sid = get_scheduler().get_last_session_id(name)
+        running_sid = get_scheduler().get_running_session_id(name)
+    except Exception:
+        pass
+
+    all_sessions: list[dict] = []
+    if scheduler_sid is None and running_sid is None:
+        try:
+            async with OpenCodeClient(server_url, default_timeout=5.0) as client:
+                all_sessions = await client.list_sessions(limit=50)
+        except Exception:
+            all_sessions = []
 
     ws_dir = _effective_workspace(sw)
     matching = [
@@ -612,6 +624,12 @@ async def list_subworker_sessions(name: str) -> SessionListResponse:
             time_created=(s.get("time") or {}).get("created"),
             message_count=s.get("messages"),
         ))
+
+    if not items:
+        if running_sid:
+            items.append(SessionListItem(session_id=running_sid, title="▶ Running", agent=sw.agent_id, time_created=None))
+        if scheduler_sid and scheduler_sid != running_sid:
+            items.append(SessionListItem(session_id=scheduler_sid, title=None, agent=sw.agent_id, time_created=None))
 
     return SessionListResponse(name=name, sessions=items)
 

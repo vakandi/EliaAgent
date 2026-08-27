@@ -15,9 +15,10 @@ echo "$OPENCODE_PID" > /tmp/opencode.pid
 echo "[entrypoint] opencode pid=$OPENCODE_PID"
 
 echo "[entrypoint] waiting for opencode to become healthy"
+set +e
 for i in $(seq 1 30); do
   echo "[entrypoint] health check attempt $i"
-  if curl -sf http://127.0.0.1:5655/global/health >/dev/null 2>&1; then
+  if curl --max-time 2 -sf http://127.0.0.1:5655/global/health >/dev/null 2>&1; then
     echo "[entrypoint] opencode healthy after ${i}s"
     break
   fi
@@ -34,6 +35,7 @@ for i in $(seq 1 30); do
     exit 1
   fi
 done
+set -e
 
 echo "[entrypoint] starting FastAPI on 0.0.0.0:5656"
 exec uvicorn app.main:app --host 0.0.0.0 --port 5656

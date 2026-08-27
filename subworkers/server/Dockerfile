@@ -34,6 +34,8 @@ RUN apt-get update && \
         sqlite3 \
         jq \
         tzdata \
+        procps \
+        unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js + npm + npx for MCP servers and parallel-browser-mcp
@@ -41,9 +43,14 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
 
-# Install opencode binary inside image (fully dockerized — no host dependency)
-RUN curl -fsSL https://opencode.ai/install | bash && \
-    ln -sf /root/.opencode/bin/opencode /usr/local/bin/opencode && \
+# Install opencode from latest GitHub release (pinned, not main) — https://github.com/anomalyco/opencode/releases
+RUN latest_tag=$(curl -s https://api.github.com/repos/anomalyco/opencode/releases/latest | jq -r .tag_name) && \
+    echo "Using opencode $latest_tag from https://github.com/anomalyco/opencode/releases" && \
+    arch=$(dpkg --print-architecture) && \
+    if [ "$arch" = "arm64" ]; then asset="opencode-linux-arm64.tar.gz"; else asset="opencode-linux-x64.tar.gz"; fi && \
+    curl -fsSL -o /tmp/opencode.tar.gz "https://github.com/anomalyco/opencode/releases/download/${latest_tag}/${asset}" && \
+    tar -xzf /tmp/opencode.tar.gz -C /usr/local/bin && \
+    chmod +x /usr/local/bin/opencode && \
     opencode --version
 
 # Docker CLI + compose plugin — lets the app manage the cloudflared container
