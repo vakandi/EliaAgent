@@ -600,12 +600,11 @@ async def list_subworker_sessions(name: str) -> SessionListResponse:
         pass
 
     all_sessions: list[dict] = []
-    if scheduler_sid is None and running_sid is None:
-        try:
-            async with OpenCodeClient(server_url, default_timeout=5.0) as client:
-                all_sessions = await client.list_sessions(limit=50)
-        except Exception:
-            all_sessions = []
+    try:
+        async with OpenCodeClient(server_url, default_timeout=5.0) as client:
+            all_sessions = await client.list_sessions(limit=100)
+    except Exception:
+        all_sessions = []
 
     ws_dir = _effective_workspace(sw)
     matching = [
@@ -625,11 +624,12 @@ async def list_subworker_sessions(name: str) -> SessionListResponse:
             message_count=s.get("messages"),
         ))
 
-    if not items:
-        if running_sid:
-            items.append(SessionListItem(session_id=running_sid, title="▶ Running", agent=sw.agent_id, time_created=None))
-        if scheduler_sid and scheduler_sid != running_sid:
-            items.append(SessionListItem(session_id=scheduler_sid, title=None, agent=sw.agent_id, time_created=None))
+    known_ids = {i.session_id for i in items}
+    if running_sid and running_sid not in known_ids:
+        items.insert(0, SessionListItem(session_id=running_sid, title="▶ Running", agent=sw.agent_id, time_created=None))
+        known_ids.add(running_sid)
+    if scheduler_sid and scheduler_sid not in known_ids:
+        items.append(SessionListItem(session_id=scheduler_sid, title=None, agent=sw.agent_id, time_created=None))
 
     return SessionListResponse(name=name, sessions=items)
 

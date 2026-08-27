@@ -50,10 +50,11 @@ EliaUI.command (launcher — 2 tmux sessions, opencode now dockerized)
 Docker container (bridged, port-mapped 5656→host; opencode on 5655 internal)
   └─ APScheduler (from subworkers.json)
        └─ SubworkerRunner ──HTTP──► localhost OpenCode server :5655 (same container)
-             ├── create_session(directory=workspace, agent=<agent-id>)
-             │     └── host server loads personality from ~/.config/opencode/agents/<agent-id>.md
-             │         + oh-my-openagent plugins/config from the HOST (~/.config/opencode/, ~/.config/omo/)
-             └── send_message(prompt) → waits for completion
+             ├── create_session(directory=/tmp/{name}, agent=<agent-id>)  # lightweight CWD for perf (89M workspace fix)
+             │     └── container opencode loads personality from /root/.config/opencode/agents/<agent-id>.md
+             │         + oh-my-openagent plugins from /root/.config/opencode
+             │         + agent workspace still at /data/subworkers/{name}/workspace (bind-mounted, accessed via absolute path per PROMPT.md)
+             └── send_message(prompt) → waits for completion  # pwd=/tmp/{name} is expected, not a bug
 
 Manual/legacy (optional): trigger_template.js --agent <name>
   └─ spawns oh-my-opencode run -d workspace/ -a <agent> "<task>" (v3 path, kept for rollback)

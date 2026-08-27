@@ -301,14 +301,23 @@ class SubworkerRunner:
                         client, session_id, model, variant, timeout,
                     )
                 else:
-                    directory = f"/tmp/{self._config.name}"
-                    try:
-                        Path(directory).mkdir(parents=True, exist_ok=True)
-                    except Exception:
-                        directory = "/tmp"
+                    openworkspace = os.environ.get("OPENCODE_WORKSPACE", "")
+                    workspace = self._config.workspace
+                    if not workspace:
+                        main_name = self._read_main_agent_name()
+                        if self._config.agent_id == main_name:
+                            workspace = "/data"
+                        else:
+                            workspace = f"/data/subworkers/{self._config.agent_id}/workspace"
+                    if openworkspace and workspace.startswith("/data/"):
+                        directory = workspace.replace("/data/", f"{openworkspace}/", 1)
+                    elif openworkspace and workspace == "/data":
+                        directory = openworkspace
+                    else:
+                        directory = openworkspace or workspace
                     log.info(
-                        "runner.create_session subworker=%s directory=%s agent_id=%s (workspace %s via absolute path)",
-                        self._config.name, directory, self._config.agent_id, self._config.workspace,
+                        "runner.create_session subworker=%s directory=%s agent_id=%s",
+                        self._config.name, directory, self._config.agent_id,
                     )
                     sess = await client.create_session(
                         directory=directory,
@@ -469,6 +478,14 @@ class SubworkerRunner:
         Subscribes to the opencode SSE event stream scoped to the run's
         workspace and forwards text deltas as ``run_log`` WS events, so
         clients get realtime logs without polling HTTP.
+
+        Delta normalization: some providers emit cumulative snapshots
+        (full text so far) rather than incremental slices. Without dedup
+        the client would see \"hello\" -> \"hello world\" appended as
+        \"hellohello world\". We keep per-field last-sent state and only
+        forward the suffix, dropping pure duplicates.
+        Tool parts (part.type==tool) are forwarded as field=\"tool\" so
+        the livestream can render them as banners instead of dropping them.
         """
         import json as _json
         import os as _os
@@ -482,6 +499,31 @@ class SubworkerRunner:
         server_url = _os.environ.get("OPENCODE_SERVER_URL", "http://127.0.0.1:5655")
         url = f"{server_url}/event?directory={quote(directory)}"
 
+        # Per-field last emitted text to handle cumulative deltas + dedup.
+        last_emitted: dict[str, str] = {}
+
+        def _normalize_and_emit(field: str, incoming: str) -> str | None:
+            """Return suffix to emit, or None if duplicate/no-new-content."""
+            if not incoming:
+                return None
+            prev = last_emitted.get(field, "")
+            if not prev:
+                last_emitted[field] = incoming
+                return incoming
+            if incoming == prev:
+                return None
+            if incoming.startswith(prev):
+                suffix = incoming[len(prev):]
+                if not suffix:
+                    return None
+                last_emitted[field] = incoming
+                return suffix
+            if prev.endswith(incoming) or incoming in prev:
+                return None
+            # Genuine incremental slice (or branch) — append.
+            last_emitted[field] = prev + incoming
+            return incoming
+
         try:
             async with httpx.AsyncClient(timeout=None) as client:
                 async with client.stream("GET", url) as resp:
@@ -492,17 +534,64 @@ class SubworkerRunner:
                             evt = _json.loads(line[5:].strip())
                         except Exception:
                             continue
-                        if evt.get("type") != "message.part.delta":
-                            continue
+                        evt_type = evt.get("type") or ""
                         props = evt.get("properties") or {}
                         if props.get("sessionID") != session_id:
                             continue
-                        field = props.get("field") or "text"
-                        if field not in ("text", "reasoning"):
+
+                        # ── Text / reasoning deltas ──────────────────
+                        if evt_type == "message.part.delta":
+                            field = props.get("field") or "text"
+                            if field not in ("text", "reasoning"):
+                                continue
+                            raw_delta = props.get("delta") or ""
+                            delta = _normalize_and_emit(field, raw_delta)
+                            if delta:
+                                await ws_manager.broadcast_run_log(name, delta, field)
                             continue
-                        delta = props.get("delta") or ""
-                        if delta:
-                            await ws_manager.broadcast_run_log(name, delta, field)
+
+                        # ── Tool calls ───────────────────────────────
+                        # Opencode emits part created/updated for tools; surface them live.
+                        if evt_type in ("message.part.created", "message.part.updated"):
+                            part = props.get("part") or {}
+                            if not isinstance(part, dict):
+                                continue
+                            ptype = part.get("type") or part.get("part_type") or ""
+                            if ptype != "tool":
+                                continue
+                            tool_name = part.get("tool") or part.get("name") or "tool"
+                            state = part.get("state") if isinstance(part.get("state"), dict) else {}
+                            tool_input = state.get("input") if isinstance(state.get("input"), dict) else part.get("input")
+                            tool_output = state.get("output") if isinstance(state.get("output"), str) else part.get("output")
+                            if not isinstance(tool_input, dict):
+                                tool_input = {}
+                            if tool_output is not None and not isinstance(tool_output, str):
+                                try:
+                                    tool_output = _json.dumps(tool_output, ensure_ascii=False)[:1000]
+                                except Exception:
+                                    tool_output = str(tool_output)[:1000]
+                            def _clip(s: str | None, n: int = 800) -> str | None:
+                                if not s:
+                                    return None
+                                return s[:n] + ("…" if len(s) > n else "")
+                            payload: dict[str, object] = {"tool": str(tool_name)}
+                            fp = tool_input.get("filePath") or tool_input.get("file_path") or tool_input.get("path") or ""
+                            if fp:
+                                payload["filePath"] = str(fp)[:600]
+                            if "oldString" in tool_input or "old_string" in tool_input:
+                                payload["oldString"] = _clip(str(tool_input.get("oldString") or tool_input.get("old_string") or ""), 1200)
+                                payload["newString"] = _clip(str(tool_input.get("newString") or tool_input.get("new_string") or ""), 1200)
+                            elif "content" in tool_input:
+                                payload["content"] = _clip(str(tool_input.get("content") or ""), 600)
+                            elif tool_input:
+                                # generic: keep short preview of remaining keys
+                                try:
+                                    payload["input"] = _json.dumps({k: _clip(str(v), 400) for k, v in tool_input.items()}, ensure_ascii=False)[:800]
+                                except Exception:
+                                    pass
+                            if isinstance(tool_output, str) and tool_output:
+                                payload["output"] = _clip(tool_output, 600)
+                            await ws_manager.broadcast_run_log(name, _json.dumps(payload, ensure_ascii=False), "tool")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
