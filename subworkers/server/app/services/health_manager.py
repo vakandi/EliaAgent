@@ -27,7 +27,7 @@ from app.utils.opencode_client import OpenCodeClient
 log = structlog.get_logger()
 
 # ── Constants ───────────────────────────────────────────────────────────
-DEFAULT_PORT = 4096
+DEFAULT_PORT = 5655
 DEFAULT_HOST = "127.0.0.1"
 HEALTH_POLL_INTERVAL = 10.0  # seconds between health checks
 HEALTH_BACKOFF_BASE = 2.0  # initial backoff on consecutive errors
@@ -69,7 +69,7 @@ class HealthManager:
 
     Usage::
 
-        manager = HealthManager(port=4096, work_dir="/path/to/opencode")
+        manager = HealthManager(port=5655, work_dir="/path/to/opencode")
         await manager.start()
         # ... server running ...
         await manager.stop()

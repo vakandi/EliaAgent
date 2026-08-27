@@ -29,31 +29,33 @@
 ### What Are Subworkers?
 
 Subworkers are autonomous AI agents that run on a schedule or trigger. Each subworker has:
-- A **personality file** (`~/.config/opencode/agents/<agent-id>.md`) — loaded automatically by oh-my-opencode via the `-a` flag
-- A **PROMPT.md** with task-specific instructions — injected by the trigger
+- A **personality file** (`~/.config/opencode/agents/<agent-id>.md`) — loaded by the host OpenCode server via the session's `agent` field
+- A **PROMPT.md** with task-specific instructions — injected by the runner as the message content
 - A **workspace folder** for isolated file I/O
 - A **JSON schedule entry** in `server/app/config/subworkers.json` — defines schedule, enabled state, retries, timeout
-- A **runner** — the Docker FastAPI server (SubworkerRunner) launches via `oh-my-opencode run`
+- A **runner** — the Docker FastAPI server (SubworkerRunner) drives runs over the **OpenCode HTTP API** (`POST /session` + `/message` on port 4096). No CLI is spawned inside the container.
 
 > **Scheduling moved from launchd → APScheduler (Docker server).** LaunchAgent plists are legacy (see §7). Control is now via the REST API / WebSocket / ColimaBar (see §8, §9).
 
 ### Architecture
 
 ```
-EliaUI.command (launcher — 3 tmux sessions)
-  ├── opencode-serve   (port 4096 — OpenCode server)
-  ├── subworker-srv    (Docker container elia-subworker-srv, port 5656 — FastAPI)
+EliaUI.command (launcher — 2 tmux sessions, opencode now dockerized)
+  ├── subworker-srv    (Docker container elia-subworker-srv, ports 5656 FastAPI + 5655 opencode)
+  │     ├── opencode serve — 127.0.0.1:5655 (inside container, fully dockerized)
+  │     └── uvicorn FastAPI — 0.0.0.0:5656
   └── elia-ui          (Discord bot + Electron UI)
 
-Docker container (host network)
+Docker container (bridged, port-mapped 5656→host; opencode on 5655 internal)
   └─ APScheduler (from subworkers.json)
-       └─ SubworkerRunner
-            ├── oh-my-opencode run -d workspace/ -a <agent> "<task>"
-            │     └── oh-my-opencode loads personality from ~/.config/opencode/agents/<agent-id>.md
-            └── OpenCode loads workspace/opencode.json (per-agent permissions)
+       └─ SubworkerRunner ──HTTP──► localhost OpenCode server :5655 (same container)
+             ├── create_session(directory=workspace, agent=<agent-id>)
+             │     └── host server loads personality from ~/.config/opencode/agents/<agent-id>.md
+             │         + oh-my-openagent plugins/config from the HOST (~/.config/opencode/, ~/.config/omo/)
+             └── send_message(prompt) → waits for completion
 
 Manual/legacy (optional): trigger_template.js --agent <name>
-  └─ oh-my-opencode run -d workspace/ -a <agent> "<task>"
+  └─ spawns oh-my-opencode run -d workspace/ -a <agent> "<task>" (v3 path, kept for rollback)
 ```
 
 ### Control & Monitoring
@@ -77,7 +79,7 @@ EliaAI/subworkers/
 │   ├── app/
 │   │   ├── main.py               # FastAPI app, /health endpoint
 │   │   ├── config/
-│   │   │   ├── server.json       # port 5656, opencode URL 4096, alert settings
+│   │   │   ├── server.json       # port 5656, opencode URL 5655, alert settings
 │   │   │   └── subworkers.json   # ★ ALL subworker definitions + schedules (14)
 │   │   ├── routes/               # subworkers.py, server.py, websocket.py
 │   │   ├── services/             # scheduler, runner, session_monitor, health_manager, error_parser, alert_manager
@@ -200,6 +202,19 @@ To orient yourself on every run:
 2. Scan previous days' docs for relevant context: decisions made, blockers, next steps
 3. If you need to revisit something from days ago, navigate by date: `workspace/2026-04-01/`
 4. Write a summary of what you did today into the current day's folder before finishing
+
+## Completion Marker (MANDATORY)
+When you build your todo list at the start of this run, ALWAYS include this final task:
+"Output <promise>DONE</promise> to signal successful completion".
+Only output `<promise>DONE</promise>` as the very last line of your final message, after ALL
+tasks are done and verified. Never output it early. Never omit it — the subworker server
+uses this marker to detect that the run succeeded.
+```
+
+> ⚠️ **The `<promise>DONE</promise>` marker is part of completion detection** (§8.5): the runner
+> polls the session status until idle, then checks the final assistant message for the marker.
+> A run without it may be classified as incomplete/failed even if the work was done — hence
+> every PROMPT.md must instruct the agent to plan it as a todo item and emit it last.
 ```
 
 ---
@@ -560,24 +575,28 @@ The **primary runtime** is a Python FastAPI server in Docker. It replaces launch
 
 ### 8.2 Start / Stop
 
-Launched by `EliaUI.command` as the third tmux session (`subworker-srv`). Killing the launcher does **NOT** stop Docker.
+Fully dockerized — no host `opencode serve` required. `entrypoint.sh` inside the container boots `opencode serve --port 5655 --hostname 127.0.0.1` before FastAPI, clears stale `models.json` cache, and healthchecks both.
 
 ```bash
-cd ~/EliaAI/subworkers/server && docker compose up --build   # start
+cd ~/EliaAI/subworkers/server && docker compose up --build   # start (builds opencode binary inside image)
 docker compose down                                          # stop (container only)
 curl http://localhost:5656/health                            # health check → {"status":"ok",...}
+curl http://localhost:5656/models -H "Authorization: Bearer $ELIA_AUTH_TOKEN" | jq .total  # 6 models, no deprecated
+docker exec elia-subworker-srv curl -sf http://127.0.0.1:5655/global/health  # opencode health inside container
+lsof -i :5655 2>/dev/null || echo "host 5655 empty — opencode is inside Docker ✓"
+lsof -i :4096 2>/dev/null || echo "host 4096 empty — legacy port unused ✓"
 ```
 
-Container: `elia-subworker-srv`, `network_mode: host`, `restart: unless-stopped`, port **5656**.
+Container: `elia-subworker-srv`, `restart: unless-stopped`, ports **5656** (FastAPI) + **5655** (opencode internal, not host-published unless you add `5655:5655`). Healthcheck requires both `GET /health` (5656) and `GET /global/health` (5655).
 
 ### 8.3 Configuration (JSON, hot-reloaded)
 
 | File | Purpose |
 |------|---------|
-| `server/app/config/server.json` | Port (5656), OpenCode server URL (http://127.0.0.1:4096), health-check interval, max restarts, alert settings |
+| `server/app/config/server.json` | Port (5656), OpenCode server URL (http://127.0.0.1:5655), health-check interval, max restarts, alert settings |
 | `server/app/config/subworkers.json` | All subworker definitions: `name`, `enabled`, `schedule` (`interval` = hours+minute / `cron`), `agent_id`, `max_retries`, `timeout_minutes`, `mcp_servers`, `notify_discord` |
 
-`subworkers.json` currently defines **4 subworkers** (your-main-agent, your-seo-agent, your-community-agent, your-promoter-agent).
+`subworkers.json` currently defines **4 example subworkers** (`your-main-agent`, `your-seo-agent`, `your-community-agent`, `your-promoter-agent`) — replace with your own agents.
 
 ### 8.4 API (localhost, no auth)
 
@@ -592,6 +611,7 @@ Container: `elia-subworker-srv`, `network_mode: host`, `restart: unless-stopped`
 | POST | `/config/reload` | Hot-reload subworkers.json from disk |
 | GET | `/logs/{name}?lines=N` | Recent log lines from run files |
 | GET | `/sessions/{name}?limit=N` | OpenCode session messages (reasoning, tools, text) |
+| GET/POST | `/main-agent` | Read / set the MAIN agent (`{"name": "..."}`) — persisted to `config/main-agent.json` |
 | GET | `/server/health` | OpenCode server subprocess state/pid/restarts |
 | POST | `/server/restart` | Restart OpenCode server subprocess |
 | WS | `/ws` | Live events: `initial_status`, `pong`, `subworker_completed`, `subworker_error` |
@@ -602,11 +622,15 @@ Interactive docs: `http://localhost:5656/docs`.
 
 1. APScheduler fires at scheduled time
 2. SubworkerRunner checks OpenCode health
-3. CLI invocation: `opencode run -d {workspace} -a {agent} "{prompt}"`
+3. HTTP invocation: `OpenCodeClient.create_session(directory={workspace}, agent_id={agent})` + `send_message(prompt)` against the **container-local** OpenCode server (`OPENCODE_SERVER_URL`, default `http://127.0.0.1:5655`) — fully dockerized, no host process
+   - ⚠️ **The workspace directory MUST be sent via the undocumented `x-opencode-directory` HTTP header.** OpenCode ignores `directory` in the `POST /session` body — without the header every session lands in the server CWD (`~/EliaAI`) instead of the agent's isolated `workspace/`.
+   - Workspace resolution: main agent → `~/EliaAI` (repo root); every other subworker → `~/EliaAI/subworkers/<agent-id>/workspace/` (mapped from `/data/...` inside the container via `OPENCODE_WORKSPACE`)
 4. SessionMonitor polls OpenCode API every 2s
 5. Completion detection: process exit code → API status + idle timeout → message markers
 6. On failure: retry with exponential backoff; on session crash: resume with `--continue`
 7. Real-time updates broadcast via WebSocket; logs → `logs/runs/{name}/YYYYMMDD_HHMMSS.log`
+
+> **oh-my-openagent plugins & config (omo.jsonc) load on the HOST, not in the container.** The container never spawns opencode — it only calls the host server over HTTP. Plugins, `~/.config/opencode/oh-my-openagent.jsonc`, `~/.config/omo/`, agents and MCP configs are all read by the host server process at startup. No extra volume mount is needed for them; the existing `~/.config/opencode:/root/.config/opencode` mount serves the container's own config reads only.
 
 ### 8.6 Tests & Dev
 
@@ -694,9 +718,11 @@ bun install -g oh-my-opencode
 
 ### 11.1 Designation
 
-- `subworkers/main-agent.json` holds `{"name":"elia"}` — the agent flagged as **MAIN**.
-- In the **subworker popup** (ui_electron), the main agent shows a **MAIN badge** and a **★/✕ edit button** to set (or unset) which agent is main. Elia is main by default.
-- The main agent runs with the **repo root** (`~/EliaAI`) as workspace instead of an isolated `subworkers/<name>/workspace/` — set via `workspace` in `subworkers/server/app/config/subworkers.json`.
+- `subworkers/main-agent.json` holds `{"name":"elia"}` — the agent flagged as **MAIN** (managed via `GET/POST /main-agent`).
+- **Both UIs fully control who is MAIN:**
+  - **ui_electron subworker popup** — MAIN badge + ★/✕ edit button (`POST /main-agent`)
+  - **EliaTopBar** — ★ marker on the agent row + "Set/Unset as Main Agent" in the submenu
+- The main agent runs with the **repo root** (`~/EliaAI`) as workspace instead of an isolated `subworkers/<name>/workspace/` — resolved at run time by `SubworkerRunner._read_main_agent_name()`. Unsetting falls back to `elia`.
 
 ### 11.2 PROMPT.md location
 
@@ -710,7 +736,7 @@ Elia runs through the **Docker subworker server** (`elia-subworker-srv`, port 56
 curl -s -X POST http://127.0.0.1:5656/trigger/elia
 ```
 
-The server's `SubworkerRunner` uses the entry's `workspace` (repo root for the main agent) and `prompt_file` (`PROMPT.md`) to invoke `opencode run -d <workspace> -a elia <prompt>`. Subworkers other than the main one keep their isolated workspace.
+The server's `SubworkerRunner` uses the entry's `workspace` (repo root for the main agent) and `prompt_file` (`PROMPT.md`) to create a session on the host OpenCode server with `agent=elia` and send the prompt over HTTP. Subworkers other than the main one keep their isolated workspace.
 
 ---
 

@@ -295,9 +295,11 @@ async def update_subworker(name: str, body: UpdateSubworkerRequest) -> Subworker
                 expression=schedule_data["expression"],
             )
         elif schedule_type == "interval":
+            days = schedule_data.get("days")
             updates["schedule"] = IntervalSchedule(
                 hours=schedule_data.get("hours", []),
                 minute=schedule_data.get("minute", 0),
+                days=[int(d) for d in days] if days else None,
             )
         else:
             raise HTTPException(status_code=422, detail=f"Invalid schedule type: {schedule_type}")
@@ -458,7 +460,7 @@ async def get_subworker_sessions(
     import os
     from app.utils.opencode_client import OpenCodeClient
 
-    server_url = os.environ.get("OPENCODE_SERVER_URL", "http://host.docker.internal:4096")
+    server_url = os.environ.get("OPENCODE_SERVER_URL", "http://127.0.0.1:5655")
 
     async with OpenCodeClient(server_url, default_timeout=10.0) as client:
         if not session_id:
@@ -555,7 +557,7 @@ def _effective_workspace(sw) -> str:
     container paths; opencode sessions carry host paths)."""
     import os as _os
 
-    root = _os.environ.get("OPENCODE_WORKSPACE") or str(Path.home() / "EliaAI")
+    root = _os.environ.get("OPENCODE_WORKSPACE") or str(__import__("pathlib").Path.home() / "EliaAI")
     workspace = sw.workspace
     if not workspace:
         try:
@@ -585,7 +587,7 @@ async def list_subworker_sessions(name: str) -> SessionListResponse:
     from app.utils.opencode_client import OpenCodeClient
     from app.utils.exceptions import OpenCodeConnectionError
 
-    server_url = os.environ.get("OPENCODE_SERVER_URL", "http://host.docker.internal:4096")
+    server_url = os.environ.get("OPENCODE_SERVER_URL", "http://127.0.0.1:5655")
 
     try:
         async with OpenCodeClient(server_url, default_timeout=10.0) as client:
@@ -616,21 +618,6 @@ async def list_subworker_sessions(name: str) -> SessionListResponse:
 
 # ── Main Agent Management ────────────────────────────────────────────────
 
-# Favorites surface first in UI model lists; everything else follows.
-FAVORITE_MODELS = [
-    "opencode/x-preview-f-free",
-    "opencode/big-pickle",
-    "opencode/nemotron-3.5-lightning-free",
-    "opencode/nemotron-3-ultra-free",
-    "opencode/hy3-free",
-    "opencode/laguna-s-2.1-free",
-    "opencode/mimo-v2.5-free",
-    "opencode/deepseek-v4-flash-free",
-    "google/gemini-2.5-flash-lite",
-    "google/gemma-4-26b-a4b-it",
-    "google/gemma-4-31b-it",
-]
-
 
 class ModelOption(BaseModel):
     id: str
@@ -647,12 +634,12 @@ class ModelsResponse(BaseModel):
 
 @router.get("/models", response_model=ModelsResponse)
 async def list_models() -> ModelsResponse:
-    """All models from connected OpenCode providers, favorites first."""
+    """All models from connected OpenCode providers (deprecated filtered, sorted by id)."""
     import os
 
     from app.utils.opencode_client import OpenCodeClient
 
-    server_url = os.environ.get("OPENCODE_SERVER_URL", "http://127.0.0.1:4096")
+    server_url = os.environ.get("OPENCODE_SERVER_URL", "http://127.0.0.1:5655")
     async with OpenCodeClient(server_url, default_timeout=30.0) as client:
         raw = await client.list_models()
 
@@ -663,6 +650,9 @@ async def list_models() -> ModelsResponse:
         if connected and pid not in connected:
             continue
         for mid, m in (provider.get("models") or {}).items():
+            # Filter deprecated — OpenCode CLI hides them but /provider still returns them
+            if m.get("status") == "deprecated":
+                continue
             variants = sorted((m.get("variants") or {}).keys())
             options.append(
                 ModelOption(
@@ -674,10 +664,8 @@ async def list_models() -> ModelsResponse:
                 )
             )
 
-    by_id = {o.id: o for o in options}
-    ordered = [by_id.pop(fid) for fid in FAVORITE_MODELS if fid in by_id]
-    ordered.extend(sorted(by_id.values(), key=lambda o: o.id.lower()))
-    return ModelsResponse(models=ordered, total=len(ordered))
+    options.sort(key=lambda o: o.id.lower())
+    return ModelsResponse(models=options, total=len(options))
 
 
 def _main_agent_file() -> Path:

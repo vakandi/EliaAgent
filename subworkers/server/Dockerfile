@@ -41,6 +41,11 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
 
+# Install opencode binary inside image (fully dockerized — no host dependency)
+RUN curl -fsSL https://opencode.ai/install | bash && \
+    ln -sf /root/.opencode/bin/opencode /usr/local/bin/opencode && \
+    opencode --version
+
 # Docker CLI + compose plugin — lets the app manage the cloudflared container
 # on the HOST daemon (via the mounted /var/run/docker.sock).
 RUN install -m 0755 -d /etc/apt/keyrings && \
@@ -58,11 +63,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY app/ ./app/
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
-# Health check
-HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=3 \
-    CMD curl -sf http://localhost:5656/health || exit 1
+EXPOSE 5656 5655
 
-EXPOSE 5656
+HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -sf http://localhost:5656/health && curl -sf http://localhost:5655/global/health || exit 1
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "5656"]
+CMD ["/app/entrypoint.sh"]

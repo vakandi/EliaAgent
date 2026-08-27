@@ -16,10 +16,15 @@ class ScheduleType(str, Enum):
 
 
 class IntervalSchedule(BaseModel):
-    """Run at specific hours: e.g. hours=[9,10,...,23], minute=0 → every hour from 9-23."""
+    """Run at specific hours: e.g. hours=[9,10,...,23], minute=0 → every hour from 9-23.
+
+    days: optional weekday filter (0=Sunday..6=Saturday, cron convention).
+    None or empty = run every day. [1,2,3,4,5] = weekdays only.
+    """
     type: ScheduleType = ScheduleType.INTERVAL
     hours: list[int] = Field(..., min_length=1, description="Hours to run (0-23)")
     minute: int = Field(0, ge=0, le=59)
+    days: list[int] | None = Field(None, description="Weekdays 0=Sun..6=Sat; None/empty = every day")
 
 
 class CronSchedule(BaseModel):
@@ -41,7 +46,7 @@ class AlertConfig(BaseModel):
 
 
 class OpenCodeConfig(BaseModel):
-    server_url: str = "http://127.0.0.1:4096"
+    server_url: str = "http://127.0.0.1:5655"
     health_check_interval: int = 10  # seconds
     max_restarts: int = 10
     backoff_max: int = 30  # seconds
