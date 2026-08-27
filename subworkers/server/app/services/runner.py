@@ -31,6 +31,13 @@ log = structlog.get_logger(__name__)
 
 # ── Constants ───────────────────────────────────────────────────────────
 COMPLETION_MARKER = "<promise>DONE</promise>"
+
+# Transient provider failures (info.error + isRetryable on the last assistant
+# message, e.g. "Upstream request failed") are always temporary → random wait,
+# then nudge the SAME session.
+CONTINUE_PROMPT = "continue the tasks"
+MAX_PROVIDER_REINJECTIONS = 3
+PROVIDER_ERROR_DELAY_RANGE = (20.0, 60.0)
 SESSION_ID_PATTERN = re.compile(r"ses_[A-Za-z0-9]+")
 EXIT_TIMEOUT = 124
 EXIT_CRASH = 137
@@ -198,6 +205,53 @@ class SubworkerRunner:
 
     # ── Single attempt ───────────────────────────────────────────────────
 
+    @staticmethod
+    def _retryable_provider_error(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """Return the error object when the LAST assistant message carries a
+        retryable provider failure (APIError / isRetryable), else None."""
+        for msg in reversed(messages):
+            info = msg.get("info", {})
+            if info.get("role") != "assistant":
+                continue
+            err = info.get("error")
+            if not isinstance(err, dict):
+                return None
+            data = err.get("data") or {}
+            if err.get("name") == "APIError" and data.get("isRetryable"):
+                return err
+            return None
+        return None
+
+    async def _reinject_on_provider_error(
+        self,
+        client: OpenCodeClient,
+        session_id: str,
+        model: str | None,
+        variant: str | None,
+        timeout: float,
+    ) -> int:
+        """Nudge the session past transient provider errors. Returns count."""
+        reinjections = 0
+        while reinjections < MAX_PROVIDER_REINJECTIONS:
+            messages = await client.list_messages(session_id)
+            err = self._retryable_provider_error(messages)
+            if err is None:
+                break
+            delay = random.uniform(*PROVIDER_ERROR_DELAY_RANGE)
+            log.warning(
+                "runner.provider_error subworker=%s session=%s error=%s — reinjecting in %.0fs (%d/%d)",
+                self._config.name, session_id,
+                (err.get("data") or {}).get("message", "?"),
+                delay, reinjections + 1, MAX_PROVIDER_REINJECTIONS,
+            )
+            await asyncio.sleep(delay)
+            await client.send_message(
+                session_id, content=CONTINUE_PROMPT, model=model, variant=variant,
+                agent=self._config.agent_id, timeout=timeout,
+            )
+            reinjections += 1
+        return reinjections
+
     async def _execute_single_attempt(
         self,
         attempt_num: int,
@@ -209,7 +263,7 @@ class SubworkerRunner:
         prompt = self._read_prompt()
         model = self._model_override or self._config.model
         variant = self._variant_override or self._config.variant
-        server_url = os.environ.get("OPENCODE_SERVER_URL", "http://127.0.0.1:4096")
+        server_url = os.environ.get("OPENCODE_SERVER_URL", "http://127.0.0.1:5655")
         timeout = self._config.timeout_minutes * 60
 
         log.info("runner.invoke subworker=%s attempt=%d session=%s", self._config.name, attempt_num, session_id or "new")
@@ -222,6 +276,9 @@ class SubworkerRunner:
                     await client.send_message(
                         session_id, content=prompt, model=model, variant=variant,
                         agent=self._config.agent_id, timeout=timeout,
+                    )
+                    await self._reinject_on_provider_error(
+                        client, session_id, model, variant, timeout,
                     )
                 else:
                     openworkspace = os.environ.get("OPENCODE_WORKSPACE", "")
@@ -263,9 +320,12 @@ class SubworkerRunner:
                     )
                     try:
                         await client.send_message(
-                        session_id, content=prompt, model=model, variant=variant,
-                        agent=self._config.agent_id, timeout=timeout,
-                    )
+                            session_id, content=prompt, model=model, variant=variant,
+                            agent=self._config.agent_id, timeout=timeout,
+                        )
+                        await self._reinject_on_provider_error(
+                            client, session_id, model, variant, timeout,
+                        )
                     finally:
                         stream_task.cancel()
 
@@ -406,7 +466,7 @@ class SubworkerRunner:
         from app.routes.websocket import ws_manager
 
         name = self._config.name
-        server_url = _os.environ.get("OPENCODE_SERVER_URL", "http://127.0.0.1:4096")
+        server_url = _os.environ.get("OPENCODE_SERVER_URL", "http://127.0.0.1:5655")
         url = f"{server_url}/event?directory={quote(directory)}"
 
         try:
@@ -424,11 +484,12 @@ class SubworkerRunner:
                         props = evt.get("properties") or {}
                         if props.get("sessionID") != session_id:
                             continue
-                        if props.get("field") not in (None, "text"):
+                        field = props.get("field") or "text"
+                        if field not in ("text", "reasoning"):
                             continue
                         delta = props.get("delta") or ""
                         if delta:
-                            await ws_manager.broadcast_run_log(name, delta)
+                            await ws_manager.broadcast_run_log(name, delta, field)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

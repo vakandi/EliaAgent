@@ -86,7 +86,7 @@ class SubworkerScheduler:
 
         trigger = self._build_trigger(config)
         self._scheduler.add_job(
-            self._execute,
+            self._scheduled_fire,
             trigger=trigger,
             args=[config],
             id=job_id,
@@ -112,6 +112,15 @@ class SubworkerScheduler:
             log.info("scheduler.subworker_removed name=%s", name)
             return True
         return False
+
+    async def _scheduled_fire(self, config: SubworkerConfig) -> None:
+        """APScheduler entry point — tracks the task so /status reports running."""
+        name = config.name
+        if name in self._running and not self._running[name].done():
+            log.info("scheduler.skip_still_running name=%s", name)
+            return
+        task = asyncio.create_task(self._execute(config))
+        self._running[name] = task
 
     async def trigger_now(
         self,
@@ -322,9 +331,10 @@ class SubworkerScheduler:
             )
         elif isinstance(schedule, IntervalSchedule):
             # Interval: run at specific hours array, each at the specified minute
-            # Convert to cron: minute=X, hour=H1,H2,...
+            # Convert to cron: minute=X, hour=H1,H2,... [, day_of_week=D1,D2,...]
             hours_str = ",".join(str(h) for h in sorted(schedule.hours))
-            return CronTrigger(minute=schedule.minute, hour=hours_str)
+            day_of_week = ",".join(str(d) for d in sorted(schedule.days)) if schedule.days else None
+            return CronTrigger(minute=schedule.minute, hour=hours_str, day_of_week=day_of_week)
         else:
             raise ValueError(f"Unknown schedule type: {type(schedule)}")
 

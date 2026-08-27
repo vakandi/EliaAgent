@@ -131,15 +131,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         subworker_count=len(_config_manager.subworkers),
     )
 
-    # Health manager — tracks the already-running OpenCode server (4096).
+    # Health manager — tracks the already-running OpenCode server (5655).
     # We do NOT start it: the server is managed by opencode-serve.sh.
     # Host must come from OPENCODE_SERVER_URL: inside the bridged container
     # 127.0.0.1 is the container itself, not the host where opencode runs.
     from urllib.parse import urlparse
 
-    _opencode_url = urlparse(os.getenv("OPENCODE_SERVER_URL", "http://127.0.0.1:4096"))
+    _opencode_url = urlparse(os.getenv("OPENCODE_SERVER_URL", "http://127.0.0.1:5655"))
     _health_manager = HealthManager(
-        port=_opencode_url.port or 4096,
+        port=_opencode_url.port or 5655,
         host=_opencode_url.hostname or "127.0.0.1",
         work_dir=str(_SUBWORKERS_DIR),
         manage_process=False,

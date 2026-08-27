@@ -1,6 +1,6 @@
-"""Async httpx wrapper for the OpenCode server API (port 4096).
+"""Async httpx wrapper for the OpenCode server API (port 5655).
 
-OpenCode runs on the host at http://127.0.0.1:4096 (port 4096).
+OpenCode runs on the host at http://127.0.0.1:5655 (port 5655).
 VERIFIED endpoints (server v1.18.18):
   - GET  /global/health            → health check
   - GET  /session/                 → list sessions
@@ -51,7 +51,7 @@ class OpenCodeClient:
 
     Usage::
 
-        async with OpenCodeClient("http://127.0.0.1:4096") as client:
+        async with OpenCodeClient("http://127.0.0.1:5655") as client:
             health = await client.health()
             session = await client.create_session(directory="/path/to/workspace")
             await client.send_message(session_id=session["id"], content="Hello")
@@ -60,7 +60,7 @@ class OpenCodeClient:
 
     def __init__(
         self,
-        base_url: str = "http://127.0.0.1:4096",
+        base_url: str = "http://127.0.0.1:5655",
         default_timeout: float = 30.0,
     ) -> None:
         self._base_url = base_url.rstrip("/")

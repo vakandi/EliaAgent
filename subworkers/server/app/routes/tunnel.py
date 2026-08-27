@@ -29,7 +29,7 @@ _manager = TunnelManager()
 # ── Models ────────────────────────────────────────────────────────────────
 
 class TunnelCheckRequest(BaseModel):
-    domain: str = Field(..., description="Public hostname, e.g. subworkers.yourdomain.com")
+    domain: str = Field(..., description="Public hostname, e.g. elia.surfai.tech")
     api_token: str = Field(..., description="Cloudflare API token (Zone:DNS:Edit + Account:Tunnel:Edit)")
 
 

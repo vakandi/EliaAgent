@@ -58,7 +58,7 @@ class SessionMonitor:
 
     def __init__(
         self,
-        opencode_base_url: str = "http://localhost:4096",
+        opencode_base_url: str = "http://localhost:5655",
         poll_interval: float = POLL_INTERVAL_SECONDS,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         idle_minutes: float = COMPLETION_IDLE_MINUTES,

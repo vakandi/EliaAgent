@@ -76,9 +76,9 @@ class ConnectionManager:
         except Exception as exc:
             logger.warning("ws.status_update_failed error=%s", exc)
 
-    async def broadcast_run_log(self, name: str, text: str) -> None:
+    async def broadcast_run_log(self, name: str, text: str, field: str = "text") -> None:
         """Stream incremental agent output to clients (hover log popovers)."""
-        await self.broadcast({"event": "run_log", "name": name, "text": text})
+        await self.broadcast({"event": "run_log", "name": name, "text": text, "field": field})
 
     async def broadcast(self, event: dict[str, Any]) -> None:
         """Send a JSON event to all connected clients.
