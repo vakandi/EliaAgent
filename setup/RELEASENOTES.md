@@ -2,6 +2,46 @@
 
 ---
 
+## 🚀 Version: v6.1.0 — 🐳 FULLY DOCKERIZED SUBWORKERS + BANNER (August 27, 2026)
+
+### ✨ Fully Dockerized — No Host Opencode
+
+**What changed**: `elia-subworker-srv` now runs **both** FastAPI (5656) **and** `opencode serve` (5655) **in the same container**. No more `host.docker.internal:4096`, no host `opencode` process.
+
+| Before | After |
+|--------|-------|
+| `subworker-srv` (FastAPI only) → `host opencode 4096` via `host.docker.internal` | `subworker-srv` (FastAPI 5656 + opencode 5655) in one container, `OPENCODE_SERVER_URL=http://127.0.0.1:5655` |
+| Host `opencode` on 4096/5655 (sleep/wifi kill = whole system down) | Fully isolated, `docker compose up --build` brings full stack |
+| `opencode` binary on host | `opencode` from latest GitHub release (`anomalyco/opencode` `v1.18.23`, `opencode-linux-arm64.tar.gz` pinned, not `main`) |
+
+**Why**: **Save CPU/RAM** (one Colima VM vs 14 host agents), **security isolation** (agents jail to `workspace/` via container FS + `opencode.json`), **full control** (`docker compose` owns the stack).
+
+**Fixes:**
+- `Dockerfile`: `procps` + `unzip`, opencode from `https://github.com/anomalyco/opencode/releases/latest` (pinned)
+- `entrypoint.sh`: boots `opencode serve --port 5655` before FastAPI, `set +e` + `--max-time 2` healthcheck, clears stale `models.json`
+- `runner.py`: lightweight `directory=/tmp/{name}` (not 89M `workspace` scan → 0.04s vs 60s+), `running_session_ids` for live LogViewer
+- `scheduler.py`: `running_session_ids` for currently running sessions
+- `subworkers.py`: remove `FAVORITE_MODELS` (TopBar filters itself), filter `status==deprecated` (hide `x-preview-f-free`), scheduler fallback for fast `list` (no 30s `list_sessions` hang)
+- `websocket.py`: `run_banner` for reinjection (big orange `ELIA SYSTEM` banner, not a chat bubble)
+- `SUBWORKERS_SYSTEM.md`: document fully dockerized architecture and purpose
+
+**Verification:**
+```bash
+docker compose up --build
+curl http://localhost:5656/health # {"status":"ok"}
+docker exec elia-subworker-srv curl -sf http://127.0.0.1:5655/global/health # {"healthy":true}
+lsof -i :5655 # empty from host ✓ (inside only)
+curl http://localhost:5656/models -H "Authorization: Bearer $ELIA_AUTH_TOKEN" | jq .total # 361, no x-preview-f-free
+```
+
+### 🎨 EliaTopBar Banner
+
+`LogPopoverView` now shows a big orange `ELIA SYSTEM` banner for `run_banner` events (provider `503 isRetryable` → `continue the tasks` reinjection). Historical `continue the tasks` user messages are converted to banners. Live `banners` + derived historical merged, sorted chronologically, auto-scroll.
+
+---
+
+
+
 ## 🚀 Version: v6.0.0 — 🤝 TEAM MODE + PUBLIC RELEASE (August 22, 2026)
 
 ### ✨ The Big News: Team Mode — Multi-Agent Collaboration
