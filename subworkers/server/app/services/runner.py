@@ -238,12 +238,27 @@ class SubworkerRunner:
             if err is None:
                 break
             delay = random.uniform(*PROVIDER_ERROR_DELAY_RANGE)
+            err_msg = (err.get("data") or {}).get("message", "?")
             log.warning(
                 "runner.provider_error subworker=%s session=%s error=%s — reinjecting in %.0fs (%d/%d)",
-                self._config.name, session_id,
-                (err.get("data") or {}).get("message", "?"),
+                self._config.name, session_id, err_msg,
                 delay, reinjections + 1, MAX_PROVIDER_REINJECTIONS,
             )
+            try:
+                from app.routes.websocket import ws_manager
+                import time as _time
+                await ws_manager.broadcast_run_banner(name=self._config.name, banner={
+                    "type": "reinjection",
+                    "attempt": reinjections + 1,
+                    "max_attempts": MAX_PROVIDER_REINJECTIONS,
+                    "delay_seconds": round(delay, 1),
+                    "error": err_msg,
+                    "prompt": CONTINUE_PROMPT,
+                    "timestamp": int(_time.time() * 1000),
+                    "session_id": session_id,
+                })
+            except Exception:
+                pass
             await asyncio.sleep(delay)
             await client.send_message(
                 session_id, content=CONTINUE_PROMPT, model=model, variant=variant,
@@ -273,6 +288,11 @@ class SubworkerRunner:
             async with OpenCodeClient(server_url, default_timeout=timeout) as client:
                 if session_id:
                     log.info("runner.recover session=%s subworker=%s", session_id, self._config.name)
+                    try:
+                        from app.main import get_scheduler
+                        get_scheduler().set_running_session_id(self._config.name, session_id)
+                    except Exception:
+                        pass
                     await client.send_message(
                         session_id, content=prompt, model=model, variant=variant,
                         agent=self._config.agent_id, timeout=timeout,
@@ -281,26 +301,14 @@ class SubworkerRunner:
                         client, session_id, model, variant, timeout,
                     )
                 else:
-                    openworkspace = os.environ.get("OPENCODE_WORKSPACE", "")
-                    workspace = self._config.workspace
-                    if not workspace:
-                        # Compute from agent_id, matching old trigger_template.js:
-                        # main agent → project root; others → subworkers/<id>/workspace
-                        main_name = self._read_main_agent_name()
-                        if self._config.agent_id == main_name:
-                            workspace = "/data"
-                        else:
-                            workspace = f"/data/subworkers/{self._config.agent_id}/workspace"
-                    # Map /data/ paths to host via OPENCODE_WORKSPACE
-                    if openworkspace and workspace.startswith("/data/"):
-                        directory = workspace.replace("/data/", f"{openworkspace}/", 1)
-                    elif openworkspace and workspace == "/data":
-                        directory = openworkspace
-                    else:
-                        directory = openworkspace or workspace
+                    directory = f"/tmp/{self._config.name}"
+                    try:
+                        Path(directory).mkdir(parents=True, exist_ok=True)
+                    except Exception:
+                        directory = "/tmp"
                     log.info(
-                        "runner.create_session subworker=%s directory=%s agent_id=%s",
-                        self._config.name, directory, self._config.agent_id,
+                        "runner.create_session subworker=%s directory=%s agent_id=%s (workspace %s via absolute path)",
+                        self._config.name, directory, self._config.agent_id, self._config.workspace,
                     )
                     sess = await client.create_session(
                         directory=directory,
@@ -313,6 +321,11 @@ class SubworkerRunner:
                     session_id = sess.get("id") or ""
                     if not session_id:
                         raise OpenCodeSessionError("No session ID returned from create_session")
+                    try:
+                        from app.main import get_scheduler
+                        get_scheduler().set_running_session_id(self._config.name, session_id)
+                    except Exception:
+                        pass
                     # NOTE: send_message blocks until the agent finishes —
                     # the progress streamer MUST start before it.
                     stream_task = asyncio.create_task(

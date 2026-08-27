@@ -5,8 +5,9 @@
 
 > Technical documentation for the autonomous subworker agent system.
 >
-> **Current runtime**: Python FastAPI server in Docker (port 5656) — JSON config + APScheduler replaces launchd. ColimaBar (menu bar) provides control/monitoring.
-> **Previous version**: `SUBWORKERS_SYSTEM_OLD.md` (v3.0 — Node.js trigger + launchd plists).
+> **Current runtime**: Fully dockerized — Python FastAPI (5656) + OpenCode serve (5655) **in the same container** `elia-subworker-srv`. No host `opencode` process.
+> **Purpose**: **Save CPU/RAM** (one Colima VM instead of 14 host agents), **security isolation** (agents blocked to `workspace/` via container filesystem + `opencode.json` permissions), **full control** (one `docker compose` owns the whole stack).
+> **Previous version**: `SUBWORKERS_SYSTEM_OLD.md` (v3.0 — Node.js trigger + launchd plists, host `opencode` on 4096).
 
 ---
 
@@ -29,11 +30,11 @@
 ### What Are Subworkers?
 
 Subworkers are autonomous AI agents that run on a schedule or trigger. Each subworker has:
-- A **personality file** (`~/.config/opencode/agents/<agent-id>.md`) — loaded by the host OpenCode server via the session's `agent` field
+- A **personality file** (`~/.config/opencode/agents/<agent-id>.md`) — loaded by the **container's** OpenCode server (`127.0.0.1:5655` inside `elia-subworker-srv`) via the session's `agent` field
 - A **PROMPT.md** with task-specific instructions — injected by the runner as the message content
-- A **workspace folder** for isolated file I/O
+- A **workspace folder** for isolated file I/O (bind-mounted `/data/subworkers/...` → host `~/EliaAI/subworkers/...`)
 - A **JSON schedule entry** in `server/app/config/subworkers.json` — defines schedule, enabled state, retries, timeout
-- A **runner** — the Docker FastAPI server (SubworkerRunner) drives runs over the **OpenCode HTTP API** (`POST /session` + `/message` on port 4096). No CLI is spawned inside the container.
+- A **runner** — the Docker FastAPI server (SubworkerRunner) drives runs over the **container-local OpenCode HTTP API** (`POST /session` + `/message` on `127.0.0.1:5655`). No host CLI, no `host.docker.internal`.
 
 > **Scheduling moved from launchd → APScheduler (Docker server).** LaunchAgent plists are legacy (see §7). Control is now via the REST API / WebSocket / ColimaBar (see §8, §9).
 
@@ -630,7 +631,7 @@ Interactive docs: `http://localhost:5656/docs`.
 6. On failure: retry with exponential backoff; on session crash: resume with `--continue`
 7. Real-time updates broadcast via WebSocket; logs → `logs/runs/{name}/YYYYMMDD_HHMMSS.log`
 
-> **oh-my-openagent plugins & config (omo.jsonc) load on the HOST, not in the container.** The container never spawns opencode — it only calls the host server over HTTP. Plugins, `~/.config/opencode/oh-my-openagent.jsonc`, `~/.config/omo/`, agents and MCP configs are all read by the host server process at startup. No extra volume mount is needed for them; the existing `~/.config/opencode:/root/.config/opencode` mount serves the container's own config reads only.
+> **Fully dockerized — no host `opencode` process.** The container's `entrypoint.sh` boots `opencode serve --port 5655` **inside the same container** before FastAPI, so `OPENCODE_SERVER_URL` is `http://127.0.0.1:5655` (container-local). `oh-my-openagent` plugins, `~/.config/opencode/`, and `~/.config/omo/` are bind-mounted read-only into the container and loaded by the container's opencode at startup. Host `opencode` is not used and should not be running on 4096/5655.
 
 ### 8.6 Tests & Dev
 

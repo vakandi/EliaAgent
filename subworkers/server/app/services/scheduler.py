@@ -43,6 +43,7 @@ class SubworkerScheduler:
         self._configs: dict[str, SubworkerConfig] = {}
         self._running: dict[str, asyncio.Task[None]] = {}
         self._last_session_ids: dict[str, str] = {}
+        self._running_session_ids: dict[str, str] = {}
         self._last_run_results: dict[str, dict[str, Any]] = {}
         self._callbacks: list[Callable[[str, str], Coroutine[Any, Any, None]]] = []
         self._start_callbacks: list[Callable[[str], Coroutine[Any, Any, None]]] = []
@@ -176,6 +177,12 @@ class SubworkerScheduler:
     def get_last_session_id(self, name: str) -> str | None:
         return self._last_session_ids.get(name)
 
+    def get_running_session_id(self, name: str) -> str | None:
+        return self._running_session_ids.get(name)
+
+    def set_running_session_id(self, name: str, session_id: str) -> None:
+        self._running_session_ids[name] = session_id
+
     def get_last_run_result(self, name: str) -> dict[str, Any] | None:
         return self._last_run_results.get(name)
 
@@ -300,6 +307,7 @@ class SubworkerScheduler:
             await self._fire_callbacks(name, "error")
         finally:
             self._running.pop(name, None)
+            self._running_session_ids.pop(name, None)
 
     async def _fire_callbacks(self, name: str, status: str) -> None:
         for cb in self._callbacks:
