@@ -17,11 +17,14 @@ export const SETTINGS_TABS: RadixTabOption[] = [
 
 export const INPUT_TO_CONFIG_KEY: Record<keyof SettingsFormState, string> = {
 	claudeCommand: "claude_command",
+	codexCommand: "codex_command",
 	observerProvider: "observer_provider",
 	observerModel: "observer_model",
 	observerTierRoutingEnabled: "observer_tier_routing_enabled",
 	observerSimpleModel: "observer_simple_model",
 	observerSimpleTemperature: "observer_simple_temperature",
+	observerReasoningEffort: "observer_reasoning_effort",
+	observerReasoningSummary: "observer_reasoning_summary",
 	observerRichModel: "observer_rich_model",
 	observerRichTemperature: "observer_rich_temperature",
 	observerRichReasoningEffort: "observer_rich_reasoning_effort",
@@ -51,6 +54,7 @@ export const INPUT_TO_CONFIG_KEY: Record<keyof SettingsFormState, string> = {
 
 export const PROTECTED_VIEWER_CONFIG_KEYS = new Set([
 	"claude_command",
+	"codex_command",
 	"observer_base_url",
 	"observer_auth_file",
 	"observer_auth_command",
@@ -60,11 +64,14 @@ export const PROTECTED_VIEWER_CONFIG_KEYS = new Set([
 
 export const EMPTY_FORM_STATE: SettingsFormState = {
 	claudeCommand: "",
+	codexCommand: "",
 	observerProvider: "",
 	observerModel: "",
 	observerTierRoutingEnabled: false,
 	observerSimpleModel: "",
 	observerSimpleTemperature: "",
+	observerReasoningEffort: "",
+	observerReasoningSummary: "",
 	observerRichModel: "",
 	observerRichTemperature: "",
 	observerRichReasoningEffort: "",

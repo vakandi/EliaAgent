@@ -51,6 +51,12 @@ If nothing meaningful happened AND nothing was learned:
 - Output no <observation> blocks
 - Output <skip_summary reason="low-signal"/> instead of a <summary> block.`;
 
+const WORTHINESS_GUIDANCE = `Observation worthiness policy:
+- Emit an <observation> only for a durable, reusable lesson such as a constraint, root cause, decision with rationale, or how-it-works insight.
+- When a durable lesson exists, emit it as an <observation>; do not leave it only in <summary>.
+- Routine status, review, setup, and workflow narration belongs only in <summary>.
+- Zero observations is valid when the session contains no durable lesson.`;
+
 const NARRATIVE_GUIDANCE = `Create narratives that tell the complete story:
 - Context: What was the problem or goal? What prompted this work?
 - Investigation: What was examined? What was discovered?
@@ -68,8 +74,9 @@ const RICH_SESSION_GUIDANCE = `When the session contains MULTIPLE meaningful thr
 - Treat the <summary> as the broad session-wide state, not a recap of only the latest thread.
 - Cover the major subthreads in the summary when they materially changed the direction, outcome, or understanding of the work.
 - Do not let recency dominate: a long transcript often ends on only one thread, but the output should still represent the major work across the full observed batch.
-- Emit a SMALL capped set of durable <observation> blocks for the highest-value reusable subthreads (usually 2-4, not a dump of everything).
-- If the session clearly contains 2 or more substantial durable subthreads, emit at least 2 <observation> blocks. Summary-only output is not sufficient for a rich session.
+- Emit a SMALL capped set of durable <observation> blocks for the subthreads that pass the worthiness bar (usually 2-4, not a dump of everything).
+- If 2 or more subthreads each pass the worthiness bar, cover each with its own <observation>; do not collapse them into summary-only output.
+- If no subthread passes the worthiness bar, emit a <summary> and zero <observation> blocks — a long, busy session can still contain nothing durable.
 - Prefer one durable observation per distinct subthread, not several observations for one thread and silence for the others.
 - Prefer coverage diversity: do not emit multiple observations that mostly restate the same dominant thread.
 - Choose subthreads that future sessions would most want for rediscovery reduction: important decisions, durable learnings, shipped changes, closed investigations, or troubleshooting outcomes.
@@ -77,9 +84,9 @@ const RICH_SESSION_GUIDANCE = `When the session contains MULTIPLE meaningful thr
 
 const OUTPUT_GUIDANCE =
 	"Output only XML. Do not include commentary outside XML.\n\n" +
-	"ALWAYS emit at least one <observation> block for any meaningful work. " +
-	"Observations are the PRIMARY output - they capture what was built, fixed, learned, or decided. " +
-	"Also emit a <summary> block to track session progress.\n\n" +
+	"Emit <observation> blocks only for content that passes the observation worthiness bar. " +
+	"Observations are the durable layer - they capture what was built, fixed, learned, or decided. " +
+	"Also emit a <summary> block to track session progress; the summary alone carries routine activity.\n\n" +
 	"For rich multi-thread sessions, prefer one broad summary plus a small set of durable observations covering the highest-value subthreads.\n\n" +
 	"For rich sessions, do not return summary-only output when multiple substantial durable subthreads are present.\n\n" +
 	"Do not collapse a rich batch into only the final or most recent thread when earlier threads produced durable decisions, learnings, or outcomes.\n\n" +
@@ -94,7 +101,9 @@ const OBSERVATION_SCHEMA = `<observation>
       - refactor: code restructured, behavior unchanged
       - change: generic modification (docs, config, misc)
       - discovery: learning about existing system, debugging insights
+        (NOT routine lookups, status checks, or process narration)
       - decision: architectural/design choice with rationale
+        (NOT restating existing workflow policy)
       - exploration: attempted approach that was tried but NOT shipped
 
     IMPORTANT: Use 'exploration' when:
@@ -271,6 +280,8 @@ export function buildObserverPrompt(context: ObserverContext): {
 		"",
 		SKIP_GUIDANCE,
 		"",
+		WORTHINESS_GUIDANCE,
+		"",
 		NARRATIVE_GUIDANCE,
 		"",
 		RICH_SESSION_GUIDANCE,
@@ -333,6 +344,38 @@ export function buildObserverPrompt(context: ObserverContext): {
 	const user = userBlocks.join("\n\n").trim();
 
 	return { system, user };
+}
+
+/** Build the one-shot prompt used to repair malformed observer XML. */
+export function buildObserverRepairPrompt(
+	system: string,
+	user: string,
+	previousRaw: string,
+	maxChars = 12_000,
+): { system: string; user: string } {
+	const repairDirective =
+		"Your previous reply was invalid because it did not follow the required XML-only schema. " +
+		"Rewrite it as valid XML only, using only wording supported verbatim by your previous reply. " +
+		'Do not add, infer, or rephrase details. If the reply was only a short acknowledgement or another low-signal response, emit only <skip_summary reason="low-signal"/>. ' +
+		"Otherwise emit a <summary> whose fields use phrases from the previous reply, optionally plus one <observation>. " +
+		"For that observation, copy the entire previous reply into <narrative>; use single-clause phrases from it for <title>, <subtitle>, and <fact>; preserve negation words; " +
+		"use only the fixed concept taxonomy and file paths that literally appear in the previous reply. Do not include prose outside XML.";
+	const repairSystem = `${repairDirective}\n\n${system}`;
+	const minUserBudget = Math.floor(maxChars * 0.25);
+	const systemBudget = Math.max(0, maxChars - minUserBudget);
+	const clippedSystemLength = Math.min(repairSystem.length, systemBudget);
+	const userBudget = Math.max(minUserBudget, maxChars - clippedSystemLength);
+	const previousPrefix = "Previous invalid response to rewrite as valid XML:\n";
+	const contextPrefix = "\n\nOriginal session context:\n";
+	const contentBudget = Math.max(0, userBudget - previousPrefix.length - contextPrefix.length);
+	const previousBudget = Math.floor(contentBudget * 0.7);
+	const contextBudget = contentBudget - previousBudget;
+	const previousResponse = truncateMiddle(previousRaw.trim(), previousBudget);
+	const originalContext = truncateMiddle(user.trim(), contextBudget);
+	return {
+		system: repairSystem,
+		user: `${previousPrefix}${previousResponse}${contextPrefix}${originalContext}`,
+	};
 }
 
 export function truncateObserverTranscript(transcript: string, maxChars: number): string {

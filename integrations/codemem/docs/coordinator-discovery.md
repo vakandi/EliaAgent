@@ -17,8 +17,11 @@ the network boundary you care about (for example VPNs).
 - it does not queue offline sync data
 - it does not replace local SQLite as the source of truth
 - it is not a codemem-hosted public service
-- it does not automatically create or repair `sync_peers`
+- it does not turn discovery-group membership into project access
 - joining a coordinator group does not, by itself, create an active sync relationship
+- joining a coordinator group does not, by itself, grant access to any Sharing domain
+
+The normal viewer flow can still use the coordinator to complete a Team, direct-Project, or add-device invitation. Those flows create explicit identity, trust, and Project-access records; discovery-group membership alone does not.
 
 ## Config
 
@@ -86,12 +89,18 @@ codemem coordinator group-create team-alpha --db-path ~/.codemem/coordinator.sql
 codemem coordinator list-groups --db-path ~/.codemem/coordinator.sqlite
 codemem coordinator enroll-device team-alpha <device-id> --fingerprint <fingerprint> --public-key-file ~/.codemem/keys/device.key.pub --db-path ~/.codemem/coordinator.sqlite
 codemem coordinator list-devices team-alpha --db-path ~/.codemem/coordinator.sqlite
+codemem coordinator list-scopes team-alpha --db-path ~/.codemem/coordinator.sqlite
+codemem coordinator create-scope team-alpha acme-work --label "Acme Work" --db-path ~/.codemem/coordinator.sqlite
+codemem coordinator update-scope team-alpha acme-work --label "Acme Work" --db-path ~/.codemem/coordinator.sqlite
+codemem coordinator list-scope-members team-alpha acme-work --db-path ~/.codemem/coordinator.sqlite
+codemem coordinator grant-scope-member team-alpha acme-work <device-id> --effect-id <effect-id> --db-path ~/.codemem/coordinator.sqlite
+codemem coordinator revoke-scope-member team-alpha acme-work <device-id> --effect-id <effect-id> --db-path ~/.codemem/coordinator.sqlite
 codemem coordinator rename-device team-alpha <device-id> --name "work-laptop" --db-path ~/.codemem/coordinator.sqlite
 codemem coordinator disable-device team-alpha <device-id> --db-path ~/.codemem/coordinator.sqlite
 codemem coordinator remove-device team-alpha <device-id> --db-path ~/.codemem/coordinator.sqlite
 codemem coordinator list-bootstrap-grants team-alpha --db-path ~/.codemem/coordinator.sqlite
 codemem coordinator revoke-bootstrap-grant <grant-id> --db-path ~/.codemem/coordinator.sqlite
-codemem coordinator serve --db-path ~/.codemem/coordinator.sqlite --host 0.0.0.0 --port 7347
+codemem coordinator serve --db-path ~/.codemem/coordinator.sqlite --coordinator-host 0.0.0.0 --coordinator-port 7347
 codemem coordinator create-invite team-alpha --db-path ~/.codemem/coordinator.sqlite
 codemem coordinator import-invite <invite>
 codemem coordinator list-join-requests team-alpha --db-path ~/.codemem/coordinator.sqlite
@@ -112,10 +121,78 @@ Coordinator group membership and sync peer relationships are not the same thing.
 
 - **Coordinator group membership** means a device is enrolled and can participate in coordinator-backed discovery.
 - **Sync peer** means a local device has an explicit `sync_peers` relationship it will use for direct replication.
+- **Sharing-domain membership** means a device is explicitly granted access to a `scope_id` such as `acme-work`.
 
 Today, coordinator-backed discovery refreshes dialable addresses for sync, but it does not automatically create, repair,
 or remove local `sync_peers` entries. That means a same-group device can be enrolled and discoverable without becoming
 an active sync peer.
+
+The same separation applies to Sharing domains: being in `team-alpha` does not
+authorize a device to receive `acme-work`, `personal:<actor_id>`, or any other
+domain. The coordinator group is the administrative container. The Sharing
+domain grant is the data-access decision.
+
+In the normal viewer vocabulary, people join **Teams**, share exact **Projects**, and review inherited Projects when adding a **device**. **Spaces** are the user-facing access boundaries. Advanced coordinator commands expose the underlying group, Sharing-domain, grant, and `scope_id` records used to enforce those choices.
+
+## Project-first sharing and advanced administration
+
+For an ongoing group, use two separate steps:
+
+1. Assign exact **Projects** to a **Team**.
+2. Send **Invite Team member**.
+
+That onboarding invitation does not create Project-to-Team assignments. It links the Identity and device, then inherits every current and future Project already assigned to the Team. Review those Projects before sending or accepting the invitation.
+
+For a direct share:
+
+1. Choose **Share exact Projects** and select one Identity and the exact Projects.
+2. Review existing-memory counts and future sharing, then send the expiring invitation.
+3. The recipient reviews and accepts it before initial sync starts.
+
+When an existing Identity adds another device, create an add-device invitation and review the exact Projects inherited from that Identity's direct and Team access. Acceptance cannot add unrelated Projects or remove existing exclusions.
+
+The coordinator remains the authority for the invite and access steps, but its groups, devices, Spaces, grants, and project mappings are advanced administration—not normal teammate setup. Legacy coordinator invites and manual pairing remain compatible, but do not grant project access by themselves.
+
+## Sharing-domain membership and revocation
+
+Use coordinator Sharing-domain commands when a group needs explicit access
+boundaries inside the same discovery/admin group. A common setup is one group
+for `team-alpha`, with separate domains such as `acme-work`, `oss-codemem`, and
+possibly one personal domain per actor-owned device set.
+
+Minimal flow:
+
+```fish
+codemem coordinator create-scope team-alpha acme-work --label "Acme Work" --db-path ~/.codemem/coordinator.sqlite
+codemem coordinator grant-scope-member team-alpha acme-work <device-id> --effect-id <effect-id> --db-path ~/.codemem/coordinator.sqlite
+codemem coordinator list-scope-members team-alpha acme-work --db-path ~/.codemem/coordinator.sqlite
+```
+
+Operational rules:
+
+- Effect ids make membership mutations deterministic and idempotent; use a stable unique value for each intended mutation.
+- Grants and revocations are explicit per `(group, scope_id, device_id)`.
+- Membership epochs make cached grants stale after revocation or replacement.
+- Revocation stops future sync after peers refresh membership. It does not erase
+  memories already copied to a revoked device.
+- Disabling a device enrollment revokes future delivery only for that coordinator group; merely being offline does not. The global identity device can remain active and retain access through other groups.
+- Re-enabling that group enrollment clears the disabled state. The next owner reconciliation pass restores only the Projects currently authorized through direct shares and Team policies for the group; unrelated Projects stay absent. A global identity-device revocation is separate and is not restored by re-enabling a group enrollment.
+- Project include/exclude filters can only narrow data after the Sharing-domain
+  membership check passes.
+- Local-only domains and migration review domains are not valid broad sharing
+  targets.
+
+If the coordinator is unavailable, peers can still attempt direct sync using
+cached peer addresses and cached membership state. They must not treat a
+coordinator outage as permission to widen access. When membership cannot be
+verified for a scoped operation, fail closed or keep data local until the cache
+is refreshed.
+
+### Compatibility and reassignment
+
+Project-first sharing may move selected project history into a managed boundary. For history that could already have replicated, participating owner devices must negotiate support for `reassign_scope`. If a required device lacks that capability, setup fails closed before any partial migration; update that device and retry the sharing operation.
+
+Older invitations and pairing payloads continue to parse through their legacy enrollment paths. They remain valid for compatibility, but are clearly separate from a project-scoped invite and cannot silently acquire its access.
 
 ## How discovery works
 
@@ -142,6 +219,10 @@ not accumulate as mixed `host:port` and `http://host:port` variants in local pee
 - devices authenticate with their existing sync keypair
 - enrollment is explicit per device/group
 - there is no username/password or codemem-operated account layer in this model
+
+Direct sync authentication failures always return a generic `401 unauthorized` response. Recipient mismatches and
+signature downgrades are recorded only in server-side diagnostics so publicly reachable listeners do not disclose peer
+enrollment or signature-validation details.
 
 ## Remote admin flow
 
@@ -189,6 +270,13 @@ Use the Worker reference path only when you specifically want a serverless/edge 
 feature lag — new coordinator capabilities may land in the built-in coordinator first and may not be ported to the
 reference Worker immediately. When you do choose it, follow the dedicated Cloudflare runbook instead of relying on the
 older scattered example notes.
+
+## Always-on peers
+
+If you need a high-uptime sync backstop, deploy an anchor peer separately from
+the coordinator. The anchor peer is a normal codemem peer with explicit
+Sharing-domain grants and its own local SQLite database. See
+[`docs/anchor-peer-deployment.md`](anchor-peer-deployment.md).
 
 ## Current limitations
 

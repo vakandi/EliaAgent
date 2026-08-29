@@ -1,8 +1,18 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { connect, initTestSchema, MemoryStore, startMaintenanceJob } from "@codemem/core";
+import {
+	connect,
+	ensureDeviceIdentity,
+	fingerprintPublicKey,
+	initTestSchema,
+	loadPublicKey,
+	MemoryStore,
+	resolveKeyPaths,
+	startMaintenanceJob,
+} from "@codemem/core";
 import { describe, expect, it, vi } from "vitest";
+import { buildCoordinatorCommand } from "./coordinator.js";
 import { syncCommand } from "./sync.js";
 import {
 	buildServeLifecycleArgs,
@@ -144,6 +154,18 @@ describe("formatSyncAttempt", () => {
 		).toEqual(["192.168.1.10:7337"]);
 	});
 
+	it("brackets configured IPv6 advertise hosts", () => {
+		expect(collectAdvertiseAddresses(null, "fd00::1", 7337, {})).toEqual(["[fd00::1]:7337"]);
+	});
+
+	it("brackets IPv6 interface advertise addresses", () => {
+		expect(
+			collectAdvertiseAddresses(null, "0.0.0.0", 7337, {
+				utun0: [{ address: "fd00::2", internal: false, family: "IPv6" }],
+			}),
+		).toEqual(["[fd00::2]:7337"]);
+	});
+
 	it("registers coordinator parity subcommands", () => {
 		const coordinator = syncCommand.commands.find((command) => command.name() === "coordinator");
 		expect(coordinator).toBeDefined();
@@ -152,6 +174,12 @@ describe("formatSyncAttempt", () => {
 			"list-groups",
 			"enroll-device",
 			"list-devices",
+			"list-scopes",
+			"create-scope",
+			"update-scope",
+			"list-scope-members",
+			"grant-scope-member",
+			"revoke-scope-member",
 			"rename-device",
 			"disable-device",
 			"remove-device",
@@ -173,6 +201,12 @@ describe("formatSyncAttempt", () => {
 		expect(help).toContain("list-groups");
 		expect(help).toContain("enroll-device");
 		expect(help).toContain("list-devices");
+		expect(help).toContain("list-scopes");
+		expect(help).toContain("create-scope");
+		expect(help).toContain("update-scope");
+		expect(help).toContain("list-scope-members");
+		expect(help).toContain("grant-scope-member");
+		expect(help).toContain("revoke-scope-member");
 		expect(help).toContain("rename-device");
 		expect(help).toContain("disable-device");
 		expect(help).toContain("remove-device");
@@ -182,6 +216,129 @@ describe("formatSyncAttempt", () => {
 		expect(help).toContain("list-join-requests");
 		expect(help).toContain("approve-join-request");
 		expect(help).toContain("deny-join-request");
+	});
+
+	it("manages Sharing domains through coordinator CLI JSON commands", async () => {
+		const tmpDbDir = mkdtempSync(join(tmpdir(), "coordinator-scope-cli-test-"));
+		const dbPath = join(tmpDbDir, "coordinator.sqlite");
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const prevExitCode = process.exitCode;
+		process.exitCode = undefined;
+		try {
+			const devicePublicKey = "test-public-key-device-a";
+			await buildCoordinatorCommand().parseAsync(
+				["group-create", "team-a", "--db-path", dbPath, "--json"],
+				{ from: "user" },
+			);
+			await buildCoordinatorCommand().parseAsync(
+				[
+					"enroll-device",
+					"team-a",
+					"device-a",
+					"--fingerprint",
+					fingerprintPublicKey(devicePublicKey),
+					"--public-key",
+					devicePublicKey,
+					"--db-path",
+					dbPath,
+					"--json",
+				],
+				{ from: "user" },
+			);
+			logSpy.mockClear();
+			await buildCoordinatorCommand().parseAsync(
+				[
+					"create-scope",
+					"team-a",
+					"scope-acme",
+					"--label",
+					"Acme Work",
+					"--membership-epoch",
+					"2",
+					"--db-path",
+					dbPath,
+					"--json",
+				],
+				{ from: "user" },
+			);
+			await buildCoordinatorCommand().parseAsync(
+				[
+					"grant-scope-member",
+					"team-a",
+					"scope-acme",
+					"device-a",
+					"--effect-id",
+					"cli:scope-acme:device-a:grant",
+					"--role",
+					"admin",
+					"--db-path",
+					dbPath,
+					"--json",
+				],
+				{ from: "user" },
+			);
+			await buildCoordinatorCommand().parseAsync(
+				["list-scope-members", "team-a", "scope-acme", "--db-path", dbPath, "--json"],
+				{ from: "user" },
+			);
+
+			const createdScope = JSON.parse(String(logSpy.mock.calls[0]?.[0])) as Record<string, unknown>;
+			const grant = JSON.parse(String(logSpy.mock.calls[1]?.[0])) as Record<string, unknown>;
+			const members = JSON.parse(String(logSpy.mock.calls[2]?.[0])) as Array<
+				Record<string, unknown>
+			>;
+			expect(createdScope).toMatchObject({
+				scope_id: "scope-acme",
+				label: "Acme Work",
+				membership_epoch: 2,
+			});
+			expect(grant).toMatchObject({ device_id: "device-a", role: "admin" });
+			expect(members).toEqual([expect.objectContaining({ device_id: "device-a" })]);
+			expect(process.exitCode).toBeUndefined();
+		} finally {
+			logSpy.mockRestore();
+			process.exitCode = prevExitCode;
+			rmSync(tmpDbDir, { recursive: true, force: true });
+		}
+	});
+
+	it("reports Sharing domain CLI errors as JSON", async () => {
+		const tmpDbDir = mkdtempSync(join(tmpdir(), "coordinator-scope-cli-error-test-"));
+		const dbPath = join(tmpDbDir, "coordinator.sqlite");
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const prevExitCode = process.exitCode;
+		process.exitCode = undefined;
+		try {
+			await buildCoordinatorCommand().parseAsync(
+				["group-create", "team-a", "--db-path", dbPath, "--json"],
+				{ from: "user" },
+			);
+			await buildCoordinatorCommand().parseAsync(
+				[
+					"grant-scope-member",
+					"team-a",
+					"missing-scope",
+					"device-a",
+					"--effect-id",
+					"cli:missing-scope:device-a:grant",
+					"--db-path",
+					dbPath,
+					"--json",
+				],
+				{ from: "user" },
+			);
+
+			const error = JSON.parse(String(logSpy.mock.calls[1]?.[0])) as Record<string, unknown>;
+			expect(error).toMatchObject({
+				error: "grant_scope_member_failed",
+				message: "Scope not found: missing-scope",
+			});
+			expect(process.exitCode).toBe(1);
+		} finally {
+			logSpy.mockRestore();
+			process.exitCode = prevExitCode;
+			rmSync(tmpDbDir, { recursive: true, force: true });
+		}
 	});
 
 	it("defaults coordinator serve to the coordinator store database", () => {
@@ -210,6 +367,39 @@ describe("formatSyncAttempt", () => {
 		expect(listRequests?.registeredArguments[0]?.required).toBe(false);
 		expect(createInvite?.helpInformation()).toContain("[group]");
 		expect(listRequests?.helpInformation()).toContain("[group]");
+	});
+
+	it("initializes sync identity from CODEMEM_KEYS_DIR during sync enable", async () => {
+		const tmpDbDir = mkdtempSync(join(tmpdir(), "sync-enable-keys-dir-test-"));
+		const dbPath = join(tmpDbDir, "mem.sqlite");
+		const configPath = join(tmpDbDir, "codemem.json");
+		const keysDir = join(tmpDbDir, "keys");
+		const prevKeysDir = process.env.CODEMEM_KEYS_DIR;
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		try {
+			process.env.CODEMEM_KEYS_DIR = keysDir;
+			const enable = syncCommand.commands.find((command) => command.name() === "enable");
+			await enable?.parseAsync(["--db-path", dbPath, "--config", configPath, "--json"], {
+				from: "user",
+			});
+
+			const publicKey = loadPublicKey(keysDir);
+			expect(publicKey).toBeTruthy();
+			const store = new MemoryStore(dbPath);
+			try {
+				const row = store.db.prepare("SELECT public_key FROM sync_device LIMIT 1").get() as
+					| { public_key: string }
+					| undefined;
+				expect(row?.public_key).toBe(publicKey);
+			} finally {
+				store.close();
+			}
+		} finally {
+			logSpy.mockRestore();
+			if (prevKeysDir == null) delete process.env.CODEMEM_KEYS_DIR;
+			else process.env.CODEMEM_KEYS_DIR = prevKeysDir;
+			rmSync(tmpDbDir, { recursive: true, force: true });
+		}
 	});
 
 	it("registers peer repair subcommands", () => {
@@ -295,6 +485,210 @@ describe("formatSyncAttempt", () => {
 		} finally {
 			logSpy.mockRestore();
 			store.close();
+			rmSync(tmpDbDir, { recursive: true, force: true });
+		}
+	});
+
+	it("signs bootstrap status and snapshot requests for the selected peer", async () => {
+		const tmpDbDir = mkdtempSync(join(tmpdir(), "sync-bootstrap-auth-test-"));
+		const dbPath = join(tmpDbDir, "mem.sqlite");
+		const keysDir = join(tmpDbDir, "keys");
+		const rawDb = connect(dbPath);
+		initTestSchema(rawDb);
+		ensureDeviceIdentity(rawDb, { keysDir });
+		rawDb
+			.prepare(
+				`INSERT INTO sync_peers(
+					peer_device_id, name, pinned_fingerprint, addresses_json, created_at
+				 ) VALUES (?, ?, ?, ?, ?)`,
+			)
+			.run(
+				"peer-bootstrap",
+				"Bootstrap peer",
+				"peer-fingerprint",
+				JSON.stringify(["http://127.0.0.1:47337"]),
+				new Date().toISOString(),
+			);
+		rawDb.close();
+		const previousFetch = globalThis.fetch;
+		const requestedPaths: string[] = [];
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		try {
+			globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+				const url = new URL(String(input));
+				requestedPaths.push(url.pathname);
+				expect(init?.headers).toMatchObject({
+					"X-Codemem-Recipient": "peer-bootstrap",
+					"X-Codemem-Signature": expect.stringMatching(/^v3:/),
+				});
+				if (url.pathname === "/v1/status") {
+					return new Response(
+						JSON.stringify({
+							fingerprint: "peer-fingerprint",
+							sync_reset: {
+								generation: 1,
+								snapshot_id: "snapshot-1",
+								baseline_cursor: null,
+							},
+						}),
+						{ status: 200 },
+					);
+				}
+				return new Response(
+					JSON.stringify({
+						generation: 1,
+						snapshot_id: "snapshot-1",
+						baseline_cursor: null,
+						items: [],
+						next_page_token: null,
+						has_more: false,
+					}),
+					{ status: 200 },
+				);
+			}) as typeof fetch;
+
+			await syncCommand.parseAsync(
+				[
+					"bootstrap",
+					"peer-bootstrap",
+					"--db-path",
+					dbPath,
+					"--keys-dir",
+					keysDir,
+					"--force",
+					"--json",
+				],
+				{ from: "user" },
+			);
+
+			expect(requestedPaths).toEqual(["/v1/status", "/v1/snapshot"]);
+		} finally {
+			globalThis.fetch = previousFetch;
+			logSpy.mockRestore();
+			rmSync(tmpDbDir, { recursive: true, force: true });
+		}
+	});
+
+	it("reports per-Space sync progress in sync status output", async () => {
+		const tmpDbDir = mkdtempSync(join(tmpdir(), "sync-status-scopes-test-"));
+		const dbPath = join(tmpDbDir, "mem.sqlite");
+		const configPath = join(tmpDbDir, "config.json");
+		writeFileSync(configPath, JSON.stringify({ sync_enabled: true }, null, 2));
+		const rawDb = connect(dbPath);
+		initTestSchema(rawDb);
+		rawDb.close();
+		const store = new MemoryStore(dbPath);
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		try {
+			const now = "2026-01-01T00:00:00.000Z";
+			store.db
+				.prepare(
+					"INSERT INTO sync_device(device_id, public_key, fingerprint, created_at) VALUES (?, ?, ?, ?)",
+				)
+				.run("local-device", "local-public-key", "local-fingerprint", now);
+			store.db
+				.prepare("INSERT INTO sync_peers(peer_device_id, name, created_at) VALUES (?, ?, ?)")
+				.run("peer-device", "Work laptop", now);
+			for (const [scopeId, label] of [
+				["work", "Work"],
+				["personal", "Personal"],
+			] as const) {
+				store.db
+					.prepare(
+						`INSERT INTO replication_scopes(scope_id, label, kind, authority_type, membership_epoch, status, created_at, updated_at)
+						 VALUES (?, ?, 'user', 'coordinator', 1, 'active', ?, ?)`,
+					)
+					.run(scopeId, label, now, now);
+				for (const deviceId of ["local-device", "peer-device"]) {
+					store.db
+						.prepare(
+							`INSERT INTO scope_memberships(scope_id, device_id, role, status, membership_epoch, updated_at)
+							 VALUES (?, ?, 'member', 'active', 1, ?)`,
+						)
+						.run(scopeId, deviceId, now);
+				}
+			}
+			store.db
+				.prepare(
+					`INSERT INTO replication_cursors_v2(peer_device_id, scope_id, last_applied_cursor, last_acked_cursor, updated_at)
+					 VALUES (?, ?, ?, ?, ?)`,
+				)
+				.run("peer-device", "work", "2026-01-01T00:00:01Z|op", null, now);
+
+			await syncCommand.parseAsync(
+				["status", "--db-path", dbPath, "--config", configPath, "--json"],
+				{
+					from: "user",
+				},
+			);
+
+			const payload = JSON.parse(String(logSpy.mock.calls[0]?.[0])) as {
+				peers?: Array<{
+					scopes?: Array<{ label: string; scope_id: string; bootstrapped: boolean }>;
+				}>;
+			};
+			expect(payload.peers?.[0]?.scopes).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({ label: "Work", scope_id: "work", bootstrapped: true }),
+					expect.objectContaining({
+						label: "Personal",
+						bootstrapped: false,
+						scope_id: "personal",
+					}),
+				]),
+			);
+
+			logSpy.mockClear();
+			const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+			try {
+				await syncCommand.parseAsync(["status", "--db-path", dbPath, "--config", configPath], {
+					from: "user",
+				});
+
+				const rendered = writeSpy.mock.calls.map((call) => String(call[0])).join("\n");
+				expect(rendered).toContain("Spaces:");
+				expect(rendered).toContain("Work (work): received");
+				expect(rendered).toContain("Personal (personal): pending");
+			} finally {
+				writeSpy.mockRestore();
+			}
+		} finally {
+			logSpy.mockRestore();
+			store.close();
+			rmSync(tmpDbDir, { recursive: true, force: true });
+		}
+	});
+
+	it("reports missing restored identity keys in sync doctor output", async () => {
+		const tmpDbDir = mkdtempSync(join(tmpdir(), "sync-doctor-identity-test-"));
+		const dbPath = join(tmpDbDir, "mem.sqlite");
+		const keysDir = join(tmpDbDir, "keys");
+		const rawDb = connect(dbPath);
+		initTestSchema(rawDb);
+		ensureDeviceIdentity(rawDb, { keysDir });
+		rawDb.close();
+		const [privatePath] = resolveKeyPaths(keysDir);
+		rmSync(privatePath);
+		const previousKeysDir = process.env.CODEMEM_KEYS_DIR;
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		try {
+			process.env.CODEMEM_KEYS_DIR = keysDir;
+			await syncCommand.parseAsync(["doctor", "--db-path", dbPath, "--json"], {
+				from: "user",
+			});
+
+			const payload = JSON.parse(String(logSpy.mock.calls[0]?.[0])) as {
+				identity_error?: string | null;
+				issues?: string[];
+			};
+			expect(payload.identity_error).toContain("device_identity_private_key_missing");
+			expect(payload.issues).toEqual(
+				expect.arrayContaining([expect.stringContaining("device_identity_private_key_missing")]),
+			);
+		} finally {
+			logSpy.mockRestore();
+			if (previousKeysDir == null) delete process.env.CODEMEM_KEYS_DIR;
+			else process.env.CODEMEM_KEYS_DIR = previousKeysDir;
 			rmSync(tmpDbDir, { recursive: true, force: true });
 		}
 	});

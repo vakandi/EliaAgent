@@ -1,28 +1,34 @@
 import * as Collapsible from "@radix-ui/react-collapsible";
 import type { TargetedInputEvent } from "preact";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import { PresencePip, type PresenceState } from "../../../components/primitives/presence-pip";
-import { RadixSelect } from "../../../components/primitives/radix-select";
 import { TextInput } from "../../../components/primitives/text-input";
+import type { DeviceIdentityInventoryItemV1 } from "../../../lib/api/sync";
 import { formatTimestamp } from "../../../lib/format";
-import { isSyncRedactionEnabled, state } from "../../../lib/state";
+import { isSyncRedactionEnabled, type SyncActor, state } from "../../../lib/state";
 import {
-	buildActorSelectOptions,
+	clearPeerScopeReview,
 	consumePeerScopeReviewRequest,
-	createChipEditor,
 	isPeerScopeReviewPending,
-	openPeerScopeEditors,
 	pickPrimaryAddress,
 	redactAddress,
 } from "../helpers";
-import { PeerScopeCollapsible } from "../peer-scope-collapsible";
 import { openSyncConfirmDialog } from "../sync-dialogs";
 import {
+	derivePeerAuthorizedDomainsView,
 	derivePeerDirection,
+	derivePeerGrantRoleMismatchView,
+	derivePeerProjectNarrowingView,
+	derivePeerScopeRejectionsView,
+	derivePeerScopeSyncView,
 	derivePeerTrustSummary,
 	derivePeerUiStatus,
+	type PeerClaimedLocalActorScopeLike,
 	type PeerDirection,
 	type PeerLike,
+	type PeerPerScopeSyncLike,
+	type PeerProjectScopeLike,
+	type PeerScopeRejectionsSummary,
 } from "../view-model";
 import { renderIntoSyncMount } from "./render-root";
 import { SyncEmptyState } from "./sync-empty-state";
@@ -97,19 +103,15 @@ const DIRECTION_GLYPH: Record<PeerDirection, { glyph: string; label: string } | 
 	none: null,
 };
 
-type PeerScopeLike = {
-	include?: string[];
-	exclude?: string[];
-	effective_include?: string[];
-	effective_exclude?: string[];
-	inherits_global?: boolean;
-};
-
 type SyncPeer = PeerLike & {
 	actor_display_name?: string;
+	address_count?: number;
 	addresses?: unknown[];
 	claimed_local_actor?: boolean;
-	project_scope?: PeerScopeLike;
+	claimed_local_actor_scope?: PeerClaimedLocalActorScopeLike | null;
+	per_scope_sync?: PeerPerScopeSyncLike[];
+	project_scope?: PeerProjectScopeLike;
+	scope_rejections?: PeerScopeRejectionsSummary;
 	discovered_via_coordinator_id?: string | null;
 	discovered_via_group_id?: string | null;
 };
@@ -123,80 +125,168 @@ type SyncPeerStatus = NonNullable<SyncPeer["status"]> & {
 
 type SyncPeerCardProps = {
 	peer: SyncPeer;
-	onAssignActor: (peerId: string, actorId: string | null) => Promise<SyncActionFeedback>;
 	onRemove: (peerId: string, label: string) => Promise<SyncActionFeedback>;
 	onRename: (peerId: string, name: string) => Promise<SyncActionFeedback>;
-	onResetScope: (peerId: string) => Promise<SyncActionFeedback>;
-	onSaveScope: (
-		peerId: string,
-		include: string[],
-		exclude: string[],
-	) => Promise<SyncActionFeedback>;
 	onSync: (peer: SyncPeer, address: string | undefined) => Promise<SyncActionFeedback | null>;
 };
+
+export interface AdvancedDeviceIdentityView {
+	status: "configured" | "setup_required" | "pairing_required" | "conflicted" | "unavailable";
+	summary: string;
+	detail: string;
+	actionLabel: string;
+}
+
+function identityName(identityId: string | null, actors: SyncActor[]): string {
+	if (!identityId) return "the selected Identity";
+	const actor = actors.find((candidate) => candidate.actor_id === identityId);
+	return String(actor?.display_name || actor?.actor_display_name || "the selected Identity");
+}
+
+export function advancedDeviceIdentityView(
+	item: DeviceIdentityInventoryItemV1 | undefined,
+	actorHintId: string | null,
+	actors: SyncActor[],
+	inventoryUnavailable = false,
+	inventoryTruncated = false,
+	coordinatorUnavailable = false,
+): AdvancedDeviceIdentityView {
+	if (inventoryTruncated) {
+		return {
+			status: "unavailable",
+			summary: "Authoritative Identity status is unavailable because the inventory is incomplete.",
+			detail:
+				"This installation has more device evidence than Advanced can safely classify. Ownership is not shown from a partial inventory.",
+			actionLabel: "Review Identity inventory in Devices",
+		};
+	}
+	if (inventoryUnavailable || (coordinatorUnavailable && !item)) {
+		return {
+			status: "unavailable",
+			summary: "Authoritative Identity status is temporarily unavailable.",
+			detail:
+				"Refresh before relying on ownership details. Advanced actor_id values remain suggestions or provenance only.",
+			actionLabel: "Review Identity in Devices",
+		};
+	}
+	if (item?.state === "configured") {
+		return {
+			status: "configured",
+			summary: `Authoritative Identity: ${identityName(item.identityId, actors)}.`,
+			detail:
+				"This result comes from an active identity_devices binding. Advanced actor_id values are not authoritative ownership.",
+			actionLabel: "Review or rebind in Devices",
+		};
+	}
+	if (item?.state === "pairing_required") {
+		return {
+			status: "pairing_required",
+			summary: "Identity setup is blocked until pairing is complete.",
+			detail: "Pairing establishes sync trust; it does not establish device ownership.",
+			actionLabel: "Review setup in Devices",
+		};
+	}
+	if (item?.state === "conflicted") {
+		return {
+			status: "conflicted",
+			summary: "Identity ownership needs review.",
+			detail:
+				"Conflicting device evidence failed closed. Advanced actor_id values cannot resolve ownership.",
+			actionLabel: "Review conflict in Devices",
+		};
+	}
+	const suggestedIdentityId = item?.suggestedIdentityId ?? actorHintId;
+	return {
+		status: item?.state ?? "unavailable",
+		summary: suggestedIdentityId
+			? `Suggested Identity: ${identityName(suggestedIdentityId, actors)}.`
+			: "No authoritative Identity binding is configured.",
+		detail:
+			"sync_peers.actor_id is only a suggestion or hint until you confirm an identity_devices binding in Devices.",
+		actionLabel: "Set up Identity in Devices",
+	};
+}
+
+export function openDeviceIdentitySetup(deviceId?: string): void {
+	state.pendingDeviceIdentityFocus = deviceId?.trim() || null;
+	window.location.hash = "devices";
+}
 
 type SyncPeersListProps = Omit<SyncPeerCardProps, "peer"> & {
 	peers: SyncPeer[];
 };
 
-function listText(value: unknown): string[] {
-	return Array.isArray(value) ? value.map((item) => String(item || "").trim()).filter(Boolean) : [];
+function claimedLocalActorScopeMessage(
+	scope: PeerClaimedLocalActorScopeLike | null | undefined,
+): string {
+	if (!scope) {
+		return "Private same-person sync is limited to an allowed personal Space; team or org Spaces do not carry your private memories.";
+	}
+	if (scope.authorized) {
+		return "Private same-person sync is limited to your personal Space. Team and org Spaces do not carry your private memories.";
+	}
+	return "Private same-person sync is blocked until this device is granted an allowed personal Space.";
 }
 
-function ExistingElementSlot({ element }: { element: HTMLElement }) {
-	const hostRef = useRef<HTMLDivElement | null>(null);
-
-	useLayoutEffect(() => {
-		const host = hostRef.current;
-		if (!host) return;
-		if (element.parentElement !== host) host.appendChild(element);
-		return () => {
-			if (element.parentElement === host) {
-				host.removeChild(element);
-			}
-		};
-	}, [element]);
-
-	return <div ref={hostRef} />;
+function openLegacyCoordinatorAdministration(): void {
+	window.location.hash = "advanced/teams";
 }
 
-function SyncPeerCard({
-	peer,
-	onAssignActor,
-	onRemove,
-	onRename,
-	onResetScope,
-	onSaveScope,
-	onSync,
-}: SyncPeerCardProps) {
+export function canManageLegacyCoordinatorSpaces(
+	status = state.lastSyncCoordinatorAdminStatus,
+): boolean {
+	return status?.readiness === "ready" && status.has_admin_secret === true;
+}
+
+function SyncPeerCard({ peer, onRemove, onRename, onSync }: SyncPeerCardProps) {
 	const peerId = String(peer.peer_device_id || "");
 	const displayName = peer.name || (peerId ? peerId.slice(0, 8) : "unknown");
 	const destructiveLabel = peer.name || peerId || displayName;
-	const pendingScopeReview = isPeerScopeReviewPending(peerId);
 	const trustSummary = derivePeerTrustSummary(peer);
 	const directionHint = DIRECTION_GLYPH[derivePeerDirection(peer)];
 	const peerStatus: SyncPeerStatus = peer.status || {};
+	const authorizedDomains = derivePeerAuthorizedDomainsView(peer);
+	const rawPendingScopeReview = isPeerScopeReviewPending(peerId);
+	const pendingScopeReview = rawPendingScopeReview && authorizedDomains.total === 0;
+	const grantRoleMismatch = derivePeerGrantRoleMismatchView(peer);
+	const scopeRejections = derivePeerScopeRejectionsView(peer);
+	const scopeSync = derivePeerScopeSyncView(peer);
 	const scope = peer.project_scope || {};
-	const includeList = listText(scope.include);
-	const excludeList = listText(scope.exclude);
+	const projectNarrowing = derivePeerProjectNarrowingView(scope);
 	const primaryAddress = pickPrimaryAddress(peer.addresses);
 	const peerAddresses = Array.isArray(peer.addresses)
 		? Array.from(new Set(peer.addresses.filter(Boolean).map((value) => String(value))))
 		: [];
+	const rawHiddenAddressCount = Number(peer.address_count ?? 0);
+	const hiddenAddressCount =
+		Number.isFinite(rawHiddenAddressCount) && rawHiddenAddressCount > 0 ? rawHiddenAddressCount : 0;
 	const addressLine = peerAddresses.length
 		? peerAddresses
 				.map((address) => (isSyncRedactionEnabled() ? redactAddress(address) : address))
 				.join(" · ")
-		: "No addresses";
-	const assignmentSummary = peer.actor_display_name
-		? `This device belongs to ${peer.claimed_local_actor ? "you" : String(peer.actor_display_name)}.`
-		: "This device is not assigned to anyone yet.";
+		: hiddenAddressCount > 0
+			? `${hiddenAddressCount} ${hiddenAddressCount === 1 ? "address" : "addresses"} hidden`
+			: "No addresses";
+	const inventoryItem = state.lastDeviceIdentityInventory?.items.find(
+		(item) => item.deviceId === peerId || item.evidenceDeviceIds.includes(peerId),
+	);
+	const ownership = advancedDeviceIdentityView(
+		inventoryItem,
+		String(peer.actor_id || "") || null,
+		state.lastSyncActors,
+		state.deviceIdentityInventoryLoadError,
+		state.lastDeviceIdentityInventory?.truncated === true,
+		state.lastDeviceIdentityInventory?.coordinatorEvidence.availability === "unavailable",
+	);
 	const lastSyncAt = String(peerStatus.last_sync_at || peerStatus.last_sync_at_utc || "");
 	const lastPingAt = String(peerStatus.last_ping_at || peerStatus.last_ping_at_utc || "");
-	const scopeEditorOpen = openPeerScopeEditors.has(peerId);
+	const discoverySummary = peer.discovered_via_group_id
+		? `Discovery: seen through coordinator group ${peer.discovered_via_group_id}. Discovery helps find devices; Space access above decides data access.`
+		: peer.discovered_via_coordinator_id
+			? `Discovery: seen through coordinator ${peer.discovered_via_coordinator_id}. Discovery helps find devices; Space access above decides data access.`
+			: null;
 	const scopeReviewRequested = consumePeerScopeReviewRequest(peerId);
 	const cardRef = useRef<HTMLDivElement | null>(null);
-	const [scopeHost, setScopeHost] = useState<HTMLDivElement | null>(null);
 
 	const [renameValue, setRenameValue] = useState(displayName);
 	const [feedback, setFeedback] = useState<SyncActionFeedback | null>(
@@ -207,42 +297,10 @@ function SyncPeerCard({
 	const [syncBusy, setSyncBusy] = useState(false);
 	const [removeBusy, setRemoveBusy] = useState(false);
 	const [removeLabel, setRemoveLabel] = useState("Remove device");
-	const [selectedActorId, setSelectedActorId] = useState(String(peer.actor_id || ""));
-	const [applyActorBusy, setApplyActorBusy] = useState(false);
-	const [applyActorLabel, setApplyActorLabel] = useState("Save assignment");
-	const [saveScopeBusy, setSaveScopeBusy] = useState(false);
-	const [saveScopeLabel, setSaveScopeLabel] = useState("Save scope");
-	const [resetScopeBusy, setResetScopeBusy] = useState(false);
-	const [resetScopeLabel, setResetScopeLabel] = useState("Reset to global scope");
-	const actorSelectOptions = useMemo(() => {
-		const options = buildActorSelectOptions(selectedActorId);
-		const hasSelected = options.some((option) => option.value === selectedActorId);
-		if (selectedActorId && !hasSelected) {
-			options.push({
-				value: selectedActorId,
-				label: peer.claimed_local_actor
-					? "You"
-					: String(peer.actor_display_name || "Current assignment"),
-			});
-		}
-		return options;
-	}, [
-		peer.actor_display_name,
-		peer.claimed_local_actor,
-		selectedActorId,
-		state.lastSyncActors,
-		state.lastSyncPeers,
-		state.lastSyncViewModel,
-	]);
 
-	const includeEditor = useMemo(
-		() => createChipEditor(includeList, "Add project", "All projects", state.knownProjects),
-		[peerId, includeList.join("|"), state.knownProjects.join("|")],
-	);
-	const excludeEditor = useMemo(
-		() => createChipEditor(excludeList, "Add project", "No exclusions", state.knownProjects),
-		[peerId, excludeList.join("|"), state.knownProjects.join("|")],
-	);
+	useEffect(() => {
+		if (rawPendingScopeReview && authorizedDomains.total > 0) clearPeerScopeReview(peerId);
+	}, [authorizedDomains.total, peerId, rawPendingScopeReview]);
 
 	useEffect(() => {
 		setRenameValue(displayName);
@@ -252,14 +310,7 @@ function SyncPeerCard({
 		setSyncBusy(false);
 		setRemoveBusy(false);
 		setRemoveLabel("Remove device");
-		setSelectedActorId(String(peer.actor_id || ""));
-		setApplyActorBusy(false);
-		setApplyActorLabel("Save assignment");
-		setSaveScopeBusy(false);
-		setSaveScopeLabel("Save scope");
-		setResetScopeBusy(false);
-		setResetScopeLabel("Reset to global scope");
-	}, [displayName, peer.actor_id, peerId, includeList.join("|"), excludeList.join("|")]);
+	}, [displayName, peer.actor_id, peerId]);
 
 	useEffect(() => {
 		if (!scopeReviewRequested || !cardRef.current) return;
@@ -302,14 +353,15 @@ function SyncPeerCard({
 	}
 
 	async function sync() {
-		if (!primaryAddress) return;
 		if (pendingScopeReview) {
+			const canReviewLegacySpaces = canManageLegacyCoordinatorSpaces();
 			const proceed = await openSyncConfirmDialog({
-				title: `Sync ${displayName} before scope review?`,
-				description:
-					"This manual sync will use the current effective scope until you finish reviewing and saving the device scope.",
+				title: `Sync ${displayName} before advanced rule review?`,
+				description: canReviewLegacySpaces
+					? "This manual sync will use the current Space access and advanced filters until you review them in coordinator administration (legacy)."
+					: "This manual sync will use the current Space access and advanced filters until a coordinator operator reviews them in coordinator administration (legacy).",
 				confirmLabel: "Sync anyway",
-				cancelLabel: "Review scope first",
+				cancelLabel: canReviewLegacySpaces ? "Review legacy coordinator setup first" : "Cancel",
 			});
 			if (!proceed) return;
 		}
@@ -347,58 +399,6 @@ function SyncPeerCard({
 		}
 	}
 
-	async function savePerson() {
-		if (!peerId) return;
-		setApplyActorBusy(true);
-		setApplyActorLabel("Saving…");
-		try {
-			const nextFeedback = await onAssignActor(peerId, selectedActorId || null);
-			setFeedback(nextFeedback);
-			state.syncPeerFeedbackById.set(peerId, nextFeedback);
-			setApplyActorLabel("Save assignment");
-		} catch {
-			setApplyActorLabel("Retry");
-		} finally {
-			setApplyActorBusy(false);
-		}
-	}
-
-	async function saveScope() {
-		if (!peerId) return;
-		setSaveScopeBusy(true);
-		setSaveScopeLabel("Saving…");
-		try {
-			const nextFeedback = await onSaveScope(
-				peerId,
-				includeEditor.values(),
-				excludeEditor.values(),
-			);
-			setFeedback(nextFeedback);
-			state.syncPeerFeedbackById.set(peerId, nextFeedback);
-			setSaveScopeLabel("Save scope");
-		} catch {
-			setSaveScopeLabel("Retry");
-		} finally {
-			setSaveScopeBusy(false);
-		}
-	}
-
-	async function resetScope() {
-		if (!peerId) return;
-		setResetScopeBusy(true);
-		setResetScopeLabel("Resetting…");
-		try {
-			const nextFeedback = await onResetScope(peerId);
-			setFeedback(nextFeedback);
-			state.syncPeerFeedbackById.set(peerId, nextFeedback);
-			setResetScopeLabel("Reset to global scope");
-		} catch {
-			setResetScopeLabel("Retry");
-		} finally {
-			setResetScopeBusy(false);
-		}
-	}
-
 	const currentExpandedId = useExpandedPeer();
 	const isExpanded = currentExpandedId === peerId && peerId !== "";
 	const drawerId = `device-drawer-${peerId || "unknown"}`;
@@ -410,6 +410,7 @@ function SyncPeerCard({
 	// in SyncPeerStatusLike.
 	const presenceState: PresenceState = presenceForPeer(peer);
 	const syncMetaText = lastSyncAt ? `Sync: ${formatTimestamp(lastSyncAt)}` : "Sync: never";
+	const canManageSpaces = canManageLegacyCoordinatorSpaces();
 
 	const toggleLabel = `${isExpanded ? "Collapse" : "Expand"} device ${displayName}`;
 	// Read module-level state directly (not the stale closure value of
@@ -455,7 +456,29 @@ function SyncPeerCard({
 								{trustSummary.badgeLabel}
 							</span>
 							{pendingScopeReview ? (
-								<span className="badge actor-badge">Needs scope review</span>
+								<span className="badge actor-badge">Review advanced rules</span>
+							) : null}
+							<span
+								className={`badge ${authorizedDomains.isWarning ? "badge-offline" : "actor-badge"}`}
+								title="Spaces are the hard access boundary; advanced filters only narrow inside them."
+							>
+								{authorizedDomains.badgeLabel}
+							</span>
+							{scopeRejections.badgeLabel ? (
+								<span
+									className="badge badge-offline"
+									title="Inbound ops rejected by the sharing-domain scope gate. Expand for reason codes."
+								>
+									{scopeRejections.badgeLabel}
+								</span>
+							) : null}
+							{grantRoleMismatch.badgeLabel ? (
+								<span
+									className="badge badge-offline"
+									title="Review whether explicit Space access matches this device's intended role."
+								>
+									{grantRoleMismatch.badgeLabel}
+								</span>
 							) : null}
 							{peer.discovered_via_group_id ? (
 								<span
@@ -482,8 +505,13 @@ function SyncPeerCard({
 						<button
 							type="button"
 							className="settings-button"
-							disabled={!primaryAddress || syncBusy}
+							disabled={syncBusy}
 							onClick={() => void sync()}
+							title={
+								primaryAddress
+									? undefined
+									: "Address details are hidden; sync will target this device by ID."
+							}
 						>
 							{syncBusy ? "Syncing…" : "Sync now"}
 						</button>
@@ -529,14 +557,19 @@ function SyncPeerCard({
 					<div className="peer-scope">
 						{scopeReviewRequested ? (
 							<div className="peer-meta">
-								Review this device&apos;s sharing rules now if the defaults are too broad.
+								{canManageSpaces
+									? "Review this device's Space access and advanced rules in coordinator administration (legacy) if the defaults are too broad."
+									: "A coordinator operator can review this device's Space access and advanced rules in coordinator administration (legacy) if the defaults are too broad."}
 							</div>
 						) : pendingScopeReview ? (
-							<div className="peer-meta">Sharing rule review is still pending for this device.</div>
+							<div className="peer-meta">
+								Advanced rule review is still pending for this device.
+							</div>
 						) : null}
 
 						<div className="peer-scope-summary">Device details</div>
 						<div className="peer-addresses">{addressLine}</div>
+						{discoverySummary ? <div className="peer-meta">{discoverySummary}</div> : null}
 						<div className="peer-meta">
 							{[
 								lastSyncAt ? `Sync: ${formatTimestamp(lastSyncAt)}` : "Sync: never",
@@ -544,73 +577,118 @@ function SyncPeerCard({
 							].join(" · ")}
 						</div>
 
-						<div className="peer-scope-summary">Who this device belongs to</div>
-						<div className="peer-meta">{assignmentSummary}</div>
-						<div className="peer-actor-row">
-							<div className="sync-radix-select-host sync-actor-select-host">
-								<RadixSelect
-									ariaLabel={`Assigned person for ${displayName}`}
-									contentClassName="sync-radix-select-content sync-actor-select-content"
-									disabled={applyActorBusy}
-									itemClassName="sync-radix-select-item"
-									onValueChange={setSelectedActorId}
-									options={actorSelectOptions}
-									placeholder="No person assigned yet"
-									triggerClassName="sync-radix-select-trigger sync-actor-select"
-									value={selectedActorId}
-									viewportClassName="sync-radix-select-viewport"
-								/>
+						<div className="peer-scope-summary">Space access</div>
+						<div className="peer-meta">
+							{authorizedDomains.total > 0
+								? "These Spaces are the hard access boundary for this device."
+								: authorizedDomains.emptyMessage}
+						</div>
+						{authorizedDomains.domains.length > 0 ? (
+							<ul className="peer-scope-chips" aria-label="Authorized Spaces">
+								{authorizedDomains.domains.map((domain) => (
+									<li className="peer-scope-chip" key={domain.scopeId} title={domain.detail}>
+										{domain.label}
+									</li>
+								))}
+							</ul>
+						) : null}
+						{grantRoleMismatch.isVisible ? (
+							<div className="settings-note" role="status">
+								<strong>{grantRoleMismatch.title}</strong>
+								<div>{grantRoleMismatch.message}</div>
+								<div>{grantRoleMismatch.detail}</div>
 							</div>
+						) : null}
+						<div className="peer-meta">{projectNarrowing.note}</div>
+
+						<div className="peer-scope-summary">Space sync progress</div>
+						<div className="peer-meta">
+							{scopeSync.total > 0
+								? "Per-Space progress for this device. Open details to see technical identifiers."
+								: scopeSync.emptyMessage}
+						</div>
+						{scopeSync.rows.length > 0 ? (
+							<ul className="peer-scope-rejections-list" aria-label="Per-Space sync progress">
+								{scopeSync.rows.map((row) => (
+									<li key={row.scopeId} title={row.detail}>
+										<span className="peer-scope-rejection-label">{row.label}</span>
+										<span
+											className={`badge ${row.status === "received" ? "badge-online" : "actor-badge"}`}
+										>
+											{row.badgeLabel}
+										</span>
+									</li>
+								))}
+							</ul>
+						) : null}
+
+						{scopeRejections.total > 0 ? (
+							<div
+								className="peer-scope-rejections"
+								data-peer-rejection-count={scopeRejections.total}
+							>
+								<div className="peer-scope-summary">Sharing-rule rejections (24h)</div>
+								<div className="peer-meta">
+									Inbound ops the local fail-closed gate refused. Diagnostics never expose op
+									payloads.
+								</div>
+								<ul className="peer-scope-rejections-list">
+									{scopeRejections.reasons.map((entry) => (
+										<li key={entry.reason}>
+											<span className="peer-scope-rejection-label">{entry.label}</span>
+											<span className="peer-scope-rejection-count">
+												{entry.count.toLocaleString()}
+											</span>
+										</li>
+									))}
+								</ul>
+								{scopeRejections.lastAt ? (
+									<div className="peer-meta">
+										Last rejected {formatTimestamp(scopeRejections.lastAt)}
+									</div>
+								) : null}
+							</div>
+						) : null}
+
+						<div className="peer-scope-summary">Authoritative Identity ownership</div>
+						<div className="peer-meta">{ownership.summary}</div>
+						<div className="peer-meta">{ownership.detail}</div>
+						{peer.claimed_local_actor ? (
+							<div className="peer-meta">
+								{claimedLocalActorScopeMessage(peer.claimed_local_actor_scope)}
+							</div>
+						) : null}
+						<div className="peer-actor-row">
 							<button
 								type="button"
 								className="settings-button"
-								disabled={applyActorBusy}
-								onClick={() => void savePerson()}
+								onClick={() => openDeviceIdentitySetup(inventoryItem?.deviceId ?? peerId)}
 							>
-								{applyActorLabel}
+								{ownership.actionLabel}
 							</button>
 						</div>
 
-						<div className="peer-scope-summary">Advanced sharing scope</div>
+						<div className="peer-scope-summary">Advanced sharing rules</div>
 						<div className="peer-meta">
-							Review or tighten what this device can share when you need more than the global
-							defaults.
+							{projectNarrowing.statusLabel}. {projectNarrowing.summary} {projectNarrowing.note}
 						</div>
-						<PeerScopeCollapsible
-							contentHost={scopeHost}
-							initialOpen={scopeEditorOpen}
-							onOpenChange={(open) => {
-								if (open) openPeerScopeEditors.add(peerId);
-								else openPeerScopeEditors.delete(peerId);
-							}}
-						>
-							<div>
-								<div className="peer-scope-row">
-									<ExistingElementSlot element={includeEditor.element} />
-									<ExistingElementSlot element={excludeEditor.element} />
-								</div>
-								<div className="peer-scope-actions">
-									<button
-										type="button"
-										className="settings-button"
-										disabled={saveScopeBusy}
-										onClick={() => void saveScope()}
-									>
-										{saveScopeLabel}
-									</button>
-									<button
-										type="button"
-										className="settings-button"
-										disabled={resetScopeBusy}
-										onClick={() => void resetScope()}
-									>
-										{resetScopeLabel}
-									</button>
-								</div>
+						{canManageSpaces ? (
+							<div className="peer-actions">
+								<button
+									type="button"
+									className="settings-button"
+									onClick={openLegacyCoordinatorAdministration}
+								>
+									Open coordinator administration (legacy)
+								</button>
 							</div>
-						</PeerScopeCollapsible>
+						) : (
+							<div className="peer-meta">
+								Legacy Space access is managed in coordinator administration (legacy) by a
+								coordinator operator.
+							</div>
+						)}
 						<SyncInlineFeedback feedback={feedback} />
-						<div ref={setScopeHost} />
 					</div>
 				</Collapsible.Content>
 			</div>

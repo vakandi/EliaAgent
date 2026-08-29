@@ -5,6 +5,8 @@
   "scripts": {
     "clean": "pnpm -r run clean && pnpm exec tsc --build --clean",
     "build": "pnpm -r run build",
+    "build:adapter-normalizers": "node scripts/build-adapter-normalizers.mjs",
+    "dogfood": "pnpm exec tsx e2e/bin/dogfood.ts",
     "e2e": "pnpm exec tsx e2e/bin/run-local.ts",
     "e2e:bootstrap": "pnpm exec tsx e2e/bin/run-local.ts bootstrap",
     "e2e:coordinator": "pnpm exec tsx e2e/bin/run-local.ts coordinator",
@@ -12,16 +14,24 @@
     "e2e:fleet-cleanup": "pnpm exec tsx e2e/bin/run-local.ts fleetCleanup",
     "e2e:fleet-ready": "pnpm exec tsx e2e/bin/run-local.ts fleetReady",
     "e2e:fleet-smoke": "pnpm exec tsx e2e/bin/run-local.ts fleetSmoke",
+    "e2e:legacy-team-migration": "pnpm exec tsx e2e/bin/run-local.ts legacyTeamMigration",
+    "e2e:project-sharing": "pnpm exec tsx e2e/bin/run-local.ts projectSharing",
+    "e2e:sharing-domains": "pnpm exec tsx e2e/bin/run-local.ts sharingDomains",
     "e2e:smoke": "pnpm exec tsx e2e/bin/run-local.ts smoke",
     "test": "pnpm exec vitest run",
     "test:watch": "pnpm exec vitest",
+    "test:release": "node --test scripts/release-version.test.mjs scripts/release-tag-preflight.test.mjs",
+    "test:adapter-normalizers": "node --test scripts/build-adapter-normalizers.test.mjs",
     "test:release-version": "node --test scripts/release-version.test.mjs",
-    "lint": "pnpm exec biome check packages/",
+    "test:release-tag-preflight": "node --test scripts/release-tag-preflight.test.mjs",
+    "lint": "pnpm exec biome check .",
     "format": "pnpm exec biome check --write packages/",
     "tsc": "pnpm exec tsc --build",
     "typecheck": "pnpm run tsc",
-    "check": "pnpm run tsc && pnpm run lint && pnpm run test",
+    "check": "pnpm run tsc && pnpm run lint && pnpm run test:release && pnpm run test:adapter-normalizers && pnpm run test",
     "codemem": "tsx --conditions source packages/cli/src/index.ts",
+    "eval:pack": "tsx --conditions source scripts/eval/pack-eval.ts",
+    "eval:pack:typecheck": "pnpm exec tsc --build packages/core && pnpm exec tsc --noEmit --project scripts/eval/tsconfig.json",
     "dev": "bash scripts/dev.sh",
     "prepare": "husky",
     "release:version": "node scripts/release-version.mjs",
@@ -34,9 +44,11 @@
   },
   "devDependencies": {
     "@biomejs/biome": "catalog:",
+    "@codemem/core": "workspace:^",
+    "@types/node": "^24.12.4",
     "drizzle-kit": "^0.31.10",
     "husky": "^9.1.7",
-    "lint-staged": "^16.2.6",
+    "lint-staged": "^16.4.0",
     "tsx": "catalog:",
     "typescript": "catalog:",
     "vite": "catalog:",
@@ -47,13 +59,6 @@
   },
   "packageManager": "pnpm@10.33.0+sha512.10568bb4a6afb58c9eb3630da90cc9516417abebd3fabbe6739f0ae795728da1491e9db5a544c76ad8eb7570f5c4bb3d6c637b2cb41bfdcdb47fa823c8649319",
   "pnpm": {
-    "strictPeerDependencies": false,
-    "onlyBuiltDependencies": [
-      "@biomejs/biome",
-      "better-sqlite3",
-      "esbuild",
-      "sharp",
-      "workerd"
-    ]
+    "strictPeerDependencies": false
   }
 }

@@ -2,20 +2,33 @@ import type { ComponentChildren } from "preact";
 import { createPortal } from "preact/compat";
 import { useState } from "preact/hooks";
 import { state } from "../../../lib/state";
-import type { UiSyncAttentionItem } from "../view-model";
+import type { UiSyncAttentionItem, UiTeamSyncPrimaryStatus } from "../view-model";
 import type { SyncActionFeedback } from "./sync-inline-feedback";
 import { SyncInlineFeedback } from "./sync-inline-feedback";
 
 export interface TeamSyncDiscoveredRow {
 	actionMessage: string | null;
 	actionLabel: string | null;
+	approvalState: "needs-local-approval" | "approval-pending" | "not-required";
 	approvalBadgeLabel: string | null;
 	availabilityLabel: string;
+	coordinatorUrl: string;
 	deviceId: string;
 	displayName: string;
 	displayTitle: string | null;
 	fingerprint: string;
-	mode: "accept" | "ambiguous" | "conflict" | "none" | "paired" | "scope-pending" | "stale";
+	groupId: string;
+	incomingRequestId: string;
+	mode:
+		| "accept"
+		| "approval-pending"
+		| "ambiguous"
+		| "conflict"
+		| "none"
+		| "paired"
+		| "scope-pending"
+		| "setup-blocked"
+		| "stale";
 	note: string;
 	pairedMessage: string | null;
 	connectionLabel: string;
@@ -41,6 +54,7 @@ type TeamSyncPanelProps = {
 	onReviewDiscoveredDevice: (row: TeamSyncDiscoveredRow) => Promise<SyncActionFeedback | null>;
 	pendingJoinRequests: TeamSyncPendingJoinRequest[];
 	presenceStatus: string;
+	primaryStatus: UiTeamSyncPrimaryStatus;
 };
 
 function SectionHeading({ count, label }: { count?: number; label: string }) {
@@ -198,10 +212,23 @@ function DiscoveredDeviceRow({
 						onClick={async () => {
 							setBusy("review");
 							setReviewLabel("Pairing…");
+							setFeedback({
+								message: `Pairing ${row.displayName}. Keep this page open while the device is approved and refreshed.`,
+								tone: "success",
+							});
 							try {
-								setFeedback((await onReview(row)) || null);
-								setReviewLabel(row.actionLabel || defaultReviewLabel);
+								const nextFeedback = (await onReview(row)) || null;
+								setFeedback(nextFeedback);
+								setReviewLabel(
+									nextFeedback?.tone === "warning"
+										? "Retry"
+										: row.actionLabel || defaultReviewLabel,
+								);
 							} catch {
+								setFeedback({
+									message: `Pairing ${row.displayName} failed. Try again.`,
+									tone: "warning",
+								});
 								setReviewLabel("Retry");
 							} finally {
 								setBusy(null);
@@ -211,7 +238,11 @@ function DiscoveredDeviceRow({
 						{reviewLabel}
 					</button>
 				) : null}
-				{(row.mode === "stale" || row.mode === "ambiguous" || row.mode === "scope-pending") &&
+				{(row.mode === "stale" ||
+					row.mode === "approval-pending" ||
+					row.mode === "ambiguous" ||
+					row.mode === "scope-pending" ||
+					row.mode === "setup-blocked") &&
 				row.actionMessage ? (
 					<div className="peer-meta">{row.actionMessage}</div>
 				) : null}
@@ -261,7 +292,7 @@ function ActionContent(props: TeamSyncPanelProps) {
 	const hasAttentionItems = props.actionItems.length > 0;
 	const hasOtherActionableWork = props.actionableCount > props.actionItems.length;
 	const showNextStepsLabel =
-		hasAttentionItems || hasOtherActionableWork || props.presenceStatus !== "posted";
+		hasAttentionItems || hasOtherActionableWork || props.primaryStatus.state !== "healthy";
 
 	return (
 		<>
@@ -269,30 +300,28 @@ function ActionContent(props: TeamSyncPanelProps) {
 			{showNextStepsLabel ? (
 				<SectionNote>Start here when something needs review, re-pairing, or approval.</SectionNote>
 			) : null}
+			{props.primaryStatus.nextAction ? (
+				<div className="sync-action" data-primary-sync-state={props.primaryStatus.state}>
+					<div className="sync-action-text">
+						{props.primaryStatus.badgeLabel}
+						<span className="sync-action-command">{props.primaryStatus.nextAction}</span>
+					</div>
+				</div>
+			) : null}
 			{hasAttentionItems
 				? props.actionItems.map((item) => (
 						<AttentionRow key={item.id} item={item} onAction={props.onAttentionAction} />
 					))
 				: null}
-			{!hasAttentionItems && !hasOtherActionableWork && props.presenceStatus === "posted" ? (
+			{!hasAttentionItems && !hasOtherActionableWork && props.primaryStatus.state === "healthy" ? (
 				<div className="sync-action">
 					<div className="sync-action-text">No urgent team work right now.</div>
 				</div>
 			) : null}
-			{!hasAttentionItems && hasOtherActionableWork && props.presenceStatus === "posted" ? (
+			{!hasAttentionItems && hasOtherActionableWork ? (
 				<div className="sync-action">
 					<div className="sync-action-text">
 						More team follow-up is listed below when you are ready.
-					</div>
-				</div>
-			) : null}
-			{!hasAttentionItems && props.presenceStatus === "not_enrolled" ? (
-				<div className="sync-action">
-					<div className="sync-action-text">
-						This device needs team enrollment
-						<span className="sync-action-command">
-							Import an invite or ask an admin to enroll it.
-						</span>
 					</div>
 				</div>
 			) : null}
@@ -337,7 +366,7 @@ function DiscoveredPortal({
 			<SyncInlineFeedback feedback={state.syncDiscoveredFeedback} />
 			{rows.map((row) => (
 				<DiscoveredDeviceRow
-					key={row.deviceId}
+					key={`${row.deviceId}:${row.incomingRequestId}:${row.fingerprint}`}
 					row={row}
 					onInspectConflict={onInspectConflict}
 					onRemoveConflict={onRemoveConflict}

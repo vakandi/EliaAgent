@@ -1,10 +1,51 @@
-import { describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { initDatabase, MemoryStore } from "@codemem/core";
+import { describe, expect, it, vi } from "vitest";
+import * as embeddings from "../../../core/src/embeddings.js";
 import {
 	forgetMemoryCommand,
 	memoryCommand,
+	reconcileExtractionBenchmarkStatus,
 	rememberMemoryCommand,
+	resolveOpenAIResponsesOverride,
 	showMemoryCommand,
+	summarizeBenchmarkReasoning,
 } from "./memory.js";
+
+vi.mock("../../../core/src/embeddings.js", async () => {
+	const actual = await vi.importActual<typeof import("../../../core/src/embeddings.js")>(
+		"../../../core/src/embeddings.js",
+	);
+	return {
+		...actual,
+		embedTexts: vi.fn(),
+		getEmbeddingClient: vi.fn(),
+		resolveEmbeddingModel: vi.fn(() => "test-model"),
+	};
+});
+
+function insertCoordinatorScope(store: MemoryStore, scopeId: string): void {
+	const now = "2026-01-01T00:00:00Z";
+	store.db
+		.prepare(
+			`INSERT INTO replication_scopes(
+				scope_id, label, kind, authority_type, membership_epoch, status, created_at, updated_at
+			 ) VALUES (?, ?, 'team', 'coordinator', 1, 'active', ?, ?)`,
+		)
+		.run(scopeId, scopeId, now, now);
+}
+
+function insertHiddenOwnedMemory(store: MemoryStore): number {
+	insertCoordinatorScope(store, "unauthorized-team");
+	const sessionId = store.startSession({ cwd: process.cwd(), project: "secret-project" });
+	const memoryId = store.remember(sessionId, "discovery", "Hidden owned memory", "Hidden body");
+	store.db
+		.prepare("UPDATE memory_items SET scope_id = ? WHERE id = ?")
+		.run("unauthorized-team", memoryId);
+	return memoryId;
+}
 
 describe("memory command aliases", () => {
 	it("keeps memory subcommands available under the memory group", () => {
@@ -15,6 +56,7 @@ describe("memory command aliases", () => {
 			"inject",
 			"role-report",
 			"role-compare",
+			"artifact-report",
 			"extraction-report",
 			"extraction-replay",
 			"extraction-benchmark",
@@ -116,6 +158,7 @@ describe("memory command aliases", () => {
 		expect(longs).toContain("--max-output-tokens");
 		expect(longs).toContain("--observer-temperature");
 		expect(longs).toContain("--transcript-budget");
+		expect(longs).toContain("--repetitions");
 		expect(longs).toContain("--json");
 	});
 
@@ -143,5 +186,295 @@ describe("memory command aliases", () => {
 		expect(longs).toContain("--all-projects");
 		expect(longs).toContain("--limit");
 		expect(longs).toContain("--json");
+	});
+});
+
+describe("benchmark reasoning summaries", () => {
+	it("preserves explicit null reasoning from tier-routed benchmark runs", () => {
+		expect(
+			summarizeBenchmarkReasoning([{ reasoningEffort: null, reasoningSummary: null }], {
+				reasoningEffort: "medium",
+				reasoningSummary: "auto",
+			}),
+		).toEqual({ reasoningEffort: null, reasoningSummary: null });
+		expect(
+			summarizeBenchmarkReasoning([], {
+				reasoningEffort: "medium",
+				reasoningSummary: "auto",
+			}),
+		).toEqual({ reasoningEffort: "medium", reasoningSummary: "auto" });
+		expect(
+			summarizeBenchmarkReasoning(
+				[
+					{ reasoningEffort: "low", reasoningSummary: null },
+					{ reasoningEffort: "medium", reasoningSummary: null },
+				],
+				{ reasoningEffort: "high", reasoningSummary: "auto" },
+			),
+		).toEqual({ reasoningEffort: "mixed", reasoningSummary: null });
+	});
+});
+
+describe("benchmark observer overrides", () => {
+	it("preserves configured Responses transport unless the CLI flag enables it", () => {
+		expect(resolveOpenAIResponsesOverride(undefined, true)).toBe(true);
+		expect(resolveOpenAIResponsesOverride(undefined, false)).toBe(false);
+		expect(resolveOpenAIResponsesOverride(true, false)).toBe(true);
+	});
+});
+
+describe("memory command error boundaries", () => {
+	it("preserves a repaired benchmark pass when the initial disposition failed", () => {
+		const initialQuality = {
+			summaryDisposition: { expected: "required", actual: "none", score: 0 },
+		};
+		const finalQuality = {
+			summaryDisposition: { expected: "required", actual: "summary", score: 1 },
+		};
+		const result = reconcileExtractionBenchmarkStatus({
+			purpose: "shape_quality",
+			classification: { status: "pass", reason: "repaired output satisfies rubric" },
+			finalFailureReasons: [],
+			initialQuality,
+			finalQuality,
+		});
+
+		expect(result).toEqual({
+			status: "pass",
+			reason: "repaired output satisfies rubric",
+			quality: finalQuality,
+			initialQuality,
+		});
+	});
+
+	it("preserves observer_no_output before summary disposition scoring", () => {
+		const quality = {
+			summaryDisposition: { expected: "required", actual: "none", score: 0 },
+		};
+		const result = reconcileExtractionBenchmarkStatus({
+			purpose: "shape_quality",
+			classification: { status: "observer_no_output", reason: "observer returned no output" },
+			finalFailureReasons: ["observer returned no output"],
+			initialQuality: quality,
+			finalQuality: quality,
+		});
+
+		expect(result).toEqual({
+			status: "observer_no_output",
+			reason: "observer returned no output",
+			quality,
+			initialQuality: quality,
+		});
+	});
+
+	it("does not accept a repaired skip with non-summary final failures", () => {
+		const quality = {
+			summaryDisposition: { expected: "skip", actual: "skip", score: 1 },
+		};
+		const result = reconcileExtractionBenchmarkStatus({
+			purpose: "shape_quality",
+			classification: { status: "shape_fail", reason: "observation count outside range" },
+			finalFailureReasons: [
+				"summary count 0 outside expected range 1-1",
+				"observation count 1 outside expected range 0-0",
+			],
+			initialQuality: quality,
+			finalQuality: quality,
+		});
+
+		expect(result).toEqual({
+			status: "shape_fail",
+			reason: "observation count outside range",
+			quality,
+			initialQuality: quality,
+		});
+	});
+
+	it("accepts a valid skip when the final failure is only summary count", () => {
+		const quality = {
+			summaryDisposition: { expected: "skip", actual: "skip", score: 1 },
+		};
+		const result = reconcileExtractionBenchmarkStatus({
+			purpose: "shape_quality",
+			classification: { status: "shape_fail", reason: "summary count outside range" },
+			finalFailureReasons: ["summary count 0 outside expected range 1-1"],
+			initialQuality: quality,
+			finalQuality: quality,
+		});
+
+		expect(result.status).toBe("pass");
+		expect(result.reason).toBe("valid low-signal skip satisfies benchmark disposition");
+	});
+
+	it("does not throw and emits a JSON error for an invalid extraction-replay batch id", async () => {
+		const extractionReplay = memoryCommand.commands.find(
+			(command) => command.name() === "extraction-replay",
+		);
+		expect(extractionReplay).toBeDefined();
+		if (!extractionReplay) throw new Error("expected extraction-replay command");
+
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const originalExitCode = process.exitCode;
+		process.exitCode = undefined;
+		try {
+			await expect(
+				extractionReplay.parseAsync(
+					["--batch-id", "not-a-number", "--scenario", "anything", "--json"],
+					{ from: "user" },
+				),
+			).resolves.toBeDefined();
+
+			const output = logSpy.mock.calls.at(-1)?.[0];
+			expect(JSON.parse(String(output))).toMatchObject({ error: expect.any(String) });
+			expect(process.exitCode).toBe(1);
+		} finally {
+			process.exitCode = originalExitCode;
+			logSpy.mockRestore();
+		}
+	});
+
+	it("does not throw and emits a JSON error for an unknown extraction-benchmark id", async () => {
+		const extractionBenchmark = memoryCommand.commands.find(
+			(command) => command.name() === "extraction-benchmark",
+		);
+		expect(extractionBenchmark).toBeDefined();
+		if (!extractionBenchmark) throw new Error("expected extraction-benchmark command");
+
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const originalExitCode = process.exitCode;
+		process.exitCode = undefined;
+		try {
+			await expect(
+				extractionBenchmark.parseAsync(["--benchmark", "does-not-exist", "--json"], {
+					from: "user",
+				}),
+			).resolves.toBeDefined();
+
+			const output = logSpy.mock.calls.at(-1)?.[0];
+			expect(JSON.parse(String(output))).toMatchObject({ error: expect.any(String) });
+			expect(process.exitCode).toBe(1);
+		} finally {
+			process.exitCode = originalExitCode;
+			logSpy.mockRestore();
+		}
+	});
+
+	it("rejects unsafe extraction-benchmark repetition counts before running a model", async () => {
+		const extractionBenchmark = memoryCommand.commands.find(
+			(command) => command.name() === "extraction-benchmark",
+		);
+		if (!extractionBenchmark) throw new Error("expected extraction-benchmark command");
+
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const originalExitCode = process.exitCode;
+		process.exitCode = undefined;
+		try {
+			await extractionBenchmark.parseAsync(
+				["--benchmark", "balanced-observer-quality-v1", "--repetitions", "11", "--json"],
+				{ from: "user" },
+			);
+
+			const output = logSpy.mock.calls.at(-1)?.[0];
+			expect(JSON.parse(String(output))).toMatchObject({
+				error: "extraction_benchmark_failed",
+				message: expect.stringContaining("Invalid repetitions"),
+			});
+			expect(process.exitCode).toBe(1);
+		} finally {
+			process.exitCode = originalExitCode;
+			logSpy.mockRestore();
+		}
+	});
+});
+
+describe("memory command scope safety", () => {
+	it("stores vectors for manually remembered memories", async () => {
+		const tmpDir = mkdtempSync(join(tmpdir(), "codemem-memory-command-vector-"));
+		const dbPath = join(tmpDir, "test.sqlite");
+		initDatabase(dbPath);
+		vi.mocked(embeddings.getEmbeddingClient).mockResolvedValue({
+			model: "test-model",
+			dimensions: 384,
+			embed: vi.fn(),
+		});
+		vi.mocked(embeddings.embedTexts).mockResolvedValue([new Float32Array(384)]);
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const originalExitCode = process.exitCode;
+		process.exitCode = undefined;
+		try {
+			await rememberMemoryCommand.parseAsync(
+				[
+					"--kind",
+					"discovery",
+					"--title",
+					"Manual vector memory",
+					"--body",
+					"Manual vector body",
+					"--db-path",
+					dbPath,
+					"--json",
+				],
+				{ from: "user" },
+			);
+
+			const output = logSpy.mock.calls.at(-1)?.[0];
+			const parsed = JSON.parse(String(output)) as { id: number };
+			expect(parsed.id).toBeGreaterThan(0);
+			expect(process.exitCode).toBeUndefined();
+
+			const verifyStore = new MemoryStore(dbPath);
+			try {
+				const row = verifyStore.db
+					.prepare("SELECT COUNT(*) AS n FROM memory_vectors WHERE memory_id = ?")
+					.get(parsed.id) as { n: number };
+				expect(row.n).toBe(1);
+			} finally {
+				verifyStore.close();
+			}
+		} finally {
+			process.exitCode = originalExitCode;
+			logSpy.mockRestore();
+			rmSync(tmpDir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not forget memories outside visible sharing domains", async () => {
+		const tmpDir = mkdtempSync(join(tmpdir(), "codemem-memory-command-scope-"));
+		const dbPath = join(tmpDir, "test.sqlite");
+		initDatabase(dbPath);
+		const store = new MemoryStore(dbPath);
+		const memoryId = insertHiddenOwnedMemory(store);
+		await store.flushPendingVectorWrites();
+		store.close();
+
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const originalExitCode = process.exitCode;
+		process.exitCode = undefined;
+		try {
+			await forgetMemoryCommand.parseAsync([String(memoryId), "--db-path", dbPath, "--json"], {
+				from: "user",
+			});
+
+			const output = logSpy.mock.calls.at(-1)?.[0];
+			expect(JSON.parse(String(output))).toMatchObject({
+				error: "not_found",
+				message: `Memory ${memoryId} not found`,
+			});
+			expect(process.exitCode).toBe(1);
+
+			const verifyStore = new MemoryStore(dbPath);
+			try {
+				const row = verifyStore.db
+					.prepare("SELECT active FROM memory_items WHERE id = ?")
+					.get(memoryId) as { active: number };
+				expect(row.active).toBe(1);
+			} finally {
+				verifyStore.close();
+			}
+		} finally {
+			process.exitCode = originalExitCode;
+			logSpy.mockRestore();
+			rmSync(tmpDir, { recursive: true, force: true });
+		}
 	});
 });

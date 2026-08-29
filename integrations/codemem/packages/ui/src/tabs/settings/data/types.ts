@@ -6,11 +6,14 @@ export type SettingsTabId = "observer" | "queue" | "sync";
 
 export type SettingsFormState = {
 	claudeCommand: string;
+	codexCommand: string;
 	observerProvider: string;
 	observerModel: string;
 	observerTierRoutingEnabled: boolean;
 	observerSimpleModel: string;
 	observerSimpleTemperature: string;
+	observerReasoningEffort: string;
+	observerReasoningSummary: string;
 	observerRichModel: string;
 	observerRichTemperature: string;
 	observerRichReasoningEffort: string;

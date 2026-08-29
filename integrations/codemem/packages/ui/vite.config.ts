@@ -70,17 +70,12 @@ export default defineConfig(({ command, mode }) => {
 					emptyOutDir: false,
 					lib: {
 						entry: resolve(__dirname, "src/app.ts"),
-						name: "OpencodeMemViewer",
+						name: "CodememViewer",
 						formats: ["iife"],
 						fileName: () => "app.js",
 					},
-					rollupOptions: {
-						output: {
-							inlineDynamicImports: true,
-						},
-					},
 					sourcemap: mode === "development",
-					minify: false,
+					minify: "esbuild",
 				},
 		plugins: [
 			preact(),
@@ -99,12 +94,34 @@ export default defineConfig(({ command, mode }) => {
 						},
 					]),
 		],
-		esbuild: {
-			legalComments: "none",
-		},
 		test: {
+			css: {
+				include: [/\/static\/(?:controls|themes|tokens)\.css(?:\?inline)?$/],
+			},
 			environment: "jsdom",
 			name: "ui",
+			server: {
+				deps: {
+					inline: [
+						"@radix-ui/react-collapsible",
+						"@radix-ui/react-compose-refs",
+						"@radix-ui/react-context",
+						"@radix-ui/react-dialog",
+						"@radix-ui/react-dismissable-layer",
+						"@radix-ui/react-focus-guards",
+						"@radix-ui/react-focus-scope",
+						"@radix-ui/react-id",
+						"@radix-ui/react-portal",
+						"@radix-ui/react-presence",
+						"@radix-ui/react-primitive",
+						"@radix-ui/react-slot",
+						"@radix-ui/react-use-callback-ref",
+						"@radix-ui/react-use-controllable-state",
+						"@radix-ui/react-use-escape-keydown",
+						"@radix-ui/react-use-layout-effect",
+					],
+				},
+			},
 		},
 	};
 });

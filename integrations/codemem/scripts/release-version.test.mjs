@@ -73,6 +73,14 @@ function makeRepo(version = "0.16.0") {
 }
 `,
 	);
+	write(
+		join(root, "plugins/codex/.codex-plugin/plugin.json"),
+		`{
+  "name": "codemem",
+  "version": "${version}"
+}
+`,
+	);
 	return root;
 }
 
@@ -134,6 +142,7 @@ describe("release-version script", () => {
 			"packages/opencode-plugin/package.json",
 			"packages/viewer-server/package.json",
 			"plugins/claude/.claude-plugin/plugin.json",
+			"plugins/codex/.codex-plugin/plugin.json",
 		]);
 		assert.deepEqual(new Set(Object.values(readVersions(root))), new Set(["1.0.1"]));
 	});
@@ -141,13 +150,29 @@ describe("release-version script", () => {
 	it("supports dry run without writing", () => {
 		const root = makeRepo("1.0.0");
 		const changed = setVersion(root, "1.0.1", { dryRun: true });
-		assert.equal(changed.length, 11);
+		assert.equal(changed.length, 12);
 		assert.deepEqual(new Set(Object.values(readVersions(root))), new Set(["1.0.0"]));
 	});
 
 	it("rejects invalid semver", () => {
 		const root = makeRepo("1.0.0");
 		assert.throws(() => setVersion(root, "v1.0.1"), /Expected format: X.Y.Z/);
+	});
+
+	it("accepts alpha/beta/rc prerelease tags routed by the Release workflow", () => {
+		const root = makeRepo("1.0.0");
+		setVersion(root, "1.0.1-alpha.0");
+		assert.deepEqual(new Set(Object.values(readVersions(root))), new Set(["1.0.1-alpha.0"]));
+		setVersion(root, "1.0.1-beta.2");
+		assert.deepEqual(new Set(Object.values(readVersions(root))), new Set(["1.0.1-beta.2"]));
+		setVersion(root, "1.0.1-rc.1");
+		assert.deepEqual(new Set(Object.values(readVersions(root))), new Set(["1.0.1-rc.1"]));
+	});
+
+	it("rejects unknown prerelease identifiers", () => {
+		const root = makeRepo("1.0.0");
+		assert.throws(() => setVersion(root, "1.0.1-canary.0"), /Expected format: X.Y.Z/);
+		assert.throws(() => setVersion(root, "1.0.1-alpha"), /Expected format: X.Y.Z/);
 	});
 
 	it("does not write partial changes before validation failure", () => {

@@ -12,14 +12,17 @@ import {
 	coordinatorEnabled,
 	fetchCoordinatorStalePeers,
 	readCoordinatorSyncConfig,
+	refreshAuthorizedCoordinatorPeerTrust,
 	registerCoordinatorPresence,
 } from "./coordinator-runtime.js";
 
 import type { Database } from "./db.js";
-import { connect as connectDb, resolveDbPath } from "./db.js";
+import { connect as connectDb, ensureAdditiveSchemaCompatibility, resolveDbPath } from "./db.js";
 import * as schema from "./schema.js";
+import { refreshConfiguredScopeMembershipCache } from "./scope-membership-cache.js";
+import type { SecretScanner } from "./secret-scanner.js";
 import { advertiseMdns, mdnsEnabled } from "./sync-discovery.js";
-import { ensureDeviceIdentity } from "./sync-identity.js";
+import { DeviceIdentityError, ensureDeviceIdentity } from "./sync-identity.js";
 import { runSyncPass, shouldSkipOfflinePeer, syncPassPreflight } from "./sync-pass.js";
 
 // ---------------------------------------------------------------------------
@@ -34,7 +37,32 @@ export interface SyncDaemonOptions {
 	keysDir?: string;
 	signal?: AbortSignal;
 	onPhaseChange?: (phase: "starting" | "running" | "stopping") => void;
+	/**
+	 * Workspace-aware secret scanner. When provided, the daemon's inbound
+	 * peer apply path uses this scanner so any rules from the workspace
+	 * `secret_scanner` config block are applied to received payloads.
+	 * Without it, the apply path falls back to the built-in default
+	 * ruleset and emits a single "sync apply running without explicit
+	 * scanner" warning per process. Pass `store.scanner` from the viewer
+	 * (`packages/cli/src/commands/serve.ts`) so foreground deployments
+	 * stay in lockstep with local writes.
+	 */
+	scanner?: SecretScanner;
+	/**
+	 * Optional maintenance work serialized with each daemon tick. It runs after
+	 * coordinator presence and membership refresh have been attempted and before
+	 * peer synchronization starts. Failures are recorded but do not stop peer sync.
+	 */
+	onAfterCoordinatorRefresh?: SyncDaemonTickCallback;
 }
+
+export interface SyncDaemonTickContext {
+	db: Database;
+	dbPath: string;
+	keysDir?: string;
+}
+
+export type SyncDaemonTickCallback = (context: SyncDaemonTickContext) => Promise<void> | void;
 
 export interface SyncTickResult {
 	ok: boolean;
@@ -43,6 +71,17 @@ export interface SyncTickResult {
 	error?: string;
 	opsIn?: number;
 	opsOut?: number;
+}
+
+export function resolveSyncDaemonKeysDir(keysDir?: string): string | undefined {
+	const explicit = keysDir?.trim();
+	if (explicit) return explicit;
+	return process.env.CODEMEM_KEYS_DIR?.trim() || undefined;
+}
+
+function tableColumnExists(db: Database, table: string, column: string): boolean {
+	const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: string }>;
+	return rows.some((row) => row.name === column);
 }
 
 // ---------------------------------------------------------------------------
@@ -89,7 +128,7 @@ export function setSyncDaemonError(db: Database, error: string, traceback?: stri
 }
 
 /** Valid sync daemon phases for the rebootstrap safety gate. */
-export type SyncDaemonPhase = "needs_attention" | null;
+export type SyncDaemonPhase = "identity_error" | "needs_attention" | null;
 
 /**
  * Get the current sync daemon phase from sync_daemon_state.
@@ -103,7 +142,7 @@ export function getSyncDaemonPhase(db: Database): SyncDaemonPhase {
 		.where(eq(schema.syncDaemonState.id, 1))
 		.get();
 	const phase = row?.phase;
-	if (phase === "needs_attention") return phase;
+	if (phase === "identity_error" || phase === "needs_attention") return phase;
 	return null;
 }
 
@@ -129,6 +168,8 @@ export async function refreshCoordinatorPresenceForDaemon(
 	const config = readCoordinatorSyncConfig();
 	if (!coordinatorEnabled(config)) return false;
 	await registerCoordinatorPresence({ db, dbPath }, config, { keysDir });
+	await refreshConfiguredScopeMembershipCache(db, config, { keysDir, dbPath });
+	await refreshAuthorizedCoordinatorPeerTrust({ db, dbPath }, config, { keysDir });
 	return true;
 }
 
@@ -146,12 +187,17 @@ export async function syncDaemonTick(
 	db: Database,
 	keysDir?: string,
 	stalePeers?: Set<string>,
+	scanner?: SecretScanner,
+	dbPath?: string,
 ): Promise<SyncTickResult[]> {
-	const d = drizzle(db, { schema });
-	const rows = d
-		.select({ peer_device_id: schema.syncPeers.peer_device_id })
-		.from(schema.syncPeers)
-		.all();
+	const hasPinnedFingerprint = tableColumnExists(db, "sync_peers", "pinned_fingerprint");
+	const rows = db
+		.prepare(
+			hasPinnedFingerprint
+				? "SELECT peer_device_id, pinned_fingerprint FROM sync_peers"
+				: "SELECT peer_device_id, NULL AS pinned_fingerprint FROM sync_peers",
+		)
+		.all() as Array<{ peer_device_id: string; pinned_fingerprint: string | null }>;
 
 	// Skip heavy preflight work when there are no peers configured.
 	// This keeps startup and idle daemon ticks responsive on large local stores.
@@ -166,8 +212,10 @@ export async function syncDaemonTick(
 	const results: SyncTickResult[] = [];
 	for (const row of rows) {
 		const peerDeviceId = row.peer_device_id;
+		const pinnedFingerprint = String(row.pinned_fingerprint ?? "").trim();
+		const stalePeerKey = pinnedFingerprint ? `${peerDeviceId}:${pinnedFingerprint}` : "";
 
-		if (stalePeers?.has(peerDeviceId)) {
+		if (stalePeers?.has(peerDeviceId) || (stalePeerKey && stalePeers?.has(stalePeerKey))) {
 			results.push({
 				ok: false,
 				skipped: true,
@@ -181,7 +229,12 @@ export async function syncDaemonTick(
 			continue;
 		}
 
-		const result = await runSyncPass(db, peerDeviceId, { keysDir, limit: opsLimit });
+		const result = await runSyncPass(db, peerDeviceId, {
+			keysDir,
+			dbPath,
+			limit: opsLimit,
+			scanner,
+		});
 		results.push({
 			ok: result.ok,
 			error: result.error,
@@ -210,20 +263,28 @@ export async function syncDaemonTick(
 export async function runSyncDaemon(options?: SyncDaemonOptions): Promise<void> {
 	const intervalS = options?.intervalS ?? 120;
 	const dbPath = resolveDbPath(options?.dbPath);
-	const keysDir = options?.keysDir;
+	const keysDir = resolveSyncDaemonKeysDir(options?.keysDir);
 	const signal = options?.signal;
 	const onPhaseChange = options?.onPhaseChange;
+	const scanner = options?.scanner;
+	const onAfterCoordinatorRefresh = options?.onAfterCoordinatorRefresh;
 	onPhaseChange?.("starting");
 
 	// Ensure device identity
 	const db = connectDb(dbPath);
 	let mdnsHandle: { close(): void } | null = null;
 	try {
-		const [deviceId] = ensureDeviceIdentity(db, { keysDir });
+		try {
+			const [deviceId] = ensureDeviceIdentity(db, { keysDir });
 
-		// Start mDNS advertising if enabled
-		if (mdnsEnabled() && options?.port) {
-			mdnsHandle = advertiseMdns(deviceId, options.port);
+			// Start mDNS advertising if enabled
+			if (mdnsEnabled() && options?.port) {
+				mdnsHandle = advertiseMdns(deviceId, options.port);
+			}
+		} catch (error) {
+			if (!(error instanceof DeviceIdentityError)) throw error;
+			setSyncDaemonError(db, error.message, error.stack ?? "");
+			setSyncDaemonPhase(db, "identity_error");
 		}
 	} finally {
 		db.close();
@@ -239,19 +300,10 @@ export async function runSyncDaemon(options?: SyncDaemonOptions): Promise<void> 
 	// Importantly, the first tick is scheduled asynchronously so startup callers
 	// are not blocked by large sync preflight work on the main request path.
 	return new Promise<void>((resolve) => {
-		let tickRunning = false;
-		let firstTickCompleted = false;
-		const runTick = () => {
-			if (tickRunning) return; // Skip if previous tick still running
-			tickRunning = true;
-			runTickOnce(dbPath, keysDir).finally(() => {
-				tickRunning = false;
-				if (!firstTickCompleted) {
-					firstTickCompleted = true;
-					onPhaseChange?.("running");
-				}
-			});
-		};
+		const runTick = createSerializedDaemonTickRunner(
+			() => runTickOnce(dbPath, keysDir, scanner, onAfterCoordinatorRefresh),
+			() => onPhaseChange?.("running"),
+		);
 
 		const timer = setInterval(runTick, intervalS * 1000);
 		setTimeout(runTick, 0).unref?.();
@@ -273,28 +325,65 @@ export async function runSyncDaemon(options?: SyncDaemonOptions): Promise<void> 
 	});
 }
 
+export function createSerializedDaemonTickRunner(
+	runTick: () => Promise<void>,
+	onFirstCompleted?: () => void,
+): () => boolean {
+	let tickRunning = false;
+	let firstTickCompleted = false;
+	return () => {
+		if (tickRunning) return false;
+		tickRunning = true;
+		void runTick().finally(() => {
+			tickRunning = false;
+			if (!firstTickCompleted) {
+				firstTickCompleted = true;
+				onFirstCompleted?.();
+			}
+		});
+		return true;
+	};
+}
+
 /**
  * Run a single tick, opening and closing a DB connection.
  *
  * Errors are caught and recorded in sync_daemon_state.
  */
-export async function runTickOnce(dbPath: string, keysDir?: string): Promise<void> {
+export async function runTickOnce(
+	dbPath: string,
+	keysDir?: string,
+	scanner?: SecretScanner,
+	onAfterCoordinatorRefresh?: SyncDaemonTickCallback,
+): Promise<void> {
+	const resolvedKeysDir = resolveSyncDaemonKeysDir(keysDir);
 	const db = connectDb(dbPath);
 	try {
+		ensureAdditiveSchemaCompatibility(db);
+		ensureDeviceIdentity(db, { keysDir: resolvedKeysDir });
 		try {
-			await refreshCoordinatorPresenceForDaemon(db, dbPath, keysDir);
+			await refreshCoordinatorPresenceForDaemon(db, dbPath, resolvedKeysDir);
 		} catch {
 			// Coordinator discovery is a supplemental surface. Keep direct peer sync running
 			// even when heartbeat posting fails for this tick.
 		}
+		let callbackFailed = false;
+		try {
+			await onAfterCoordinatorRefresh?.({ db, dbPath, keysDir: resolvedKeysDir });
+		} catch (error) {
+			callbackFailed = true;
+			const message = error instanceof Error ? error.message : String(error);
+			const stack = error instanceof Error ? (error.stack ?? "") : "";
+			setSyncDaemonError(db, `daemon tick callback failed: ${message}`, stack);
+		}
 		// Best-effort: skip peers the coordinator reports as offline.
 		// Returns empty set when coordinator is disabled or lookup fails.
-		const stalePeers = await fetchCoordinatorStalePeers(db, dbPath, keysDir);
-		const results = await syncDaemonTick(db, keysDir, stalePeers);
+		const stalePeers = await fetchCoordinatorStalePeers(db, dbPath, resolvedKeysDir);
+		const results = await syncDaemonTick(db, resolvedKeysDir, stalePeers, scanner, dbPath);
 		const needsAttention = results.some((r) => !r.ok && r.error?.includes("needs_attention"));
 		if (needsAttention) {
 			setSyncDaemonPhase(db, "needs_attention");
-		} else {
+		} else if (!callbackFailed) {
 			// Clear any prior needs_attention phase — all peers are healthy.
 			setSyncDaemonOk(db);
 		}
@@ -302,6 +391,9 @@ export async function runTickOnce(dbPath: string, keysDir?: string): Promise<voi
 		const message = err instanceof Error ? err.message : String(err);
 		const stack = err instanceof Error ? (err.stack ?? "") : "";
 		setSyncDaemonError(db, message, stack);
+		if (err instanceof DeviceIdentityError) {
+			setSyncDaemonPhase(db, "identity_error");
+		}
 	} finally {
 		db.close();
 	}

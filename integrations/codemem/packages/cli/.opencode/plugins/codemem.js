@@ -1,7 +1,8 @@
-const PINNED_BACKEND_VERSION = "0.29.1";
+const PINNED_BACKEND_VERSION = "0.43.1";
 
 export {
 	default,
+	CodememPlugin,
 	OpencodeMemPlugin,
 	__testUtils,
 	buildInjectionToastMessage,

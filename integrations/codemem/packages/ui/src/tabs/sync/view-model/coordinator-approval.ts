@@ -9,8 +9,17 @@ import { cleanText } from "./internal";
 import type {
 	DiscoveredDeviceLike,
 	UiCoordinatorApprovalSummary,
+	UiSyncFailureCategory,
+	UiSyncRunItem,
 	UiSyncRunResponse,
+	UiSyncSkippedOutDetail,
 } from "./types";
+
+const OUTBOUND_FILTER_LABELS: Record<string, string> = {
+	scope_filter: "sharing-domain membership",
+	visibility_filter: "visibility",
+	project_filter: "project filter",
+};
 
 export function deriveCoordinatorApprovalSummary(input: {
 	device: DiscoveredDeviceLike;
@@ -49,9 +58,8 @@ export function shouldShowCoordinatorReviewAction(input: {
 }): boolean {
 	const approvalSummary = deriveCoordinatorApprovalSummary(input);
 	const deviceId = cleanText(input.device?.device_id);
-	const fingerprint = cleanText(input.device?.fingerprint);
-	if (!deviceId || !fingerprint) return false;
-	if (Boolean(input.device?.stale) || Boolean(input.hasAmbiguousCoordinatorGroup)) return false;
+	if (!deviceId) return false;
+	if (input.device?.stale || input.hasAmbiguousCoordinatorGroup) return false;
 	if (!input.pairedLocally) return true;
 	return approvalSummary.state === "needs-your-approval";
 }
@@ -66,7 +74,22 @@ export function summarizeSyncRunResult(payload: UiSyncRunResponse): {
 		return { ok: true, message: "Sync pass completed with no eligible devices.", warning: false };
 	}
 	const failedItems = items.filter((item) => item && item.ok === false);
+	const skippedItems = items.filter((item) => Math.max(0, Number(item.opsSkipped ?? 0)) > 0);
 	if (!failedItems.length) {
+		if (skippedItems.length) {
+			const skipped = skippedItems.reduce(
+				(total, item) => total + Math.max(0, Number(item.opsSkipped ?? 0)),
+				0,
+			);
+			const reasonSummary = skippedReasonSummary(
+				skippedItems.map((item) => item.skipped_out ?? null),
+			);
+			return {
+				ok: true,
+				message: `${skipped.toLocaleString()} outbound op${skipped === 1 ? " was" : "s were"} filtered: ${reasonSummary}. No payload was sent for filtered data.`,
+				warning: true,
+			};
+		}
 		return {
 			ok: true,
 			message: `Sync pass finished for ${items.length} device${items.length === 1 ? "" : "s"}.`,
@@ -74,15 +97,22 @@ export function summarizeSyncRunResult(payload: UiSyncRunResponse): {
 		};
 	}
 	const unauthorizedFailures = failedItems.filter(
-		(item) =>
-			cleanText(item.error).toLowerCase().includes("401") &&
-			cleanText(item.error).toLowerCase().includes("unauthorized"),
+		(item) => failureCategoryForItem(item) === "trust",
 	);
 	if (unauthorizedFailures.length === failedItems.length) {
 		return {
 			ok: false,
 			message:
 				"This device no longer has two-way trust with the peer. Pair it again from the other device, or remove the stale local record if it should be gone.",
+			warning: true,
+		};
+	}
+	const scopeFailures = failedItems.filter((item) => failureCategoryForItem(item) === "scope");
+	if (scopeFailures.length === failedItems.length) {
+		return {
+			ok: false,
+			message:
+				"Sync ran, but the peer is not authorized for one or more Spaces. Review legacy Space access for this device in coordinator administration (legacy), then sync again.",
 			warning: true,
 		};
 	}
@@ -99,4 +129,79 @@ export function summarizeSyncRunResult(payload: UiSyncRunResponse): {
 		message: error || "Sync failed for at least one device.",
 		warning: true,
 	};
+}
+
+function failureCategoryForItem(item: UiSyncRunItem): UiSyncFailureCategory | null {
+	if (item.failureCategory) return item.failureCategory;
+	const scopeCategories = Array.isArray(item.perScopeResults)
+		? item.perScopeResults
+				.filter((scope) => scope && scope.ok === false)
+				.map((scope) => scope.failureCategory)
+				.filter((category): category is UiSyncFailureCategory => Boolean(category))
+		: [];
+	if (scopeCategories.length) {
+		const unique = new Set(scopeCategories);
+		return unique.size === 1 ? scopeCategories[0] : "other";
+	}
+	const error = cleanText(item.error);
+	if (isTrustFailureError(error)) return "trust";
+	if (isScopeMembershipFailureError(error)) return "scope";
+	return null;
+}
+
+/**
+ * True when a sync-failure error string looks like a two-way-trust failure
+ * (401 unauthorized on the peer's /v1/status), which is the only class of
+ * failure that should trigger the "no longer has two-way trust" toast. Any
+ * other class — connectivity, scope/membership, generation mismatch — flows
+ * through the generic mixed-failure or scoped paths so users do not get
+ * pointed at re-pairing for problems that re-pairing will not fix.
+ */
+function isTrustFailureError(error: string): boolean {
+	const lower = error.toLowerCase();
+	return lower.includes("401") && lower.includes("unauthorized");
+}
+
+/**
+ * True when a sync-failure error string indicates the peer is not authorized
+ * for a Space (or is authorized at a stale epoch). These failures map to the
+ * scoped-sync protocol classes documented in
+ * docs/plans/2026-05-25-scoped-sync-protocol.md:
+ *
+ * - `403: scope_rejected` from POST /v1/ops outbound scope filter.
+ * - `409: reset_required` with `reason=missing_scope` or `stale_epoch`
+ *   from GET /v1/ops or GET /v1/snapshot.
+ * - syncOneScope's aggregate string only when it includes one of those wire
+ *   reasons. Other scoped-sync failures remain generic sync failures.
+ *
+ * Detection is intentionally substring-based because the wire reason can
+ * arrive embedded in a longer error string from the address-fallback loop.
+ */
+function isScopeMembershipFailureError(error: string): boolean {
+	const lower = error.toLowerCase();
+	if (lower.includes("scope_rejected")) return true;
+	if (lower.includes("missing_scope")) return true;
+	if (lower.includes("stale_epoch")) return true;
+	if (lower.includes("scope_inactive")) return true;
+	return false;
+}
+
+function outboundFilterLabel(detail: UiSyncSkippedOutDetail | null): string {
+	const reason = cleanText(detail?.reason);
+	return OUTBOUND_FILTER_LABELS[reason] ?? (reason.replaceAll("_", " ") || "sync filters");
+}
+
+function skippedReasonSummary(details: Array<UiSyncSkippedOutDetail | null>): string {
+	const counts = new Map<string, number>();
+	for (const detail of details) {
+		const label = outboundFilterLabel(detail);
+		const count = Math.max(0, Number(detail?.skipped_count ?? 0));
+		if (count === 0) continue;
+		counts.set(label, (counts.get(label) ?? 0) + count);
+	}
+	if (!counts.size) return "sync filters";
+	return Array.from(counts.entries())
+		.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+		.map(([label, count]) => `${count.toLocaleString()} by ${label}`)
+		.join(", ");
 }

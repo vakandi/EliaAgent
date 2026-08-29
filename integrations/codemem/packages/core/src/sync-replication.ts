@@ -8,15 +8,19 @@
  * a raw Database handle. Ported from codemem/sync/replication.py.
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { and, desc, eq, gt, isNotNull, isNull, like, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import type { Database } from "./db.js";
 import { fromJson, fromJsonStrict, toJson, toJsonNullable } from "./db.js";
 import { readCodememConfigFile } from "./observer-config.js";
 import { projectBasename } from "./project.js";
+import { getAnyRecipientPolicyDenyOverlayForScopeDevice } from "./recipient-policy-reconciliation.js";
 import { clearMemoryRefs, populateMemoryRefs } from "./ref-populate.js";
 import * as schema from "./schema.js";
+import { getCachedScopeAuthorization } from "./scope-membership-cache.js";
+import { ensureMemoryScopeId } from "./scope-stamping.js";
+import { redactMemoryFields, SecretScanner } from "./secret-scanner.js";
 import { deriveTags } from "./tags.js";
 import type {
 	ReplicationOp,
@@ -26,7 +30,14 @@ import type {
 	SyncMemorySnapshotItem,
 } from "./types.js";
 
+export const DEFAULT_SYNC_SCOPE_ID = "local-default";
+export const ACCESS_CLEANUP_OP_TYPE = "access_cleanup";
+export const REASSIGN_SCOPE_OP_TYPE = "reassign_scope";
+export const SCOPED_NULL_BASELINE_BOOTSTRAP_CURSOR_MARKER =
+	"__codemem_scoped_null_baseline_bootstrap__";
+
 export interface SyncResetBoundary {
+	scope_id?: string | null;
 	generation: number;
 	snapshot_id: string;
 	baseline_cursor: string | null;
@@ -35,17 +46,33 @@ export interface SyncResetBoundary {
 
 export interface SyncResetRequired extends SyncResetBoundary {
 	reset_required: true;
-	reason: "stale_cursor" | "generation_mismatch" | "boundary_mismatch";
+	reason:
+		| "stale_cursor"
+		| "generation_mismatch"
+		| "boundary_mismatch"
+		| "missing_scope"
+		| "scope_inactive"
+		| "stale_epoch"
+		| "unsupported_scope";
 }
 
-export interface LoadReplicationOpsForPeerOptions {
+interface LoadReplicationOpsForPeerBaseOptions {
 	since: string | null;
 	limit?: number;
-	deviceId?: string;
 	generation?: number | null;
 	snapshotId?: string | null;
 	baselineCursor?: string | null;
 }
+
+export type LoadReplicationOpsForPeerOptions =
+	| (LoadReplicationOpsForPeerBaseOptions & {
+			deviceId?: string;
+			scopeId?: null;
+	  })
+	| (LoadReplicationOpsForPeerBaseOptions & {
+			deviceId: string;
+			scopeId: string;
+	  });
 
 export type LoadReplicationOpsForPeerResult =
 	| {
@@ -63,6 +90,7 @@ export interface LoadMemorySnapshotPageForPeerOptions {
 	limit?: number;
 	pageToken?: string | null;
 	peerDeviceId?: string | null;
+	scopeId?: string | null;
 	generation?: number | null;
 	snapshotId?: string | null;
 	baselineCursor?: string | null;
@@ -105,6 +133,7 @@ interface MemoryPayload {
 	user_prompt_id: number | null;
 	prompt_number: number | null;
 	deleted_at: string | null;
+	scope_id: string | null;
 	// Wire payloads use this as "sender explicitly included deleted_at" so we can
 	// distinguish a tombstone clear (`deleted_at: null`) from an omitted field.
 	// Row-derived payloads set it from current storage truth instead.
@@ -112,6 +141,78 @@ interface MemoryPayload {
 	rev: number;
 	import_key: string | null;
 	project?: string | null;
+}
+
+interface AccessCleanupPayload {
+	cleanup_scope_id: string | null;
+	reason: string | null;
+	target_peer_device_id: string | null;
+}
+
+export interface ReassignScopePayload {
+	operation_id: string;
+	memory_id: string;
+	old_scope_id: string;
+	new_scope_id: string;
+	revision: number;
+	side: "old" | "new";
+}
+
+function requiredPayloadText(value: unknown): string | null {
+	return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+export function parseReassignScopePayload(op: ReplicationOp): ReassignScopePayload {
+	if (op.op_type !== REASSIGN_SCOPE_OP_TYPE) throw new Error("reassign_payload_invalid");
+	const payload = parsePayload(op.payload_json);
+	const operationId = requiredPayloadText(payload?.operation_id);
+	const memoryId = requiredPayloadText(payload?.memory_id);
+	const oldScopeId = requiredPayloadText(payload?.old_scope_id);
+	const newScopeId = requiredPayloadText(payload?.new_scope_id);
+	const side = payload?.side;
+	const revision = payload?.revision;
+	if (
+		!operationId ||
+		!memoryId ||
+		memoryId !== op.entity_id ||
+		!oldScopeId ||
+		!newScopeId ||
+		oldScopeId === newScopeId ||
+		(side !== "old" && side !== "new") ||
+		!Number.isSafeInteger(revision) ||
+		Number(revision) <= 0 ||
+		Number(revision) !== op.clock_rev ||
+		cleanText(op.scope_id) !== (side === "old" ? oldScopeId : newScopeId) ||
+		(side === "new" && cleanText(payload?.scope_id) !== newScopeId)
+	) {
+		throw new Error("reassign_payload_invalid");
+	}
+	return {
+		operation_id: operationId,
+		memory_id: memoryId,
+		old_scope_id: oldScopeId,
+		new_scope_id: newScopeId,
+		revision: Number(revision),
+		side,
+	};
+}
+
+function parseAccessCleanupPayload(op: ReplicationOp): AccessCleanupPayload {
+	const payload = parsePayload(op.payload_json);
+	return {
+		cleanup_scope_id: cleanText(payload?.cleanup_scope_id ?? payload?.scope_id),
+		reason: cleanText(payload?.reason),
+		target_peer_device_id: cleanText(payload?.target_peer_device_id),
+	};
+}
+
+function accessCleanupTargetsPeer(op: ReplicationOp, peerDeviceId: string | null): boolean {
+	const cleanup = parseAccessCleanupPayload(op);
+	if (!cleanup.cleanup_scope_id) return false;
+	return (
+		cleanup.target_peer_device_id === null ||
+		cleanup.target_peer_device_id === cleanText(peerDeviceId)
+	);
 }
 
 function resolveReplicatedTextUpdate(
@@ -188,6 +289,7 @@ function parseMemoryPayload(op: ReplicationOp, errors: string[]): MemoryPayload 
 		user_prompt_id: asNumberOrNull(raw.user_prompt_id),
 		prompt_number: asNumberOrNull(raw.prompt_number),
 		deleted_at: asStringOrNull(raw.deleted_at),
+		scope_id: asStringOrNull(raw.scope_id),
 		has_deleted_at: Object.hasOwn(raw, "deleted_at"),
 		rev: asNumberOrNull(raw.rev) ?? 0,
 		import_key: asStringOrNull(raw.import_key),
@@ -222,6 +324,35 @@ function normalizeCursor(value: string | null | undefined): string | null {
 	return trimmed.length > 0 ? trimmed : null;
 }
 
+function normalizeSyncStateScopeId(scopeId: string | null | undefined): string {
+	const trimmed = String(scopeId ?? "").trim();
+	return trimmed.length > 0 ? trimmed : DEFAULT_SYNC_SCOPE_ID;
+}
+
+function shouldReturnScopeId(scopeId: string | null | undefined): boolean {
+	return scopeId !== undefined;
+}
+
+function resetBoundaryFromRow(
+	row: {
+		generation: number | null;
+		snapshot_id: string | null;
+		baseline_cursor: string | null;
+		retained_floor_cursor: string | null;
+	},
+	scopeId: string,
+	includeScopeId: boolean,
+): SyncResetBoundary {
+	const boundary: SyncResetBoundary = {
+		generation: Number(row.generation ?? 1),
+		snapshot_id: String(row.snapshot_id),
+		baseline_cursor: normalizeCursor(row.baseline_cursor),
+		retained_floor_cursor: normalizeCursor(row.retained_floor_cursor),
+	};
+	if (includeScopeId) boundary.scope_id = scopeId;
+	return boundary;
+}
+
 function parseSnapshotPageToken(
 	token: string | null | undefined,
 ): { importKey: string; id: number } | null {
@@ -250,48 +381,99 @@ function ensureSyncResetStateTable(db: Database): void {
 			updated_at TEXT NOT NULL
 		)
 	`);
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS sync_reset_state_v2 (
+			scope_id TEXT PRIMARY KEY NOT NULL,
+			generation INTEGER NOT NULL,
+			snapshot_id TEXT NOT NULL,
+			baseline_cursor TEXT,
+			retained_floor_cursor TEXT,
+			updated_at TEXT NOT NULL
+		)
+	`);
 }
 
-export function getSyncResetState(db: Database): SyncResetBoundary {
+function seedDefaultSyncResetStateFromLegacy(db: Database): void {
+	db.exec(`
+		INSERT OR IGNORE INTO sync_reset_state_v2
+			(scope_id, generation, snapshot_id, baseline_cursor, retained_floor_cursor, updated_at)
+		SELECT '${DEFAULT_SYNC_SCOPE_ID}', generation, snapshot_id, baseline_cursor, retained_floor_cursor, updated_at
+		FROM sync_reset_state
+		WHERE id = 1
+	`);
+}
+
+function mirrorDefaultSyncResetStateToLegacy(
+	db: Database,
+	boundary: SyncResetBoundary,
+	updatedAt: string,
+): void {
+	const d = drizzle(db, { schema });
+	d.insert(schema.syncResetState)
+		.values({
+			id: 1,
+			generation: boundary.generation,
+			snapshot_id: boundary.snapshot_id,
+			baseline_cursor: boundary.baseline_cursor,
+			retained_floor_cursor: boundary.retained_floor_cursor,
+			updated_at: updatedAt,
+		})
+		.onConflictDoUpdate({
+			target: schema.syncResetState.id,
+			set: {
+				generation: boundary.generation,
+				snapshot_id: boundary.snapshot_id,
+				baseline_cursor: boundary.baseline_cursor,
+				retained_floor_cursor: boundary.retained_floor_cursor,
+				updated_at: updatedAt,
+			},
+		})
+		.run();
+}
+
+export function getSyncResetState(db: Database, scopeId?: string | null): SyncResetBoundary {
 	ensureSyncResetStateTable(db);
+	const effectiveScopeId = normalizeSyncStateScopeId(scopeId);
+	const includeScopeId = shouldReturnScopeId(scopeId);
+	if (effectiveScopeId === DEFAULT_SYNC_SCOPE_ID) {
+		seedDefaultSyncResetStateFromLegacy(db);
+	}
 	const d = drizzle(db, { schema });
 	const existing = d
 		.select()
-		.from(schema.syncResetState)
-		.where(eq(schema.syncResetState.id, 1))
+		.from(schema.syncResetStateV2)
+		.where(eq(schema.syncResetStateV2.scope_id, effectiveScopeId))
 		.get();
 	if (existing) {
-		return {
-			generation: Number(existing.generation ?? 1),
-			snapshot_id: String(existing.snapshot_id),
-			baseline_cursor: normalizeCursor(existing.baseline_cursor),
-			retained_floor_cursor: normalizeCursor(existing.retained_floor_cursor),
-		};
+		return resetBoundaryFromRow(existing, effectiveScopeId, includeScopeId);
 	}
 
 	const now = new Date().toISOString();
 	const created = {
-		id: 1,
+		scope_id: effectiveScopeId,
 		generation: 1,
 		snapshot_id: randomUUID(),
 		baseline_cursor: null,
 		retained_floor_cursor: null,
 		updated_at: now,
 	};
-	d.insert(schema.syncResetState).values(created).run();
-	return {
-		generation: created.generation,
-		snapshot_id: created.snapshot_id,
-		baseline_cursor: created.baseline_cursor,
-		retained_floor_cursor: created.retained_floor_cursor,
-	};
+	d.insert(schema.syncResetStateV2).values(created).run();
+	const boundary = resetBoundaryFromRow(created, effectiveScopeId, includeScopeId);
+	if (effectiveScopeId === DEFAULT_SYNC_SCOPE_ID) {
+		mirrorDefaultSyncResetStateToLegacy(db, boundary, now);
+	}
+	return boundary;
 }
 
 export function setSyncResetState(
 	db: Database,
 	updates: Partial<SyncResetBoundary> & { generation?: number },
+	scopeId?: string | null,
 ): SyncResetBoundary {
-	const current = getSyncResetState(db);
+	const requestedScopeId = scopeId !== undefined ? scopeId : updates.scope_id;
+	const effectiveScopeId = normalizeSyncStateScopeId(requestedScopeId);
+	const includeScopeId = scopeId !== undefined || updates.scope_id !== undefined;
+	const current = getSyncResetState(db, includeScopeId ? effectiveScopeId : undefined);
 	const now = new Date().toISOString();
 	const next: SyncResetBoundary = {
 		generation: updates.generation ?? current.generation,
@@ -305,11 +487,19 @@ export function setSyncResetState(
 				? current.retained_floor_cursor
 				: normalizeCursor(updates.retained_floor_cursor),
 	};
+	if (includeScopeId) next.scope_id = effectiveScopeId;
 	const d = drizzle(db, { schema });
-	d.insert(schema.syncResetState)
-		.values({ id: 1, ...next, updated_at: now })
+	d.insert(schema.syncResetStateV2)
+		.values({
+			scope_id: effectiveScopeId,
+			generation: next.generation,
+			snapshot_id: next.snapshot_id,
+			baseline_cursor: next.baseline_cursor,
+			retained_floor_cursor: next.retained_floor_cursor,
+			updated_at: now,
+		})
 		.onConflictDoUpdate({
-			target: schema.syncResetState.id,
+			target: schema.syncResetStateV2.scope_id,
 			set: {
 				generation: next.generation,
 				snapshot_id: next.snapshot_id,
@@ -319,6 +509,9 @@ export function setSyncResetState(
 			},
 		})
 		.run();
+	if (effectiveScopeId === DEFAULT_SYNC_SCOPE_ID) {
+		mirrorDefaultSyncResetStateToLegacy(db, next, now);
+	}
 	return next;
 }
 
@@ -346,7 +539,7 @@ function mergePayloadMetadata(
 	};
 }
 
-function clockDeviceIdFromMetadataJson(raw: string | null): string {
+export function clockDeviceIdFromMetadataJson(raw: string | null): string {
 	const metadata = fromJson(raw);
 	return typeof metadata.clock_device_id === "string" ? metadata.clock_device_id : "";
 }
@@ -396,6 +589,65 @@ export function chunkOpsBySize(ops: ReplicationOp[], maxBytes: number): Replicat
 
 // Cursor read/write
 
+function ensureReplicationCursorTables(db: Database): void {
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS replication_cursors (
+			peer_device_id TEXT PRIMARY KEY,
+			last_applied_cursor TEXT,
+			last_acked_cursor TEXT,
+			updated_at TEXT NOT NULL
+		)
+	`);
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS replication_cursors_v2 (
+			peer_device_id TEXT NOT NULL,
+			scope_id TEXT NOT NULL,
+			last_applied_cursor TEXT,
+			last_acked_cursor TEXT,
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY (peer_device_id, scope_id)
+		);
+		CREATE INDEX IF NOT EXISTS idx_replication_cursors_v2_scope
+			ON replication_cursors_v2(scope_id)
+	`);
+}
+
+function seedDefaultReplicationCursorFromLegacy(db: Database): void {
+	db.exec(`
+		INSERT OR IGNORE INTO replication_cursors_v2
+			(peer_device_id, scope_id, last_applied_cursor, last_acked_cursor, updated_at)
+		SELECT peer_device_id, '${DEFAULT_SYNC_SCOPE_ID}', last_applied_cursor, last_acked_cursor, updated_at
+		FROM replication_cursors
+	`);
+}
+
+function mirrorDefaultReplicationCursorToLegacy(
+	db: Database,
+	peerDeviceId: string,
+	options: { lastApplied?: string | null; lastAcked?: string | null },
+	updatedAt: string,
+): void {
+	const lastApplied = options.lastApplied ?? null;
+	const lastAcked = options.lastAcked ?? null;
+	const d = drizzle(db, { schema });
+	d.insert(schema.replicationCursors)
+		.values({
+			peer_device_id: peerDeviceId,
+			last_applied_cursor: lastApplied,
+			last_acked_cursor: lastAcked,
+			updated_at: updatedAt,
+		})
+		.onConflictDoUpdate({
+			target: schema.replicationCursors.peer_device_id,
+			set: {
+				last_applied_cursor: sql`COALESCE(excluded.last_applied_cursor, ${schema.replicationCursors.last_applied_cursor})`,
+				last_acked_cursor: sql`COALESCE(excluded.last_acked_cursor, ${schema.replicationCursors.last_acked_cursor})`,
+				updated_at: sql`excluded.updated_at`,
+			},
+		})
+		.run();
+}
+
 /**
  * Read the replication cursor for a peer device.
  *
@@ -404,15 +656,26 @@ export function chunkOpsBySize(ops: ReplicationOp[], maxBytes: number): Replicat
 export function getReplicationCursor(
 	db: Database,
 	peerDeviceId: string,
+	scopeId?: string | null,
 ): [lastApplied: string | null, lastAcked: string | null] {
+	ensureReplicationCursorTables(db);
+	const effectiveScopeId = normalizeSyncStateScopeId(scopeId);
+	if (effectiveScopeId === DEFAULT_SYNC_SCOPE_ID) {
+		seedDefaultReplicationCursorFromLegacy(db);
+	}
 	const d = drizzle(db, { schema });
 	const row = d
 		.select({
-			last_applied_cursor: schema.replicationCursors.last_applied_cursor,
-			last_acked_cursor: schema.replicationCursors.last_acked_cursor,
+			last_applied_cursor: schema.replicationCursorsV2.last_applied_cursor,
+			last_acked_cursor: schema.replicationCursorsV2.last_acked_cursor,
 		})
-		.from(schema.replicationCursors)
-		.where(eq(schema.replicationCursors.peer_device_id, peerDeviceId))
+		.from(schema.replicationCursorsV2)
+		.where(
+			and(
+				eq(schema.replicationCursorsV2.peer_device_id, peerDeviceId),
+				eq(schema.replicationCursorsV2.scope_id, effectiveScopeId),
+			),
+		)
 		.get();
 
 	if (!row) return [null, null];
@@ -429,8 +692,14 @@ export function setReplicationCursor(
 	db: Database,
 	peerDeviceId: string,
 	options: { lastApplied?: string | null; lastAcked?: string | null } = {},
+	scopeId?: string | null,
 ): void {
+	ensureReplicationCursorTables(db);
 	const now = new Date().toISOString();
+	const effectiveScopeId = normalizeSyncStateScopeId(scopeId);
+	if (effectiveScopeId === DEFAULT_SYNC_SCOPE_ID) {
+		seedDefaultReplicationCursorFromLegacy(db);
+	}
 	const lastApplied = options.lastApplied ?? null;
 	const lastAcked = options.lastAcked ?? null;
 
@@ -438,21 +707,49 @@ export function setReplicationCursor(
 	// Atomic UPSERT — avoids TOCTOU race with concurrent sync workers.
 	// Drizzle's onConflictDoUpdate doesn't support COALESCE(excluded.col, col)
 	// natively, so we use raw SQL for the SET expressions.
-	d.insert(schema.replicationCursors)
+	d.insert(schema.replicationCursorsV2)
 		.values({
 			peer_device_id: peerDeviceId,
+			scope_id: effectiveScopeId,
 			last_applied_cursor: lastApplied,
 			last_acked_cursor: lastAcked,
 			updated_at: now,
 		})
 		.onConflictDoUpdate({
-			target: schema.replicationCursors.peer_device_id,
+			target: [schema.replicationCursorsV2.peer_device_id, schema.replicationCursorsV2.scope_id],
 			set: {
-				last_applied_cursor: sql`COALESCE(excluded.last_applied_cursor, ${schema.replicationCursors.last_applied_cursor})`,
-				last_acked_cursor: sql`COALESCE(excluded.last_acked_cursor, ${schema.replicationCursors.last_acked_cursor})`,
+				last_applied_cursor: sql`COALESCE(excluded.last_applied_cursor, ${schema.replicationCursorsV2.last_applied_cursor})`,
+				last_acked_cursor: sql`COALESCE(excluded.last_acked_cursor, ${schema.replicationCursorsV2.last_acked_cursor})`,
 				updated_at: sql`excluded.updated_at`,
 			},
 		})
+		.run();
+	if (effectiveScopeId === DEFAULT_SYNC_SCOPE_ID) {
+		mirrorDefaultReplicationCursorToLegacy(db, peerDeviceId, options, now);
+	}
+}
+
+export function clearReplicationCursorLastApplied(
+	db: Database,
+	peerDeviceId: string,
+	scopeId?: string | null,
+): void {
+	ensureReplicationCursorTables(db);
+	const now = new Date().toISOString();
+	const effectiveScopeId = normalizeSyncStateScopeId(scopeId);
+	drizzle(db, { schema })
+		.update(schema.replicationCursorsV2)
+		.set({
+			last_applied_cursor: null,
+			last_acked_cursor: null,
+			updated_at: now,
+		})
+		.where(
+			and(
+				eq(schema.replicationCursorsV2.peer_device_id, peerDeviceId),
+				eq(schema.replicationCursorsV2.scope_id, effectiveScopeId),
+			),
+		)
 		.run();
 }
 
@@ -548,11 +845,17 @@ export function recordReplicationOp(
 		opType: "upsert" | "delete";
 		deviceId: string;
 		payload?: Record<string, unknown>;
+		scopeId?: string | null;
+		clockRev?: number;
+		clockUpdatedAt?: string;
+		clockDeviceId?: string;
+		createdAt?: string;
+		opId?: string;
 	},
 ): string {
 	const d = drizzle(db, { schema });
-	const opId = randomUUID();
-	const now = new Date().toISOString();
+	const opId = opts.opId ?? randomUUID();
+	const now = opts.createdAt ?? new Date().toISOString();
 
 	// Read the full memory row — typed via Drizzle schema
 	const row = d
@@ -561,14 +864,20 @@ export function recordReplicationOp(
 		.where(eq(schema.memoryItems.id, opts.memoryId))
 		.get();
 
-	const rev = Number(row?.rev ?? 0);
-	const updatedAt = row?.updated_at ?? now;
+	const rev = opts.clockRev ?? Number(row?.rev ?? 0);
+	const updatedAt = opts.clockUpdatedAt ?? row?.updated_at ?? now;
 	const entityId = row?.import_key ?? String(opts.memoryId);
 	const metadata = fromJson(row?.metadata_json);
+	// Backfill missing memory scope before emitting an op so storage, op row,
+	// and payload all carry the same authoritative local scope.
+	const scopeId =
+		opts.scopeId !== undefined ? opts.scopeId : row ? ensureMemoryScopeId(db, opts.memoryId) : null;
 	const clockDeviceId =
-		typeof metadata.clock_device_id === "string" && metadata.clock_device_id.trim().length > 0
-			? metadata.clock_device_id
-			: opts.deviceId;
+		typeof opts.clockDeviceId === "string" && opts.clockDeviceId.trim().length > 0
+			? opts.clockDeviceId.trim()
+			: typeof metadata.clock_device_id === "string" && metadata.clock_device_id.trim().length > 0
+				? metadata.clock_device_id
+				: opts.deviceId;
 
 	// Resolve session project so peers can reconstruct the project association.
 	const sessionProject = row?.session_id
@@ -580,10 +889,12 @@ export function recordReplicationOp(
 		: null;
 
 	// Build payload from the memory row so peers can reconstruct the full item.
-	// Explicit payload override takes precedence (used by tests).
+	// Explicit payload override wins except for authoritative scope_id on upserts.
 	let payloadJson: string | null;
 	if (opts.payload) {
-		payloadJson = toJson(opts.payload);
+		payloadJson = toJson(
+			row && opts.opType === "upsert" ? { ...opts.payload, scope_id: scopeId } : opts.payload,
+		);
 	} else if (row && opts.opType === "upsert") {
 		// Parse JSON-string columns so they round-trip as objects, not double-encoded strings
 		const parseSqliteJson = (val: string | null | undefined): unknown => {
@@ -624,6 +935,7 @@ export function recordReplicationOp(
 			user_prompt_id: row.user_prompt_id,
 			prompt_number: row.prompt_number,
 			deleted_at: row.deleted_at,
+			scope_id: scopeId,
 		});
 	} else {
 		payloadJson = null;
@@ -641,9 +953,193 @@ export function recordReplicationOp(
 			clock_device_id: clockDeviceId,
 			device_id: opts.deviceId,
 			created_at: now,
+			scope_id: scopeId,
 		})
 		.run();
 
+	return opId;
+}
+
+function deterministicReassignOpId(
+	operationId: string,
+	memoryId: string,
+	oldScopeId: string,
+	newScopeId: string,
+	side: "old" | "new",
+): string {
+	return `reassign_${createHash("sha256")
+		.update(JSON.stringify([operationId, memoryId, oldScopeId, newScopeId, side]))
+		.digest("hex")}`;
+}
+
+export function recordScopeReassignment(
+	db: Database,
+	opts: {
+		operationId: string;
+		memoryId: number;
+		oldScopeId: string;
+		newScopeId: string;
+		deviceId: string;
+		createdAt?: string;
+	},
+): { revision: number; oldOpId: string; newOpId: string } {
+	const operationId = requiredPayloadText(opts.operationId);
+	const oldScopeId = requiredPayloadText(opts.oldScopeId);
+	const newScopeId = requiredPayloadText(opts.newScopeId);
+	const deviceId = requiredPayloadText(opts.deviceId);
+	if (
+		!operationId ||
+		!oldScopeId ||
+		!newScopeId ||
+		oldScopeId === newScopeId ||
+		!deviceId ||
+		!Number.isSafeInteger(opts.memoryId) ||
+		opts.memoryId <= 0
+	) {
+		throw new Error("reassign_input_invalid");
+	}
+	const d = drizzle(db, { schema });
+	const existing = d
+		.select()
+		.from(schema.memoryItems)
+		.where(eq(schema.memoryItems.id, opts.memoryId))
+		.get();
+	if (!existing) throw new Error("reassign_memory_not_found");
+	const memoryId = existing.import_key ?? String(existing.id);
+	const oldOpId = deterministicReassignOpId(operationId, memoryId, oldScopeId, newScopeId, "old");
+	const newOpId = deterministicReassignOpId(operationId, memoryId, oldScopeId, newScopeId, "new");
+	const existingOps = db
+		.prepare("SELECT op_id, clock_rev FROM replication_ops WHERE op_id IN (?, ?)")
+		.all(oldOpId, newOpId) as Array<{ op_id: string; clock_rev: number }>;
+	if (existingOps.length > 0) {
+		if (
+			existingOps.length !== 2 ||
+			existingOps.some((op) => op.clock_rev !== existingOps[0]?.clock_rev)
+		) {
+			throw new Error("reassign_replay_conflict");
+		}
+		return { revision: Number(existingOps[0]?.clock_rev ?? 0), oldOpId, newOpId };
+	}
+	if ((cleanText(existing.scope_id) ?? DEFAULT_SYNC_SCOPE_ID) !== oldScopeId) {
+		throw new Error("reassign_old_scope_mismatch");
+	}
+	const revision = Number(existing.rev ?? 0) + 1;
+	const createdAt = opts.createdAt ?? new Date().toISOString();
+	const metadata = fromJson(existing.metadata_json);
+	metadata.clock_device_id = deviceId;
+	metadata.last_scope_reassignment = {
+		operation_id: operationId,
+		old_scope_id: oldScopeId,
+		new_scope_id: newScopeId,
+		revision,
+	};
+	const write = db.transaction(() => {
+		d.update(schema.memoryItems)
+			.set({
+				scope_id: newScopeId,
+				rev: revision,
+				updated_at: createdAt,
+				metadata_json: toJson(metadata),
+			})
+			.where(eq(schema.memoryItems.id, opts.memoryId))
+			.run();
+		const updated = d
+			.select()
+			.from(schema.memoryItems)
+			.where(eq(schema.memoryItems.id, opts.memoryId))
+			.get();
+		if (!updated) throw new Error("reassign_memory_not_found");
+		const sessionProject = updated.session_id
+			? cleanText(
+					db.prepare("SELECT project FROM sessions WHERE id = ?").pluck().get(updated.session_id),
+				)
+			: null;
+		const common = {
+			operation_id: operationId,
+			memory_id: memoryId,
+			old_scope_id: oldScopeId,
+			new_scope_id: newScopeId,
+			revision,
+		};
+		const insert = db.prepare(`INSERT INTO replication_ops(
+			op_id, entity_type, entity_id, op_type, payload_json, clock_rev,
+			clock_updated_at, clock_device_id, device_id, created_at, scope_id
+		) VALUES (?, 'memory_item', ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+		insert.run(
+			oldOpId,
+			memoryId,
+			REASSIGN_SCOPE_OP_TYPE,
+			toJson({ ...common, side: "old" }),
+			revision,
+			createdAt,
+			deviceId,
+			deviceId,
+			createdAt,
+			oldScopeId,
+		);
+		insert.run(
+			newOpId,
+			memoryId,
+			REASSIGN_SCOPE_OP_TYPE,
+			toJson({
+				...buildPayloadFromMemoryRow(updated),
+				project: cleanText(updated.project) ?? sessionProject,
+				...common,
+				side: "new",
+				scope_id: newScopeId,
+			}),
+			revision,
+			createdAt,
+			deviceId,
+			deviceId,
+			createdAt,
+			newScopeId,
+		);
+	});
+	write.immediate();
+	return { revision, oldOpId, newOpId };
+}
+
+export function recordAccessCleanupOp(
+	db: Database,
+	opts: {
+		importKey: string;
+		deviceId: string;
+		cleanupScopeId: string;
+		clockRev: number;
+		clockUpdatedAt: string;
+		clockDeviceId?: string;
+		createdAt?: string;
+		targetPeerDeviceId?: string | null;
+		reason?: string | null;
+		opId?: string;
+	},
+): string {
+	const d = drizzle(db, { schema });
+	const opId = opts.opId ?? randomUUID();
+	const now = opts.createdAt ?? new Date().toISOString();
+	const payload = {
+		cleanup_scope_id: opts.cleanupScopeId,
+		reason: cleanText(opts.reason) ?? "scope_access_cleanup",
+		...(cleanText(opts.targetPeerDeviceId)
+			? { target_peer_device_id: cleanText(opts.targetPeerDeviceId) }
+			: {}),
+	};
+	d.insert(schema.replicationOps)
+		.values({
+			op_id: opId,
+			entity_type: "memory_item",
+			entity_id: opts.importKey,
+			op_type: ACCESS_CLEANUP_OP_TYPE,
+			payload_json: toJson(payload),
+			clock_rev: opts.clockRev,
+			clock_updated_at: opts.clockUpdatedAt,
+			clock_device_id: opts.clockDeviceId ?? opts.deviceId,
+			device_id: opts.deviceId,
+			created_at: now,
+			scope_id: DEFAULT_SYNC_SCOPE_ID,
+		})
+		.run();
 	return opId;
 }
 
@@ -673,10 +1169,13 @@ export function loadReplicationOpsSince(
 	cursor: string | null,
 	limit = 100,
 	deviceId?: string,
+	scopeId?: string | null,
 ): [ReplicationOp[], string | null] {
 	const d = drizzle(db, { schema });
 	const t = schema.replicationOps;
 	const conditions = [];
+	const scopeFilterRequested = scopeId !== undefined;
+	const effectiveScopeId = normalizeSyncStateScopeId(scopeId);
 
 	if (cursor) {
 		const parsed = parseCursor(cursor);
@@ -689,7 +1188,17 @@ export function loadReplicationOpsSince(
 	}
 
 	if (deviceId) {
-		conditions.push(or(eq(t.device_id, deviceId), eq(t.device_id, "local")));
+		conditions.push(
+			or(and(eq(t.device_id, deviceId), eq(t.clock_device_id, deviceId)), eq(t.device_id, "local")),
+		);
+	}
+
+	if (scopeFilterRequested) {
+		conditions.push(
+			effectiveScopeId === DEFAULT_SYNC_SCOPE_ID
+				? or(isNull(t.scope_id), eq(t.scope_id, DEFAULT_SYNC_SCOPE_ID))
+				: eq(t.scope_id, effectiveScopeId),
+		);
 	}
 
 	const whereClause = conditions.length > 0 ? and(...conditions) : undefined;
@@ -713,6 +1222,7 @@ export function loadReplicationOpsSince(
 		clock_device_id: r.clock_device_id,
 		device_id: r.device_id,
 		created_at: r.created_at,
+		scope_id: r.scope_id,
 	}));
 
 	let nextCursor: string | null = null;
@@ -730,7 +1240,9 @@ export function loadReplicationOpsForPeer(
 	db: Database,
 	options: LoadReplicationOpsForPeerOptions,
 ): LoadReplicationOpsForPeerResult {
-	const boundary = getSyncResetState(db);
+	const scopeFilterRequested = options.scopeId !== undefined;
+	const effectiveScopeId = normalizeSyncStateScopeId(options.scopeId);
+	const boundary = getSyncResetState(db, scopeFilterRequested ? options.scopeId : undefined);
 	const since = normalizeCursor(options.since);
 	const requestedGeneration = options.generation ?? null;
 	const requestedSnapshotId = normalizeCursor(options.snapshotId);
@@ -766,11 +1278,30 @@ export function loadReplicationOpsForPeer(
 		return resetRequired(boundary, "stale_cursor");
 	}
 
-	const [ops, nextCursor] = loadReplicationOpsSince(db, since, options.limit, options.deviceId);
+	const [ops, nextCursor] = loadReplicationOpsSince(
+		db,
+		since,
+		options.limit,
+		// `/v1/ops` is an author stream, not a Space relay. Even when a
+		// scoped request filters by `scope_id`, this keeps returned ops authored
+		// by the serving device (plus legacy `local` rows) so receivers can keep
+		// rejecting batches whose device_id / clock_device_id do not match the
+		// authenticated peer.
+		options.deviceId,
+		effectiveScopeId,
+	);
+	const peerBoundaryOps = ops.filter((op) => {
+		if (op.entity_type !== "memory_item") return true;
+		if (op.op_type === ACCESS_CLEANUP_OP_TYPE || op.op_type === REASSIGN_SCOPE_OP_TYPE) {
+			return true;
+		}
+		const scopeId = cleanText(op.scope_id);
+		return Boolean(scopeId && scopeId !== DEFAULT_SYNC_SCOPE_ID);
+	});
 	return {
 		reset_required: false,
 		boundary,
-		ops,
+		ops: peerBoundaryOps,
 		nextCursor,
 	};
 }
@@ -779,7 +1310,17 @@ export function loadMemorySnapshotPageForPeer(
 	db: Database,
 	options: LoadMemorySnapshotPageForPeerOptions,
 ): LoadMemorySnapshotPageForPeerResult {
-	const boundary = getSyncResetState(db);
+	const scopeFilterRequested = options.scopeId !== undefined;
+	const effectiveScopeId = normalizeSyncStateScopeId(options.scopeId);
+	const boundary = getSyncResetState(db, scopeFilterRequested ? options.scopeId : undefined);
+	if (scopeFilterRequested) {
+		const scope = db
+			.prepare("SELECT authority_type FROM replication_scopes WHERE scope_id = ? LIMIT 1")
+			.get(effectiveScopeId) as { authority_type?: string | null } | undefined;
+		if (scope?.authority_type === "local") {
+			return { boundary, items: [], nextPageToken: null, hasMore: false };
+		}
+	}
 	if (options.generation !== boundary.generation) {
 		throw new Error("generation_mismatch");
 	}
@@ -788,6 +1329,17 @@ export function loadMemorySnapshotPageForPeer(
 	}
 	if (normalizeCursor(options.baselineCursor) !== boundary.baseline_cursor) {
 		throw new Error("boundary_mismatch");
+	}
+	const peerDeviceId = cleanText(options.peerDeviceId);
+	if (
+		scopeFilterRequested &&
+		peerDeviceId &&
+		getAnyRecipientPolicyDenyOverlayForScopeDevice(db, {
+			scopeId: effectiveScopeId,
+			deviceId: peerDeviceId,
+		})
+	) {
+		return { boundary, items: [], nextPageToken: null, hasMore: false };
 	}
 
 	// Cap raised to 5000 to support elevated bootstrap page sizes (default 2000).
@@ -808,6 +1360,9 @@ export function loadMemorySnapshotPageForPeer(
 			.where(
 				and(
 					isNotNull(schema.memoryItems.import_key),
+					effectiveScopeId === DEFAULT_SYNC_SCOPE_ID
+						? sql`0 = 1`
+						: eq(schema.memoryItems.scope_id, effectiveScopeId),
 					token
 						? or(
 								gt(schema.memoryItems.import_key, token.importKey),
@@ -842,8 +1397,17 @@ export function loadMemorySnapshotPageForPeer(
 
 			const payload = buildPayloadFromMemoryRow(row.memory);
 			if (
-				!syncVisibilityAllowed(payload as unknown as Record<string, unknown>) &&
-				!peerClaimedLocalActor(db, options.peerDeviceId ?? null)
+				(replicationOpRequiresPersonalScopeAuthorization(
+					{ scope_id: row.memory.scope_id },
+					payload as unknown as Record<string, unknown>,
+				) ||
+					!syncVisibilityAllowed(payload as unknown as Record<string, unknown>)) &&
+				!peerCanSyncPrivateOpByPersonalScopeGrant(
+					db,
+					{ scope_id: row.memory.scope_id },
+					payload as unknown as Record<string, unknown>,
+					options.peerDeviceId ?? null,
+				)
 			) {
 				continue;
 			}
@@ -924,21 +1488,48 @@ export function pruneReplicationOps(
 		maxSizeBytes?: number;
 		maxDeleteOps?: number;
 		maxRuntimeMs?: number;
+		scopeId?: string | null;
 	},
 ): ReplicationOpsPruneResult {
 	const maxAgeDays = Math.max(1, Math.floor(options?.maxAgeDays ?? 30));
 	const maxSizeBytes = Math.max(1, Math.floor(options?.maxSizeBytes ?? 512 * 1024 * 1024));
 	const maxDeleteOps = Math.max(1, Math.floor(options?.maxDeleteOps ?? Number.MAX_SAFE_INTEGER));
 	const maxRuntimeMs = Math.max(1, Math.floor(options?.maxRuntimeMs ?? Number.MAX_SAFE_INTEGER));
+	const scopeId = normalizeSyncStateScopeId(options?.scopeId);
 	const d = drizzle(db, { schema });
 	const cutoff = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000).toISOString();
 	const startedAt = Date.now();
 	let deleted = 0;
 	let lastDeletedCursor: string | null = null;
-	const bulkDeleteBeforeStmt = db.prepare(
-		"DELETE FROM replication_ops WHERE created_at < ? OR (created_at = ? AND op_id <= ?)",
-	);
-	const estimatedBytesBefore = estimateReplicationOpsStorageBytes(db);
+	const deleteThroughCursor = (createdAt: string, opId: string): number => {
+		const floorCursor = computeCursor(createdAt, opId);
+		return db
+			.transaction(() => {
+				const result =
+					scopeId === DEFAULT_SYNC_SCOPE_ID
+						? (db
+								.prepare(
+									`DELETE FROM replication_ops
+									 WHERE (scope_id IS NULL OR scope_id = ?)
+									   AND (created_at < ? OR (created_at = ? AND op_id <= ?))`,
+								)
+								.run(scopeId, createdAt, createdAt, opId) as { changes?: number })
+						: (db
+								.prepare(
+									`DELETE FROM replication_ops
+									 WHERE scope_id = ?
+									   AND (created_at < ? OR (created_at = ? AND op_id <= ?))`,
+								)
+								.run(scopeId, createdAt, createdAt, opId) as { changes?: number });
+				const changes = result.changes ?? 0;
+				if (changes > 0) {
+					setSyncResetState(db, { retained_floor_cursor: floorCursor }, scopeId);
+				}
+				return changes;
+			})
+			.immediate();
+	};
+	const estimatedBytesBefore = estimateReplicationOpsScopeBytes(db, scopeId);
 	if (estimatedBytesBefore == null) {
 		throw new Error("replication_ops_size_unavailable");
 	}
@@ -958,7 +1549,17 @@ export function pruneReplicationOps(
 				created_at: schema.replicationOps.created_at,
 			})
 			.from(schema.replicationOps)
-			.where(sql`${schema.replicationOps.created_at} < ${cutoff}`)
+			.where(
+				and(
+					sql`${schema.replicationOps.created_at} < ${cutoff}`,
+					scopeId === DEFAULT_SYNC_SCOPE_ID
+						? or(
+								isNull(schema.replicationOps.scope_id),
+								eq(schema.replicationOps.scope_id, scopeId),
+							)
+						: eq(schema.replicationOps.scope_id, scopeId),
+				),
+			)
 			.orderBy(schema.replicationOps.created_at, schema.replicationOps.op_id)
 			.limit(ageBatchSize)
 			.all();
@@ -966,12 +1567,7 @@ export function pruneReplicationOps(
 		const boundary = ageCandidates[ageCandidates.length - 1];
 		if (!boundary) break;
 		lastDeletedCursor = computeCursor(String(boundary.created_at), String(boundary.op_id));
-		deleted +=
-			(
-				bulkDeleteBeforeStmt.run(boundary.created_at, boundary.created_at, boundary.op_id) as {
-					changes?: number;
-				}
-			).changes ?? 0;
+		deleted += deleteThroughCursor(String(boundary.created_at), String(boundary.op_id));
 		if (budgetExceeded()) {
 			stoppedByBudget = true;
 			break;
@@ -993,29 +1589,28 @@ export function pruneReplicationOps(
 				created_at: schema.replicationOps.created_at,
 			})
 			.from(schema.replicationOps)
+			.where(
+				scopeId === DEFAULT_SYNC_SCOPE_ID
+					? or(isNull(schema.replicationOps.scope_id), eq(schema.replicationOps.scope_id, scopeId))
+					: eq(schema.replicationOps.scope_id, scopeId),
+			)
 			.orderBy(schema.replicationOps.created_at, schema.replicationOps.op_id)
 			.limit(sizeBatchSize)
 			.all();
 		const boundary = oldestChunk[oldestChunk.length - 1];
 		if (!boundary) break;
 		lastDeletedCursor = computeCursor(String(boundary.created_at), String(boundary.op_id));
-		deleted +=
-			(
-				bulkDeleteBeforeStmt.run(boundary.created_at, boundary.created_at, boundary.op_id) as {
-					changes?: number;
-				}
-			).changes ?? 0;
-		const nextEstimatedSize = estimateReplicationOpsStorageBytes(db);
+		deleted += deleteThroughCursor(String(boundary.created_at), String(boundary.op_id));
+		const nextEstimatedSize = estimateReplicationOpsScopeBytes(db, scopeId);
 		if (nextEstimatedSize == null) {
 			throw new Error("replication_ops_size_unavailable");
 		}
 		estimatedSizeBytes = nextEstimatedSize;
 	}
 
-	const currentBoundary = getSyncResetState(db);
+	const currentBoundary = getSyncResetState(db, scopeId);
 	const retainedFloorCursor =
 		deleted > 0 ? lastDeletedCursor : currentBoundary.retained_floor_cursor;
-	setSyncResetState(db, { retained_floor_cursor: retainedFloorCursor });
 	return {
 		deleted,
 		retained_floor_cursor: retainedFloorCursor,
@@ -1040,6 +1635,7 @@ export function pruneReplicationOpsUntilCaughtUp(
 		maxSizeBytes: number;
 		maxDeleteOps: number;
 		maxRuntimeMs: number;
+		scopeId?: string | null;
 		maxPasses?: number;
 		signal?: AbortSignal;
 		onPass?: (pass: {
@@ -1090,25 +1686,34 @@ export function bulkPruneReplicationOpsByAgeCutoff(
 	db: Database,
 	maxAgeDays: number,
 	maxDeleteOps = Number.MAX_SAFE_INTEGER,
+	scopeIdInput?: string | null,
 ): ReplicationOpsPruneResult {
 	const d = drizzle(db, { schema });
+	const scopeId = normalizeSyncStateScopeId(scopeIdInput);
 	const cutoff = new Date(
 		Date.now() - Math.max(1, Math.floor(maxAgeDays)) * 24 * 60 * 60 * 1000,
 	).toISOString();
-	const estimatedBytesBefore = estimateReplicationOpsStorageBytes(db);
+	const estimatedBytesBefore = estimateReplicationOpsScopeBytes(db, scopeId);
 	if (estimatedBytesBefore == null) {
 		throw new Error("replication_ops_size_unavailable");
 	}
 	const oldestEligible = d
 		.select({ op_id: schema.replicationOps.op_id, created_at: schema.replicationOps.created_at })
 		.from(schema.replicationOps)
-		.where(sql`${schema.replicationOps.created_at} < ${cutoff}`)
+		.where(
+			and(
+				sql`${schema.replicationOps.created_at} < ${cutoff}`,
+				scopeId === DEFAULT_SYNC_SCOPE_ID
+					? or(isNull(schema.replicationOps.scope_id), eq(schema.replicationOps.scope_id, scopeId))
+					: eq(schema.replicationOps.scope_id, scopeId),
+			),
+		)
 		.orderBy(schema.replicationOps.created_at, schema.replicationOps.op_id)
 		.limit(Math.max(1, maxDeleteOps))
 		.all();
 	const boundary = oldestEligible[oldestEligible.length - 1];
 	if (!boundary) {
-		const currentBoundary = getSyncResetState(db);
+		const currentBoundary = getSyncResetState(db, scopeId);
 		return {
 			deleted: 0,
 			retained_floor_cursor: currentBoundary.retained_floor_cursor,
@@ -1117,18 +1722,37 @@ export function bulkPruneReplicationOpsByAgeCutoff(
 			stopped_by_budget: false,
 		};
 	}
-	const deleteStmt = db.prepare(
-		"DELETE FROM replication_ops WHERE created_at < ? OR (created_at = ? AND op_id <= ?)",
-	);
-	const deleted =
-		(
-			deleteStmt.run(boundary.created_at, boundary.created_at, boundary.op_id) as {
-				changes?: number;
-			}
-		).changes ?? 0;
 	const retainedFloorCursor = computeCursor(String(boundary.created_at), String(boundary.op_id));
-	setSyncResetState(db, { retained_floor_cursor: retainedFloorCursor });
-	const estimatedBytesAfter = estimateReplicationOpsStorageBytes(db);
+	const deleted = db
+		.transaction(() => {
+			const result =
+				scopeId === DEFAULT_SYNC_SCOPE_ID
+					? (db
+							.prepare(
+								`DELETE FROM replication_ops
+								 WHERE (scope_id IS NULL OR scope_id = ?)
+								   AND (created_at < ? OR (created_at = ? AND op_id <= ?))`,
+							)
+							.run(scopeId, boundary.created_at, boundary.created_at, boundary.op_id) as {
+							changes?: number;
+						})
+					: (db
+							.prepare(
+								`DELETE FROM replication_ops
+								 WHERE scope_id = ?
+								   AND (created_at < ? OR (created_at = ? AND op_id <= ?))`,
+							)
+							.run(scopeId, boundary.created_at, boundary.created_at, boundary.op_id) as {
+							changes?: number;
+						});
+			const changes = result.changes ?? 0;
+			if (changes > 0) {
+				setSyncResetState(db, { retained_floor_cursor: retainedFloorCursor }, scopeId);
+			}
+			return changes;
+		})
+		.immediate();
+	const estimatedBytesAfter = estimateReplicationOpsScopeBytes(db, scopeId);
 	if (estimatedBytesAfter == null) {
 		throw new Error("replication_ops_size_unavailable");
 	}
@@ -1192,6 +1816,33 @@ function estimateReplicationOpsStorageBytes(db: Database): number | null {
 				    OR name LIKE 'sqlite_autoindex_replication_ops_%'`,
 			)
 			.get() as { total_bytes?: number | string | null } | undefined;
+		const total = Number(row?.total_bytes ?? 0);
+		return Number.isFinite(total) && total >= 0 ? total : null;
+	} catch {
+		return null;
+	}
+}
+
+export function estimateReplicationOpsScopeBytes(db: Database, scopeId: string): number | null {
+	const estimateSql = `SELECT COALESCE(SUM(
+		LENGTH(COALESCE(op_id, '')) +
+		LENGTH(COALESCE(entity_type, '')) +
+		LENGTH(COALESCE(entity_id, '')) +
+		LENGTH(COALESCE(op_type, '')) +
+		LENGTH(COALESCE(payload_json, '')) +
+		LENGTH(COALESCE(clock_updated_at, '')) +
+		LENGTH(COALESCE(clock_device_id, '')) +
+		LENGTH(COALESCE(device_id, '')) +
+		LENGTH(COALESCE(created_at, '')) +
+		LENGTH(COALESCE(scope_id, '')) +
+		96
+	), 0) AS total_bytes
+	FROM replication_ops
+	WHERE ${scopeId === DEFAULT_SYNC_SCOPE_ID ? "scope_id IS NULL OR scope_id = ?" : "scope_id = ?"}`;
+	try {
+		const row = db.prepare(estimateSql).get(scopeId) as
+			| { total_bytes?: number | string | null }
+			| undefined;
 		const total = Number(row?.total_bytes ?? 0);
 		return Number.isFinite(total) && total >= 0 ? total : null;
 	} catch {
@@ -1269,7 +1920,7 @@ function effectiveSyncProjectFilters(
 	};
 }
 
-function syncProjectAllowed(
+export function syncProjectAllowed(
 	db: Database,
 	project: string | null,
 	peerDeviceId: string | null,
@@ -1337,16 +1988,83 @@ export function syncVisibilityAllowed(payload: Record<string, unknown> | null): 
 	return visibility === "shared";
 }
 
-function peerClaimedLocalActor(db: Database, peerDeviceId: string | null): boolean {
-	if (!peerDeviceId) return false;
-	const d = drizzle(db, { schema });
-	const row = d
-		.select({ claimed_local_actor: schema.syncPeers.claimed_local_actor })
-		.from(schema.syncPeers)
-		.where(eq(schema.syncPeers.peer_device_id, peerDeviceId))
-		.limit(1)
-		.get();
-	return Boolean(row?.claimed_local_actor);
+function cleanText(value: unknown): string | null {
+	const trimmed = typeof value === "string" ? value.trim() : "";
+	return trimmed.length > 0 ? trimmed : null;
+}
+
+export interface PersonalScopeGrantStatus {
+	scope_id: string | null;
+	authorized: boolean;
+	state: string;
+}
+
+export function personalScopeGrantStatusForPeer(
+	db: Database,
+	input: { peerDeviceId: string | null; actorId: string | null },
+): PersonalScopeGrantStatus {
+	const peerDeviceId = cleanText(input.peerDeviceId);
+	const actorId = cleanText(input.actorId);
+	if (!peerDeviceId || !actorId) {
+		return { scope_id: null, authorized: false, state: "missing_peer_or_actor" };
+	}
+	const scopeId = `personal:${actorId}`;
+	const auth = getCachedScopeAuthorization(db, { deviceId: peerDeviceId, scopeId });
+	return { scope_id: scopeId, authorized: auth.authorized, state: auth.state };
+}
+
+function personalScopeAuthorizationRequirement(
+	op: Pick<ReplicationOp, "scope_id">,
+	payload: Record<string, unknown> | null,
+): { required: boolean; scopeId: string | null } {
+	const metadata =
+		payload?.metadata_json &&
+		typeof payload.metadata_json === "object" &&
+		!Array.isArray(payload.metadata_json)
+			? (payload.metadata_json as Record<string, unknown>)
+			: {};
+	const opScopeId = cleanText(op.scope_id);
+	const payloadScopeId = cleanText(payload?.scope_id);
+	const visibility = cleanText(payload?.visibility ?? metadata.visibility)?.toLowerCase() ?? null;
+	const workspaceId = cleanText(payload?.workspace_id ?? metadata.workspace_id);
+	const workspaceKind =
+		cleanText(payload?.workspace_kind ?? metadata.workspace_kind)?.toLowerCase() ?? null;
+	const actorId = cleanText(payload?.actor_id ?? metadata.actor_id);
+	const personalWorkspaceId = workspaceId?.startsWith("personal:") ? workspaceId : null;
+	const hasPersonalSignal =
+		visibility === "private" ||
+		visibility === "personal" ||
+		workspaceKind === "personal" ||
+		Boolean(personalWorkspaceId);
+	const actorScopeId = actorId && hasPersonalSignal ? `personal:${actorId}` : null;
+	const candidates = [opScopeId, payloadScopeId, personalWorkspaceId, actorScopeId].filter(
+		(candidate): candidate is string => Boolean(candidate?.startsWith("personal:")),
+	);
+	const scopeId = candidates[0] ?? null;
+	if (!scopeId) return { required: hasPersonalSignal, scopeId: null };
+	if (candidates.some((candidate) => candidate !== scopeId)) {
+		return { required: true, scopeId: null };
+	}
+	return { required: true, scopeId };
+}
+
+export function replicationOpRequiresPersonalScopeAuthorization(
+	op: Pick<ReplicationOp, "scope_id">,
+	payload: Record<string, unknown> | null,
+): boolean {
+	return personalScopeAuthorizationRequirement(op, payload).required;
+}
+
+export function peerCanSyncPrivateOpByPersonalScopeGrant(
+	db: Database,
+	op: Pick<ReplicationOp, "scope_id">,
+	payload: Record<string, unknown> | null,
+	peerDeviceId: string | null,
+): boolean {
+	const { scopeId } = personalScopeAuthorizationRequirement(op, payload);
+	if (!scopeId) return false;
+	const actorId = scopeId.slice("personal:".length);
+	return personalScopeGrantStatusForPeer(db, { peerDeviceId, actorId }).authorized;
 }
 
 function parsePayload(payloadJson: string | null): Record<string, unknown> | null {
@@ -1361,14 +2079,158 @@ function parsePayload(payloadJson: string | null): Record<string, unknown> | nul
 }
 
 export interface FilterReplicationSkipped {
-	reason: "visibility_filter" | "project_filter";
+	reason: "scope_filter" | "visibility_filter" | "project_filter";
 	op_id: string;
 	created_at: string;
 	entity_type: string;
 	entity_id: string;
 	skipped_count: number;
 	project?: string | null;
+	scope_id?: string | null;
 	visibility?: string | null;
+}
+
+export interface FilterReplicationOpsForSyncOptions {
+	localDeviceId?: string | null;
+	applyScopeFilter?: boolean;
+	supportsReassignScope?: boolean;
+}
+
+interface ExistingMemoryFilterContext {
+	payload: Record<string, unknown>;
+	project: string | null;
+	scopeId: string | null;
+}
+
+function addSkipped(
+	state: { count: number; first: FilterReplicationSkipped | null },
+	op: ReplicationOp,
+	skipped: Pick<FilterReplicationSkipped, "reason"> &
+		Partial<Omit<FilterReplicationSkipped, "reason" | "skipped_count">>,
+): void {
+	state.count += 1;
+	if (!state.first) {
+		state.first = {
+			...skipped,
+			op_id: op.op_id,
+			created_at: op.created_at,
+			entity_type: op.entity_type,
+			entity_id: op.entity_id,
+			skipped_count: 0,
+		};
+	}
+}
+
+function metadataRecord(payload: Record<string, unknown> | null): Record<string, unknown> {
+	const metadata = payload?.metadata_json;
+	if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return {};
+	return metadata as Record<string, unknown>;
+}
+
+function payloadScopeId(payload: Record<string, unknown> | null): string | null {
+	const metadata = metadataRecord(payload);
+	return cleanText(payload?.scope_id ?? metadata.scope_id);
+}
+
+function payloadContradictsOutboundScope(
+	op: Pick<ReplicationOp, "scope_id">,
+	payload: Record<string, unknown> | null,
+): boolean {
+	const opScopeId = cleanText(op.scope_id);
+	const explicitPayloadScopeId = payloadScopeId(payload);
+	if (explicitPayloadScopeId && explicitPayloadScopeId !== opScopeId) return true;
+	if (!opScopeId) return explicitPayloadScopeId != null;
+
+	const personalRequirement = personalScopeAuthorizationRequirement(op, payload);
+	return Boolean(
+		personalRequirement.required &&
+			personalRequirement.scopeId &&
+			personalRequirement.scopeId !== opScopeId,
+	);
+}
+
+function existingMemoryFilterContext(
+	db: Database,
+	importKey: string,
+): ExistingMemoryFilterContext | null {
+	const key = cleanText(importKey);
+	if (!key) return null;
+	const row = db
+		.prepare(
+			`SELECT
+				m.actor_id,
+				m.metadata_json,
+				m.scope_id,
+				m.visibility,
+				m.workspace_id,
+				m.workspace_kind,
+				s.project
+			 FROM memory_items m
+			 LEFT JOIN sessions s ON s.id = m.session_id
+			 WHERE m.import_key = ?
+			 LIMIT 1`,
+		)
+		.get(key) as
+		| {
+				actor_id: string | null;
+				metadata_json: string | null;
+				project: string | null;
+				scope_id: string | null;
+				visibility: string | null;
+				workspace_id: string | null;
+				workspace_kind: string | null;
+		  }
+		| undefined;
+	if (!row) return null;
+	return {
+		payload: {
+			actor_id: row.actor_id,
+			metadata_json: fromJson(row.metadata_json),
+			visibility: row.visibility,
+			workspace_id: row.workspace_id,
+			workspace_kind: row.workspace_kind,
+		},
+		project: cleanText(row.project),
+		scopeId: cleanText(row.scope_id),
+	};
+}
+
+function outboundScopeAllowed(
+	db: Database,
+	op: ReplicationOp,
+	payload: Record<string, unknown> | null,
+	peerDeviceId: string | null,
+	localDeviceId: string | null,
+): boolean {
+	if (payloadContradictsOutboundScope(op, payload)) return false;
+	const scopeId = cleanText(op.scope_id);
+	if (!scopeId) return true;
+	if (scopeId === DEFAULT_SYNC_SCOPE_ID) return false;
+	const peerId = cleanText(peerDeviceId);
+	if (!peerId) return false;
+	const peerAuth = getCachedScopeAuthorization(db, { deviceId: peerId, scopeId });
+	if (!peerAuth.authorized || peerAuth.scope?.authority_type === "local") return false;
+	const localId = cleanText(localDeviceId);
+	if (!localId) return true;
+	const localAuth = getCachedScopeAuthorization(db, { deviceId: localId, scopeId });
+	return localAuth.authorized && localAuth.scope?.authority_type !== "local";
+}
+
+function legacyDefaultReassignAllowed(
+	db: Database,
+	op: ReplicationOp,
+	peerDeviceId: string | null,
+): boolean {
+	const existing = existingMemoryFilterContext(db, op.entity_id);
+	if (!existing) return false;
+	if (
+		(replicationOpRequiresPersonalScopeAuthorization(op, existing.payload) ||
+			!syncVisibilityAllowed(existing.payload)) &&
+		!peerCanSyncPrivateOpByPersonalScopeGrant(db, op, existing.payload, peerDeviceId)
+	) {
+		return false;
+	}
+	return syncProjectAllowed(db, existing.project, peerDeviceId);
 }
 
 /**
@@ -1382,32 +2244,133 @@ export function filterReplicationOpsForSyncWithStatus(
 	db: Database,
 	ops: ReplicationOp[],
 	peerDeviceId: string | null,
+	options: FilterReplicationOpsForSyncOptions = {},
 ): [ReplicationOp[], string | null, FilterReplicationSkipped | null] {
 	const allowed: ReplicationOp[] = [];
 	let nextCursor: string | null = null;
-	let skippedCount = 0;
-	let firstSkipped: FilterReplicationSkipped | null = null;
+	const skipped = { count: 0, first: null as FilterReplicationSkipped | null };
+	const applyScopeFilter = options.applyScopeFilter !== false;
 	for (const op of ops) {
 		if (op.entity_type === "memory_item") {
 			const payload = parsePayload(op.payload_json);
-			if (op.op_type === "delete" && payload == null) {
+			if (op.op_type === REASSIGN_SCOPE_OP_TYPE && options.supportsReassignScope !== true) {
+				addSkipped(skipped, op, {
+					reason: "scope_filter",
+					scope_id: cleanText(op.scope_id),
+				});
+				nextCursor = computeCursor(op.created_at, op.op_id);
+				continue;
+			}
+			if (op.op_type === ACCESS_CLEANUP_OP_TYPE) {
+				if (!accessCleanupTargetsPeer(op, peerDeviceId)) {
+					addSkipped(skipped, op, {
+						reason: "scope_filter",
+						scope_id: cleanText(payload?.cleanup_scope_id ?? op.scope_id),
+					});
+					nextCursor = computeCursor(op.created_at, op.op_id);
+					continue;
+				}
 				allowed.push(op);
 				nextCursor = computeCursor(op.created_at, op.op_id);
 				continue;
 			}
-			if (!syncVisibilityAllowed(payload) && !peerClaimedLocalActor(db, peerDeviceId)) {
-				skippedCount += 1;
-				if (!firstSkipped) {
-					firstSkipped = {
-						reason: "visibility_filter",
-						op_id: op.op_id,
-						created_at: op.created_at,
-						entity_type: op.entity_type,
-						entity_id: op.entity_id,
-						visibility: typeof payload?.visibility === "string" ? String(payload.visibility) : null,
-						skipped_count: 0,
-					};
+			if (op.op_type === REASSIGN_SCOPE_OP_TYPE) {
+				try {
+					const reassignment = parseReassignScopePayload(op);
+					const scopeAllowed =
+						!applyScopeFilter ||
+						(reassignment.side === "old" && reassignment.old_scope_id === DEFAULT_SYNC_SCOPE_ID
+							? legacyDefaultReassignAllowed(db, op, peerDeviceId)
+							: outboundScopeAllowed(db, op, payload, peerDeviceId, options.localDeviceId ?? null));
+					if (!scopeAllowed) {
+						addSkipped(skipped, op, {
+							reason: "scope_filter",
+							scope_id: cleanText(op.scope_id),
+						});
+						nextCursor = computeCursor(op.created_at, op.op_id);
+						continue;
+					}
+					if (reassignment.side === "old") {
+						allowed.push(op);
+						nextCursor = computeCursor(op.created_at, op.op_id);
+						continue;
+					}
+				} catch {
+					addSkipped(skipped, op, {
+						reason: "scope_filter",
+						scope_id: cleanText(op.scope_id),
+					});
+					nextCursor = computeCursor(op.created_at, op.op_id);
+					continue;
 				}
+			}
+			const regularScopeId = cleanText(op.scope_id);
+			if (!regularScopeId || regularScopeId === DEFAULT_SYNC_SCOPE_ID) {
+				addSkipped(skipped, op, { reason: "scope_filter", scope_id: regularScopeId });
+				nextCursor = computeCursor(op.created_at, op.op_id);
+				continue;
+			}
+			if (
+				applyScopeFilter &&
+				!outboundScopeAllowed(db, op, payload, peerDeviceId, options.localDeviceId ?? null)
+			) {
+				addSkipped(skipped, op, { reason: "scope_filter", scope_id: cleanText(op.scope_id) });
+				nextCursor = computeCursor(op.created_at, op.op_id);
+				continue;
+			}
+			if (op.op_type === "delete" && payload == null) {
+				const existing = existingMemoryFilterContext(db, op.entity_id);
+				if (existing) {
+					if (applyScopeFilter && existing.scopeId && existing.scopeId !== cleanText(op.scope_id)) {
+						addSkipped(skipped, op, { reason: "scope_filter", scope_id: cleanText(op.scope_id) });
+						nextCursor = computeCursor(op.created_at, op.op_id);
+						continue;
+					}
+					if (
+						(replicationOpRequiresPersonalScopeAuthorization(op, existing.payload) ||
+							!syncVisibilityAllowed(existing.payload)) &&
+						!peerCanSyncPrivateOpByPersonalScopeGrant(db, op, existing.payload, peerDeviceId)
+					) {
+						addSkipped(skipped, op, {
+							reason: "visibility_filter",
+							visibility:
+								typeof existing.payload.visibility === "string"
+									? String(existing.payload.visibility)
+									: null,
+						});
+						nextCursor = computeCursor(op.created_at, op.op_id);
+						continue;
+					}
+					if (!syncProjectAllowed(db, existing.project, peerDeviceId)) {
+						addSkipped(skipped, op, {
+							reason: "project_filter",
+							project: existing.project,
+						});
+						nextCursor = computeCursor(op.created_at, op.op_id);
+						continue;
+					}
+				}
+				if (
+					replicationOpRequiresPersonalScopeAuthorization(op, payload) &&
+					!peerCanSyncPrivateOpByPersonalScopeGrant(db, op, payload, peerDeviceId)
+				) {
+					addSkipped(skipped, op, { reason: "visibility_filter" });
+					nextCursor = computeCursor(op.created_at, op.op_id);
+					continue;
+				}
+				allowed.push(op);
+				nextCursor = computeCursor(op.created_at, op.op_id);
+				continue;
+			}
+			if (
+				(replicationOpRequiresPersonalScopeAuthorization(op, payload) ||
+					!syncVisibilityAllowed(payload)) &&
+				!peerCanSyncPrivateOpByPersonalScopeGrant(db, op, payload, peerDeviceId)
+			) {
+				addSkipped(skipped, op, {
+					reason: "visibility_filter",
+					visibility: typeof payload?.visibility === "string" ? String(payload.visibility) : null,
+				});
 				nextCursor = computeCursor(op.created_at, op.op_id);
 				continue;
 			}
@@ -1417,18 +2380,7 @@ export function filterReplicationOpsForSyncWithStatus(
 					? payload.project.trim()
 					: null;
 			if (!syncProjectAllowed(db, project, peerDeviceId)) {
-				skippedCount += 1;
-				if (!firstSkipped) {
-					firstSkipped = {
-						reason: "project_filter",
-						op_id: op.op_id,
-						created_at: op.created_at,
-						entity_type: op.entity_type,
-						entity_id: op.entity_id,
-						project,
-						skipped_count: 0,
-					};
-				}
+				addSkipped(skipped, op, { reason: "project_filter", project });
 				nextCursor = computeCursor(op.created_at, op.op_id);
 				continue;
 			}
@@ -1438,19 +2390,25 @@ export function filterReplicationOpsForSyncWithStatus(
 		nextCursor = computeCursor(op.created_at, op.op_id);
 	}
 
-	if (firstSkipped) {
-		firstSkipped.skipped_count = skippedCount;
+	if (skipped.first) {
+		skipped.first.skipped_count = skipped.count;
 	}
 
-	return [allowed, nextCursor, firstSkipped];
+	return [allowed, nextCursor, skipped.first];
 }
 
 export function filterReplicationOpsForSync(
 	db: Database,
 	ops: ReplicationOp[],
 	peerDeviceId: string | null,
+	options: FilterReplicationOpsForSyncOptions = {},
 ): [ReplicationOp[], string | null] {
-	const [allowed, nextCursor] = filterReplicationOpsForSyncWithStatus(db, ops, peerDeviceId);
+	const [allowed, nextCursor] = filterReplicationOpsForSyncWithStatus(
+		db,
+		ops,
+		peerDeviceId,
+		options,
+	);
 	return [allowed, nextCursor];
 }
 
@@ -1459,14 +2417,733 @@ export function filterReplicationOpsForSync(
 export interface ApplyResult {
 	applied: number;
 	skipped: number;
+	rejected: number;
 	conflicts: number;
 	errors: string[];
+	rejections: InboundScopeRejection[];
 	vectorWork: ReplicationVectorWork;
 }
 
 export interface ReplicationVectorWork {
 	upsertMemoryIds: number[];
 	deleteMemoryIds: number[];
+}
+
+export type StalePeerReceivedRowReason =
+	| "authorization_unknown"
+	| "missing_import_key"
+	| "missing_origin_device"
+	| "missing_scope";
+
+export interface StalePeerReceivedRowDiagnostic {
+	memory_id: number;
+	import_key: string | null;
+	origin_device_id: string | null;
+	scope_id: string | null;
+	reason: StalePeerReceivedRowReason;
+}
+
+export interface ReconcileStalePeerReceivedRowsResult {
+	checked: number;
+	deleted: number;
+	deleted_memory_ids: number[];
+	retained: number;
+	ambiguous: StalePeerReceivedRowDiagnostic[];
+}
+
+export interface ReconcileStalePeerReceivedRowsOptions {
+	localDeviceId: string;
+	maxRows?: number | null;
+	peerDeviceId?: string | null;
+}
+
+export type DiagnoseStalePeerReceivedRowsResult = Omit<
+	ReconcileStalePeerReceivedRowsResult,
+	"deleted" | "deleted_memory_ids"
+> & {
+	would_delete: number;
+	would_delete_memory_ids: number[];
+};
+
+type StalePeerCandidateAuthState = ReturnType<typeof getCachedScopeAuthorization>["state"];
+
+function stalePeerCandidateIsDeletable(state: StalePeerCandidateAuthState): boolean {
+	return state === "revoked" || state === "scope_inactive" || state === "stale_epoch";
+}
+
+function stalePeerCandidateDiagnostic(input: {
+	importKey: string | null;
+	memoryId: number;
+	originDeviceId: string | null;
+	reason: StalePeerReceivedRowReason;
+	scopeId: string | null;
+}): StalePeerReceivedRowDiagnostic {
+	return {
+		memory_id: input.memoryId,
+		import_key: input.importKey,
+		origin_device_id: input.originDeviceId,
+		scope_id: input.scopeId,
+		reason: input.reason,
+	};
+}
+
+export function reconcileStalePeerReceivedRows(
+	db: Database,
+	options: ReconcileStalePeerReceivedRowsOptions,
+): ReconcileStalePeerReceivedRowsResult {
+	return reconcileStalePeerReceivedRowsInternal(db, options, true);
+}
+
+export function diagnoseStalePeerReceivedRows(
+	db: Database,
+	options: ReconcileStalePeerReceivedRowsOptions,
+): DiagnoseStalePeerReceivedRowsResult {
+	const result = reconcileStalePeerReceivedRowsInternal(db, options, false);
+	return {
+		checked: result.checked,
+		would_delete: result.deleted,
+		would_delete_memory_ids: result.deleted_memory_ids,
+		retained: result.retained,
+		ambiguous: result.ambiguous,
+	};
+}
+
+function reconcileStalePeerReceivedRowsInternal(
+	db: Database,
+	options: ReconcileStalePeerReceivedRowsOptions,
+	deleteRows: boolean,
+): ReconcileStalePeerReceivedRowsResult {
+	const localDeviceId = cleanText(options.localDeviceId);
+	if (!localDeviceId) throw new Error("localDeviceId must be a non-empty string");
+	const peerDeviceId = cleanText(options.peerDeviceId);
+	const maxRows =
+		typeof options.maxRows === "number" && Number.isFinite(options.maxRows)
+			? Math.max(0, Math.trunc(options.maxRows))
+			: -1;
+	const rows = db
+		.prepare(
+			`SELECT id, import_key, origin_device_id, scope_id
+			 FROM memory_items
+			 WHERE active = 1
+			   AND (? IS NULL OR origin_device_id = ?)
+			 ORDER BY id
+			 LIMIT ?`,
+		)
+		.all(peerDeviceId, peerDeviceId, maxRows) as Array<{
+		id: number;
+		import_key: string | null;
+		origin_device_id: string | null;
+		scope_id: string | null;
+	}>;
+	const result: ReconcileStalePeerReceivedRowsResult = {
+		checked: rows.length,
+		deleted: 0,
+		deleted_memory_ids: [],
+		retained: 0,
+		ambiguous: [],
+	};
+	const deleteMemory = deleteRows ? db.prepare("DELETE FROM memory_items WHERE id = ?") : null;
+	const clearDeletedScopeCursor = (originDeviceId: string, scopeId: string): void => {
+		if (!deleteRows || scopeId === DEFAULT_SYNC_SCOPE_ID) return;
+		clearReplicationCursorLastApplied(db, originDeviceId, scopeId);
+	};
+	db.transaction(() => {
+		for (const row of rows) {
+			const memoryId = Number(row.id);
+			const importKey = cleanText(row.import_key);
+			const originDeviceId = cleanText(row.origin_device_id);
+			const scopeId = cleanText(row.scope_id);
+			if (!originDeviceId) {
+				result.ambiguous.push(
+					stalePeerCandidateDiagnostic({
+						importKey,
+						memoryId,
+						originDeviceId,
+						reason: "missing_origin_device",
+						scopeId,
+					}),
+				);
+				continue;
+			}
+			if (originDeviceId === localDeviceId) {
+				result.retained += 1;
+				continue;
+			}
+			if (!scopeId || scopeId === DEFAULT_SYNC_SCOPE_ID) {
+				if (deleteRows) {
+					clearMemoryRefs(db, memoryId);
+					deleteMemory?.run(memoryId);
+				}
+				result.deleted += 1;
+				result.deleted_memory_ids.push(memoryId);
+				continue;
+			}
+			if (!importKey) {
+				result.ambiguous.push(
+					stalePeerCandidateDiagnostic({
+						importKey,
+						memoryId,
+						originDeviceId,
+						reason: "missing_import_key",
+						scopeId,
+					}),
+				);
+				continue;
+			}
+			const auth = getCachedScopeAuthorization(db, { deviceId: localDeviceId, scopeId });
+			if (auth.authorized) {
+				result.retained += 1;
+				continue;
+			}
+			if (!auth.scope) {
+				result.ambiguous.push(
+					stalePeerCandidateDiagnostic({
+						importKey,
+						memoryId,
+						originDeviceId,
+						reason: "authorization_unknown",
+						scopeId,
+					}),
+				);
+				continue;
+			}
+			if (!auth.membership) {
+				if (deleteRows) {
+					clearMemoryRefs(db, memoryId);
+					deleteMemory?.run(memoryId);
+					clearDeletedScopeCursor(originDeviceId, scopeId);
+				}
+				result.deleted += 1;
+				result.deleted_memory_ids.push(memoryId);
+				continue;
+			}
+			if (!stalePeerCandidateIsDeletable(auth.state)) {
+				result.ambiguous.push(
+					stalePeerCandidateDiagnostic({
+						importKey,
+						memoryId,
+						originDeviceId,
+						reason: "authorization_unknown",
+						scopeId,
+					}),
+				);
+				continue;
+			}
+			if (deleteRows) {
+				clearMemoryRefs(db, memoryId);
+				deleteMemory?.run(memoryId);
+				clearDeletedScopeCursor(originDeviceId, scopeId);
+			}
+			result.deleted += 1;
+			result.deleted_memory_ids.push(memoryId);
+		}
+	})();
+	return result;
+}
+
+export type InboundScopeRejectionReason =
+	| "missing_scope"
+	| "sender_not_member"
+	| "receiver_not_member"
+	| "stale_epoch"
+	| "scope_mismatch";
+
+export interface InboundScopeRejection {
+	op_id: string;
+	entity_type: string;
+	entity_id: string;
+	scope_id: string | null;
+	peer_device_id: string | null;
+	reason: InboundScopeRejectionReason;
+}
+
+export interface InboundScopeValidationOptions {
+	peerDeviceId?: string | null;
+	enabled?: boolean;
+}
+
+export interface ApplyReplicationOpsOptions {
+	inboundScopeValidation?: InboundScopeValidationOptions | null;
+}
+
+type CachedScopeAuthorizationResult = ReturnType<typeof getCachedScopeAuthorization>;
+
+function inboundScopeRejection(
+	op: ReplicationOp,
+	reason: InboundScopeRejectionReason,
+	peerDeviceId: string | null,
+	scopeId: string | null,
+): InboundScopeRejection {
+	return {
+		op_id: op.op_id,
+		entity_type: op.entity_type,
+		entity_id: op.entity_id,
+		scope_id: scopeId,
+		peer_device_id: peerDeviceId,
+		reason,
+	};
+}
+
+function normalizeInboundScopeId(value: unknown): string | null {
+	return cleanText(value);
+}
+
+function metadataObject(payload: Record<string, unknown> | null): Record<string, unknown> {
+	const metadata = payload?.metadata_json;
+	if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return {};
+	return metadata as Record<string, unknown>;
+}
+
+function payloadContradictsInboundScope(
+	opScopeId: string,
+	payload: Record<string, unknown> | null,
+): boolean {
+	const metadata = metadataObject(payload);
+	const payloadScopeId = cleanText(payload?.scope_id ?? metadata.scope_id);
+	if (payloadScopeId && payloadScopeId !== opScopeId) return true;
+
+	const workspaceId = cleanText(payload?.workspace_id ?? metadata.workspace_id);
+	if (workspaceId?.startsWith("personal:") && workspaceId !== opScopeId) return true;
+
+	const workspaceKind = cleanText(
+		payload?.workspace_kind ?? metadata.workspace_kind,
+	)?.toLowerCase();
+	const actorId = cleanText(payload?.actor_id ?? metadata.actor_id);
+	if (workspaceKind === "personal" && actorId && `personal:${actorId}` !== opScopeId) {
+		return true;
+	}
+
+	return false;
+}
+
+function authorizationFailureReason(
+	auth: CachedScopeAuthorizationResult,
+	notMemberReason: "sender_not_member" | "receiver_not_member",
+): InboundScopeRejectionReason | null {
+	if (auth.scope?.authority_type === "local") return "missing_scope";
+	if (auth.authorized) return null;
+	if (
+		!auth.scope ||
+		auth.state === "revoked" ||
+		auth.state === "stale_epoch" ||
+		auth.state === "scope_unknown" ||
+		auth.state === "scope_inactive"
+	) {
+		return "stale_epoch";
+	}
+	return notMemberReason;
+}
+
+type LocalDefaultOldSideReassignmentValidation =
+	| { ok: true; reassignment: ReassignScopePayload }
+	| { ok: false; reason: "scope_mismatch" | "sender_not_member" };
+
+function validateLocalDefaultOldSideReassignment(
+	db: Database,
+	op: ReplicationOp,
+	senderDeviceId: string | null,
+): LocalDefaultOldSideReassignmentValidation {
+	let reassignment: ReassignScopePayload;
+	try {
+		reassignment = parseReassignScopePayload(op);
+	} catch {
+		return { ok: false, reason: "scope_mismatch" };
+	}
+	if (reassignment.side !== "old" || reassignment.old_scope_id !== DEFAULT_SYNC_SCOPE_ID) {
+		return { ok: false, reason: "scope_mismatch" };
+	}
+	if (
+		!senderDeviceId ||
+		cleanText(op.device_id) !== senderDeviceId ||
+		cleanText(op.clock_device_id) !== senderDeviceId
+	) {
+		return { ok: false, reason: "sender_not_member" };
+	}
+	const existing = db
+		.prepare("SELECT origin_device_id FROM memory_items WHERE import_key = ?")
+		.get(op.entity_id) as { origin_device_id: string | null } | undefined;
+	if (existing && cleanText(existing.origin_device_id) !== senderDeviceId) {
+		return { ok: false, reason: "sender_not_member" };
+	}
+	return { ok: true, reassignment };
+}
+
+function validateInboundScopeOp(
+	db: Database,
+	op: ReplicationOp,
+	localDeviceId: string,
+	options: InboundScopeValidationOptions,
+): InboundScopeRejection | null {
+	const peerDeviceId = cleanText(options.peerDeviceId) ?? cleanText(op.device_id);
+	if (op.op_type === ACCESS_CLEANUP_OP_TYPE) {
+		const senderDeviceId = peerDeviceId ?? cleanText(op.clock_device_id);
+		if (
+			!senderDeviceId ||
+			cleanText(op.device_id) !== senderDeviceId ||
+			cleanText(op.clock_device_id) !== senderDeviceId
+		) {
+			return inboundScopeRejection(op, "sender_not_member", peerDeviceId, null);
+		}
+		return null;
+	}
+	const senderDeviceId = peerDeviceId ?? cleanText(op.clock_device_id);
+	const receiverDeviceId = cleanText(localDeviceId);
+	const opScopeId = normalizeInboundScopeId(op.scope_id);
+
+	if (!opScopeId) return inboundScopeRejection(op, "missing_scope", peerDeviceId, null);
+	const payload = parsePayload(op.payload_json);
+	if (payloadContradictsInboundScope(opScopeId, payload)) {
+		return inboundScopeRejection(op, "scope_mismatch", peerDeviceId, opScopeId);
+	}
+
+	if (
+		!senderDeviceId ||
+		cleanText(op.device_id) !== senderDeviceId ||
+		cleanText(op.clock_device_id) !== senderDeviceId
+	) {
+		return inboundScopeRejection(op, "sender_not_member", peerDeviceId, opScopeId);
+	}
+	let authorizationScopeId = opScopeId;
+	let requireReceiverMembership = true;
+	let allowLocalAuthorityRetraction = false;
+	if (opScopeId === DEFAULT_SYNC_SCOPE_ID) {
+		const validation = validateLocalDefaultOldSideReassignment(db, op, senderDeviceId);
+		if (!validation.ok) {
+			return inboundScopeRejection(op, validation.reason, peerDeviceId, opScopeId);
+		}
+		authorizationScopeId = validation.reassignment.new_scope_id;
+		allowLocalAuthorityRetraction = true;
+		// This side only retracts sender-origin data previously delivered through
+		// local-default. Prior recipients intentionally are not members of the new
+		// boundary, and the apply path cannot create a new-scope row for them.
+		requireReceiverMembership = false;
+	}
+
+	const senderAuth = getCachedScopeAuthorization(db, {
+		deviceId: senderDeviceId,
+		scopeId: authorizationScopeId,
+	});
+	// A validated old-side op only retracts a sender-owned local-default row;
+	// it cannot create data in the destination scope. Permit that removal when
+	// the receiver cannot know the sender's new device-local scope.
+	const senderFailure =
+		allowLocalAuthorityRetraction &&
+		(senderAuth.authorized || (senderAuth.state === "not_authorized" && !senderAuth.scope))
+			? null
+			: authorizationFailureReason(senderAuth, "sender_not_member");
+	if (senderFailure) return inboundScopeRejection(op, senderFailure, peerDeviceId, opScopeId);
+
+	if (requireReceiverMembership) {
+		if (!receiverDeviceId) {
+			return inboundScopeRejection(op, "receiver_not_member", peerDeviceId, opScopeId);
+		}
+		const receiverAuth = getCachedScopeAuthorization(db, {
+			deviceId: receiverDeviceId,
+			scopeId: authorizationScopeId,
+		});
+		const receiverFailure = authorizationFailureReason(receiverAuth, "receiver_not_member");
+		if (receiverFailure) return inboundScopeRejection(op, receiverFailure, peerDeviceId, opScopeId);
+	}
+
+	return null;
+}
+
+function validateInboundScopeBatch(
+	db: Database,
+	ops: ReplicationOp[],
+	localDeviceId: string,
+	options: InboundScopeValidationOptions,
+): InboundScopeRejection[] {
+	const rejections: InboundScopeRejection[] = [];
+	const expectedPeerDeviceId = cleanText(options.peerDeviceId);
+	for (const op of ops) {
+		if (!expectedPeerDeviceId && op.device_id === localDeviceId) continue;
+		const rejection = validateInboundScopeOp(db, op, localDeviceId, options);
+		if (rejection) rejections.push(rejection);
+	}
+	return rejections;
+}
+
+function validateInboundLocalOnlyBatch(
+	db: Database,
+	ops: ReplicationOp[],
+	options: InboundScopeValidationOptions,
+): InboundScopeRejection[] {
+	const peerDeviceId = cleanText(options.peerDeviceId);
+	const rejections: InboundScopeRejection[] = [];
+	for (const op of ops) {
+		if (op.entity_type !== "memory_item" || op.op_type === ACCESS_CLEANUP_OP_TYPE) continue;
+		const scopeId = normalizeInboundScopeId(op.scope_id);
+		if (!scopeId) {
+			rejections.push(inboundScopeRejection(op, "missing_scope", peerDeviceId, null));
+			continue;
+		}
+		if (scopeId !== DEFAULT_SYNC_SCOPE_ID) {
+			const scope = db
+				.prepare("SELECT authority_type FROM replication_scopes WHERE scope_id = ? LIMIT 1")
+				.get(scopeId) as { authority_type?: string | null } | undefined;
+			if (scope?.authority_type === "local" || (!scope && options.enabled === false)) {
+				rejections.push(inboundScopeRejection(op, "missing_scope", peerDeviceId, scopeId));
+			}
+			continue;
+		}
+		if (op.op_type === REASSIGN_SCOPE_OP_TYPE) {
+			const validation = validateLocalDefaultOldSideReassignment(
+				db,
+				op,
+				peerDeviceId ?? cleanText(op.clock_device_id),
+			);
+			if (validation.ok) continue;
+			if (validation.reason === "sender_not_member") {
+				rejections.push(inboundScopeRejection(op, validation.reason, peerDeviceId, scopeId));
+				continue;
+			}
+		}
+		rejections.push(inboundScopeRejection(op, "scope_mismatch", peerDeviceId, scopeId));
+	}
+	return rejections;
+}
+
+function ensureSyncScopeRejectionLogTable(db: Database): void {
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS sync_scope_rejections (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			peer_device_id TEXT,
+			op_id TEXT NOT NULL,
+			entity_type TEXT NOT NULL,
+			entity_id TEXT NOT NULL,
+			scope_id TEXT,
+			reason TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_sync_scope_rejections_peer_created
+			ON sync_scope_rejections(peer_device_id, created_at);
+		CREATE INDEX IF NOT EXISTS idx_sync_scope_rejections_scope_created
+			ON sync_scope_rejections(scope_id, created_at);
+	`);
+}
+
+function recordInboundScopeRejections(db: Database, rejections: InboundScopeRejection[]): void {
+	if (rejections.length === 0) return;
+	ensureSyncScopeRejectionLogTable(db);
+	const now = new Date().toISOString();
+	const insert = db.prepare(
+		`INSERT INTO sync_scope_rejections(
+			peer_device_id, op_id, entity_type, entity_id, scope_id, reason, created_at
+		 ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+	);
+	db.transaction(() => {
+		for (const rejection of rejections) {
+			insert.run(
+				rejection.peer_device_id,
+				rejection.op_id,
+				rejection.entity_type,
+				rejection.entity_id,
+				rejection.scope_id,
+				rejection.reason,
+				now,
+			);
+		}
+	})();
+}
+
+function emptyApplyResult(): ApplyResult {
+	return {
+		applied: 0,
+		skipped: 0,
+		rejected: 0,
+		conflicts: 0,
+		errors: [],
+		rejections: [],
+		vectorWork: { upsertMemoryIds: [], deleteMemoryIds: [] },
+	};
+}
+
+export function rejectInboundScopeFailures(
+	db: Database,
+	ops: ReplicationOp[],
+	localDeviceId: string,
+	options: InboundScopeValidationOptions,
+): ApplyResult | null {
+	const localOnlyRejections = validateInboundLocalOnlyBatch(db, ops, options);
+	const rejections =
+		localOnlyRejections.length > 0
+			? localOnlyRejections
+			: options.enabled === false
+				? []
+				: validateInboundScopeBatch(db, ops, localDeviceId, options);
+	if (rejections.length === 0) return null;
+	const result = emptyApplyResult();
+	result.rejected = rejections.length;
+	result.rejections = rejections;
+	result.errors.push(
+		...rejections.map((rejection) => `op ${rejection.op_id}: rejected — ${rejection.reason}`),
+	);
+	try {
+		recordInboundScopeRejections(db, rejections);
+	} catch (err) {
+		result.errors.push(
+			`scope rejection log failed: ${err instanceof Error ? err.message : String(err)}`,
+		);
+	}
+	return result;
+}
+
+/** Aggregate counts of recorded inbound-scope rejections per peer device. */
+export interface InboundScopeRejectionPeerSummary {
+	peer_device_id: string | null;
+	total: number;
+	by_reason: Partial<Record<InboundScopeRejectionReason, number>>;
+	last_at: string | null;
+}
+
+export interface InboundScopeRejectionSummaryOptions {
+	/** ISO timestamp; rejections older than this are ignored. */
+	sinceIso?: string;
+	/** Optional: only summarize rejections recorded for this peer. */
+	peerDeviceId?: string | null;
+}
+
+/**
+ * Read-only summary of recorded inbound-scope rejections grouped by peer.
+ * Pure aggregate over the rejection log — never reads payloads (the log
+ * does not store any). Used by the sync API to render reason-code
+ * breakdowns without exposing op contents.
+ */
+export function summarizeInboundScopeRejections(
+	db: Database,
+	options: InboundScopeRejectionSummaryOptions = {},
+): InboundScopeRejectionPeerSummary[] {
+	if (!syncScopeRejectionsTableExists(db)) return [];
+	const params: unknown[] = [];
+	const filters: string[] = [];
+	if (options.sinceIso) {
+		filters.push(`created_at >= ?`);
+		params.push(options.sinceIso);
+	}
+	if (options.peerDeviceId !== undefined) {
+		const id = cleanText(options.peerDeviceId);
+		if (id === null) {
+			filters.push(`peer_device_id IS NULL`);
+		} else {
+			filters.push(`peer_device_id = ?`);
+			params.push(id);
+		}
+	}
+	const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+	const rows = db
+		.prepare(
+			`SELECT peer_device_id, reason, COUNT(*) AS count, MAX(created_at) AS last_at
+			   FROM sync_scope_rejections
+			   ${where}
+			  GROUP BY peer_device_id, reason`,
+		)
+		.all(...params) as Array<{
+		peer_device_id: string | null;
+		reason: string;
+		count: number;
+		last_at: string | null;
+	}>;
+
+	const summaries = new Map<string, InboundScopeRejectionPeerSummary>();
+	for (const row of rows) {
+		const key = row.peer_device_id ?? "";
+		let entry = summaries.get(key);
+		if (!entry) {
+			entry = {
+				peer_device_id: row.peer_device_id ?? null,
+				total: 0,
+				by_reason: {},
+				last_at: null,
+			};
+			summaries.set(key, entry);
+		}
+		const reason = row.reason as InboundScopeRejectionReason;
+		const count = Number(row.count ?? 0);
+		entry.by_reason[reason] = (entry.by_reason[reason] ?? 0) + count;
+		entry.total += count;
+		if (row.last_at && (!entry.last_at || row.last_at > entry.last_at)) {
+			entry.last_at = row.last_at;
+		}
+	}
+	return Array.from(summaries.values());
+}
+
+export interface InboundScopeRejectionRecord extends InboundScopeRejection {
+	id: number;
+	created_at: string;
+}
+
+export interface ListInboundScopeRejectionsOptions {
+	peerDeviceId?: string | null;
+	sinceIso?: string;
+	limit?: number;
+}
+
+/**
+ * List recently recorded inbound-scope rejections (newest first). Each row
+ * is metadata only — op id, entity ref, scope id, reason, timestamp — and
+ * never includes op payloads (the log does not store them).
+ */
+export function listInboundScopeRejections(
+	db: Database,
+	options: ListInboundScopeRejectionsOptions = {},
+): InboundScopeRejectionRecord[] {
+	if (!syncScopeRejectionsTableExists(db)) return [];
+	const params: unknown[] = [];
+	const filters: string[] = [];
+	if (options.sinceIso) {
+		filters.push(`created_at >= ?`);
+		params.push(options.sinceIso);
+	}
+	if (options.peerDeviceId !== undefined) {
+		const id = cleanText(options.peerDeviceId);
+		if (id === null) {
+			filters.push(`peer_device_id IS NULL`);
+		} else {
+			filters.push(`peer_device_id = ?`);
+			params.push(id);
+		}
+	}
+	const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+	const limit = Math.max(1, Math.min(options.limit ?? 100, 500));
+	const rows = db
+		.prepare(
+			`SELECT id, peer_device_id, op_id, entity_type, entity_id, scope_id, reason, created_at
+			   FROM sync_scope_rejections
+			   ${where}
+			  ORDER BY created_at DESC, id DESC
+			  LIMIT ?`,
+		)
+		.all(...params, limit) as Array<{
+		id: number;
+		peer_device_id: string | null;
+		op_id: string;
+		entity_type: string;
+		entity_id: string;
+		scope_id: string | null;
+		reason: string;
+		created_at: string;
+	}>;
+	return rows.map((row) => ({
+		id: Number(row.id),
+		peer_device_id: row.peer_device_id ?? null,
+		op_id: row.op_id,
+		entity_type: row.entity_type,
+		entity_id: row.entity_id,
+		scope_id: row.scope_id ?? null,
+		reason: row.reason as InboundScopeRejectionReason,
+		created_at: row.created_at,
+	}));
+}
+
+function syncScopeRejectionsTableExists(db: Database): boolean {
+	const row = db
+		.prepare(
+			`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_scope_rejections' LIMIT 1`,
+		)
+		.get();
+	return Boolean(row);
 }
 
 const LEGACY_IMPORT_KEY_OLD_RE = /^legacy:memory_item:(.+)$/;
@@ -1660,7 +3337,8 @@ export function backfillReplicationOps(db: Database, limit = 200): number {
 
 		const clockDeviceId = originDeviceId;
 		if (!clockDeviceId) continue;
-		const payload = buildPayloadFromMemoryRow(row);
+		const scopeId = ensureMemoryScopeId(db, rowId);
+		const payload = buildPayloadFromMemoryRow({ ...row, scope_id: scopeId });
 
 		d.insert(schema.replicationOps)
 			.values({
@@ -1674,6 +3352,7 @@ export function backfillReplicationOps(db: Database, limit = 200): number {
 				clock_device_id: clockDeviceId,
 				device_id: clockDeviceId,
 				created_at: now,
+				scope_id: scopeId,
 			})
 			.onConflictDoNothing()
 			.run();
@@ -1733,9 +3412,14 @@ function buildPayloadFromMemoryRow(row: MemoryItemRow): MemoryPayload {
 		user_prompt_id: row.user_prompt_id ?? null,
 		prompt_number: row.prompt_number ?? null,
 		deleted_at: row.deleted_at ?? null,
+		scope_id: row.scope_id ?? null,
 		has_deleted_at: row.deleted_at != null,
 		rev: row.rev ?? 0,
 		import_key: row.import_key ?? null,
+		// Denormalized project from memory_items so the outbound payload
+		// carries it without a session join. Callers may still override with
+		// sessions.project for legacy rows whose memory_items.project is null.
+		project: row.project ?? null,
 	};
 }
 
@@ -1754,15 +3438,21 @@ export function applyReplicationOps(
 	db: Database,
 	ops: ReplicationOp[],
 	localDeviceId: string,
+	scanner?: SecretScanner,
+	options: ApplyReplicationOpsOptions = {},
 ): ApplyResult {
 	const d = drizzle(db, { schema });
-	const result: ApplyResult = {
-		applied: 0,
-		skipped: 0,
-		conflicts: 0,
-		errors: [],
-		vectorWork: { upsertMemoryIds: [], deleteMemoryIds: [] },
-	};
+	// Peer-shipped content goes through the same redaction policy as
+	// locally-authored writes. Callers that maintain their own scanner
+	// (typically a MemoryStore instance) should pass it so workspace-level
+	// rule overrides apply uniformly. Otherwise fall back to defaults.
+	const activeScanner = scanner ?? new SecretScanner();
+	const result: ApplyResult = emptyApplyResult();
+	const inboundScopeValidation = options.inboundScopeValidation;
+	if (inboundScopeValidation) {
+		const rejected = rejectInboundScopeFailures(db, ops, localDeviceId, inboundScopeValidation);
+		if (rejected) return rejected;
+	}
 	const upsertMemoryIds = new Set<number>();
 	const deleteMemoryIds = new Set<number>();
 	const queueVectorUpsert = (memoryId: number): void => {
@@ -1774,6 +3464,30 @@ export function applyReplicationOps(
 		if (!Number.isInteger(memoryId) || memoryId <= 0) return;
 		upsertMemoryIds.delete(memoryId);
 		deleteMemoryIds.add(memoryId);
+	};
+	const applyAccessCleanupOp = (op: ReplicationOp): boolean => {
+		const cleanup = parseAccessCleanupPayload(op);
+		if (!cleanup.cleanup_scope_id) return false;
+		const existingForCleanup = d
+			.select({
+				id: schema.memoryItems.id,
+				origin_device_id: schema.memoryItems.origin_device_id,
+				scope_id: schema.memoryItems.scope_id,
+			})
+			.from(schema.memoryItems)
+			.where(eq(schema.memoryItems.import_key, op.entity_id))
+			.limit(1)
+			.get();
+		if (!existingForCleanup) return true;
+		const sourceDeviceId = cleanText(op.clock_device_id) ?? cleanText(op.device_id);
+		const originDeviceId = cleanText(existingForCleanup.origin_device_id);
+		if (!sourceDeviceId || !originDeviceId || originDeviceId !== sourceDeviceId) return false;
+		if (originDeviceId === localDeviceId) return false;
+		if (cleanText(existingForCleanup.scope_id) !== cleanup.cleanup_scope_id) return false;
+		clearMemoryRefs(db, Number(existingForCleanup.id));
+		d.delete(schema.memoryItems).where(eq(schema.memoryItems.id, existingForCleanup.id)).run();
+		queueVectorDelete(Number(existingForCleanup.id));
+		return true;
 	};
 
 	const applyAll = db.transaction(() => {
@@ -1796,8 +3510,86 @@ export function applyReplicationOps(
 					continue;
 				}
 
-				if (op.op_type === "upsert") {
+				const reassignment =
+					op.op_type === REASSIGN_SCOPE_OP_TYPE ? parseReassignScopePayload(op) : null;
+				if (reassignment?.side === "old") {
+					const current = d
+						.select({
+							id: schema.memoryItems.id,
+							origin_device_id: schema.memoryItems.origin_device_id,
+							rev: schema.memoryItems.rev,
+							updated_at: schema.memoryItems.updated_at,
+							metadata_json: schema.memoryItems.metadata_json,
+							scope_id: schema.memoryItems.scope_id,
+						})
+						.from(schema.memoryItems)
+						.where(eq(schema.memoryItems.import_key, op.entity_id))
+						.get();
+					if (
+						!current ||
+						(cleanText(current.scope_id) ?? DEFAULT_SYNC_SCOPE_ID) !== reassignment.old_scope_id
+					) {
+						insertReplicationOpRow(d, op);
+						result.skipped++;
+						continue;
+					}
+					if (reassignment.old_scope_id === DEFAULT_SYNC_SCOPE_ID) {
+						const senderDeviceId = cleanText(op.clock_device_id);
+						const originDeviceId = cleanText(current.origin_device_id);
+						if (
+							!senderDeviceId ||
+							cleanText(op.device_id) !== senderDeviceId ||
+							!originDeviceId ||
+							originDeviceId !== senderDeviceId ||
+							originDeviceId === localDeviceId
+						) {
+							throw new Error("reassign_origin_mismatch");
+						}
+					}
+					const currentClock = clockTuple(
+						current.rev ?? 0,
+						current.updated_at ?? "",
+						clockDeviceIdFromMetadataJson(current.metadata_json),
+					);
+					const incomingClock = clockTuple(op.clock_rev, op.clock_updated_at, op.clock_device_id);
+					if (!isNewerClock(incomingClock, currentClock)) {
+						insertReplicationOpRow(d, op);
+						result.conflicts++;
+						continue;
+					}
+					const metadata = fromJson(current.metadata_json);
+					metadata.clock_device_id = op.clock_device_id;
+					metadata.last_scope_reassignment = reassignment;
+					d.update(schema.memoryItems)
+						.set({
+							active: 0,
+							deleted_at: op.clock_updated_at,
+							rev: op.clock_rev,
+							updated_at: op.clock_updated_at,
+							metadata_json: toJson(metadata),
+						})
+						.where(eq(schema.memoryItems.id, current.id))
+						.run();
+					queueVectorDelete(Number(current.id));
+					insertReplicationOpRow(d, op);
+					result.applied++;
+					continue;
+				}
+
+				if (op.op_type === ACCESS_CLEANUP_OP_TYPE) {
+					const cleaned = applyAccessCleanupOp(op);
+					insertReplicationOpRow(d, op);
+					if (cleaned) result.applied++;
+					else result.skipped++;
+					continue;
+				}
+
+				if (op.op_type === "upsert" || reassignment?.side === "new") {
 					const importKey = op.entity_id;
+					const opScopeId =
+						typeof op.scope_id === "string" && op.scope_id.trim().length > 0
+							? op.scope_id.trim()
+							: null;
 					const memRow = d
 						.select({
 							id: schema.memoryItems.id,
@@ -1808,6 +3600,7 @@ export function applyReplicationOps(
 							active: schema.memoryItems.active,
 							deleted_at: schema.memoryItems.deleted_at,
 							metadata_json: schema.memoryItems.metadata_json,
+							scope_id: schema.memoryItems.scope_id,
 						})
 						.from(schema.memoryItems)
 						.where(eq(schema.memoryItems.import_key, importKey))
@@ -1822,7 +3615,21 @@ export function applyReplicationOps(
 						);
 						const opClock = clockTuple(op.clock_rev, op.clock_updated_at, op.clock_device_id);
 
-						if (!isNewerClock(opClock, existingClock)) {
+						const sameReassignmentClock =
+							reassignment?.side === "new" &&
+							opClock[0] === existingClock[0] &&
+							opClock[1] === existingClock[1] &&
+							opClock[2] === existingClock[2] &&
+							(cleanText(memRow.scope_id) ?? DEFAULT_SYNC_SCOPE_ID) === reassignment.old_scope_id;
+						if (
+							reassignment &&
+							![reassignment.old_scope_id, reassignment.new_scope_id].includes(
+								cleanText(memRow.scope_id) ?? DEFAULT_SYNC_SCOPE_ID,
+							)
+						) {
+							throw new Error("reassign_existing_scope_mismatch");
+						}
+						if (!isNewerClock(opClock, existingClock) && !sameReassignmentClock) {
 							result.conflicts++;
 							// Still record the op so we don't re-process it
 							insertReplicationOpRow(d, op);
@@ -1831,7 +3638,16 @@ export function applyReplicationOps(
 
 						// Update existing row from payload — skip if malformed
 						const payload = parseMemoryPayload(op, result.errors);
-						if (!payload) continue;
+						if (!payload) {
+							// A malformed payload can never be applied. Record the op so
+							// it is acknowledged exactly once (not re-parsed and re-errored
+							// every pass) and the inbound cursor can eventually advance
+							// past it instead of stalling forever.
+							insertReplicationOpRow(d, op);
+							result.skipped++;
+							continue;
+						}
+						redactMemoryFields(payload, activeScanner);
 						const metaObj = mergePayloadMetadata(payload.metadata_json, op.clock_device_id);
 						const nextTitle = resolveReplicatedTextUpdate(payload.title, memRow.title);
 						const nextBodyText = resolveReplicatedTextUpdate(payload.body_text, memRow.body_text);
@@ -1844,9 +3660,17 @@ export function applyReplicationOps(
 							? payload.deleted_at
 							: (memRow.deleted_at ?? null);
 						const becomesActive = nextActive !== 0 && nextDeletedAt == null;
-						const shouldDeleteVectors =
-							payload.deleted_at != null ||
-							(payload.active != null && Number(payload.active) === 0);
+						// Keep `active` consistent with the tombstone: when the row stays
+						// (or becomes) tombstoned, force active=0 so a field-omitting
+						// upsert that carries active=1 cannot resurrect a deleted memory
+						// (read paths filter on active=1).
+						const writtenActive = nextDeletedAt != null ? 0 : nextActive;
+						// Base the vector decision on the FINAL persisted state, not the
+						// raw payload: a row that stays (or becomes) tombstoned — active=0
+						// or deleted_at set — must have its embeddings removed, not
+						// re-upserted (the vector queue lets an upsert cancel a pending
+						// delete, which would leave a deleted memory searchable).
+						const shouldDeleteVectors = nextDeletedAt != null || writtenActive === 0;
 						const shouldQueueVectorUpsert =
 							!shouldDeleteVectors && (contentChanged || (wasInactive && becomesActive));
 
@@ -1858,11 +3682,15 @@ export function applyReplicationOps(
 								body_text: sql`COALESCE(${payload.body_text}, ${schema.memoryItems.body_text})`,
 								confidence: sql`COALESCE(${payload.confidence != null ? Number(payload.confidence) : null}, ${schema.memoryItems.confidence})`,
 								tags_text: sql`COALESCE(NULLIF(TRIM(${payload.tags_text}), ''), ${schema.memoryItems.tags_text})`,
-								active: sql`COALESCE(${payload.active != null ? Number(payload.active) : null}, ${schema.memoryItems.active})`,
+								active: writtenActive,
 								updated_at: op.clock_updated_at,
 								metadata_json: toJson(metaObj),
 								rev: op.clock_rev,
-								deleted_at: payload.deleted_at,
+								// Honor the wire intent flag: only clear/set the tombstone
+								// when the payload actually carried `deleted_at`; otherwise
+								// preserve the existing value (nextDeletedAt). Guards against
+								// a field-omitting upsert resurrecting a tombstoned row.
+								deleted_at: nextDeletedAt,
 								actor_id: sql`COALESCE(${payload.actor_id}, ${schema.memoryItems.actor_id})`,
 								actor_display_name: sql`COALESCE(${payload.actor_display_name}, ${schema.memoryItems.actor_display_name})`,
 								visibility: sql`COALESCE(${payload.visibility}, ${schema.memoryItems.visibility})`,
@@ -1878,6 +3706,11 @@ export function applyReplicationOps(
 								files_modified: toJsonNullable(payload.files_modified),
 								user_prompt_id: payload.user_prompt_id,
 								prompt_number: payload.prompt_number,
+								scope_id: sql`COALESCE(${opScopeId}, ${schema.memoryItems.scope_id})`,
+								// Backfill project on existing rows when the inbound
+								// payload carries it; preserve the existing value when
+								// the sender (older code) omitted the field.
+								project: sql`COALESCE(${typeof payload.project === "string" && payload.project.trim() ? payload.project.trim() : null}, ${schema.memoryItems.project})`,
 							})
 							.where(eq(schema.memoryItems.import_key, importKey))
 							.run();
@@ -1895,7 +3728,14 @@ export function applyReplicationOps(
 					} else {
 						// Insert new memory item — skip if malformed
 						const payload = parseMemoryPayload(op, result.errors);
-						if (!payload) continue;
+						if (!payload) {
+							// See the update branch: record malformed ops so they are
+							// acknowledged once and never block inbound cursor progress.
+							insertReplicationOpRow(d, op);
+							result.skipped++;
+							continue;
+						}
+						redactMemoryFields(payload, activeScanner);
 						const replicatedProject =
 							typeof payload.project === "string" && payload.project.trim()
 								? payload.project.trim()
@@ -1939,6 +3779,11 @@ export function applyReplicationOps(
 								files_modified: toJsonNullable(payload.files_modified),
 								user_prompt_id: payload.user_prompt_id,
 								prompt_number: payload.prompt_number,
+								scope_id: opScopeId,
+								// Persist replicated project name so the Projects read
+								// model can surface this memory under its originating
+								// project identity without joining through sessions.
+								project: replicatedProject,
 							})
 							.returning({ id: schema.memoryItems.id })
 							.all();
@@ -1959,6 +3804,10 @@ export function applyReplicationOps(
 					}
 				} else if (op.op_type === "delete") {
 					const importKey = op.entity_id;
+					const opScopeId =
+						typeof op.scope_id === "string" && op.scope_id.trim().length > 0
+							? op.scope_id.trim()
+							: null;
 					const existingForDelete = d
 						.select({
 							id: schema.memoryItems.id,
@@ -1974,7 +3823,9 @@ export function applyReplicationOps(
 					if (existingForDelete) {
 						// Clock-compare: only delete if the incoming op is newer
 						const existingClock = clockTuple(
-							existingForDelete.rev ?? 1,
+							// Match the upsert path's `rev ?? 0` so Lamport tie-breaks are
+							// symmetric when an existing row has a NULL rev.
+							existingForDelete.rev ?? 0,
 							existingForDelete.updated_at ?? "",
 							clockDeviceIdFromMetadataJson(existingForDelete.metadata_json),
 						);
@@ -1985,18 +3836,28 @@ export function applyReplicationOps(
 							continue;
 						}
 						const now = new Date().toISOString();
+						const deleteMetadata = fromJson(existingForDelete.metadata_json);
+						deleteMetadata.clock_device_id = op.clock_device_id;
 						d.update(schema.memoryItems)
 							.set({
 								active: 0,
 								deleted_at: sql`COALESCE(${schema.memoryItems.deleted_at}, ${now})`,
 								rev: op.clock_rev,
 								updated_at: op.clock_updated_at,
+								metadata_json: toJson(deleteMetadata),
+								scope_id: sql`COALESCE(${opScopeId}, ${schema.memoryItems.scope_id})`,
 							})
 							.where(eq(schema.memoryItems.id, existingForDelete.id))
 							.run();
 						queueVectorDelete(Number(existingForDelete.id));
+					} else {
+						// import_key not found: record the delete as a tombstone for
+						// future resolution, but it mutated nothing — count it as
+						// skipped rather than applied.
+						insertReplicationOpRow(d, op);
+						result.skipped++;
+						continue;
 					}
-					// If import_key not found, record the op as a tombstone for future resolution
 				} else {
 					result.skipped++;
 					insertReplicationOpRow(d, op);
@@ -2034,6 +3895,7 @@ function insertReplicationOpRow(d: ReturnType<typeof drizzle>, op: ReplicationOp
 			clock_device_id: op.clock_device_id,
 			device_id: op.device_id,
 			created_at: op.created_at,
+			scope_id: op.scope_id ?? null,
 		})
 		.onConflictDoNothing()
 		.run();

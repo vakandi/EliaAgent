@@ -8,9 +8,15 @@
 import * as p from "@clack/prompts";
 import {
 	compareMemoryRoleReports,
+	type ExtractionBenchmarkScore,
+	type ExtractionModelCostEstimate,
+	type ExtractionStructuralDiagnostics,
+	estimateExtractionModelCost,
 	getExtractionBenchmarkProfile,
+	getExtractionModelPricing,
 	getInjectionEvalScenarioPack,
 	getInjectionEvalScenarioPrompts,
+	getMemoryArtifactReport,
 	getMemoryRoleReport,
 	getRawEventRelinkPlan,
 	getRawEventRelinkReport,
@@ -19,10 +25,12 @@ import {
 	loadObserverConfig,
 	MemoryStore,
 	ObserverClient,
+	type ObserverTokenUsage,
 	replayBatchExtraction,
 	replayBatchExtractionWithTierRouting,
 	resolveDbPath,
 	resolveProject,
+	scoreExtractionBenchmarkOutput,
 } from "@codemem/core";
 import { Command } from "commander";
 import { helpStyle } from "../help-style.js";
@@ -42,6 +50,13 @@ function parseStrictPositiveId(value: string): number | null {
 	if (!/^\d+$/.test(value.trim())) return null;
 	const n = Number(value.trim());
 	return Number.isFinite(n) && n >= 1 && Number.isInteger(n) ? n : null;
+}
+
+export function resolveOpenAIResponsesOverride(
+	cliEnabled: boolean | undefined,
+	configured: boolean | undefined,
+): boolean | undefined {
+	return cliEnabled === true ? true : configured;
 }
 
 function showMemoryAction(idStr: string, opts: DbOpts & JsonOpts): void {
@@ -99,6 +114,15 @@ function forgetMemoryAction(idStr: string, opts: DbOpts & JsonOpts): void {
 	}
 	const store = new MemoryStore(resolveDbPath(resolveDbOpt(opts)));
 	try {
+		if (!store.get(memoryId)) {
+			if (opts.json) {
+				emitJsonError("not_found", `Memory ${memoryId} not found`);
+			} else {
+				p.log.error(`Memory ${memoryId} not found`);
+				process.exitCode = 1;
+			}
+			return;
+		}
 		store.forget(memoryId);
 		if (opts.json) {
 			console.log(JSON.stringify({ id: memoryId, status: "forgotten" }));
@@ -118,6 +142,30 @@ interface RememberMemoryOptions extends DbOpts, JsonOpts {
 	project?: string;
 }
 
+function rollbackManualMemory(store: MemoryStore, sessionId: number, memoryId: number): void {
+	store.db.transaction(() => {
+		const row = store.db
+			.prepare("SELECT import_key FROM memory_items WHERE id = ?")
+			.get(memoryId) as { import_key: string | null } | undefined;
+		store.db.prepare("DELETE FROM memory_vectors WHERE memory_id = ?").run(memoryId);
+		store.db.prepare("DELETE FROM memory_file_refs WHERE memory_id = ?").run(memoryId);
+		store.db.prepare("DELETE FROM memory_concept_refs WHERE memory_id = ?").run(memoryId);
+		store.db
+			.prepare(
+				"DELETE FROM replication_ops WHERE entity_type = 'memory_item' AND (entity_id = ? OR entity_id = ?)",
+			)
+			.run(row?.import_key ?? "", String(memoryId));
+		store.db.prepare("DELETE FROM memory_items WHERE id = ?").run(memoryId);
+		store.db
+			.prepare(
+				`DELETE FROM sessions
+				 WHERE id = ?
+				   AND NOT EXISTS (SELECT 1 FROM memory_items WHERE session_id = ?)`,
+			)
+			.run(sessionId, sessionId);
+	})();
+}
+
 async function rememberMemoryAction(opts: RememberMemoryOptions): Promise<void> {
 	const store = new MemoryStore(resolveDbPath(resolveDbOpt(opts)));
 	let sessionId: number | null = null;
@@ -131,8 +179,14 @@ async function rememberMemoryAction(opts: RememberMemoryOptions): Promise<void> 
 			metadata: { manual: true },
 		});
 		const memId = store.remember(sessionId, opts.kind, opts.title, opts.body, 0.5, opts.tags);
-		await store.flushPendingVectorWrites();
+		if (!store.get(memId)) {
+			await store.flushPendingVectorWrites();
+			rollbackManualMemory(store, sessionId, memId);
+			sessionId = null;
+			throw new Error("unauthorized_scope");
+		}
 		store.endSession(sessionId, { manual: true });
+		await store.flushPendingVectorWrites();
 		if (opts.json) {
 			console.log(JSON.stringify({ id: memId }));
 		} else {
@@ -274,108 +328,121 @@ function createMemoryRoleReportCommand(): Command {
 					inactive?: boolean;
 				},
 		) => {
-			const project =
-				opts.allProjects === true
-					? null
-					: opts.project?.trim() ||
-						process.env.CODEMEM_PROJECT?.trim() ||
-						resolveProject(process.cwd(), null);
-			const invalidScenario = (opts.scenario ?? []).find(
-				(id) => getInjectionEvalScenarioPack(id) == null,
-			);
-			if (invalidScenario) {
-				throw new Error(`Unknown eval scenario pack: ${invalidScenario}`);
-			}
-			const probes = [
-				...(opts.probe ?? []),
-				...getInjectionEvalScenarioPrompts(opts.scenario ?? []),
-			];
-			const result = getMemoryRoleReport(resolveDbOpt(opts), {
-				project,
-				allProjects: opts.allProjects === true,
-				includeInactive: opts.inactive === true,
-				probes,
-			});
+			try {
+				const project =
+					opts.allProjects === true
+						? null
+						: opts.project?.trim() ||
+							process.env.CODEMEM_PROJECT?.trim() ||
+							resolveProject(process.cwd(), null);
+				const invalidScenario = (opts.scenario ?? []).find(
+					(id) => getInjectionEvalScenarioPack(id) == null,
+				);
+				if (invalidScenario) {
+					throw new Error(`Unknown eval scenario pack: ${invalidScenario}`);
+				}
+				const probes = [
+					...(opts.probe ?? []),
+					...getInjectionEvalScenarioPrompts(opts.scenario ?? []),
+				];
+				const result = getMemoryRoleReport(resolveDbOpt(opts), {
+					project,
+					allProjects: opts.allProjects === true,
+					includeInactive: opts.inactive === true,
+					probes,
+				});
 
-			if (opts.json) {
-				console.log(JSON.stringify(result, null, 2));
-				return;
-			}
+				if (opts.json) {
+					console.log(JSON.stringify(result, null, 2));
+					return;
+				}
 
-			p.intro("codemem memory role-report");
-			p.log.info(
-				[
-					`Memories: ${result.totals.memories}`,
-					`Active: ${result.totals.active}`,
-					`Sessions: ${result.totals.sessions}`,
-				].join("\n"),
-			);
-			p.log.info("Counts by role:");
-			for (const [role, count] of Object.entries(result.counts_by_role)) {
-				p.log.message(`  ${role.padEnd(10)} ${String(count)}`);
-			}
-			p.log.info("Counts by mapping:");
-			p.log.message(`  mapped      ${result.counts_by_mapping.mapped}`);
-			p.log.message(`  unmapped    ${result.counts_by_mapping.unmapped}`);
-			p.log.info("Summary lineages:");
-			p.log.message(`  session_summary         ${result.summary_lineages.session_summary}`);
-			p.log.message(`  legacy_metadata_summary ${result.summary_lineages.legacy_metadata_summary}`);
-			p.log.message(`  summary_mapped          ${result.summary_mapping.mapped}`);
-			p.log.message(`  summary_unmapped        ${result.summary_mapping.unmapped}`);
-			p.log.info("Project quality:");
-			for (const [bucket, count] of Object.entries(result.project_quality)) {
-				p.log.message(`  ${bucket.padEnd(12)} ${String(count)}`);
-			}
-			p.log.info("Session classes:");
-			for (const [bucket, count] of Object.entries(result.session_class_buckets)) {
-				p.log.message(`  ${bucket.padEnd(20)} ${String(count)}`);
-			}
-			p.log.info("Summary dispositions:");
-			for (const [bucket, count] of Object.entries(result.summary_disposition_buckets)) {
-				p.log.message(`  ${bucket.padEnd(20)} ${String(count)}`);
-			}
-			if (result.probe_results.length > 0) {
-				p.log.info("Probe results:");
-				for (const probe of result.probe_results) {
-					p.log.message(`  query: ${probe.query}`);
-					if (probe.scenario_id) {
+				p.intro("codemem memory role-report");
+				p.log.info(
+					[
+						`Memories: ${result.totals.memories}`,
+						`Active: ${result.totals.active}`,
+						`Sessions: ${result.totals.sessions}`,
+					].join("\n"),
+				);
+				p.log.info("Counts by role:");
+				for (const [role, count] of Object.entries(result.counts_by_role)) {
+					p.log.message(`  ${role.padEnd(10)} ${String(count)}`);
+				}
+				p.log.info("Counts by mapping:");
+				p.log.message(`  mapped      ${result.counts_by_mapping.mapped}`);
+				p.log.message(`  unmapped    ${result.counts_by_mapping.unmapped}`);
+				p.log.info("Summary lineages:");
+				p.log.message(`  session_summary         ${result.summary_lineages.session_summary}`);
+				p.log.message(
+					`  legacy_metadata_summary ${result.summary_lineages.legacy_metadata_summary}`,
+				);
+				p.log.message(`  summary_mapped          ${result.summary_mapping.mapped}`);
+				p.log.message(`  summary_unmapped        ${result.summary_mapping.unmapped}`);
+				p.log.info("Project quality:");
+				for (const [bucket, count] of Object.entries(result.project_quality)) {
+					p.log.message(`  ${bucket.padEnd(12)} ${String(count)}`);
+				}
+				p.log.info("Session classes:");
+				for (const [bucket, count] of Object.entries(result.session_class_buckets)) {
+					p.log.message(`  ${bucket.padEnd(20)} ${String(count)}`);
+				}
+				p.log.info("Summary dispositions:");
+				for (const [bucket, count] of Object.entries(result.summary_disposition_buckets)) {
+					p.log.message(`  ${bucket.padEnd(20)} ${String(count)}`);
+				}
+				if (result.probe_results.length > 0) {
+					p.log.info("Probe results:");
+					for (const probe of result.probe_results) {
+						p.log.message(`  query: ${probe.query}`);
+						if (probe.scenario_id) {
+							p.log.message(
+								`    scenario: ${probe.scenario_id} (${probe.scenario_category ?? "unknown"})${probe.scenario_title ? ` — ${probe.scenario_title}` : ""}`,
+							);
+						}
+						p.log.message(`    mode: ${probe.mode}`);
 						p.log.message(
-							`    scenario: ${probe.scenario_id} (${probe.scenario_category ?? "unknown"})${probe.scenario_title ? ` — ${probe.scenario_title}` : ""}`,
+							`    top roles: durable=${probe.top_role_counts.durable} recap=${probe.top_role_counts.recap} ephemeral=${probe.top_role_counts.ephemeral} general=${probe.top_role_counts.general}`,
 						);
-					}
-					p.log.message(`    mode: ${probe.mode}`);
-					p.log.message(
-						`    top roles: durable=${probe.top_role_counts.durable} recap=${probe.top_role_counts.recap} ephemeral=${probe.top_role_counts.ephemeral} general=${probe.top_role_counts.general}`,
-					);
-					p.log.message(
-						`    top mapping: mapped=${probe.top_mapping_counts.mapped} unmapped=${probe.top_mapping_counts.unmapped}`,
-					);
-					p.log.message(
-						`    burden: recap_share=${probe.top_burden.recap_share.toFixed(2)} unmapped_share=${probe.top_burden.unmapped_share.toFixed(2)} recap_unmapped_share=${probe.top_burden.recap_unmapped_share.toFixed(2)}`,
-					);
-					if (probe.simulated_demoted_unmapped_recap) {
 						p.log.message(
-							`    simulated demote-unmapped-recap burden: recap_share=${probe.simulated_demoted_unmapped_recap.top_burden.recap_share.toFixed(2)} unmapped_share=${probe.simulated_demoted_unmapped_recap.top_burden.unmapped_share.toFixed(2)} recap_unmapped_share=${probe.simulated_demoted_unmapped_recap.top_burden.recap_unmapped_share.toFixed(2)}`,
+							`    top mapping: mapped=${probe.top_mapping_counts.mapped} unmapped=${probe.top_mapping_counts.unmapped}`,
 						);
-					}
-					if (probe.simulated_demoted_unmapped_recap_and_ephemeral) {
 						p.log.message(
-							`    simulated demote-unmapped-recap+ephemeral burden: recap_share=${probe.simulated_demoted_unmapped_recap_and_ephemeral.top_burden.recap_share.toFixed(2)} unmapped_share=${probe.simulated_demoted_unmapped_recap_and_ephemeral.top_burden.unmapped_share.toFixed(2)} recap_unmapped_share=${probe.simulated_demoted_unmapped_recap_and_ephemeral.top_burden.recap_unmapped_share.toFixed(2)}`,
+							`    burden: recap_share=${probe.top_burden.recap_share.toFixed(2)} unmapped_share=${probe.top_burden.unmapped_share.toFixed(2)} recap_unmapped_share=${probe.top_burden.recap_unmapped_share.toFixed(2)}`,
 						);
-					}
-					if (probe.scenario_score) {
-						p.log.message(
-							`    scenario score: mode_match=${probe.scenario_score.mode_match ? "yes" : "no"} top1_primary=${probe.scenario_score.primary_in_top1 ? "yes" : "no"} top3_primary=${probe.scenario_score.primary_in_top3_count} top1_anti=${probe.scenario_score.anti_signal_in_top1 ? "yes" : "no"} primary=${probe.scenario_score.primary_match_count} anti=${probe.scenario_score.anti_signal_count} recap=${probe.scenario_score.recap_count} unmapped_recap=${probe.scenario_score.unmapped_recap_count} chatter=${probe.scenario_score.administrative_chatter_count} net=${probe.scenario_score.score}`,
-						);
-					}
-					for (const item of probe.items.slice(0, 5)) {
-						p.log.message(
-							`    [${item.id}] (${item.kind}/${item.role}/${item.mapping}/${item.session_class}/${item.summary_disposition}) ${item.title} — ${item.role_reason}`,
-						);
+						if (probe.simulated_demoted_unmapped_recap) {
+							p.log.message(
+								`    simulated demote-unmapped-recap burden: recap_share=${probe.simulated_demoted_unmapped_recap.top_burden.recap_share.toFixed(2)} unmapped_share=${probe.simulated_demoted_unmapped_recap.top_burden.unmapped_share.toFixed(2)} recap_unmapped_share=${probe.simulated_demoted_unmapped_recap.top_burden.recap_unmapped_share.toFixed(2)}`,
+							);
+						}
+						if (probe.simulated_demoted_unmapped_recap_and_ephemeral) {
+							p.log.message(
+								`    simulated demote-unmapped-recap+ephemeral burden: recap_share=${probe.simulated_demoted_unmapped_recap_and_ephemeral.top_burden.recap_share.toFixed(2)} unmapped_share=${probe.simulated_demoted_unmapped_recap_and_ephemeral.top_burden.unmapped_share.toFixed(2)} recap_unmapped_share=${probe.simulated_demoted_unmapped_recap_and_ephemeral.top_burden.recap_unmapped_share.toFixed(2)}`,
+							);
+						}
+						if (probe.scenario_score) {
+							p.log.message(
+								`    scenario score: mode_match=${probe.scenario_score.mode_match ? "yes" : "no"} top1_primary=${probe.scenario_score.primary_in_top1 ? "yes" : "no"} top3_primary=${probe.scenario_score.primary_in_top3_count} top1_anti=${probe.scenario_score.anti_signal_in_top1 ? "yes" : "no"} primary=${probe.scenario_score.primary_match_count} anti=${probe.scenario_score.anti_signal_count} recap=${probe.scenario_score.recap_count} unmapped_recap=${probe.scenario_score.unmapped_recap_count} chatter=${probe.scenario_score.administrative_chatter_count} net=${probe.scenario_score.score}`,
+							);
+						}
+						for (const item of probe.items.slice(0, 5)) {
+							p.log.message(
+								`    [${item.id}] (${item.kind}/${item.role}/${item.mapping}/${item.session_class}/${item.summary_disposition}) ${item.title} — ${item.role_reason}`,
+							);
+						}
 					}
 				}
+				p.outro("done");
+			} catch (error) {
+				const message = error instanceof Error ? error.message : "Role report failed";
+				if (opts.json) {
+					emitJsonError("role_report_failed", message);
+				} else {
+					p.log.error(message);
+					process.exitCode = 1;
+				}
+				return;
 			}
-			p.outro("done");
 		},
 	);
 	return cmd;
@@ -415,91 +482,180 @@ function createMemoryRoleCompareCommand(): Command {
 				inactive?: boolean;
 			},
 		) => {
-			const project =
-				opts.allProjects === true
-					? null
-					: opts.project?.trim() ||
-						process.env.CODEMEM_PROJECT?.trim() ||
-						resolveProject(process.cwd(), null);
-			const invalidScenario = (opts.scenario ?? []).find(
-				(id) => getInjectionEvalScenarioPack(id) == null,
-			);
-			if (invalidScenario) {
-				throw new Error(`Unknown eval scenario pack: ${invalidScenario}`);
-			}
-			const probes = [
-				...(opts.probe ?? []),
-				...getInjectionEvalScenarioPrompts(opts.scenario ?? []),
-			];
-			const result = compareMemoryRoleReports(baselineDb, candidateDb, {
-				project,
-				allProjects: opts.allProjects === true,
-				includeInactive: opts.inactive === true,
-				probes,
-			});
+			try {
+				const project =
+					opts.allProjects === true
+						? null
+						: opts.project?.trim() ||
+							process.env.CODEMEM_PROJECT?.trim() ||
+							resolveProject(process.cwd(), null);
+				const invalidScenario = (opts.scenario ?? []).find(
+					(id) => getInjectionEvalScenarioPack(id) == null,
+				);
+				if (invalidScenario) {
+					throw new Error(`Unknown eval scenario pack: ${invalidScenario}`);
+				}
+				const probes = [
+					...(opts.probe ?? []),
+					...getInjectionEvalScenarioPrompts(opts.scenario ?? []),
+				];
+				const result = compareMemoryRoleReports(baselineDb, candidateDb, {
+					project,
+					allProjects: opts.allProjects === true,
+					includeInactive: opts.inactive === true,
+					probes,
+				});
 
-			if (opts.json) {
-				console.log(JSON.stringify(result, null, 2));
-				return;
-			}
+				if (opts.json) {
+					console.log(JSON.stringify(result, null, 2));
+					return;
+				}
 
-			p.intro("codemem memory role-compare");
-			p.log.info(
-				[
-					`Baseline sessions: ${result.baseline.totals.sessions}`,
-					`Candidate sessions: ${result.candidate.totals.sessions}`,
-					`Delta sessions: ${result.delta.totals.sessions}`,
-					`Mapped delta: ${result.delta.counts_by_mapping.mapped}`,
-					`Unmapped delta: ${result.delta.counts_by_mapping.unmapped}`,
-					`Summary mapped delta: ${result.delta.summary_mapping.mapped}`,
-					`Summary unmapped delta: ${result.delta.summary_mapping.unmapped}`,
-				].join("\n"),
-			);
-			p.log.info("Role deltas:");
-			for (const [role, count] of Object.entries(result.delta.counts_by_role)) {
-				p.log.message(`  ${role.padEnd(10)} ${String(count)}`);
-			}
-			p.log.info("Session class deltas:");
-			for (const [bucket, count] of Object.entries(result.delta.session_class_buckets)) {
-				p.log.message(`  ${bucket.padEnd(20)} ${String(count)}`);
-			}
-			p.log.info("Summary disposition deltas:");
-			for (const [bucket, count] of Object.entries(result.delta.summary_disposition_buckets)) {
-				p.log.message(`  ${bucket.padEnd(20)} ${String(count)}`);
-			}
-			if (result.probe_comparisons.length > 0) {
-				p.log.info("Probe comparisons:");
-				for (const probe of result.probe_comparisons) {
-					p.log.message(`  query: ${probe.query}`);
-					p.log.message(
-						`    modes: baseline=${probe.baseline_mode ?? "-"} candidate=${probe.candidate_mode ?? "-"}`,
-					);
-					p.log.message(
-						`    overlap: shared_top_keys=${probe.shared_item_keys.length} baseline_top=${probe.baseline_item_ids.slice(0, 5).join(",") || "-"} candidate_top=${probe.candidate_item_ids.slice(0, 5).join(",") || "-"}`,
-					);
-					if (probe.delta_top_burden) {
+				p.intro("codemem memory role-compare");
+				p.log.info(
+					[
+						`Baseline sessions: ${result.baseline.totals.sessions}`,
+						`Candidate sessions: ${result.candidate.totals.sessions}`,
+						`Delta sessions: ${result.delta.totals.sessions}`,
+						`Mapped delta: ${result.delta.counts_by_mapping.mapped}`,
+						`Unmapped delta: ${result.delta.counts_by_mapping.unmapped}`,
+						`Summary mapped delta: ${result.delta.summary_mapping.mapped}`,
+						`Summary unmapped delta: ${result.delta.summary_mapping.unmapped}`,
+					].join("\n"),
+				);
+				p.log.info("Role deltas:");
+				for (const [role, count] of Object.entries(result.delta.counts_by_role)) {
+					p.log.message(`  ${role.padEnd(10)} ${String(count)}`);
+				}
+				p.log.info("Session class deltas:");
+				for (const [bucket, count] of Object.entries(result.delta.session_class_buckets)) {
+					p.log.message(`  ${bucket.padEnd(20)} ${String(count)}`);
+				}
+				p.log.info("Summary disposition deltas:");
+				for (const [bucket, count] of Object.entries(result.delta.summary_disposition_buckets)) {
+					p.log.message(`  ${bucket.padEnd(20)} ${String(count)}`);
+				}
+				if (result.probe_comparisons.length > 0) {
+					p.log.info("Probe comparisons:");
+					for (const probe of result.probe_comparisons) {
+						p.log.message(`  query: ${probe.query}`);
 						p.log.message(
-							`    burden delta: recap_share=${probe.delta_top_burden.recap_share.toFixed(2)} unmapped_share=${probe.delta_top_burden.unmapped_share.toFixed(2)} recap_unmapped_share=${probe.delta_top_burden.recap_unmapped_share.toFixed(2)}`,
+							`    modes: baseline=${probe.baseline_mode ?? "-"} candidate=${probe.candidate_mode ?? "-"}`,
 						);
-					}
-					if (probe.delta_top_mapping_counts) {
 						p.log.message(
-							`    mapping delta: mapped=${probe.delta_top_mapping_counts.mapped} unmapped=${probe.delta_top_mapping_counts.unmapped}`,
+							`    overlap: shared_top_keys=${probe.shared_item_keys.length} baseline_top=${probe.baseline_item_ids.slice(0, 5).join(",") || "-"} candidate_top=${probe.candidate_item_ids.slice(0, 5).join(",") || "-"}`,
 						);
-					}
-					if (probe.baseline_scenario_score || probe.candidate_scenario_score) {
-						p.log.message(
-							`    scenario scores: baseline=${probe.baseline_scenario_score?.score ?? "-"} candidate=${probe.candidate_scenario_score?.score ?? "-"}`,
-						);
-					}
-					if (probe.delta_scenario_score) {
-						p.log.message(
-							`    scenario delta: mode_match=${probe.delta_scenario_score.mode_match ?? "-"} top1_primary=${probe.delta_scenario_score.primary_in_top1 ?? "-"} top3_primary=${probe.delta_scenario_score.primary_in_top3_count ?? "-"} top1_anti=${probe.delta_scenario_score.anti_signal_in_top1 ?? "-"} primary=${probe.delta_scenario_score.primary_match_count ?? "-"} anti=${probe.delta_scenario_score.anti_signal_count ?? "-"} recap=${probe.delta_scenario_score.recap_count ?? "-"} unmapped_recap=${probe.delta_scenario_score.unmapped_recap_count ?? "-"} chatter=${probe.delta_scenario_score.administrative_chatter_count ?? "-"} net=${probe.delta_scenario_score.score ?? "-"}`,
-						);
+						if (probe.delta_top_burden) {
+							p.log.message(
+								`    burden delta: recap_share=${probe.delta_top_burden.recap_share.toFixed(2)} unmapped_share=${probe.delta_top_burden.unmapped_share.toFixed(2)} recap_unmapped_share=${probe.delta_top_burden.recap_unmapped_share.toFixed(2)}`,
+							);
+						}
+						if (probe.delta_top_mapping_counts) {
+							p.log.message(
+								`    mapping delta: mapped=${probe.delta_top_mapping_counts.mapped} unmapped=${probe.delta_top_mapping_counts.unmapped}`,
+							);
+						}
+						if (probe.baseline_scenario_score || probe.candidate_scenario_score) {
+							p.log.message(
+								`    scenario scores: baseline=${probe.baseline_scenario_score?.score ?? "-"} candidate=${probe.candidate_scenario_score?.score ?? "-"}`,
+							);
+						}
+						if (probe.delta_scenario_score) {
+							p.log.message(
+								`    scenario delta: mode_match=${probe.delta_scenario_score.mode_match ?? "-"} top1_primary=${probe.delta_scenario_score.primary_in_top1 ?? "-"} top3_primary=${probe.delta_scenario_score.primary_in_top3_count ?? "-"} top1_anti=${probe.delta_scenario_score.anti_signal_in_top1 ?? "-"} primary=${probe.delta_scenario_score.primary_match_count ?? "-"} anti=${probe.delta_scenario_score.anti_signal_count ?? "-"} recap=${probe.delta_scenario_score.recap_count ?? "-"} unmapped_recap=${probe.delta_scenario_score.unmapped_recap_count ?? "-"} chatter=${probe.delta_scenario_score.administrative_chatter_count ?? "-"} net=${probe.delta_scenario_score.score ?? "-"}`,
+							);
+						}
 					}
 				}
+				p.outro("done");
+			} catch (error) {
+				const message = error instanceof Error ? error.message : "Role compare failed";
+				if (opts.json) {
+					emitJsonError("role_compare_failed", message);
+				} else {
+					p.log.error(message);
+					process.exitCode = 1;
+				}
+				return;
 			}
-			p.outro("done");
+		},
+	);
+	return cmd;
+}
+
+function createMemoryArtifactReportCommand(): Command {
+	const cmd = new Command("artifact-report")
+		.configureHelp(helpStyle)
+		.description("Analyze legacy memory artifacts in a DB snapshot without mutating rows")
+		.option("--project <project>", "project identifier (defaults to git repo root)")
+		.option("--all-projects", "analyze across all projects")
+		.option("--inactive", "include inactive memories");
+	addDbOption(cmd);
+	addJsonOption(cmd);
+	cmd.action(
+		(
+			opts: DbOpts &
+				JsonOpts & {
+					project?: string;
+					allProjects?: boolean;
+					inactive?: boolean;
+				},
+		) => {
+			try {
+				const project =
+					opts.allProjects === true
+						? null
+						: opts.project?.trim() ||
+							process.env.CODEMEM_PROJECT?.trim() ||
+							resolveProject(process.cwd(), null);
+				const result = getMemoryArtifactReport(resolveDbOpt(opts), {
+					project,
+					allProjects: opts.allProjects === true,
+					includeInactive: opts.inactive === true,
+				});
+
+				if (opts.json) {
+					console.log(JSON.stringify(result, null, 2));
+					return;
+				}
+
+				p.intro("codemem memory artifact-report");
+				p.log.info(
+					[
+						`Memories: ${result.totals.memories}`,
+						`Active: ${result.totals.active}`,
+						`Sessions: ${result.totals.sessions}`,
+					].join("\n"),
+				);
+				p.log.info("Counts by artifact:");
+				for (const [artifact, count] of Object.entries(result.counts_by_artifact)) {
+					p.log.message(`  ${artifact.padEnd(16)} ${String(count)}`);
+				}
+				p.log.info("Counts by action:");
+				for (const [action, count] of Object.entries(result.counts_by_action)) {
+					p.log.message(`  ${action.padEnd(14)} ${String(count)}`);
+				}
+				const topReasons = Object.entries(result.counts_by_reason)
+					.sort(([, a], [, b]) => b - a)
+					.slice(0, 10);
+				if (topReasons.length > 0) {
+					p.log.info("Top reasons:");
+					for (const [reason, count] of topReasons) {
+						p.log.message(`  ${reason.padEnd(36)} ${String(count)}`);
+					}
+				}
+				p.log.info(`High-confidence telemetry: ${result.high_confidence_telemetry.total}`);
+				p.outro("done");
+			} catch (error) {
+				const message = error instanceof Error ? error.message : "Artifact report failed";
+				if (opts.json) {
+					emitJsonError("artifact_report_failed", message);
+				} else {
+					p.log.error(message);
+					process.exitCode = 1;
+				}
+				return;
+			}
 		},
 	);
 	return cmd;
@@ -525,78 +681,89 @@ function createMemoryExtractionReportCommand(): Command {
 					inactive?: boolean;
 				},
 		) => {
-			const sessionIdInput = opts.sessionId?.trim() ?? "";
-			const batchIdInput = opts.batchId?.trim() ?? "";
-			const hasSessionId = sessionIdInput.length > 0;
-			const hasBatchId = batchIdInput.length > 0;
-			if (hasSessionId === hasBatchId) {
-				throw new Error("Provide exactly one of --session-id or --batch-id");
-			}
-			const sessionId = hasSessionId ? parseStrictPositiveId(sessionIdInput) : null;
-			if (hasSessionId && sessionId === null) {
-				throw new Error(`Invalid session ID: ${sessionIdInput || opts.sessionId}`);
-			}
-			const batchId = hasBatchId ? parseStrictPositiveId(batchIdInput) : null;
-			if (hasBatchId && batchId === null) {
-				throw new Error(`Invalid batch ID: ${batchIdInput || opts.batchId}`);
-			}
-			const scenarioId = opts.scenario?.trim() ?? "";
-			const scenario = getSessionExtractionEvalScenario(scenarioId);
-			if (!scenario) {
-				throw new Error(`Unknown extraction eval scenario: ${scenarioId || opts.scenario}`);
-			}
-			const result =
-				batchId != null
-					? getSessionExtractionEval(resolveDbOpt(opts), {
-							batchId,
-							scenarioId: scenario.id,
-							includeInactive: opts.inactive === true,
-						})
-					: getSessionExtractionEval(resolveDbOpt(opts), {
-							sessionId: sessionId as number,
-							scenarioId: scenario.id,
-							includeInactive: opts.inactive === true,
-						});
+			try {
+				const sessionIdInput = opts.sessionId?.trim() ?? "";
+				const batchIdInput = opts.batchId?.trim() ?? "";
+				const hasSessionId = sessionIdInput.length > 0;
+				const hasBatchId = batchIdInput.length > 0;
+				if (hasSessionId === hasBatchId) {
+					throw new Error("Provide exactly one of --session-id or --batch-id");
+				}
+				const sessionId = hasSessionId ? parseStrictPositiveId(sessionIdInput) : null;
+				if (hasSessionId && sessionId === null) {
+					throw new Error(`Invalid session ID: ${sessionIdInput || opts.sessionId}`);
+				}
+				const batchId = hasBatchId ? parseStrictPositiveId(batchIdInput) : null;
+				if (hasBatchId && batchId === null) {
+					throw new Error(`Invalid batch ID: ${batchIdInput || opts.batchId}`);
+				}
+				const scenarioId = opts.scenario?.trim() ?? "";
+				const scenario = getSessionExtractionEvalScenario(scenarioId);
+				if (!scenario) {
+					throw new Error(`Unknown extraction eval scenario: ${scenarioId || opts.scenario}`);
+				}
+				const result =
+					batchId != null
+						? getSessionExtractionEval(resolveDbOpt(opts), {
+								batchId,
+								scenarioId: scenario.id,
+								includeInactive: opts.inactive === true,
+							})
+						: getSessionExtractionEval(resolveDbOpt(opts), {
+								sessionId: sessionId as number,
+								scenarioId: scenario.id,
+								includeInactive: opts.inactive === true,
+							});
 
-			if (opts.json) {
-				console.log(JSON.stringify(result, null, 2));
+				if (opts.json) {
+					console.log(JSON.stringify(result, null, 2));
+					return;
+				}
+
+				p.intro("codemem memory extraction-report");
+				p.log.info(
+					[
+						`Scenario: ${result.scenario.id} — ${result.scenario.title}`,
+						`Target: ${result.target.type}${result.target.batchId != null ? ` #${result.target.batchId}` : ""}`,
+						`Session: ${result.session.id} (${result.session.project ?? "no-project"})`,
+						`Session class: ${result.session.sessionClass}`,
+						`Summary disposition: ${result.session.summaryDisposition}`,
+					].join("\n"),
+				);
+				p.log.info(
+					[
+						`Pass: ${result.pass ? "yes" : "no"}`,
+						`Summary count: ${result.counts.summaries}`,
+						`Observation count: ${result.counts.observations}`,
+						`Summary thread coverage: ${result.coverage.summaryThreadCoverage}`,
+						`Observation thread coverage: ${result.coverage.observationThreadCoverage}`,
+						`Total thread coverage: ${result.coverage.totalThreadCoverage}`,
+						`Duplicate observation threads: ${result.coverage.duplicateObservationThreads}`,
+					].join("\n"),
+				);
+				if (result.failureReasons.length > 0) {
+					p.log.warn("Failure reasons:");
+					for (const reason of result.failureReasons) {
+						p.log.message(`  - ${reason}`);
+					}
+				}
+				p.log.info("Thread coverage:");
+				for (const thread of result.threads) {
+					p.log.message(
+						`  ${thread.id.padEnd(22)} summary=${thread.summaryMatch ? "yes" : "no"} observations=${thread.observationMatch ? "yes" : "no"}`,
+					);
+				}
+				p.outro("done");
+			} catch (error) {
+				const message = error instanceof Error ? error.message : "Extraction report failed";
+				if (opts.json) {
+					emitJsonError("extraction_report_failed", message);
+				} else {
+					p.log.error(message);
+					process.exitCode = 1;
+				}
 				return;
 			}
-
-			p.intro("codemem memory extraction-report");
-			p.log.info(
-				[
-					`Scenario: ${result.scenario.id} — ${result.scenario.title}`,
-					`Target: ${result.target.type}${result.target.batchId != null ? ` #${result.target.batchId}` : ""}`,
-					`Session: ${result.session.id} (${result.session.project ?? "no-project"})`,
-					`Session class: ${result.session.sessionClass}`,
-					`Summary disposition: ${result.session.summaryDisposition}`,
-				].join("\n"),
-			);
-			p.log.info(
-				[
-					`Pass: ${result.pass ? "yes" : "no"}`,
-					`Summary count: ${result.counts.summaries}`,
-					`Observation count: ${result.counts.observations}`,
-					`Summary thread coverage: ${result.coverage.summaryThreadCoverage}`,
-					`Observation thread coverage: ${result.coverage.observationThreadCoverage}`,
-					`Total thread coverage: ${result.coverage.totalThreadCoverage}`,
-					`Duplicate observation threads: ${result.coverage.duplicateObservationThreads}`,
-				].join("\n"),
-			);
-			if (result.failureReasons.length > 0) {
-				p.log.warn("Failure reasons:");
-				for (const reason of result.failureReasons) {
-					p.log.message(`  - ${reason}`);
-				}
-			}
-			p.log.info("Thread coverage:");
-			for (const thread of result.threads) {
-				p.log.message(
-					`  ${thread.id.padEnd(22)} summary=${thread.summaryMatch ? "yes" : "no"} observations=${thread.observationMatch ? "yes" : "no"}`,
-				);
-			}
-			p.outro("done");
 		},
 	);
 	return cmd;
@@ -646,111 +813,204 @@ function createMemoryExtractionReplayCommand(): Command {
 					scenario: string;
 				},
 		) => {
-			const batchIdInput = opts.batchId?.trim() ?? "";
-			const batchId = parseStrictPositiveId(batchIdInput);
-			if (batchId === null) {
-				throw new Error(`Invalid batch ID: ${batchIdInput || opts.batchId}`);
-			}
-			const scenarioId = opts.scenario?.trim() ?? "";
-			const scenario = getSessionExtractionEvalScenario(scenarioId);
-			if (!scenario) {
-				throw new Error(`Unknown extraction eval scenario: ${scenarioId || opts.scenario}`);
-			}
-			const transcriptBudgetInput = opts.transcriptBudget?.trim() ?? "";
-			const transcriptBudget =
-				transcriptBudgetInput.length > 0 ? parseStrictPositiveId(transcriptBudgetInput) : null;
-			if (transcriptBudgetInput.length > 0 && transcriptBudget === null) {
-				throw new Error(
-					`Invalid transcript budget: ${transcriptBudgetInput || opts.transcriptBudget}`,
-				);
-			}
-			const observerTemperatureInput = opts.observerTemperature?.trim() ?? "";
-			let observerTemperature: number | undefined;
-			if (observerTemperatureInput.length > 0) {
-				const parsed = Number(observerTemperatureInput);
-				if (!Number.isFinite(parsed)) {
+			try {
+				const batchIdInput = opts.batchId?.trim() ?? "";
+				const batchId = parseStrictPositiveId(batchIdInput);
+				if (batchId === null) {
+					throw new Error(`Invalid batch ID: ${batchIdInput || opts.batchId}`);
+				}
+				const scenarioId = opts.scenario?.trim() ?? "";
+				const scenario = getSessionExtractionEvalScenario(scenarioId);
+				if (!scenario) {
+					throw new Error(`Unknown extraction eval scenario: ${scenarioId || opts.scenario}`);
+				}
+				const transcriptBudgetInput = opts.transcriptBudget?.trim() ?? "";
+				const transcriptBudget =
+					transcriptBudgetInput.length > 0 ? parseStrictPositiveId(transcriptBudgetInput) : null;
+				if (transcriptBudgetInput.length > 0 && transcriptBudget === null) {
 					throw new Error(
-						`Invalid observer temperature: ${observerTemperatureInput || opts.observerTemperature}`,
+						`Invalid transcript budget: ${transcriptBudgetInput || opts.transcriptBudget}`,
 					);
 				}
-				observerTemperature = parsed;
-			}
-			const maxOutputTokensInput = opts.maxOutputTokens?.trim() ?? "";
-			const maxOutputTokens =
-				maxOutputTokensInput.length > 0 ? parseStrictPositiveId(maxOutputTokensInput) : null;
-			if (maxOutputTokensInput.length > 0 && maxOutputTokens === null) {
-				throw new Error(
-					`Invalid max output tokens: ${maxOutputTokensInput || opts.maxOutputTokens}`,
-				);
-			}
-			const observerConfig = loadObserverConfig();
-			const observerConfigWithOverrides = {
-				...observerConfig,
-				observerTemperature: observerTemperature ?? observerConfig.observerTemperature,
-				observerOpenAIUseResponses: opts.openaiResponses === true,
-				observerReasoningEffort: opts.reasoningEffort?.trim() || null,
-				observerReasoningSummary: opts.reasoningSummary?.trim() || null,
-				observerMaxOutputTokens: maxOutputTokens ?? observerConfig.observerMaxTokens,
-			};
-			const observer = new ObserverClient(observerConfigWithOverrides);
-			const result =
-				opts.observerTierRouting === true
-					? await replayBatchExtractionWithTierRouting(
-							resolveDbOpt(opts),
-							observerConfigWithOverrides,
-							{
+				const observerTemperatureInput = opts.observerTemperature?.trim() ?? "";
+				let observerTemperature: number | undefined;
+				if (observerTemperatureInput.length > 0) {
+					const parsed = Number(observerTemperatureInput);
+					if (!Number.isFinite(parsed)) {
+						throw new Error(
+							`Invalid observer temperature: ${observerTemperatureInput || opts.observerTemperature}`,
+						);
+					}
+					observerTemperature = parsed;
+				}
+				const maxOutputTokensInput = opts.maxOutputTokens?.trim() ?? "";
+				const maxOutputTokens =
+					maxOutputTokensInput.length > 0 ? parseStrictPositiveId(maxOutputTokensInput) : null;
+				if (maxOutputTokensInput.length > 0 && maxOutputTokens === null) {
+					throw new Error(
+						`Invalid max output tokens: ${maxOutputTokensInput || opts.maxOutputTokens}`,
+					);
+				}
+				const observerConfig = loadObserverConfig();
+				const observerConfigWithOverrides = {
+					...observerConfig,
+					observerTemperature: observerTemperature ?? observerConfig.observerTemperature,
+					observerOpenAIUseResponses: resolveOpenAIResponsesOverride(
+						opts.openaiResponses,
+						observerConfig.observerOpenAIUseResponses,
+					),
+					observerReasoningEffort:
+						opts.reasoningEffort === undefined
+							? observerConfig.observerReasoningEffort
+							: opts.reasoningEffort.trim() || null,
+					observerReasoningSummary:
+						opts.reasoningSummary === undefined
+							? observerConfig.observerReasoningSummary
+							: opts.reasoningSummary.trim() || null,
+					observerMaxOutputTokens:
+						maxOutputTokens ??
+						observerConfig.observerMaxOutputTokens ??
+						observerConfig.observerMaxTokens,
+					observerExplicitConfigKeys:
+						maxOutputTokens === null
+							? observerConfig.observerExplicitConfigKeys
+							: [
+									...new Set([
+										...(observerConfig.observerExplicitConfigKeys ?? []),
+										"observerMaxOutputTokens",
+									]),
+								],
+				};
+				const observer = new ObserverClient(observerConfigWithOverrides);
+				const result =
+					opts.observerTierRouting === true
+						? await replayBatchExtractionWithTierRouting(
+								resolveDbOpt(opts),
+								observerConfigWithOverrides,
+								{
+									batchId,
+									scenarioId: scenario.id,
+									transcriptBudget: transcriptBudget ?? undefined,
+								},
+							)
+						: await replayBatchExtraction(resolveDbOpt(opts), observer, {
 								batchId,
 								scenarioId: scenario.id,
 								transcriptBudget: transcriptBudget ?? undefined,
-							},
-						)
-					: await replayBatchExtraction(resolveDbOpt(opts), observer, {
-							batchId,
-							scenarioId: scenario.id,
-							transcriptBudget: transcriptBudget ?? undefined,
-						});
+							});
 
-			if (opts.json) {
-				console.log(JSON.stringify(result, null, 2));
+				if (opts.json) {
+					console.log(JSON.stringify(result, null, 2));
+					return;
+				}
+
+				p.intro("codemem memory extraction-replay");
+				p.log.info(
+					[
+						`Scenario: ${result.scenario.id} — ${result.scenario.title}`,
+						`Batch: ${result.target.batchId}`,
+						`Session: ${result.target.sessionId}`,
+						`Observer: ${result.observer.provider}/${result.observer.model}`,
+						`Tier: ${result.observer.tier ?? "manual"}`,
+						`OpenAI Responses: ${result.observer.openaiUseResponses ? "yes" : "no"}`,
+						`Reasoning effort: ${result.observer.reasoningEffort ?? "none"}`,
+						`Classification: ${result.classification.status}`,
+						`Pass: ${result.evaluation.pass ? "yes" : "no"}`,
+					].join("\n"),
+				);
+				if (result.classification.reason) {
+					p.log.message(`Classification reason: ${result.classification.reason}`);
+				}
+				if (result.evaluation.failureReasons.length > 0) {
+					p.log.warn("Failure reasons:");
+					for (const reason of result.evaluation.failureReasons) {
+						p.log.message(`  - ${reason}`);
+					}
+				}
+				p.log.info(
+					[
+						`Fresh summaries: ${result.evaluation.counts.summaries}`,
+						`Fresh observations: ${result.evaluation.counts.observations}`,
+						`Summary thread coverage: ${result.evaluation.coverage.summaryThreadCoverage}`,
+						`Observation thread coverage: ${result.evaluation.coverage.observationThreadCoverage}`,
+						`Total thread coverage: ${result.evaluation.coverage.totalThreadCoverage}`,
+					].join("\n"),
+				);
+				p.outro("done");
+			} catch (error) {
+				const message = error instanceof Error ? error.message : "Extraction replay failed";
+				if (opts.json) {
+					emitJsonError("extraction_replay_failed", message);
+				} else {
+					p.log.error(message);
+					process.exitCode = 1;
+				}
 				return;
 			}
-
-			p.intro("codemem memory extraction-replay");
-			p.log.info(
-				[
-					`Scenario: ${result.scenario.id} — ${result.scenario.title}`,
-					`Batch: ${result.target.batchId}`,
-					`Session: ${result.target.sessionId}`,
-					`Observer: ${result.observer.provider}/${result.observer.model}`,
-					`Tier: ${result.observer.tier ?? "manual"}`,
-					`OpenAI Responses: ${result.observer.openaiUseResponses ? "yes" : "no"}`,
-					`Reasoning effort: ${result.observer.reasoningEffort ?? "none"}`,
-					`Classification: ${result.classification.status}`,
-					`Pass: ${result.evaluation.pass ? "yes" : "no"}`,
-				].join("\n"),
-			);
-			if (result.classification.reason) {
-				p.log.message(`Classification reason: ${result.classification.reason}`);
-			}
-			if (result.evaluation.failureReasons.length > 0) {
-				p.log.warn("Failure reasons:");
-				for (const reason of result.evaluation.failureReasons) {
-					p.log.message(`  - ${reason}`);
-				}
-			}
-			p.log.info(
-				[
-					`Fresh summaries: ${result.evaluation.counts.summaries}`,
-					`Fresh observations: ${result.evaluation.counts.observations}`,
-					`Summary thread coverage: ${result.evaluation.coverage.summaryThreadCoverage}`,
-					`Observation thread coverage: ${result.evaluation.coverage.observationThreadCoverage}`,
-					`Total thread coverage: ${result.evaluation.coverage.totalThreadCoverage}`,
-				].join("\n"),
-			);
-			p.outro("done");
 		},
 	);
 	return cmd;
+}
+
+interface BenchmarkDispositionQuality {
+	summaryDisposition: {
+		expected: string;
+		actual: string;
+		score: number | null;
+	};
+}
+
+export function reconcileExtractionBenchmarkStatus<T extends BenchmarkDispositionQuality>(input: {
+	purpose: "shape_quality" | "replay_robustness";
+	classification: {
+		status: "pass" | "shape_fail" | "observer_no_output";
+		reason: string;
+	};
+	finalFailureReasons: string[];
+	initialQuality: T | null;
+	finalQuality: T | null;
+}): {
+	status: "pass" | "shape_fail" | "observer_no_output";
+	reason: string;
+	quality: T | null;
+	initialQuality: T | null;
+} {
+	const quality = input.finalQuality;
+	let status = input.classification.status;
+	let reason = input.classification.reason;
+	if (input.purpose === "shape_quality" && quality && status !== "observer_no_output") {
+		if (quality.summaryDisposition.score === 0) {
+			status = "shape_fail";
+			reason = `summary disposition ${quality.summaryDisposition.actual} does not satisfy expected ${quality.summaryDisposition.expected}`;
+		} else if (
+			status === "shape_fail" &&
+			quality.summaryDisposition.actual === "skip" &&
+			input.finalFailureReasons.length > 0 &&
+			input.finalFailureReasons.every((failure) => failure.startsWith("summary count "))
+		) {
+			status = "pass";
+			reason = "valid low-signal skip satisfies benchmark disposition";
+		}
+	}
+	return { status, reason, quality, initialQuality: input.initialQuality };
+}
+
+interface BenchmarkReasoningSettings {
+	reasoningEffort: string | null;
+	reasoningSummary: string | null;
+}
+
+export function summarizeBenchmarkReasoning(
+	runs: readonly BenchmarkReasoningSettings[],
+	fallback: BenchmarkReasoningSettings,
+): BenchmarkReasoningSettings {
+	const source = runs[0] ?? fallback;
+	const reasoningEfforts = new Set(runs.map((run) => run.reasoningEffort));
+	const reasoningSummaries = new Set(runs.map((run) => run.reasoningSummary));
+	return {
+		reasoningEffort: reasoningEfforts.size > 1 ? "mixed" : source.reasoningEffort,
+		reasoningSummary: reasoningSummaries.size > 1 ? "mixed" : source.reasoningSummary,
+	};
 }
 
 function createMemoryExtractionBenchmarkCommand(): Command {
@@ -783,6 +1043,11 @@ function createMemoryExtractionBenchmarkCommand(): Command {
 		.option(
 			"--transcript-budget <chars>",
 			"override replay transcript budget in characters for this benchmark run",
+		)
+		.option(
+			"--repetitions <n>",
+			"run every benchmark batch 1-10 times to measure model stability",
+			"1",
 		);
 	addDbOption(cmd);
 	addJsonOption(cmd);
@@ -800,234 +1065,483 @@ function createMemoryExtractionBenchmarkCommand(): Command {
 					maxOutputTokens?: string;
 					observerTemperature?: string;
 					transcriptBudget?: string;
+					repetitions?: string;
 				},
 		) => {
-			const benchmarkId = opts.benchmark?.trim() ?? "";
-			const benchmark = getExtractionBenchmarkProfile(benchmarkId);
-			if (!benchmark) {
-				throw new Error(`Unknown extraction benchmark: ${benchmarkId || opts.benchmark}`);
-			}
-			const transcriptBudgetInput = opts.transcriptBudget?.trim() ?? "";
-			const transcriptBudget =
-				transcriptBudgetInput.length > 0 ? parseStrictPositiveId(transcriptBudgetInput) : null;
-			if (transcriptBudgetInput.length > 0 && transcriptBudget === null) {
-				throw new Error(
-					`Invalid transcript budget: ${transcriptBudgetInput || opts.transcriptBudget}`,
-				);
-			}
-			const observerTemperatureInput = opts.observerTemperature?.trim() ?? "";
-			let observerTemperature: number | undefined;
-			if (observerTemperatureInput.length > 0) {
-				const parsed = Number(observerTemperatureInput);
-				if (!Number.isFinite(parsed)) {
+			try {
+				const benchmarkId = opts.benchmark?.trim() ?? "";
+				const benchmark = getExtractionBenchmarkProfile(benchmarkId);
+				if (!benchmark) {
+					throw new Error(`Unknown extraction benchmark: ${benchmarkId || opts.benchmark}`);
+				}
+				const transcriptBudgetInput = opts.transcriptBudget?.trim() ?? "";
+				const transcriptBudget =
+					transcriptBudgetInput.length > 0 ? parseStrictPositiveId(transcriptBudgetInput) : null;
+				if (transcriptBudgetInput.length > 0 && transcriptBudget === null) {
 					throw new Error(
-						`Invalid observer temperature: ${observerTemperatureInput || opts.observerTemperature}`,
+						`Invalid transcript budget: ${transcriptBudgetInput || opts.transcriptBudget}`,
 					);
 				}
-				observerTemperature = parsed;
-			}
-			const maxOutputTokensInput = opts.maxOutputTokens?.trim() ?? "";
-			const maxOutputTokens =
-				maxOutputTokensInput.length > 0 ? parseStrictPositiveId(maxOutputTokensInput) : null;
-			if (maxOutputTokensInput.length > 0 && maxOutputTokens === null) {
-				throw new Error(
-					`Invalid max output tokens: ${maxOutputTokensInput || opts.maxOutputTokens}`,
-				);
-			}
-			const observerConfig = loadObserverConfig();
-			const observerConfigWithOverrides = {
-				...observerConfig,
-				observerProvider: opts.observerProvider?.trim() || observerConfig.observerProvider,
-				observerModel: opts.observerModel?.trim() || observerConfig.observerModel,
-				observerTemperature: observerTemperature ?? observerConfig.observerTemperature,
-				observerOpenAIUseResponses: opts.openaiResponses === true,
-				observerReasoningEffort: opts.reasoningEffort?.trim() || null,
-				observerReasoningSummary: opts.reasoningSummary?.trim() || null,
-				observerMaxOutputTokens: maxOutputTokens ?? observerConfig.observerMaxTokens,
-			};
-			const observer = new ObserverClient(observerConfigWithOverrides);
-			const runs = [] as Array<{
-				batchId: number;
-				sessionId: number;
-				label: string;
-				purpose: "shape_quality" | "replay_robustness";
-				complexity: string;
-				scenarioId: string;
-				expectedTier: string | null;
-				analysis: {
-					eventSpan: number;
-					promptCount: number;
-					toolCount: number;
-					transcriptLength: number;
-				};
-				status: "pass" | "shape_fail" | "observer_no_output";
-				reason: string;
-				tier: string;
-				provider: string;
-				model: string;
-				openaiUseResponses: boolean;
-				reasoningEffort: string | null;
-				reasoningSummary: string | null;
-				maxOutputTokens: number;
-				temperature: number | null;
-				summaries: number;
-				observations: number;
-				repairApplied: boolean;
-			}>;
-			for (const batch of benchmark.batches) {
-				const scenarioId = batch.scenarioId ?? benchmark.scenarioId;
-				const result =
-					opts.observerTierRouting === true
-						? await replayBatchExtractionWithTierRouting(
-								resolveDbOpt(opts),
-								observerConfigWithOverrides,
-								{
-									batchId: batch.batchId,
-									scenarioId,
-									transcriptBudget: transcriptBudget ?? undefined,
-								},
-							)
-						: await replayBatchExtraction(resolveDbOpt(opts), observer, {
-								batchId: batch.batchId,
-								scenarioId,
-								transcriptBudget: transcriptBudget ?? undefined,
-							});
-				runs.push({
-					batchId: batch.batchId,
-					sessionId: batch.sessionId,
-					label: batch.label,
-					purpose: batch.purpose,
-					complexity: batch.complexity,
-					scenarioId,
-					expectedTier: batch.expectedTier ?? null,
-					analysis: {
-						eventSpan: result.analysis.eventSpan,
-						promptCount: result.analysis.promptCount,
-						toolCount: result.analysis.toolCount,
-						transcriptLength: result.analysis.transcriptLength,
-					},
-					status: result.classification.status,
-					reason: result.classification.reason,
-					tier: result.observer.tier ?? "manual",
-					provider: result.observer.provider,
-					model: result.observer.model,
-					openaiUseResponses: result.observer.openaiUseResponses,
-					reasoningEffort: result.observer.reasoningEffort,
-					reasoningSummary: result.observer.reasoningSummary,
-					maxOutputTokens: result.observer.maxOutputTokens,
-					temperature: result.observer.temperature,
-					summaries: result.evaluation.counts.summaries,
-					observations: result.evaluation.counts.observations,
-					repairApplied: result.observer.repairApplied,
-				});
-			}
-			const summary = {
-				total: runs.length,
-				shapeQualityTotal: runs.filter((run) => run.purpose === "shape_quality").length,
-				shapeQualityPasses: runs.filter(
-					(run) => run.purpose === "shape_quality" && run.status === "pass",
-				).length,
-				shapeQualityFails: runs.filter(
-					(run) => run.purpose === "shape_quality" && run.status === "shape_fail",
-				).length,
-				expectedTierTotal: runs.filter((run) => run.expectedTier != null).length,
-				expectedTierMatches: runs.filter(
-					(run) => run.expectedTier != null && run.expectedTier === run.tier,
-				).length,
-				robustnessNoOutput: runs.filter((run) => run.status === "observer_no_output").length,
-			};
-			const uniqueObserverKeys = Array.from(
-				new Set(
-					runs.map(
-						(run) =>
-							`${run.provider}::${run.model}::${run.openaiUseResponses ? "responses" : "chat"}`,
+				const observerTemperatureInput = opts.observerTemperature?.trim() ?? "";
+				let observerTemperature: number | undefined;
+				if (observerTemperatureInput.length > 0) {
+					const parsed = Number(observerTemperatureInput);
+					if (!Number.isFinite(parsed)) {
+						throw new Error(
+							`Invalid observer temperature: ${observerTemperatureInput || opts.observerTemperature}`,
+						);
+					}
+					observerTemperature = parsed;
+				}
+				const maxOutputTokensInput = opts.maxOutputTokens?.trim() ?? "";
+				const maxOutputTokens =
+					maxOutputTokensInput.length > 0 ? parseStrictPositiveId(maxOutputTokensInput) : null;
+				if (maxOutputTokensInput.length > 0 && maxOutputTokens === null) {
+					throw new Error(
+						`Invalid max output tokens: ${maxOutputTokensInput || opts.maxOutputTokens}`,
+					);
+				}
+				const repetitionsInput = opts.repetitions?.trim() ?? "1";
+				const repetitions = parseStrictPositiveId(repetitionsInput);
+				if (repetitions === null || repetitions > 10) {
+					throw new Error(`Invalid repetitions: ${repetitionsInput || opts.repetitions}`);
+				}
+				const observerConfig = loadObserverConfig();
+				const observerConfigWithOverrides = {
+					...observerConfig,
+					observerProvider: opts.observerProvider?.trim() || observerConfig.observerProvider,
+					observerModel: opts.observerModel?.trim() || observerConfig.observerModel,
+					observerTemperature: observerTemperature ?? observerConfig.observerTemperature,
+					observerOpenAIUseResponses: resolveOpenAIResponsesOverride(
+						opts.openaiResponses,
+						observerConfig.observerOpenAIUseResponses,
 					),
-				),
-			);
-			const observerSummary =
-				opts.observerTierRouting === true
-					? {
-							provider:
-								uniqueObserverKeys.length === 1
-									? (runs[0]?.provider ?? observer.provider)
-									: "mixed",
-							model: uniqueObserverKeys.length === 1 ? (runs[0]?.model ?? observer.model) : "mixed",
-							tierRouting: true,
-							openaiUseResponses:
-								uniqueObserverKeys.length === 1
-									? (runs[0]?.openaiUseResponses ?? observer.openaiUseResponses)
-									: null,
-							reasoningEffort:
-								uniqueObserverKeys.length === 1
-									? (runs[0]?.reasoningEffort ?? observer.reasoningEffort)
-									: "mixed",
-							reasoningSummary:
-								uniqueObserverKeys.length === 1
-									? (runs[0]?.reasoningSummary ?? observer.reasoningSummary)
-									: "mixed",
-							maxOutputTokens:
-								uniqueObserverKeys.length === 1
-									? (runs[0]?.maxOutputTokens ?? observer.maxOutputTokens)
-									: null,
-							temperature:
-								uniqueObserverKeys.length === 1
-									? (runs[0]?.temperature ?? observer.temperature)
-									: null,
-							transcriptBudget: transcriptBudget ?? null,
-							selectedObservers: uniqueObserverKeys,
-						}
-					: {
-							provider: observer.provider,
-							model: observer.model,
-							tierRouting: false,
-							openaiUseResponses: observer.openaiUseResponses,
-							reasoningEffort: observer.reasoningEffort,
-							reasoningSummary: observer.reasoningSummary,
-							maxOutputTokens: observer.maxOutputTokens,
-							temperature: observer.temperature,
-							transcriptBudget: transcriptBudget ?? null,
-							selectedObservers: uniqueObserverKeys,
+					observerReasoningEffort:
+						opts.reasoningEffort === undefined
+							? observerConfig.observerReasoningEffort
+							: opts.reasoningEffort.trim() || null,
+					observerReasoningSummary:
+						opts.reasoningSummary === undefined
+							? observerConfig.observerReasoningSummary
+							: opts.reasoningSummary.trim() || null,
+					observerMaxOutputTokens:
+						maxOutputTokens ??
+						observerConfig.observerMaxOutputTokens ??
+						observerConfig.observerMaxTokens,
+					observerExplicitConfigKeys:
+						maxOutputTokens === null
+							? observerConfig.observerExplicitConfigKeys
+							: [
+									...new Set([
+										...(observerConfig.observerExplicitConfigKeys ?? []),
+										"observerMaxOutputTokens",
+									]),
+								],
+				};
+				const observer = new ObserverClient(observerConfigWithOverrides);
+				const runs = [] as Array<{
+					iteration: number;
+					batchId: number;
+					sessionId: number;
+					label: string;
+					purpose: "shape_quality" | "replay_robustness";
+					complexity: string;
+					scenarioId: string;
+					expectedTier: string | null;
+					expectedSummaryDisposition: "required" | "optional" | "skip";
+					analysis: {
+						eventSpan: number;
+						promptCount: number;
+						toolCount: number;
+						transcriptLength: number;
+					};
+					status: "pass" | "shape_fail" | "observer_no_output";
+					reason: string;
+					tier: string;
+					provider: string;
+					model: string;
+					transport: string;
+					requestedModel: string;
+					resolvedModel: string | null;
+					modelFallbackApplied: boolean;
+					modelFallbackReason: string | null;
+					openaiUseResponses: boolean;
+					reasoningEffort: string | null;
+					reasoningSummary: string | null;
+					maxOutputTokens: number | null;
+					temperature: number | null;
+					summaries: number;
+					observations: number;
+					repairApplied: boolean;
+					initial: {
+						raw: string | null;
+						status: "pass" | "shape_fail" | "observer_no_output";
+						reason: string;
+						pass: boolean;
+						failureReasons: string[];
+						summaries: number;
+						observations: number;
+						diagnostics: ExtractionStructuralDiagnostics | null;
+						elapsedMs: number | null;
+						usage: ObserverTokenUsage | null;
+						quality: ExtractionBenchmarkScore | null;
+					};
+					repair: {
+						applied: boolean;
+						raw: string | null;
+						status: "pass" | "shape_fail" | "observer_no_output" | null;
+						reason: string | null;
+						pass: boolean | null;
+						failureReasons: string[];
+						summaries: number | null;
+						observations: number | null;
+						diagnostics: ExtractionStructuralDiagnostics | null;
+						elapsedMs: number | null;
+						usage: ObserverTokenUsage | null;
+						quality: ExtractionBenchmarkScore | null;
+					};
+					telemetry: {
+						totalElapsedMs: number | null;
+						totalUsage: ObserverTokenUsage | null;
+					};
+					pricing: ReturnType<typeof getExtractionModelPricing>;
+					cost: {
+						initial: ExtractionModelCostEstimate | null;
+						repair: ExtractionModelCostEstimate | null;
+						total: ExtractionModelCostEstimate | null;
+						unavailableReason:
+							| "missing_usage"
+							| "unknown_model_pricing"
+							| "model_fallback_unresolved"
+							| null;
+					};
+					quality: ExtractionBenchmarkScore | null;
+				}>;
+				for (let iteration = 1; iteration <= repetitions; iteration += 1) {
+					for (const batch of benchmark.batches) {
+						const scenarioId = batch.scenarioId ?? benchmark.scenarioId;
+						const result =
+							opts.observerTierRouting === true
+								? await replayBatchExtractionWithTierRouting(
+										resolveDbOpt(opts),
+										observerConfigWithOverrides,
+										{
+											batchId: batch.batchId,
+											scenarioId,
+											transcriptBudget: transcriptBudget ?? undefined,
+										},
+									)
+								: await replayBatchExtraction(resolveDbOpt(opts), observer, {
+										batchId: batch.batchId,
+										scenarioId,
+										transcriptBudget: transcriptBudget ?? undefined,
+									});
+						const costModel = result.observer.modelFallbackApplied
+							? result.observer.resolvedModel
+							: (result.observer.resolvedModel ?? result.observer.model);
+						const initialCost = costModel
+							? estimateExtractionModelCost(costModel, result.observer.initialUsage)
+							: null;
+						const repairCost = costModel
+							? estimateExtractionModelCost(costModel, result.observer.repairedUsage)
+							: null;
+						const totalCost = costModel
+							? estimateExtractionModelCost(costModel, result.observer.totalUsage)
+							: null;
+						const pricing = costModel ? getExtractionModelPricing(costModel) : null;
+						const costUnavailableReason = totalCost
+							? null
+							: result.observer.modelFallbackApplied && !result.observer.resolvedModel
+								? "model_fallback_unresolved"
+								: result.observer.totalUsage == null
+									? "missing_usage"
+									: "unknown_model_pricing";
+						const initialQuality = result.observer.initialDiagnostics
+							? scoreExtractionBenchmarkOutput({
+									parsed: result.observer.initialParsed,
+									diagnostics: result.observer.initialDiagnostics,
+									review: batch.review ?? {
+										status: "unreviewed",
+										reviewerNotes: "No durable-fact review has been recorded for this batch.",
+									},
+									estimatedCostUsd: initialCost?.totalCostUsd ?? null,
+									expectedSummaryDisposition: batch.expectedSummaryDisposition,
+								})
+							: null;
+						const repairQuality =
+							result.observer.repairedParsed && result.observer.repairedDiagnostics
+								? scoreExtractionBenchmarkOutput({
+										parsed: result.observer.repairedParsed,
+										diagnostics: result.observer.repairedDiagnostics,
+										review: batch.review ?? {
+											status: "unreviewed",
+											reviewerNotes: "No durable-fact review has been recorded for this batch.",
+										},
+										estimatedCostUsd: repairCost?.totalCostUsd ?? null,
+										expectedSummaryDisposition: batch.expectedSummaryDisposition,
+									})
+								: null;
+						const finalQuality = result.observer.diagnostics
+							? scoreExtractionBenchmarkOutput({
+									parsed: result.observer.parsed,
+									diagnostics: result.observer.diagnostics,
+									review: batch.review ?? {
+										status: "unreviewed",
+										reviewerNotes: "No durable-fact review has been recorded for this batch.",
+									},
+									estimatedCostUsd: totalCost?.totalCostUsd ?? null,
+									expectedSummaryDisposition: batch.expectedSummaryDisposition,
+								})
+							: null;
+						const reconciled = reconcileExtractionBenchmarkStatus({
+							purpose: batch.purpose,
+							classification: result.classification,
+							finalFailureReasons: result.evaluation.failureReasons,
+							initialQuality,
+							finalQuality,
+						});
+						runs.push({
+							iteration,
+							batchId: batch.batchId,
+							sessionId: batch.sessionId,
+							label: batch.label,
+							purpose: batch.purpose,
+							complexity: batch.complexity,
+							scenarioId,
+							expectedTier: batch.expectedTier ?? null,
+							expectedSummaryDisposition: batch.expectedSummaryDisposition,
+							analysis: {
+								eventSpan: result.analysis.eventSpan,
+								promptCount: result.analysis.promptCount,
+								toolCount: result.analysis.toolCount,
+								transcriptLength: result.analysis.transcriptLength,
+							},
+							status: reconciled.status,
+							reason: reconciled.reason,
+							tier: result.observer.tier ?? "manual",
+							provider: result.observer.provider,
+							model: result.observer.model,
+							transport: result.observer.transport,
+							requestedModel: result.observer.requestedModel,
+							resolvedModel: result.observer.resolvedModel,
+							modelFallbackApplied: result.observer.modelFallbackApplied,
+							modelFallbackReason: result.observer.modelFallbackReason,
+							openaiUseResponses: result.observer.openaiUseResponses,
+							reasoningEffort: result.observer.reasoningEffort,
+							reasoningSummary: result.observer.reasoningSummary,
+							maxOutputTokens: result.observer.maxOutputTokens,
+							temperature: result.observer.temperature,
+							summaries: result.evaluation.counts.summaries,
+							observations: result.evaluation.counts.observations,
+							repairApplied: result.observer.repairApplied,
+							initial: {
+								raw: result.observer.initialRaw,
+								status: result.initialClassification.status,
+								reason: result.initialClassification.reason,
+								pass: result.initialEvaluation.pass,
+								failureReasons: result.initialEvaluation.failureReasons,
+								summaries: result.initialEvaluation.counts.summaries,
+								observations: result.initialEvaluation.counts.observations,
+								diagnostics: result.observer.initialDiagnostics,
+								elapsedMs: result.observer.initialElapsedMs,
+								usage: result.observer.initialUsage,
+								quality: reconciled.initialQuality,
+							},
+							repair: {
+								applied: result.observer.repairApplied,
+								raw: result.observer.repairedRaw,
+								status: result.repairedClassification?.status ?? null,
+								reason: result.repairedClassification?.reason ?? null,
+								pass: result.repairedEvaluation?.pass ?? null,
+								failureReasons: result.repairedEvaluation?.failureReasons ?? [],
+								summaries: result.repairedEvaluation?.counts.summaries ?? null,
+								observations: result.repairedEvaluation?.counts.observations ?? null,
+								diagnostics: result.observer.repairedDiagnostics,
+								elapsedMs: result.observer.repairedElapsedMs,
+								usage: result.observer.repairedUsage,
+								quality: repairQuality,
+							},
+							telemetry: {
+								totalElapsedMs: result.observer.totalElapsedMs,
+								totalUsage: result.observer.totalUsage,
+							},
+							pricing,
+							cost: {
+								initial: initialCost,
+								repair: repairCost,
+								total: totalCost,
+								unavailableReason: costUnavailableReason,
+							},
+							quality: reconciled.quality,
+						});
+					}
+				}
+				const reviewedQualityRuns = runs.filter((run) => run.quality?.weightedQualityScore != null);
+				const knownCostRuns = runs.filter((run) => run.cost.total != null);
+				const knownElapsedRuns = runs.filter((run) => run.telemetry.totalElapsedMs != null);
+				const summary = {
+					repetitions,
+					total: runs.length,
+					shapeQualityTotal: runs.filter((run) => run.purpose === "shape_quality").length,
+					shapeQualityPasses: runs.filter(
+						(run) => run.purpose === "shape_quality" && run.status === "pass",
+					).length,
+					shapeQualityFails: runs.filter(
+						(run) => run.purpose === "shape_quality" && run.status === "shape_fail",
+					).length,
+					expectedTierTotal: runs.filter((run) => run.expectedTier != null).length,
+					expectedTierMatches: runs.filter(
+						(run) => run.expectedTier != null && run.expectedTier === run.tier,
+					).length,
+					robustnessNoOutput: runs.filter((run) => run.status === "observer_no_output").length,
+					summaryDispositionTotal: runs.filter((run) => run.quality != null).length,
+					summaryDispositionMatches: runs.filter(
+						(run) => run.quality?.summaryDisposition.score === 1,
+					).length,
+					reviewedQualityRuns: reviewedQualityRuns.length,
+					knownCostRuns: knownCostRuns.length,
+					unknownCostRuns: runs.length - knownCostRuns.length,
+					missingUsageRuns: runs.filter((run) => run.cost.unavailableReason === "missing_usage")
+						.length,
+					unknownPricingRuns: runs.filter(
+						(run) => run.cost.unavailableReason === "unknown_model_pricing",
+					).length,
+					fallbackUnresolvedRuns: runs.filter(
+						(run) => run.cost.unavailableReason === "model_fallback_unresolved",
+					).length,
+					totalKnownCostUsd: knownCostRuns.reduce(
+						(sum, run) => sum + (run.cost.total?.totalCostUsd ?? 0),
+						0,
+					),
+					knownElapsedRuns: knownElapsedRuns.length,
+					totalKnownElapsedMs: knownElapsedRuns.reduce(
+						(sum, run) => sum + (run.telemetry.totalElapsedMs ?? 0),
+						0,
+					),
+					perBatchStability: benchmark.batches.map((batch) => {
+						const batchRuns = runs.filter((run) => run.batchId === batch.batchId);
+						const passes = batchRuns.filter((run) => run.status === "pass").length;
+						return {
+							batchId: batch.batchId,
+							purpose: batch.purpose,
+							passes,
+							total: batchRuns.length,
+							passRate: batchRuns.length > 0 ? passes / batchRuns.length : null,
+							statuses: batchRuns.map((run) => run.status),
 						};
-			const output = {
-				benchmark: {
-					id: benchmark.id,
-					title: benchmark.title,
-					scenarioId: benchmark.scenarioId,
-				},
-				observer: observerSummary,
-				summary,
-				runs,
-			};
+					}),
+				};
+				const uniqueObserverKeys = Array.from(
+					new Set(runs.map((run) => `${run.provider}::${run.model}::${run.transport}`)),
+				);
+				const benchmarkReasoning = summarizeBenchmarkReasoning(runs, {
+					reasoningEffort: observer.reasoningEffort,
+					reasoningSummary: observer.reasoningSummary,
+				});
+				const observerSummary =
+					opts.observerTierRouting === true
+						? {
+								provider:
+									uniqueObserverKeys.length === 1
+										? (runs[0]?.provider ?? observer.provider)
+										: "mixed",
+								model:
+									uniqueObserverKeys.length === 1 ? (runs[0]?.model ?? observer.model) : "mixed",
+								transport:
+									uniqueObserverKeys.length === 1 ? (runs[0]?.transport ?? "unknown") : "mixed",
+								tierRouting: true,
+								openaiUseResponses:
+									uniqueObserverKeys.length === 1
+										? (runs[0]?.openaiUseResponses ?? observer.openaiUseResponses)
+										: null,
+								reasoningEffort: benchmarkReasoning.reasoningEffort,
+								reasoningSummary: benchmarkReasoning.reasoningSummary,
+								maxOutputTokens:
+									uniqueObserverKeys.length === 1 ? (runs[0]?.maxOutputTokens ?? null) : null,
+								temperature:
+									uniqueObserverKeys.length === 1 ? (runs[0]?.temperature ?? null) : null,
+								transcriptBudget: transcriptBudget ?? null,
+								selectedObservers: uniqueObserverKeys,
+							}
+						: {
+								provider: observer.provider,
+								model: observer.model,
+								transport: runs[0]?.transport ?? observer.getStatus().runtime,
+								tierRouting: false,
+								openaiUseResponses: observer.openaiUseResponses,
+								reasoningEffort: benchmarkReasoning.reasoningEffort,
+								reasoningSummary: benchmarkReasoning.reasoningSummary,
+								maxOutputTokens: runs[0]?.maxOutputTokens ?? null,
+								temperature: runs[0]?.temperature ?? null,
+								transcriptBudget: transcriptBudget ?? null,
+								selectedObservers: uniqueObserverKeys,
+							};
+				const output = {
+					benchmark: {
+						id: benchmark.id,
+						title: benchmark.title,
+						scenarioId: benchmark.scenarioId,
+						modelCandidates: benchmark.modelCandidates,
+					},
+					observer: observerSummary,
+					summary,
+					runs,
+				};
 
-			if (opts.json) {
-				console.log(JSON.stringify(output, null, 2));
+				if (opts.json) {
+					console.log(JSON.stringify(output, null, 2));
+					return;
+				}
+
+				p.intro("codemem memory extraction-benchmark");
+				p.log.info(
+					[
+						`Benchmark: ${benchmark.id} — ${benchmark.title}`,
+						`Observer: ${observerSummary.provider}/${observerSummary.model}`,
+						`Transport: ${observerSummary.transport}`,
+						`Tier routing: ${opts.observerTierRouting === true ? "yes" : "no"}`,
+						`OpenAI Responses: ${observerSummary.openaiUseResponses === null ? "mixed" : observerSummary.openaiUseResponses ? "yes" : "no"}`,
+						`Reasoning effort: ${observerSummary.reasoningEffort ?? "not transmitted"}`,
+						`Reasoning summary: ${observerSummary.reasoningSummary ?? "not transmitted"}`,
+						`Max output tokens: ${observerSummary.transport === "codex_consumer" ? "not transmitted" : (observerSummary.maxOutputTokens ?? "mixed")}`,
+						`Temperature: ${observerSummary.transport === "mixed" ? "mixed" : (observerSummary.temperature ?? "not transmitted")}`,
+						`Transcript budget override: ${transcriptBudget ?? "default"}`,
+						`Repetitions: ${summary.repetitions}`,
+						`Shape-quality passes: ${summary.shapeQualityPasses}/${summary.shapeQualityTotal}`,
+						`Shape-quality fails: ${summary.shapeQualityFails}`,
+						`Expected-tier matches: ${summary.expectedTierMatches}/${summary.expectedTierTotal}`,
+						`Observer no-output cases: ${summary.robustnessNoOutput}`,
+						`Summary disposition matches: ${summary.summaryDispositionMatches}/${summary.summaryDispositionTotal}`,
+						`Reviewed quality runs: ${summary.reviewedQualityRuns} (compare per-run dimensions; scores are fixture-specific)`,
+						`Known estimated cost: $${summary.totalKnownCostUsd.toFixed(6)} (${summary.knownCostRuns}/${summary.total}; missing usage=${summary.missingUsageRuns}, unknown pricing=${summary.unknownPricingRuns}, unresolved fallback=${summary.fallbackUnresolvedRuns})`,
+						`Known elapsed time: ${summary.totalKnownElapsedMs}ms (${summary.knownElapsedRuns}/${summary.total} run(s))`,
+					].join("\n"),
+				);
+				for (const run of runs) {
+					const qualityLabel =
+						run.quality?.weightedQualityScore == null
+							? "n/a"
+							: run.quality.weightedQualityScore.toFixed(3);
+					const costLabel =
+						run.cost.total == null ? "n/a" : `$${run.cost.total.totalCostUsd.toFixed(6)}`;
+					const latencyLabel =
+						run.telemetry.totalElapsedMs == null ? "n/a" : `${run.telemetry.totalElapsedMs}ms`;
+					const missingRequired = run.quality?.requiredRecall.missingLabelIds.join(",") || "none";
+					p.log.message(
+						`  [${run.batchId}#${run.iteration}] ${run.status.padEnd(18)} ${run.complexity.padEnd(10)} tier=${run.tier.padEnd(6)} expected=${(run.expectedTier ?? "n/a").padEnd(6)} disposition=${run.quality?.summaryDisposition.actual ?? "n/a"}/${run.expectedSummaryDisposition} span=${String(run.analysis.eventSpan).padEnd(3)} prompts=${run.analysis.promptCount} tools=${String(run.analysis.toolCount).padEnd(2)} transcript=${run.analysis.transcriptLength} ${run.provider}/${run.model} [${run.transport}] initial=${run.initial.summaries}s/${run.initial.observations}o final=${run.summaries}s/${run.observations}o quality=${qualityLabel} coverage=${run.quality?.weightedQualityCoverage?.toFixed(3) ?? "n/a"} required_missing=${missingRequired} cost=${costLabel} latency=${latencyLabel} schema_loss=${run.initial.diagnostics?.dataLoss === true ? "yes" : "no"} fallback=${run.modelFallbackApplied ? "yes" : "no"} repair=${run.repairApplied ? "yes" : "no"} — ${run.label}`,
+					);
+				}
+				p.outro("done");
+			} catch (error) {
+				const message = error instanceof Error ? error.message : "Extraction benchmark failed";
+				if (opts.json) {
+					emitJsonError("extraction_benchmark_failed", message);
+				} else {
+					p.log.error(message);
+					process.exitCode = 1;
+				}
 				return;
 			}
-
-			p.intro("codemem memory extraction-benchmark");
-			p.log.info(
-				[
-					`Benchmark: ${benchmark.id} — ${benchmark.title}`,
-					`Observer: ${observerSummary.provider}/${observerSummary.model}`,
-					`Tier routing: ${opts.observerTierRouting === true ? "yes" : "no"}`,
-					`OpenAI Responses: ${observerSummary.openaiUseResponses === null ? "mixed" : observerSummary.openaiUseResponses ? "yes" : "no"}`,
-					`Reasoning effort: ${observerSummary.reasoningEffort ?? "none"}`,
-					`Reasoning summary: ${observerSummary.reasoningSummary ?? "none"}`,
-					`Max output tokens: ${observerSummary.maxOutputTokens ?? "mixed"}`,
-					`Temperature: ${observerSummary.temperature ?? "mixed"}`,
-					`Transcript budget override: ${transcriptBudget ?? "default"}`,
-					`Shape-quality passes: ${summary.shapeQualityPasses}/${summary.shapeQualityTotal}`,
-					`Shape-quality fails: ${summary.shapeQualityFails}`,
-					`Expected-tier matches: ${summary.expectedTierMatches}/${summary.expectedTierTotal}`,
-					`Observer no-output cases: ${summary.robustnessNoOutput}`,
-				].join("\n"),
-			);
-			for (const run of runs) {
-				p.log.message(
-					`  [${run.batchId}] ${run.status.padEnd(18)} ${run.complexity.padEnd(10)} tier=${run.tier.padEnd(6)} expected=${(run.expectedTier ?? "n/a").padEnd(6)} span=${String(run.analysis.eventSpan).padEnd(3)} prompts=${run.analysis.promptCount} tools=${String(run.analysis.toolCount).padEnd(2)} transcript=${run.analysis.transcriptLength} ${run.provider}/${run.model}${run.openaiUseResponses ? " [responses]" : ""} summaries=${run.summaries} observations=${run.observations} repair=${run.repairApplied ? "yes" : "no"} — ${run.label}`,
-				);
-			}
-			p.outro("done");
 		},
 	);
 	return cmd;
@@ -1173,6 +1687,7 @@ memoryCommand.addCommand(createRememberMemoryCommand());
 memoryCommand.addCommand(createInjectMemoryCommand());
 memoryCommand.addCommand(createMemoryRoleReportCommand());
 memoryCommand.addCommand(createMemoryRoleCompareCommand());
+memoryCommand.addCommand(createMemoryArtifactReportCommand());
 memoryCommand.addCommand(createMemoryExtractionReportCommand());
 memoryCommand.addCommand(createMemoryExtractionReplayCommand());
 memoryCommand.addCommand(createMemoryExtractionBenchmarkCommand());

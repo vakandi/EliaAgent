@@ -2,7 +2,7 @@ import { MemoryStore, resolveDbPath, resolveHookProject } from "@codemem/core";
 import { Command } from "commander";
 import { helpStyle } from "../help-style.js";
 import { addDbOption, type DbOpts, resolveDbOpt } from "../shared-options.js";
-import { logHookFailure } from "./claude-hook-plugin-log.js";
+import { logHookEvent } from "./claude-hook-plugin-log.js";
 import {
 	buildInjectQuery,
 	normalizePromptText,
@@ -27,23 +27,29 @@ const HOOK_EVENT_NAME = "UserPromptSubmit" as const;
 
 type InjectOpts = DbOpts;
 
-type HttpPackResponse = {
-	pack_text?: string;
+export type PackResult = {
+	packText: string;
+	items: number;
+	packTokens: number;
 };
+
+const EMPTY_PACK: PackResult = { packText: "", items: 0, packTokens: 0 };
 
 type InjectDeps = {
 	buildLocalPack?: typeof buildLocalPack;
-	httpPack?: typeof tryHttpPack;
 	resolveDb?: typeof resolveDbPath;
 };
 
-const DEFAULT_VIEWER_HOST = "127.0.0.1";
-const DEFAULT_VIEWER_PORT = 38888;
 const DEFAULT_MAX_CHARS = 16000;
-const DEFAULT_HTTP_MAX_TIME_S = 2;
 
-function emitJson(value: InjectResult | { error: string; message: string }): void {
+function emitJson(value: InjectResult): void {
 	console.log(JSON.stringify(value));
+}
+
+function emitError(value: { error: string; message: string }): void {
+	// Errors go to stderr so a non-zero exit from `codemem` doesn't poison
+	// the Node hook's stdout when its compatibility chain reaches `npx`.
+	process.stderr.write(`${JSON.stringify(value)}\n`);
 }
 
 function envNotDisabled(value: string | undefined): boolean {
@@ -114,7 +120,7 @@ async function buildLocalPack(
 	project: string | null,
 	dbPath: string,
 	workingSetPaths: string[] = [],
-): Promise<string> {
+): Promise<PackResult> {
 	const store = new MemoryStore(dbPath);
 	try {
 		const limit = parsePositiveInt(process.env.CODEMEM_INJECT_LIMIT, 8);
@@ -127,43 +133,14 @@ async function buildLocalPack(
 			filters.working_set_paths = workingSetPaths;
 		}
 		const pack = await store.buildMemoryPackAsync(context, limit, budget, filters);
-		return String(pack.pack_text ?? "").trim();
+		const packText = String(pack.pack_text ?? "").trim();
+		const items = Array.isArray(pack.items) ? pack.items.length : 0;
+		const packTokens = Number.isFinite(Number(pack.metrics?.pack_tokens))
+			? Number(pack.metrics.pack_tokens)
+			: 0;
+		return { packText, items, packTokens };
 	} finally {
 		store.close();
-	}
-}
-
-async function tryHttpPack(
-	context: string,
-	project: string | null,
-	maxTimeMs = DEFAULT_HTTP_MAX_TIME_S * 1000,
-): Promise<string> {
-	const host = process.env.CODEMEM_VIEWER_HOST || DEFAULT_VIEWER_HOST;
-	const port = parsePositiveInt(process.env.CODEMEM_VIEWER_PORT, DEFAULT_VIEWER_PORT);
-	const url = new URL(`http://${host}:${port}/api/pack`);
-	url.searchParams.set("context", context);
-	url.searchParams.set("limit", String(parsePositiveInt(process.env.CODEMEM_INJECT_LIMIT, 8)));
-	url.searchParams.set(
-		"token_budget",
-		String(parsePositiveInt(process.env.CODEMEM_INJECT_TOKEN_BUDGET, 800)),
-	);
-	if (project) {
-		url.searchParams.set("project", project);
-	}
-
-	const controller = new AbortController();
-	const timeout = setTimeout(() => controller.abort(), maxTimeMs);
-	try {
-		const res = await fetch(url, { signal: controller.signal });
-		if (!res.ok) {
-			return "";
-		}
-		const body = (await res.json()) as HttpPackResponse;
-		return String(body.pack_text ?? "").trim();
-	} catch {
-		return "";
-	} finally {
-		clearTimeout(timeout);
 	}
 }
 
@@ -197,40 +174,48 @@ export async function buildClaudeHookInjection(
 	}
 
 	const buildPack = deps.buildLocalPack ?? buildLocalPack;
-	const httpPack = deps.httpPack ?? tryHttpPack;
 	const resolveDb = deps.resolveDb ?? resolveDbPath;
 	const project = resolveInjectProject(payload);
 	const query = buildInjectQuery({ prompt: promptText, project, state });
 	const workingSetPaths = workingSetPathsFromState(state);
 	const maxChars = parsePositiveInt(process.env.CODEMEM_INJECT_MAX_CHARS, DEFAULT_MAX_CHARS);
-	const httpMaxTimeMs =
-		parsePositiveInt(process.env.CODEMEM_INJECT_HTTP_MAX_TIME_S, DEFAULT_HTTP_MAX_TIME_S) * 1000;
 
-	let additionalContext = "";
+	let pack: PackResult = EMPTY_PACK;
+	let origin: "local" | "none" = "none";
 	try {
 		const dbPath = resolveDb(resolveDbOpt(opts));
-		additionalContext = await buildPack(query, project, dbPath, workingSetPaths);
+		pack = await buildPack(query, project, dbPath, workingSetPaths);
+		if (pack.packText) {
+			origin = "local";
+		}
 	} catch (err) {
-		additionalContext = "";
-		logHookFailure(
+		logHookEvent(
 			`codemem claude-hook-inject local pack failed: ${err instanceof Error ? err.message : String(err)}`,
 		);
 	}
 
-	if (!additionalContext && envNotDisabled(process.env.CODEMEM_INJECT_HTTP_FALLBACK || "1")) {
-		// tryHttpPack swallows its own network errors and returns "" on
-		// failure; don't wrap it here so tests that throw from a stub mock
-		// still surface as failures (the existing
-		// "should not run" assertions rely on this).
-		additionalContext = await httpPack(query, project, httpMaxTimeMs);
+	// `empty` reflects retrieval, not post-truncation delivery, so the metric
+	// stays load-bearing for measuring whether the pipeline is producing
+	// memory candidates at all.
+	const fields = [
+		"inject.pack.ok",
+		"source=claude",
+		`origin=${origin}`,
+		`items=${pack.items}`,
+		`pack_tokens=${pack.packTokens}`,
+		`query_len=${query.length}`,
+		`empty=${pack.packText ? "false" : "true"}`,
+	];
+	if (project) {
+		fields.push(`project=${JSON.stringify(project)}`);
 	}
-
-	return continueResult(truncateAdditionalContext(additionalContext, maxChars));
+	logHookEvent(fields.join(" "));
+	return continueResult(truncateAdditionalContext(pack.packText, maxChars));
 }
 
 const claudeHookInjectCmd = new Command("claude-hook-inject")
 	.configureHelp(helpStyle)
-	.description("Return Claude hook additionalContext from local pack generation");
+	.description("Compatibility fallback for Claude hook local additionalContext generation");
 
 addDbOption(claudeHookInjectCmd);
 
@@ -249,13 +234,13 @@ export const claudeHookInjectCommand = claudeHookInjectCmd.action(async (opts: I
 	try {
 		const parsed = JSON.parse(trimmed) as unknown;
 		if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) {
-			emitJson({ error: "parse_error", message: "payload must be a JSON object" });
+			emitError({ error: "parse_error", message: "payload must be a JSON object" });
 			process.exitCode = 1;
 			return;
 		}
 		payload = parsed as Record<string, unknown>;
 	} catch {
-		emitJson({ error: "parse_error", message: "invalid JSON" });
+		emitError({ error: "parse_error", message: "invalid JSON" });
 		process.exitCode = 1;
 		return;
 	}

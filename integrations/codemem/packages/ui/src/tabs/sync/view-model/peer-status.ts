@@ -9,7 +9,16 @@ import {
 	isUnauthorizedPeerError,
 	peerErrorText,
 } from "./internal";
-import type { PeerDirection, PeerLike, UiPeerTrustSummary, UiSyncStatus } from "./types";
+import type {
+	PeerAuthorizedScopeLike,
+	PeerDirection,
+	PeerLike,
+	PeerPerScopeSyncLike,
+	PeerProjectScopeLike,
+	PeerScopeRejectionReason,
+	UiPeerTrustSummary,
+	UiSyncStatus,
+} from "./types";
 
 // Classify a peer's recent sync direction from observed traffic:
 // ↕ bidirectional when both directions have flowed in the recent window,
@@ -92,5 +101,286 @@ export function derivePeerTrustSummary(peer: PeerLike): UiPeerTrustSummary {
 		description:
 			"This device is already trusted here. Finish setup on the other device before sync can run both ways.",
 		isWarning: false,
+	};
+}
+
+const SCOPE_REJECTION_REASON_LABELS: Record<PeerScopeRejectionReason, string> = {
+	missing_scope: "Missing scope id",
+	sender_not_member: "Sender not a scope member",
+	receiver_not_member: "Receiver not a scope member",
+	stale_epoch: "Stale or revoked membership",
+	scope_mismatch: "Scope mismatch",
+	visibility_filter: "Visibility filter",
+	project_filter: "Project filter",
+};
+
+export interface PeerScopeRejectionsView {
+	total: number;
+	badgeLabel: string | null;
+	reasons: Array<{ reason: PeerScopeRejectionReason; label: string; count: number }>;
+	lastAt: string | null;
+}
+
+/**
+ * Translate the per-peer scope-rejection summary returned by /api/sync/peers
+ * into a UI-ready view. Returns total=0 when nothing has been rejected, in
+ * which case the row should not display a rejection badge or detail block.
+ */
+export function derivePeerScopeRejectionsView(peer: PeerLike): PeerScopeRejectionsView {
+	const summary = peer?.scope_rejections;
+	const total = Math.max(0, Number(summary?.total ?? 0));
+	if (!summary || total === 0) {
+		return { total: 0, badgeLabel: null, reasons: [], lastAt: null };
+	}
+	const reasons: Array<{ reason: PeerScopeRejectionReason; label: string; count: number }> = [];
+	for (const [reason, count] of Object.entries(summary.by_reason ?? {})) {
+		const numeric = Math.max(0, Number(count ?? 0));
+		if (numeric === 0) continue;
+		const key = reason as PeerScopeRejectionReason;
+		reasons.push({
+			reason: key,
+			label: SCOPE_REJECTION_REASON_LABELS[key] ?? reason,
+			count: numeric,
+		});
+	}
+	reasons.sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+	const badgeLabel = total === 1 ? "1 sync rejection" : `${total.toLocaleString()} sync rejections`;
+	return {
+		total,
+		badgeLabel,
+		reasons,
+		lastAt: summary.last_at ?? null,
+	};
+}
+
+function cleanList(values: unknown): string[] {
+	return Array.isArray(values)
+		? values.map((item) => cleanText(item)).filter((item): item is string => Boolean(item))
+		: [];
+}
+
+function shortList(values: string[], emptyLabel: string): string {
+	if (values.length === 0) return emptyLabel;
+	const visible = values.slice(0, 3).join(", ");
+	const remaining = values.length - 3;
+	return remaining > 0 ? `${visible} +${remaining.toLocaleString()} more` : visible;
+}
+
+function labelPart(value: string | null, fallback: string): string {
+	return value ? value.replaceAll("_", " ") : fallback;
+}
+
+export interface PeerAuthorizedDomainViewItem {
+	scopeId: string;
+	label: string;
+	detail: string;
+}
+
+export interface PeerAuthorizedDomainsView {
+	total: number;
+	badgeLabel: string;
+	isWarning: boolean;
+	domains: PeerAuthorizedDomainViewItem[];
+	emptyMessage: string;
+}
+
+export interface PeerGrantRoleMismatchView {
+	isVisible: boolean;
+	badgeLabel: string | null;
+	title: string;
+	message: string;
+	detail: string;
+}
+
+export type PeerScopeSyncStatus = "received" | "pending";
+
+export interface PeerScopeSyncViewItem {
+	scopeId: string;
+	label: string;
+	status: PeerScopeSyncStatus;
+	badgeLabel: string;
+	detail: string;
+}
+
+export interface PeerScopeSyncView {
+	total: number;
+	rows: PeerScopeSyncViewItem[];
+	emptyMessage: string;
+}
+
+export function derivePeerAuthorizedDomainsView(peer: PeerLike): PeerAuthorizedDomainsView {
+	const domains = (Array.isArray(peer.authorized_scopes) ? peer.authorized_scopes : [])
+		.map((scope: PeerAuthorizedScopeLike): PeerAuthorizedDomainViewItem | null => {
+			const scopeId = cleanText(scope.scope_id);
+			const rawLabel = cleanText(scope.label);
+			if (!scopeId && !rawLabel) return null;
+			const label = rawLabel || "Untitled Space";
+			const detail = [
+				labelPart(cleanText(scope.kind), "user"),
+				labelPart(cleanText(scope.authority_type), "local"),
+				`${labelPart(cleanText(scope.role), "member")} role`,
+			]
+				.filter(Boolean)
+				.join(" · ");
+			return { scopeId: scopeId || label, label, detail };
+		})
+		.filter((item): item is PeerAuthorizedDomainViewItem => item != null);
+	const total = domains.length;
+	return {
+		total,
+		badgeLabel: total === 1 ? "1 Space" : total > 1 ? `${total} Spaces` : "No Space access",
+		isWarning: total === 0,
+		domains,
+		emptyMessage:
+			"No Space access grants exist for this device yet. Advanced project filters cannot send data by themselves.",
+	};
+}
+
+export function derivePeerScopeSyncView(peer: PeerLike): PeerScopeSyncView {
+	const rows = (Array.isArray(peer.per_scope_sync) ? peer.per_scope_sync : [])
+		.map((scope: PeerPerScopeSyncLike): PeerScopeSyncViewItem | null => {
+			const scopeId = cleanText(scope.scope_id);
+			const rawLabel = cleanText(scope.label);
+			if (!scopeId && !rawLabel) return null;
+			const label = rawLabel || "Untitled Space";
+			const lastApplied = cleanText(scope.last_applied_cursor);
+			const lastAcked = cleanText(scope.last_acked_cursor);
+			const bootstrapped = scope.bootstrapped === true || Boolean(lastApplied);
+			const status: PeerScopeSyncStatus = bootstrapped ? "received" : "pending";
+			const authority = labelPart(cleanText(scope.authority_type), "local");
+			const epoch = Number(scope.membership_epoch ?? 0);
+			const detail = [
+				`Scope id: ${scopeId || "unknown"}`,
+				`${authority} authority`,
+				Number.isFinite(epoch) ? `membership epoch ${epoch}` : null,
+				lastApplied ? `last applied ${lastApplied}` : null,
+				lastAcked ? `last acknowledged ${lastAcked}` : null,
+			]
+				.filter((value): value is string => Boolean(value))
+				.join(" · ");
+			return {
+				scopeId: scopeId || label,
+				label,
+				status,
+				badgeLabel: status === "received" ? "Received" : "Pending",
+				detail,
+			};
+		})
+		.filter((item): item is PeerScopeSyncViewItem => item != null);
+	return {
+		total: rows.length,
+		rows,
+		emptyMessage:
+			"No per-Space sync progress is available yet. Run sync after both devices have Space access.",
+	};
+}
+
+const PERSONAL_SCOPE_WORDS = ["personal", "private", "home", "mine", "me"];
+const OSS_SCOPE_WORDS = ["oss", "open source", "opensource", "community", "public"];
+const WORK_LIKE_SCOPE_WORDS = ["work", "client"];
+const LOCAL_SCOPE_WORDS = ["local", "legacy", "review"];
+
+function scopeSearchText(scope: PeerAuthorizedScopeLike): string {
+	return [scope.scope_id, scope.label, scope.kind, scope.authority_type]
+		.map((value) => cleanText(value) ?? "")
+		.join(" ")
+		.toLowerCase();
+}
+
+function scopeIdentitySearchText(scope: PeerAuthorizedScopeLike): string {
+	return [scope.scope_id, scope.label, scope.kind]
+		.map((value) => cleanText(value) ?? "")
+		.join(" ")
+		.toLowerCase();
+}
+
+function escapeRegex(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function hasScopeWord(scope: PeerAuthorizedScopeLike, words: string[]): boolean {
+	const text = scopeSearchText(scope);
+	return words.some((word) => {
+		const escaped = escapeRegex(word.toLowerCase());
+		return new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`).test(text);
+	});
+}
+
+function isPersonalOrOssScope(scope: PeerAuthorizedScopeLike): boolean {
+	return hasScopeWord(scope, PERSONAL_SCOPE_WORDS) || hasScopeWord(scope, OSS_SCOPE_WORDS);
+}
+
+function isLocalOrLegacyScope(scope: PeerAuthorizedScopeLike): boolean {
+	const text = scopeIdentitySearchText(scope);
+	return LOCAL_SCOPE_WORDS.some((word) => {
+		const escaped = escapeRegex(word.toLowerCase());
+		return new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`).test(text);
+	});
+}
+
+function isWorkLikeScope(scope: PeerAuthorizedScopeLike): boolean {
+	return (
+		!isPersonalOrOssScope(scope) &&
+		(!isLocalOrLegacyScope(scope) || hasScopeWord(scope, WORK_LIKE_SCOPE_WORDS))
+	);
+}
+
+export function derivePeerGrantRoleMismatchView(peer: PeerLike): PeerGrantRoleMismatchView {
+	const scopes = Array.isArray(peer.authorized_scopes) ? peer.authorized_scopes : [];
+	const hasCoordinatorContext = Boolean(
+		cleanText(peer.discovered_via_group_id) || cleanText(peer.discovered_via_coordinator_id),
+	);
+	if (!hasCoordinatorContext || scopes.length === 0) {
+		return { badgeLabel: null, detail: "", isVisible: false, message: "", title: "" };
+	}
+	const hasPersonalOrOssGrant = scopes.some(isPersonalOrOssScope);
+	const hasWorkLikeGrant = scopes.some(isWorkLikeScope);
+	if (!hasPersonalOrOssGrant || hasWorkLikeGrant) {
+		return { badgeLabel: null, detail: "", isVisible: false, message: "", title: "" };
+	}
+	return {
+		badgeLabel: "Review Space fit",
+		detail:
+			"Team discovery helps find the device, and advanced project filters only narrow already-authorized Spaces. Neither one grants missing work/client Space access.",
+		isVisible: true,
+		message:
+			"This Team-discovered device has personal or OSS Space access, but no separate work/client-like Space access. If this device is meant for work/client sync, grant that Space explicitly before treating sync as validated.",
+		title: "Check this device's Space access",
+	};
+}
+
+export interface PeerProjectNarrowingView {
+	hasAdvancedFilters: boolean;
+	statusLabel: string;
+	summary: string;
+	note: string;
+	sourceLabel: string;
+	includeLabel: string;
+	excludeLabel: string;
+}
+
+function hasActiveProjectNarrowing(include: string[], exclude: string[]): boolean {
+	const normalizedInclude = include.map((item) => item.trim()).filter(Boolean);
+	const includeNarrows = normalizedInclude.length > 0 && !normalizedInclude.includes("*");
+	return includeNarrows || exclude.length > 0;
+}
+
+export function derivePeerProjectNarrowingView(
+	scope: PeerProjectScopeLike | null | undefined,
+): PeerProjectNarrowingView {
+	const effectiveInclude = cleanList(scope?.effective_include);
+	const effectiveExclude = cleanList(scope?.effective_exclude);
+	const sourceLabel = scope?.inherits_global ? "Global defaults" : "Device override";
+	const includeLabel = `Include filter: ${shortList(effectiveInclude, "all projects")}`;
+	const excludeLabel = `Exclude filter: ${shortList(effectiveExclude, "no exclusions")}`;
+	const hasAdvancedFilters = hasActiveProjectNarrowing(effectiveInclude, effectiveExclude);
+	return {
+		hasAdvancedFilters,
+		statusLabel: hasAdvancedFilters ? "Advanced filters active" : "No advanced filters",
+		sourceLabel,
+		includeLabel,
+		excludeLabel,
+		summary: `${sourceLabel}. ${includeLabel}; ${excludeLabel}.`,
+		note: "Advanced filters only narrow data after Space access; they never grant access to another Space.",
 	};
 }

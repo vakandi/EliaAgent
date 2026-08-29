@@ -2,9 +2,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
-import { buildRawEventEnvelopeFromHook } from "./claude-hooks.js";
-import { replayBatchExtraction } from "./extraction-replay.js";
-import type { ObserverClient } from "./observer-client.js";
+import { buildRawEventEnvelopeFromHook, TRUSTED_HOOK_MAPPER_OPTIONS } from "./claude-hooks.js";
+import { buildTierRoutedReplayObserverConfig, replayBatchExtraction } from "./extraction-replay.js";
+import {
+	type ObserverClient,
+	ObserverClient as ObserverClientImpl,
+	type ObserverConfig,
+} from "./observer-client.js";
 import { initTestSchema } from "./test-utils.js";
 
 function createDbPath(name: string): string {
@@ -14,7 +18,133 @@ function createDbPath(name: string): string {
 	);
 }
 
+function replayObserverConfig(overrides: Partial<ObserverConfig> = {}): ObserverConfig {
+	return {
+		observerProvider: "openai",
+		observerModel: "gpt-5.4-mini",
+		observerRuntime: "api_http",
+		observerApiKey: null,
+		observerBaseUrl: null,
+		observerTemperature: 0.2,
+		observerSimpleModel: null,
+		observerRichModel: null,
+		observerRichReasoningEffort: null,
+		observerRichReasoningSummary: null,
+		observerReasoningEffort: null,
+		observerReasoningSummary: null,
+		observerMaxChars: 12_000,
+		observerMaxTokens: 4_000,
+		observerHeaders: {},
+		observerAuthSource: "none",
+		observerAuthFile: null,
+		observerAuthCommand: [],
+		observerAuthTimeoutMs: 1_500,
+		observerAuthCacheTtlS: 300,
+		observerExplicitConfigKeys: [],
+		...overrides,
+	};
+}
+
 describe("extraction replay", () => {
+	it.each([
+		{ tier: "simple", eventSpan: 12, toolCount: 1, expectedModel: "gpt-5.6-luna" },
+		{ tier: "rich", eventSpan: 153, toolCount: 12, expectedModel: "gpt-5.6-terra" },
+	] as const)("preserves the CLI reasoning override for $tier tier routing", (scenario) => {
+		const routed = buildTierRoutedReplayObserverConfig(
+			new ObserverClientImpl(
+				replayObserverConfig({
+					observerReasoningEffort: "low",
+					observerReasoningSummary: "auto",
+				}),
+			),
+			{
+				batchId: 18503,
+				sessionId: 166405,
+				eventSpan: scenario.eventSpan,
+				promptCount: scenario.tier === "rich" ? 4 : 1,
+				toolCount: scenario.toolCount,
+				transcriptLength: scenario.tier === "rich" ? 2800 : 320,
+			},
+		);
+
+		expect(routed.tier).toBe(scenario.tier);
+		expect(routed.observer.observerModel).toBe(scenario.expectedModel);
+		expect(routed.observer.observerReasoningEffort).toBe("low");
+		expect(routed.observer.observerReasoningSummary).toBe("auto");
+	});
+
+	it("keeps rich-specific replay reasoning ahead of the global override", () => {
+		const routed = buildTierRoutedReplayObserverConfig(
+			new ObserverClientImpl(
+				replayObserverConfig({
+					observerReasoningEffort: "medium",
+					observerReasoningSummary: "auto",
+					observerRichReasoningEffort: "high",
+					observerRichReasoningSummary: "detailed",
+				}),
+			),
+			{
+				batchId: 18503,
+				sessionId: 166405,
+				eventSpan: 153,
+				promptCount: 4,
+				toolCount: 12,
+				transcriptLength: 2800,
+			},
+		);
+
+		expect(routed.observer.observerReasoningEffort).toBe("high");
+		expect(routed.observer.observerReasoningSummary).toBe("detailed");
+	});
+
+	it("routes with the resolved base provider", () => {
+		const routed = buildTierRoutedReplayObserverConfig(
+			new ObserverClientImpl(
+				replayObserverConfig({
+					observerProvider: null,
+					observerModel: null,
+				}),
+			),
+			{
+				batchId: 19001,
+				sessionId: 200001,
+				eventSpan: 12,
+				promptCount: 1,
+				toolCount: 1,
+				transcriptLength: 320,
+			},
+		);
+
+		expect(routed.tier).toBe("simple");
+		expect(routed.observer.observerProvider).toBe("openai");
+		expect(routed.observer.observerModel).toBe("gpt-5.6-luna");
+	});
+
+	it.each([
+		{ tier: "simple", eventSpan: 12, toolCount: 1 },
+		{ tier: "rich", eventSpan: 153, toolCount: 12 },
+	] as const)("preserves an explicit output-token override for the $tier tier", (scenario) => {
+		const routed = buildTierRoutedReplayObserverConfig(
+			new ObserverClientImpl(
+				replayObserverConfig({
+					observerMaxOutputTokens: 7_777,
+					observerExplicitConfigKeys: ["observerMaxOutputTokens"],
+				}),
+			),
+			{
+				batchId: scenario.tier === "rich" ? 18503 : 19001,
+				sessionId: scenario.tier === "rich" ? 166405 : 200001,
+				eventSpan: scenario.eventSpan,
+				promptCount: scenario.tier === "rich" ? 4 : 1,
+				toolCount: scenario.toolCount,
+				transcriptLength: scenario.tier === "rich" ? 2800 : 320,
+			},
+		);
+
+		expect(routed.tier).toBe(scenario.tier);
+		expect(routed.observer.observerMaxOutputTokens).toBe(7_777);
+	});
+
 	it("replays a historical batch through the current observer prompt without persisting", async () => {
 		const dbPath = createDbPath("extraction-replay");
 		const db = new Database(dbPath);
@@ -37,23 +167,35 @@ describe("extraction replay", () => {
 		}
 
 		const observer = {
+			model: "test-model",
+			requestedModel: "test-model-alias",
+			reasoningEffort: "medium",
+			reasoningSummary: "auto",
+			maxOutputTokens: 12_000,
+			temperature: 0.2,
 			observe: async () => {
 				callCount += 1;
 				if (callCount === 1) {
 					return {
-						raw: `<summary>
-						  <request>Investigate qd7h, prep 0.23.0, and reframe Track 3 around injection-first quality.</request>
+						raw: `<observation><type>decision</type><title>Track 3 reframed around injection-first quality<narrative>Track 3 was reframed to focus on injection-first quality while 0.23.0 release readiness was discussed as a near-term product pressure.</narrative><subtitle>Track 3 now targets rediscovery reduction.</subtitle><facts><fact>Track 3 was reframed around injection-first quality and rediscovery reduction for 0.23.0 release readiness.</fact></facts><concepts><concept>decision</concept></concepts><files_read><file>/tmp/repo/docs/plans/2026-04-07-track-3-injection-first-memory-policy.md</file></files_read><files_modified></files_modified></observation>
+						<observation><type>exploration</type><title>qd7h closure and graph direction<narrative>Graph and progressive disclosure ideas were captured as future work while qd7h closure confirmed the regression thread could be wrapped up.</narrative><subtitle>Graph relationship retrieval stayed exploratory.</subtitle><facts><fact>qd7h was closed after the root cause had already been identified, and graph progressive disclosure remained future-direction work.</fact></facts><concepts><concept>exploration</concept></concepts><files_read></files_read><files_modified></files_modified></observation>
+						<summary>
+						  <request>Preserve the reviewed batch.</request>
 						  <investigated>Reviewed the policy plan and discussed qd7h closure, release readiness, and graph future direction.</investigated>
-						  <learned>qd7h could be closed and Track 3 needed reframing.</learned>
-						  <completed>Started the investigation and captured a broad summary only.</completed>
-						  <next_steps>Add durable observations for the missing subthreads.</next_steps>
-						  <notes>This intentionally under-extracts to trigger the repair pass.</notes>
-						  <files_read><file>docs/plans/2026-04-07-track-3-injection-first-memory-policy.md</file></files_read>
-						  <files_modified></files_modified>
+						  <completed>Reframed Track 3 around injection-first quality and captured graph direction as future work.</completed>
+						  <next_steps>Continue quality tuning and finish release readiness.</next_steps>
+						  <files_read><file>/tmp/repo/docs/plans/2026-04-07-track-3-injection-first-memory-policy.md</file></files_read>
+						</summary>
+						<summary>
+						  <request>Preserve the reviewed batch.</request>
+						  <learned>The batch contains durable lessons.</learned>
+						  <notes>Keep the summary broad across the major subthreads.</notes>
 						</summary>`,
 						parsed: null,
 						provider: "test",
 						model: "test-model",
+						elapsedMs: 12,
+						usage: { inputTokens: 100, outputTokens: 10, totalTokens: 110 },
 					};
 				}
 				return {
@@ -64,7 +206,7 @@ describe("extraction replay", () => {
 				  <facts><fact>Track 3 was reframed around injection-first quality and rediscovery reduction for 0.23.0 release readiness.</fact></facts>
 				  <narrative>Track 3 was reframed to focus on injection-first quality while 0.23.0 release readiness was discussed as a near-term product pressure.</narrative>
 				  <concepts><concept>decision</concept></concepts>
-				  <files_read><file>docs/plans/2026-04-07-track-3-injection-first-memory-policy.md</file></files_read>
+				  <files_read><file>/tmp/repo/docs/plans/2026-04-07-track-3-injection-first-memory-policy.md</file></files_read>
 				  <files_modified></files_modified>
 				</observation>
 				<observation>
@@ -78,15 +220,106 @@ describe("extraction replay", () => {
 				  <files_modified></files_modified>
 				</observation>
 				<summary>
-				  <request>Investigate qd7h, prep 0.23.0, and reframe Track 3 around injection-first quality.</request>
+				  <request>Preserve the reviewed batch.</request>
 				  <investigated>Reviewed the policy plan and discussed qd7h closure, release readiness, and graph future direction.</investigated>
-				  <learned>qd7h could be closed, 0.23.0 readiness mattered, and graph work should remain future-facing.</learned>
+				  <learned>The batch contains durable lessons.</learned>
 				  <completed>Reframed Track 3 around injection-first quality and captured graph direction as future work.</completed>
 				  <next_steps>Continue quality tuning and finish release readiness.</next_steps>
 				  <notes>Keep the summary broad across the major subthreads.</notes>
-				  <files_read><file>docs/plans/2026-04-07-track-3-injection-first-memory-policy.md</file></files_read>
+				  <files_read><file>/tmp/repo/docs/plans/2026-04-07-track-3-injection-first-memory-policy.md</file></files_read>
 				  <files_modified></files_modified>
 				</summary>`,
+					parsed: null,
+					provider: "test",
+					model: "test-model",
+					elapsedMs: 20,
+					usage: { inputTokens: 120, outputTokens: 30, totalTokens: 150 },
+				};
+			},
+			getStatus: () => ({
+				provider: "test",
+				model: "test-model",
+				runtime: "api_http",
+				auth: { source: "opencode", type: "codex_consumer", hasToken: true },
+			}),
+		} as unknown as ObserverClient;
+		let callCount = 0;
+
+		const result = await replayBatchExtraction(dbPath, observer, {
+			batchId: 18503,
+			scenarioId: "rich-session-under-extraction",
+		});
+		expect(result.target).toEqual({ batchId: 18503, sessionId: 166405 });
+		expect(result.classification.status).toBe("pass");
+		expect(result.evaluation.target).toEqual({ type: "batch", sessionId: 166405, batchId: 18503 });
+		expect(result.evaluation.counts.summaries).toBe(1);
+		expect(result.evaluation.counts.observations).toBe(2);
+		expect(result.observer.provider).toBe("test");
+		expect(result.observer.requestedModel).toBe("test-model-alias");
+		expect(result.observer.resolvedModel).toBe("test-model");
+		expect(result.observer.transport).toBe("codex_consumer");
+		expect(result.observer.reasoningEffort).toBe("medium");
+		expect(result.observer.reasoningSummary).toBe("auto");
+		expect(result.observer.maxOutputTokens).toBeNull();
+		expect(result.observer.temperature).toBeNull();
+		expect(result.observer.modelFallbackApplied).toBe(false);
+		expect(result.observer.repairApplied).toBe(true);
+		expect(result.observer.initialRaw).toContain(
+			"<observation><type>decision</type><title>Track 3 reframed",
+		);
+		expect(result.observer.raw).toContain("<observation>");
+		expect(result.initialEvaluation.counts.observations).toBe(0);
+		expect(result.initialEvaluation.pass).toBe(false);
+		expect(result.initialClassification.status).toBe("shape_fail");
+		expect(result.repairedClassification?.status).toBe("pass");
+		expect(result.observer.repairedDiagnostics?.dataLoss).toBe(false);
+		expect(result.observer.initialDiagnostics).toMatchObject({
+			recognizedOutput: true,
+			dataLoss: true,
+		});
+		expect(result.observer.totalElapsedMs).toBe(32);
+		expect(result.observer.totalUsage).toEqual({
+			inputTokens: 220,
+			outputTokens: 40,
+			totalTokens: 260,
+		});
+		expect(callCount).toBe(2);
+		expect(result.observerContext.userPrompt).toContain("Track 3");
+		expect(result.evaluation.coverage.totalThreadCoverage).toBeGreaterThanOrEqual(3);
+		expect(result.evaluation.pass).toBe(true);
+	});
+
+	it("uses initial diagnostics when a clean but disjoint repair is rejected", async () => {
+		const dbPath = createDbPath("extraction-replay-rejected-repair");
+		const db = new Database(dbPath);
+		try {
+			initTestSchema(db);
+			db.exec(`
+				INSERT INTO sessions(id, started_at, ended_at, cwd, project, user, tool_version, metadata_json) VALUES
+				  (166406, '2026-04-06T21:23:59.631Z', '2026-04-07T06:13:45.667Z', '/tmp/repo', 'codemem', 'adam', 'test', '{"post":{"session_class":"durable","summary_disposition":"stored"}}');
+				INSERT INTO opencode_sessions(source, stream_id, opencode_session_id, session_id, created_at) VALUES
+				  ('opencode', 'ses-2', 'ses-2', 166406, '2026-04-06T21:23:59.631Z');
+				INSERT INTO raw_event_flush_batches(id, source, stream_id, opencode_session_id, start_event_seq, end_event_seq, extractor_version, status, attempt_count, created_at, updated_at) VALUES
+				  (18504, 'opencode', 'ses-2', 'ses-2', 1, 1, 'raw_events_v1', 'completed', 1, '2026-04-07T06:13:45.600Z', '2026-04-07T06:13:45.700Z');
+				INSERT INTO raw_events(id, source, stream_id, opencode_session_id, event_id, event_seq, event_type, ts_wall_ms, ts_mono_ms, payload_json, created_at) VALUES
+				  (4, 'opencode', 'ses-2', 'ses-2', 'evt-4', 1, 'user_prompt', 1000, 1, '{"type":"user_prompt","prompt_text":"Preserve valid replay content"}', '2026-04-07T06:13:45.600Z');
+			`);
+		} finally {
+			db.close();
+		}
+
+		let callCount = 0;
+		const observer = {
+			openaiUseResponses: false,
+			reasoningEffort: "medium",
+			reasoningSummary: "auto",
+			observe: async () => {
+				callCount += 1;
+				return {
+					raw:
+						callCount === 1
+							? `<observation><type>discovery</type><title>Retained replay lesson</title><narrative>Keep this observation.</narrative></observation><observation><type>discovery</type><title>Truncated`
+							: `<observation><type>discovery</type><title>Different repaired lesson</title><narrative>This omits the retained observation.</narrative></observation>`,
 					parsed: null,
 					provider: "test",
 					model: "test-model",
@@ -99,23 +332,218 @@ describe("extraction replay", () => {
 				auth: { source: "none", type: "none", hasToken: false },
 			}),
 		} as unknown as ObserverClient;
-		let callCount = 0;
 
 		const result = await replayBatchExtraction(dbPath, observer, {
-			batchId: 18503,
+			batchId: 18504,
 			scenarioId: "rich-session-under-extraction",
 		});
 
-		expect(result.target).toEqual({ batchId: 18503, sessionId: 166405 });
-		expect(result.classification.status).toBe("pass");
-		expect(result.evaluation.target).toEqual({ type: "batch", sessionId: 166405, batchId: 18503 });
-		expect(result.evaluation.counts.summaries).toBe(1);
-		expect(result.evaluation.counts.observations).toBe(2);
-		expect(result.observer.provider).toBe("test");
-		expect(result.observer.repairApplied).toBe(true);
 		expect(callCount).toBe(2);
-		expect(result.observerContext.userPrompt).toContain("Track 3");
-		expect(result.evaluation.coverage.totalThreadCoverage).toBeGreaterThanOrEqual(3);
+		expect(result.observer.raw).toContain("Retained replay lesson");
+		expect(result.observer.parsed.observations[0]?.title).toBe("Retained replay lesson");
+		expect(result.observer.diagnostics).toEqual(result.observer.initialDiagnostics);
+		expect(result.observer.diagnostics.dataLoss).toBe(true);
+		expect(result.observer.repairedDiagnostics?.dataLoss).toBe(false);
+		expect(result.observer.reasoningEffort).toBeNull();
+		expect(result.observer.reasoningSummary).toBeNull();
+	});
+
+	it("retains usable initial replay output when the repair call throws", async () => {
+		const dbPath = createDbPath("extraction-replay-repair-error");
+		const db = new Database(dbPath);
+		try {
+			initTestSchema(db);
+			db.exec(`
+				INSERT INTO sessions(id, started_at, ended_at, cwd, project, user, tool_version, metadata_json) VALUES
+				  (166408, '2026-04-06T21:23:59.631Z', '2026-04-07T06:13:45.667Z', '/tmp/repo', 'codemem', 'adam', 'test', '{"post":{"session_class":"durable","summary_disposition":"stored"}}');
+				INSERT INTO opencode_sessions(source, stream_id, opencode_session_id, session_id, created_at) VALUES
+				  ('opencode', 'ses-repair-error', 'ses-repair-error', 166408, '2026-04-06T21:23:59.631Z');
+				INSERT INTO raw_event_flush_batches(id, source, stream_id, opencode_session_id, start_event_seq, end_event_seq, extractor_version, status, attempt_count, created_at, updated_at) VALUES
+				  (18506, 'opencode', 'ses-repair-error', 'ses-repair-error', 1, 1, 'raw_events_v1', 'completed', 1, '2026-04-07T06:13:45.600Z', '2026-04-07T06:13:45.700Z');
+				INSERT INTO raw_events(id, source, stream_id, opencode_session_id, event_id, event_seq, event_type, ts_wall_ms, ts_mono_ms, payload_json, created_at) VALUES
+				  (23, 'opencode', 'ses-repair-error', 'ses-repair-error', 'evt-23', 1, 'user_prompt', 1000, 1, '{"type":"user_prompt","prompt_text":"Preserve replay output after a repair error"}', '2026-04-07T06:13:45.600Z');
+			`);
+		} finally {
+			db.close();
+		}
+
+		let callCount = 0;
+		let observerStatus = {
+			provider: "test",
+			model: "requested-sidecar-model",
+			runtime: "claude_sidecar",
+			auth: { source: "none", type: "claude_sidecar", hasToken: false },
+			actualModel: "requested-sidecar-model",
+			modelFallbackApplied: false,
+			modelFallbackReason: null as string | null,
+		};
+		const observer = {
+			model: "requested-sidecar-model",
+			requestedModel: "requested-sidecar-model",
+			observe: async () => {
+				callCount += 1;
+				if (callCount === 2) {
+					observerStatus = {
+						...observerStatus,
+						actualModel: "requested-sidecar-model",
+						modelFallbackApplied: false,
+						modelFallbackReason: null,
+					};
+					throw new Error("repair transport failed");
+				}
+				observerStatus = {
+					...observerStatus,
+					model: "fallback-sidecar-model",
+					actualModel: "fallback-sidecar-model",
+					modelFallbackApplied: true,
+					modelFallbackReason: "requested model unavailable",
+				};
+				return {
+					raw: `<observation><type>discovery</type><title>Retained replay result</title><narrative>Keep this usable initial observation.</narrative></observation><observation><type>bugfix</type><title>Truncated`,
+					parsed: null,
+					provider: "test",
+					model: "fallback-sidecar-model",
+				};
+			},
+			getStatus: () => observerStatus,
+		} as unknown as ObserverClient;
+
+		const result = await replayBatchExtraction(dbPath, observer, {
+			batchId: 18506,
+			scenarioId: "rich-session-under-extraction",
+		});
+
+		expect(callCount).toBe(2);
+		expect(result.observer.repairApplied).toBe(false);
+		expect(result.observer.raw).toContain("Retained replay result");
+		expect(result.observer.parsed.observations[0]?.title).toBe("Retained replay result");
+		expect(result.observer.repairedRaw).toBeNull();
+		expect(result.observer.repairedDiagnostics).toBeNull();
+		expect(result.observer.diagnostics).toEqual(result.observer.initialDiagnostics);
+		expect(result.observer.requestedModel).toBe("requested-sidecar-model");
+		expect(result.observer.resolvedModel).toBe("fallback-sidecar-model");
+		expect(result.observer.modelFallbackApplied).toBe(true);
+		expect(result.observer.modelFallbackReason).toBe("requested model unavailable");
+	});
+
+	it("does not repair a rich result when observation count is its only potential failure", async () => {
+		// Arrange
+		const dbPath = createDbPath("extraction-replay-rich-count-only");
+		const db = new Database(dbPath);
+		try {
+			initTestSchema(db);
+			db.exec(`
+				INSERT INTO sessions(id, started_at, ended_at, cwd, project, user, tool_version, metadata_json) VALUES
+				  (166407, '2026-04-06T21:23:59.631Z', '2026-04-07T06:13:45.667Z', '/tmp/repo', 'codemem', 'adam', 'test', '{"post":{"session_class":"durable","summary_disposition":"stored"}}');
+				INSERT INTO opencode_sessions(source, stream_id, opencode_session_id, session_id, created_at) VALUES
+				  ('opencode', 'ses-3', 'ses-3', 166407, '2026-04-06T21:23:59.631Z');
+				INSERT INTO raw_event_flush_batches(id, source, stream_id, opencode_session_id, start_event_seq, end_event_seq, extractor_version, status, attempt_count, created_at, updated_at) VALUES
+				  (18505, 'opencode', 'ses-3', 'ses-3', 1, 2, 'raw_events_v1', 'completed', 1, '2026-04-07T06:13:45.600Z', '2026-04-07T06:13:45.700Z');
+				INSERT INTO raw_events(id, source, stream_id, opencode_session_id, event_id, event_seq, event_type, ts_wall_ms, ts_mono_ms, payload_json, created_at) VALUES
+				  (21, 'opencode', 'ses-3', 'ses-3', 'evt-21', 1, 'user_prompt', 1000, 1, '{"type":"user_prompt","prompt_text":"Investigate several extraction evaluation concerns"}', '2026-04-07T06:13:45.600Z'),
+				  (22, 'opencode', 'ses-3', 'ses-3', 'evt-22', 2, 'user_prompt', 1010, 2, '{"type":"user_prompt","prompt_text":"Report only durable outcomes"}', '2026-04-07T06:13:45.610Z');
+			`);
+		} finally {
+			db.close();
+		}
+		const raw = `<summary>
+		  <request>Investigate several extraction evaluation concerns.</request>
+		  <investigated>Reviewed the evaluation policy and replay behavior.</investigated>
+		  <learned>No individual fact cleared the durable observation bar.</learned>
+		  <completed>Produced a broad summary without manufacturing observations.</completed>
+		  <next_steps>Continue with labelled durable-fact evaluation.</next_steps>
+		  <notes>The zero-observation cardinality is intentional.</notes>
+		</summary>`;
+		let callCount = 0;
+		const observer = {
+			observe: async () => {
+				callCount += 1;
+				return { raw, parsed: null, provider: "test", model: "test-model" };
+			},
+			getStatus: () => ({
+				provider: "test",
+				model: "test-model",
+				runtime: "test",
+				auth: { source: "none", type: "none", hasToken: false },
+			}),
+		} as unknown as ObserverClient;
+
+		// Act
+		const result = await replayBatchExtraction(dbPath, observer, {
+			batchId: 18505,
+			scenarioId: "rich-batch-shape",
+		});
+
+		// Assert
+		expect(callCount).toBe(1);
+		expect(result.observer.repairApplied).toBe(false);
+		expect(result.observer.initialRaw).toBe(raw);
+		expect(result.observer.raw).toBe(raw);
+		expect(result.initialEvaluation.counts.observations).toBe(0);
+		expect(result.evaluation.counts.observations).toBe(0);
+		expect(result.evaluation.pass).toBe(true);
+	});
+
+	it("does not repair summary-only output for a routine-shape scenario", async () => {
+		const dbPath = createDbPath("extraction-replay-routine");
+		const db = new Database(dbPath);
+		try {
+			initTestSchema(db);
+			db.exec(`
+				INSERT INTO sessions(id, started_at, ended_at, cwd, project, user, tool_version, metadata_json) VALUES
+				  (166406, '2026-04-06T21:23:59.631Z', '2026-04-07T06:13:45.667Z', '/tmp/repo', 'codemem', 'adam', 'test', '{"post":{"session_class":"working","summary_disposition":"stored"}}');
+				INSERT INTO opencode_sessions(source, stream_id, opencode_session_id, session_id, created_at) VALUES
+				  ('opencode', 'ses-2', 'ses-2', 166406, '2026-04-06T21:23:59.631Z');
+				INSERT INTO raw_event_flush_batches(id, source, stream_id, opencode_session_id, start_event_seq, end_event_seq, extractor_version, status, attempt_count, created_at, updated_at) VALUES
+				  (18504, 'opencode', 'ses-2', 'ses-2', 1204, 1356, 'raw_events_v1', 'completed', 1, '2026-04-07T06:13:45.600Z', '2026-04-07T06:13:45.700Z');
+				INSERT INTO raw_events(id, source, stream_id, opencode_session_id, event_id, event_seq, event_type, ts_wall_ms, ts_mono_ms, payload_json, created_at) VALUES
+				  (11, 'opencode', 'ses-2', 'ses-2', 'evt-11', 1204, 'user_prompt', 1000, 1, '{"type":"user_prompt","prompt_text":"Cut release 0.31.2"}', '2026-04-07T06:13:45.600Z'),
+				  (12, 'opencode', 'ses-2', 'ses-2', 'evt-12', 1205, 'user_prompt', 1005, 2, '{"type":"user_prompt","prompt_text":"Is the release workflow green?"}', '2026-04-07T06:13:45.605Z'),
+				  (13, 'opencode', 'ses-2', 'ses-2', 'evt-13', 1206, 'assistant_message', 1010, 3, '{"type":"assistant_message","assistant_text":"Tag pushed; the release workflow is running and green so far."}', '2026-04-07T06:13:45.610Z');
+			`);
+		} finally {
+			db.close();
+		}
+
+		let callCount = 0;
+		const observer = {
+			observe: async () => {
+				callCount += 1;
+				return {
+					raw: `<summary>
+					  <request>Cut release 0.31.2 and confirm the workflow is green.</request>
+					  <investigated>Checked the release workflow status after pushing the tag.</investigated>
+					  <learned>Nothing durable; routine release monitoring.</learned>
+					  <completed>Pushed tag v0.31.2 and confirmed the release workflow was running.</completed>
+					  <next_steps>Wait for the workflow to finish publishing.</next_steps>
+					  <notes>Routine release session with no durable lessons.</notes>
+					  <files_read></files_read>
+					  <files_modified></files_modified>
+					</summary>`,
+					parsed: null,
+					provider: "test",
+					model: "test-model",
+				};
+			},
+			getStatus: () => ({
+				provider: "test",
+				model: "test-model",
+				runtime: "test",
+				auth: { source: "none", type: "none", hasToken: false },
+			}),
+		} as unknown as ObserverClient;
+
+		const result = await replayBatchExtraction(dbPath, observer, {
+			batchId: 18504,
+			scenarioId: "routine-batch-shape",
+		});
+
+		// Two prompts make this a rich replay candidate, but the routine scenario
+		// expects zero observations — summary-only output must stand unrepaired.
+		expect(callCount).toBe(1);
+		expect(result.observer.repairApplied).toBe(false);
+		expect(result.evaluation.counts.summaries).toBe(1);
+		expect(result.evaluation.counts.observations).toBe(0);
 		expect(result.evaluation.pass).toBe(true);
 	});
 
@@ -176,7 +604,8 @@ describe("extraction replay", () => {
 
 		expect(result.evaluation.counts.summaries).toBe(1);
 		expect(result.evaluation.counts.observations).toBe(0);
-		expect(result.classification.status).toBe("shape_fail");
+		expect(result.classification.status).toBe("pass");
+		expect(result.observer.initialDiagnostics?.unsupportedObservationKinds).toEqual(["foo"]);
 	});
 
 	it("populates session context fields from Claude Code adapter-enveloped raw events during replay", async () => {
@@ -241,7 +670,7 @@ describe("extraction replay", () => {
 				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			);
 			hookEvents.forEach((hook, index) => {
-				const envelope = buildRawEventEnvelopeFromHook(hook);
+				const envelope = buildRawEventEnvelopeFromHook(hook, TRUSTED_HOOK_MAPPER_OPTIONS);
 				if (envelope == null) throw new Error("expected envelope");
 				insertRaw.run(
 					envelope.source,

@@ -1,12 +1,16 @@
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toJson } from "./db.js";
+import { SecretScanner } from "./secret-scanner.js";
 import {
 	applyReplicationOps,
 	backfillReplicationOps,
 	bulkPruneReplicationOpsByAgeCutoff,
 	chunkOpsBySize,
+	clearReplicationCursorLastApplied,
 	clockTuple,
+	DEFAULT_SYNC_SCOPE_ID,
+	diagnoseStalePeerReceivedRows,
 	extractReplicationOps,
 	filterReplicationOpsForSync,
 	filterReplicationOpsForSyncWithStatus,
@@ -14,6 +18,7 @@ import {
 	getSyncResetState,
 	hasUnsyncedSharedMemoryChanges,
 	isNewerClock,
+	listInboundScopeRejections,
 	loadMemorySnapshotPageForPeer,
 	loadReplicationOpsForPeer,
 	loadReplicationOpsSince,
@@ -21,9 +26,13 @@ import {
 	planReplicationOpsAgePrune,
 	pruneReplicationOps,
 	pruneReplicationOpsUntilCaughtUp,
+	reconcileStalePeerReceivedRows,
+	recordAccessCleanupOp,
 	recordReplicationOp,
+	SCOPED_NULL_BASELINE_BOOTSTRAP_CURSOR_MARKER,
 	setReplicationCursor,
 	setSyncResetState,
+	summarizeInboundScopeRejections,
 } from "./sync-replication.js";
 import { initTestSchema, insertTestSession } from "./test-utils.js";
 import type { ReplicationOp } from "./types.js";
@@ -44,6 +53,7 @@ function makeOp(id: string, payloadSize = 10): ReplicationOp {
 		clock_device_id: "dev-a",
 		device_id: "dev-a",
 		created_at: "2026-01-01T00:00:00Z",
+		scope_id: null,
 	};
 }
 
@@ -126,6 +136,35 @@ describe("replication cursors", () => {
 		setReplicationCursor(db, "peer-3", { lastApplied: "new" });
 		const [applied] = getReplicationCursor(db, "peer-3");
 		expect(applied).toBe("new");
+	});
+
+	it("keeps cursor values independent per scope", () => {
+		setReplicationCursor(db, "peer-scoped", { lastApplied: "default-applied" });
+		setReplicationCursor(
+			db,
+			"peer-scoped",
+			{ lastApplied: "work-applied", lastAcked: "work-acked" },
+			"work-scope",
+		);
+
+		expect(getReplicationCursor(db, "peer-scoped")).toEqual(["default-applied", null]);
+		expect(getReplicationCursor(db, "peer-scoped", "work-scope")).toEqual([
+			"work-applied",
+			"work-acked",
+		]);
+	});
+
+	it("seeds legacy default cursor before a partial v2 update", () => {
+		db.prepare("DELETE FROM replication_cursors_v2").run();
+		db.prepare(
+			`INSERT INTO replication_cursors(
+				peer_device_id, last_applied_cursor, last_acked_cursor, updated_at
+			 ) VALUES (?, ?, ?, ?)`,
+		).run("peer-legacy", "legacy-applied", "legacy-acked", "2026-01-01T00:00:00Z");
+
+		setReplicationCursor(db, "peer-legacy", { lastApplied: "new-applied" });
+
+		expect(getReplicationCursor(db, "peer-legacy")).toEqual(["new-applied", "legacy-acked"]);
 	});
 });
 
@@ -248,6 +287,54 @@ describe("recordReplicationOp", () => {
 		expect(row.clock_device_id).toBe("dev-a");
 	});
 
+	it("stamps a missing memory scope before recording the replication op", () => {
+		const sessionId = insertTestSession(db);
+		db.prepare("UPDATE sessions SET cwd = ?, project = ? WHERE id = ?").run(
+			"/work/acme/service",
+			"service",
+			sessionId,
+		);
+		db.prepare(
+			`INSERT INTO project_scope_mappings(
+				workspace_identity, project_pattern, scope_id, priority, source, created_at, updated_at
+			 ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		).run(
+			"/work/acme/service",
+			"/work/acme/*",
+			"acme-work",
+			10,
+			"user",
+			"2026-05-01T00:00:00Z",
+			"2026-05-01T00:00:00Z",
+		);
+		const now = new Date().toISOString();
+		db.prepare(
+			`INSERT INTO memory_items(session_id, kind, title, body_text, created_at, updated_at, import_key, rev, metadata_json)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		).run(sessionId, "discovery", "Test", "body", now, now, "key:scope-stamp", 3, toJson({}));
+
+		const memId = (
+			db.prepare("SELECT id FROM memory_items WHERE import_key = ?").get("key:scope-stamp") as {
+				id: number;
+			}
+		).id;
+
+		const opId = recordReplicationOp(db, {
+			memoryId: memId,
+			opType: "delete",
+			deviceId: "dev-a",
+		});
+
+		const memory = db.prepare("SELECT scope_id FROM memory_items WHERE id = ?").get(memId) as {
+			scope_id: string | null;
+		};
+		expect(memory.scope_id).toBe("acme-work");
+		const op = db.prepare("SELECT scope_id FROM replication_ops WHERE op_id = ?").get(opId) as {
+			scope_id: string | null;
+		};
+		expect(op.scope_id).toBe("acme-work");
+	});
+
 	it("includes full memory payload in upsert ops and round-trips all columns", () => {
 		const sessionId = insertTestSession(db);
 		const now = new Date().toISOString();
@@ -258,8 +345,8 @@ describe("recordReplicationOp", () => {
 				created_at, updated_at, import_key, rev, metadata_json, active,
 				actor_id, actor_display_name, visibility, workspace_id, workspace_kind,
 				origin_device_id, origin_source, trust_state, narrative,
-				facts, concepts, files_read, files_modified
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				facts, concepts, files_read, files_modified, scope_id
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		).run(
 			sessionId,
 			"feature",
@@ -287,6 +374,7 @@ describe("recordReplicationOp", () => {
 			toJson(["concept-1"]),
 			toJson(["src/a.ts"]),
 			toJson(["src/b.ts"]),
+			"acme-work",
 		);
 
 		const memId = (
@@ -297,8 +385,9 @@ describe("recordReplicationOp", () => {
 
 		const opId = recordReplicationOp(db, { memoryId: memId, opType: "upsert", deviceId: "dev-a" });
 		const row = db
-			.prepare("SELECT payload_json FROM replication_ops WHERE op_id = ?")
-			.get(opId) as { payload_json: string | null };
+			.prepare("SELECT payload_json, scope_id FROM replication_ops WHERE op_id = ?")
+			.get(opId) as { payload_json: string | null; scope_id: string | null };
+		expect(row.scope_id).toBe("acme-work");
 
 		const payloadJson = row.payload_json;
 		if (payloadJson === null) throw new Error("expected row.payload_json to be non-null");
@@ -321,6 +410,7 @@ describe("recordReplicationOp", () => {
 		// JSON array fields should be arrays, not strings
 		expect(payload.facts).toEqual(["fact-1"]);
 		expect(payload.files_read).toEqual(["src/a.ts"]);
+		expect(payload.scope_id).toBe("acme-work");
 
 		// Full round-trip: load op → apply to a second DB → verify all columns
 		const [ops] = loadReplicationOpsSince(db, null);
@@ -353,6 +443,7 @@ describe("recordReplicationOp", () => {
 			expect(applied.origin_device_id).toBe("dev-a");
 			expect(applied.origin_source).toBe("manual");
 			expect(applied.trust_state).toBe("verified");
+			expect(applied.scope_id).toBe("acme-work");
 			expect(applied.narrative).toBe("Full narrative text");
 			// metadata_json round-trips as proper JSON with clock_device_id added
 			const appliedMeta = JSON.parse(applied.metadata_json as string);
@@ -387,6 +478,37 @@ describe("recordReplicationOp", () => {
 			.prepare("SELECT payload_json FROM replication_ops WHERE op_id = ?")
 			.get(opId) as { payload_json: string | null };
 		expect(row.payload_json).toBeNull();
+	});
+
+	it("records access cleanup ops on the default sync path", () => {
+		const opId = recordAccessCleanupOp(db, {
+			importKey: "key:cleanup",
+			deviceId: "dev-source",
+			cleanupScopeId: "acme-work",
+			clockRev: 7,
+			clockUpdatedAt: "2026-01-01T00:00:07Z",
+			targetPeerDeviceId: "dev-receiver",
+			reason: "scope_revoked",
+			opId: "cleanup-op",
+		});
+
+		expect(opId).toBe("cleanup-op");
+		const row = db.prepare("SELECT * FROM replication_ops WHERE op_id = ?").get(opId) as Record<
+			string,
+			unknown
+		>;
+		expect(row).toMatchObject({
+			clock_rev: 7,
+			device_id: "dev-source",
+			entity_id: "key:cleanup",
+			op_type: "access_cleanup",
+			scope_id: DEFAULT_SYNC_SCOPE_ID,
+		});
+		expect(JSON.parse(String(row.payload_json))).toMatchObject({
+			cleanup_scope_id: "acme-work",
+			reason: "scope_revoked",
+			target_peer_device_id: "dev-receiver",
+		});
 	});
 
 	it("falls back to memoryId as entity_id when import_key is null", () => {
@@ -431,11 +553,17 @@ describe("loadReplicationOpsSince", () => {
 		db.close();
 	});
 
-	function insertOp(opId: string, createdAt: string, deviceId = "dev-a") {
+	function insertOp(
+		opId: string,
+		createdAt: string,
+		deviceId = "dev-a",
+		scopeId: string | null = null,
+		clockDeviceId = deviceId,
+	) {
 		db.prepare(
-			`INSERT INTO replication_ops(op_id, entity_type, entity_id, op_type, payload_json, clock_rev, clock_updated_at, clock_device_id, device_id, created_at)
-			 VALUES (?, 'memory_item', ?, 'upsert', NULL, 1, ?, ?, ?, ?)`,
-		).run(opId, `ent-${opId}`, createdAt, deviceId, deviceId, createdAt);
+			`INSERT INTO replication_ops(op_id, entity_type, entity_id, op_type, payload_json, clock_rev, clock_updated_at, clock_device_id, device_id, created_at, scope_id)
+			 VALUES (?, 'memory_item', ?, 'upsert', NULL, 1, ?, ?, ?, ?, ?)`,
+		).run(opId, `ent-${opId}`, createdAt, clockDeviceId, deviceId, createdAt, scopeId);
 	}
 
 	it("returns all ops when cursor is null", () => {
@@ -473,6 +601,7 @@ describe("loadReplicationOpsSince", () => {
 	it("filters by deviceId", () => {
 		insertOp("op-1", "2026-01-01T00:00:00Z", "dev-a");
 		insertOp("op-2", "2026-01-01T00:00:01Z", "dev-b");
+		insertOp("op-3", "2026-01-01T00:00:02Z", "dev-a", null, "dev-third");
 
 		const [ops] = loadReplicationOpsSince(db, null, 100, "dev-a");
 		expect(ops).toHaveLength(1);
@@ -523,6 +652,30 @@ describe("sync reset state", () => {
 		});
 		expect(getSyncResetState(db)).toEqual(updated);
 	});
+
+	it("keeps reset boundaries independent per scope", () => {
+		const defaultBoundary = setSyncResetState(db, {
+			generation: 2,
+			snapshot_id: "snapshot-default",
+			baseline_cursor: "2026-01-01T00:00:01Z|default-base",
+			retained_floor_cursor: "2026-01-01T00:00:02Z|default-floor",
+		});
+		const workBoundary = setSyncResetState(
+			db,
+			{
+				generation: 9,
+				snapshot_id: "snapshot-work",
+				baseline_cursor: "2026-01-01T00:00:03Z|work-base",
+				retained_floor_cursor: "2026-01-01T00:00:04Z|work-floor",
+			},
+			"work-scope",
+		);
+
+		expect(getSyncResetState(db)).toEqual(defaultBoundary);
+		expect(getSyncResetState(db, "work-scope")).toEqual(workBoundary);
+		expect(getSyncResetState(db).snapshot_id).toBe("snapshot-default");
+		expect(getSyncResetState(db, "work-scope").snapshot_id).toBe("snapshot-work");
+	});
 });
 
 describe("loadReplicationOpsForPeer", () => {
@@ -537,17 +690,33 @@ describe("loadReplicationOpsForPeer", () => {
 			baseline_cursor: "2026-01-01T00:00:01Z|base-op",
 			retained_floor_cursor: "2026-01-01T00:00:02Z|floor-op",
 		});
+		setSyncResetState(
+			db,
+			{
+				generation: 2,
+				snapshot_id: "snapshot-2",
+				baseline_cursor: "2026-01-01T00:00:01Z|base-op",
+				retained_floor_cursor: "2026-01-01T00:00:02Z|floor-op",
+			},
+			"work-scope",
+		);
 	});
 
 	afterEach(() => {
 		db.close();
 	});
 
-	function insertOp(opId: string, createdAt: string, deviceId = "dev-a") {
+	function insertOp(
+		opId: string,
+		createdAt: string,
+		deviceId = "dev-a",
+		scopeId: string | null = "work-scope",
+		clockDeviceId = deviceId,
+	) {
 		db.prepare(
-			`INSERT INTO replication_ops(op_id, entity_type, entity_id, op_type, payload_json, clock_rev, clock_updated_at, clock_device_id, device_id, created_at)
-			 VALUES (?, 'memory_item', ?, 'upsert', NULL, 1, ?, ?, ?, ?)`,
-		).run(opId, `ent-${opId}`, createdAt, deviceId, deviceId, createdAt);
+			`INSERT INTO replication_ops(op_id, entity_type, entity_id, op_type, payload_json, clock_rev, clock_updated_at, clock_device_id, device_id, created_at, scope_id)
+			 VALUES (?, 'memory_item', ?, 'upsert', NULL, 1, ?, ?, ?, ?, ?)`,
+		).run(opId, `ent-${opId}`, createdAt, clockDeviceId, deviceId, createdAt, scopeId);
 	}
 
 	it("returns reset_required when the cursor is older than the retained floor", () => {
@@ -580,6 +749,7 @@ describe("loadReplicationOpsForPeer", () => {
 	it("requires an explicit reset boundary on incremental requests", () => {
 		const result = loadReplicationOpsForPeer(db, {
 			since: "2026-01-01T00:00:02Z|floor-op",
+			scopeId: "work-scope",
 		});
 		expect(result.reset_required).toBe(true);
 		if (result.reset_required) {
@@ -591,6 +761,7 @@ describe("loadReplicationOpsForPeer", () => {
 	it("returns reset_required when snapshot metadata is omitted for the current generation", () => {
 		const result = loadReplicationOpsForPeer(db, {
 			since: "2026-01-01T00:00:02Z|floor-op",
+			scopeId: "work-scope",
 			generation: 2,
 		});
 		expect(result.reset_required).toBe(true);
@@ -615,6 +786,7 @@ describe("loadReplicationOpsForPeer", () => {
 		insertOp("op-1", "2026-01-01T00:00:03Z");
 		const result = loadReplicationOpsForPeer(db, {
 			since: "2026-01-01T00:00:02Z|floor-op",
+			scopeId: "work-scope",
 			generation: 2,
 			snapshotId: "snapshot-2",
 			baselineCursor: "2026-01-01T00:00:01Z|base-op",
@@ -624,6 +796,94 @@ describe("loadReplicationOpsForPeer", () => {
 			expect(result.boundary.generation).toBe(2);
 			expect(result.ops.map((op) => op.op_id)).toEqual(["op-1"]);
 			expect(result.nextCursor).toBe("2026-01-01T00:00:03Z|op-1");
+		}
+	});
+
+	it("uses scoped reset boundaries and op windows independently", () => {
+		setSyncResetState(
+			db,
+			{
+				generation: 7,
+				snapshot_id: "snapshot-work",
+				baseline_cursor: "2026-01-01T00:00:05Z|work-base",
+				retained_floor_cursor: "2026-01-01T00:00:06Z|work-floor",
+			},
+			"work-scope",
+		);
+		insertOp("op-default", "2026-01-01T00:00:07Z", "dev-a", null);
+		insertOp("op-work", "2026-01-01T00:00:08Z", "dev-a", "work-scope");
+
+		const result = loadReplicationOpsForPeer(db, {
+			deviceId: "dev-a",
+			scopeId: "work-scope",
+			since: "2026-01-01T00:00:06Z|work-floor",
+			generation: 7,
+			snapshotId: "snapshot-work",
+			baselineCursor: "2026-01-01T00:00:05Z|work-base",
+		});
+
+		expect(result.reset_required).toBe(false);
+		if (!result.reset_required) {
+			expect(result.boundary.scope_id).toBe("work-scope");
+			expect(result.boundary.snapshot_id).toBe("snapshot-work");
+			expect(result.ops.map((op) => op.op_id)).toEqual(["op-work"]);
+			expect(result.nextCursor).toBe("2026-01-01T00:00:08Z|op-work");
+		}
+	});
+
+	it("scoped peer op windows only emit ops authored by the serving device", () => {
+		setSyncResetState(
+			db,
+			{
+				generation: 7,
+				snapshot_id: "snapshot-work",
+				baseline_cursor: "2026-01-01T00:00:05Z|work-base",
+				retained_floor_cursor: "2026-01-01T00:00:06Z|work-floor",
+			},
+			"work-scope",
+		);
+		insertOp("op-local-author", "2026-01-01T00:00:07Z", "dev-a", "work-scope");
+		insertOp("op-third-author", "2026-01-01T00:00:08Z", "dev-third", "work-scope");
+		insertOp("op-third-clock", "2026-01-01T00:00:09Z", "dev-a", "work-scope", "dev-third");
+
+		const result = loadReplicationOpsForPeer(db, {
+			deviceId: "dev-a",
+			scopeId: "work-scope",
+			since: "2026-01-01T00:00:06Z|work-floor",
+			generation: 7,
+			snapshotId: "snapshot-work",
+			baselineCursor: "2026-01-01T00:00:05Z|work-base",
+		});
+
+		expect(result.reset_required).toBe(false);
+		if (!result.reset_required) {
+			expect(result.ops.map((op) => op.op_id)).toEqual(["op-local-author"]);
+			expect(result.ops[0]).toMatchObject({
+				clock_device_id: "dev-a",
+				device_id: "dev-a",
+				scope_id: "work-scope",
+			});
+			expect(result.nextCursor).toBe("2026-01-01T00:00:07Z|op-local-author");
+		}
+	});
+
+	it("omitted scope advances past local-only ops without serving them", () => {
+		insertOp("op-default", "2026-01-01T00:00:03Z", "dev-a", null);
+		insertOp("op-local-default", "2026-01-01T00:00:04Z", "dev-a", "local-default");
+		insertOp("op-work", "2026-01-01T00:00:05Z", "dev-a", "work-scope");
+
+		const result = loadReplicationOpsForPeer(db, {
+			since: "2026-01-01T00:00:02Z|floor-op",
+			generation: 2,
+			snapshotId: "snapshot-2",
+			baselineCursor: "2026-01-01T00:00:01Z|base-op",
+		});
+
+		expect(result.reset_required).toBe(false);
+		if (!result.reset_required) {
+			expect(result.boundary.scope_id).toBeUndefined();
+			expect(result.ops).toEqual([]);
+			expect(result.nextCursor).toBe("2026-01-01T00:00:04Z|op-local-default");
 		}
 	});
 });
@@ -642,17 +902,39 @@ describe("loadMemorySnapshotPageForPeer", () => {
 			baseline_cursor: "2026-01-01T00:00:01Z|base-op",
 			retained_floor_cursor: "2026-01-01T00:00:02Z|floor-op",
 		});
+		setSyncResetState(
+			db,
+			{
+				generation: 4,
+				snapshot_id: "snapshot-4",
+				baseline_cursor: "2026-01-01T00:00:01Z|base-op",
+				retained_floor_cursor: "2026-01-01T00:00:02Z|floor-op",
+			},
+			"work-scope",
+		);
 	});
 
 	afterEach(() => {
 		db.close();
 	});
 
-	function insertMemory(importKey: string, opts?: { deleted?: boolean; visibility?: string }) {
+	function insertMemory(
+		importKey: string,
+		opts?: {
+			actorId?: string | null;
+			deleted?: boolean;
+			scopeId?: string | null;
+			visibility?: string | null;
+			workspaceId?: string | null;
+			workspaceKind?: string | null;
+		},
+	) {
 		const now = new Date().toISOString();
 		db.prepare(
-			`INSERT INTO memory_items(session_id, kind, title, body_text, created_at, updated_at, import_key, rev, active, deleted_at, visibility, metadata_json)
-			 VALUES (?, 'discovery', ?, 'body', ?, ?, ?, 1, ?, ?, ?, ?)`,
+			`INSERT INTO memory_items(
+				session_id, kind, title, body_text, created_at, updated_at, import_key, rev,
+				active, deleted_at, visibility, actor_id, workspace_id, workspace_kind, scope_id, metadata_json
+			 ) VALUES (?, 'discovery', ?, 'body', ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		).run(
 			sessionId,
 			importKey,
@@ -661,9 +943,33 @@ describe("loadMemorySnapshotPageForPeer", () => {
 			importKey,
 			opts?.deleted ? 0 : 1,
 			opts?.deleted ? now : null,
-			opts?.visibility ?? "shared",
+			Object.hasOwn(opts ?? {}, "visibility") ? (opts?.visibility ?? null) : "shared",
+			opts?.actorId ?? null,
+			opts?.workspaceId ?? null,
+			opts?.workspaceKind ?? null,
+			Object.hasOwn(opts ?? {}, "scopeId") ? (opts?.scopeId ?? null) : "work-scope",
 			toJson({ clock_device_id: "dev-a" }),
 		);
+	}
+
+	function grantScope(scopeId: string, deviceIds: string[], authorityType = "coordinator") {
+		const now = new Date().toISOString();
+		db.prepare(
+			`INSERT OR IGNORE INTO replication_scopes(
+				scope_id, label, kind, authority_type, membership_epoch, status, created_at, updated_at
+			 ) VALUES (?, ?, 'user', ?, 1, 'active', ?, ?)`,
+		).run(scopeId, scopeId, authorityType, now, now);
+		for (const deviceId of deviceIds) {
+			db.prepare(
+				`INSERT OR REPLACE INTO scope_memberships(
+					scope_id, device_id, role, status, membership_epoch, updated_at
+				 ) VALUES (?, ?, 'member', 'active', 1, ?)`,
+			).run(scopeId, deviceId, now);
+		}
+	}
+
+	function grantPersonalScope(scopeId: string, peerDeviceId: string) {
+		grantScope(scopeId, [peerDeviceId]);
 	}
 
 	function insertSessionWithProject(project: string): number {
@@ -683,6 +989,7 @@ describe("loadMemorySnapshotPageForPeer", () => {
 
 		const first = loadMemorySnapshotPageForPeer(db, {
 			limit: 2,
+			scopeId: "work-scope",
 			generation: 4,
 			snapshotId: "snapshot-4",
 			baselineCursor: "2026-01-01T00:00:01Z|base-op",
@@ -697,6 +1004,7 @@ describe("loadMemorySnapshotPageForPeer", () => {
 		const second = loadMemorySnapshotPageForPeer(db, {
 			limit: 2,
 			pageToken: first.nextPageToken,
+			scopeId: "work-scope",
 			generation: 4,
 			snapshotId: "snapshot-4",
 			baselineCursor: "2026-01-01T00:00:01Z|base-op",
@@ -711,12 +1019,162 @@ describe("loadMemorySnapshotPageForPeer", () => {
 		insertMemory("key-shared", { visibility: "shared" });
 
 		const page = loadMemorySnapshotPageForPeer(db, {
+			scopeId: "work-scope",
 			generation: 4,
 			snapshotId: "snapshot-4",
 			baselineCursor: "2026-01-01T00:00:01Z|base-op",
 		});
 
 		expect(page.items.map((item) => item.entity_id)).toEqual(["key-shared"]);
+	});
+
+	it("omitted scope excludes null and local-default snapshot rows", () => {
+		insertMemory("key-default", { scopeId: null });
+		insertMemory("key-local-default", { scopeId: "local-default" });
+		insertMemory("key-work", { scopeId: "work-scope" });
+
+		const page = loadMemorySnapshotPageForPeer(db, {
+			generation: 4,
+			snapshotId: "snapshot-4",
+			baselineCursor: "2026-01-01T00:00:01Z|base-op",
+		});
+
+		expect(page.boundary.scope_id).toBeUndefined();
+		expect(page.items).toEqual([]);
+	});
+
+	it("blocks custom local-authority snapshots while allowing coordinator siblings", () => {
+		for (const scopeId of ["local-notes", "team-notes"]) {
+			setSyncResetState(
+				db,
+				{
+					generation: 4,
+					snapshot_id: "snapshot-4",
+					baseline_cursor: "2026-01-01T00:00:01Z|base-op",
+					retained_floor_cursor: "2026-01-01T00:00:02Z|floor-op",
+				},
+				scopeId,
+			);
+		}
+		grantScope("local-notes", ["local-device", "peer-device"], "local");
+		grantScope("team-notes", ["local-device", "peer-device"]);
+		insertMemory("key-local", { scopeId: "local-notes" });
+		insertMemory("key-team", { scopeId: "team-notes" });
+
+		const localPage = loadMemorySnapshotPageForPeer(db, {
+			peerDeviceId: "peer-device",
+			scopeId: "local-notes",
+			generation: 4,
+			snapshotId: "snapshot-4",
+			baselineCursor: "2026-01-01T00:00:01Z|base-op",
+		});
+		const coordinatorPage = loadMemorySnapshotPageForPeer(db, {
+			peerDeviceId: "peer-device",
+			scopeId: "team-notes",
+			generation: 4,
+			snapshotId: "snapshot-4",
+			baselineCursor: "2026-01-01T00:00:01Z|base-op",
+		});
+
+		expect(localPage.items.map((item) => item.entity_id)).toEqual([]);
+		expect(coordinatorPage.items.map((item) => item.entity_id)).toEqual(["key-team"]);
+	});
+
+	it("requires a matching personal scope grant for claimed local actor snapshot rows", () => {
+		setSyncResetState(
+			db,
+			{
+				generation: 4,
+				snapshot_id: "snapshot-4",
+				baseline_cursor: "2026-01-01T00:00:01Z|base-op",
+				retained_floor_cursor: "2026-01-01T00:00:02Z|floor-op",
+			},
+			"personal:actor-1",
+		);
+		db.prepare(
+			"INSERT INTO sync_peers(peer_device_id, claimed_local_actor, created_at) VALUES (?, 1, ?)",
+		).run("peer-1", "2026-01-01T00:00:00Z");
+		insertMemory("key-private", {
+			actorId: "actor-1",
+			scopeId: "personal:actor-1",
+			visibility: "private",
+			workspaceId: "personal:actor-1",
+			workspaceKind: "personal",
+		});
+
+		const blocked = loadMemorySnapshotPageForPeer(db, {
+			generation: 4,
+			peerDeviceId: "peer-1",
+			scopeId: "personal:actor-1",
+			snapshotId: "snapshot-4",
+			baselineCursor: "2026-01-01T00:00:01Z|base-op",
+		});
+		expect(blocked.items).toEqual([]);
+
+		grantPersonalScope("personal:actor-1", "peer-1");
+		const allowed = loadMemorySnapshotPageForPeer(db, {
+			generation: 4,
+			peerDeviceId: "peer-1",
+			scopeId: "personal:actor-1",
+			snapshotId: "snapshot-4",
+			baselineCursor: "2026-01-01T00:00:01Z|base-op",
+		});
+		expect(allowed.items.map((item) => item.entity_id)).toEqual(["key-private"]);
+	});
+
+	it("requires a personal scope grant for snapshot rows with personal scope but missing visibility", () => {
+		setSyncResetState(
+			db,
+			{
+				generation: 4,
+				snapshot_id: "snapshot-4",
+				baseline_cursor: "2026-01-01T00:00:01Z|base-op",
+				retained_floor_cursor: "2026-01-01T00:00:02Z|floor-op",
+			},
+			"personal:actor-1",
+		);
+		insertMemory("key-personal-no-visibility", {
+			actorId: "actor-1",
+			scopeId: "personal:actor-1",
+			visibility: null,
+			workspaceId: "personal:actor-1",
+			workspaceKind: "personal",
+		});
+
+		const blocked = loadMemorySnapshotPageForPeer(db, {
+			generation: 4,
+			peerDeviceId: "peer-1",
+			scopeId: "personal:actor-1",
+			snapshotId: "snapshot-4",
+			baselineCursor: "2026-01-01T00:00:01Z|base-op",
+		});
+		expect(blocked.items).toEqual([]);
+
+		grantPersonalScope("personal:actor-1", "peer-1");
+		const allowed = loadMemorySnapshotPageForPeer(db, {
+			generation: 4,
+			peerDeviceId: "peer-1",
+			scopeId: "personal:actor-1",
+			snapshotId: "snapshot-4",
+			baselineCursor: "2026-01-01T00:00:01Z|base-op",
+		});
+		expect(allowed.items.map((item) => item.entity_id)).toEqual(["key-personal-no-visibility"]);
+	});
+
+	it("fails closed for scoped snapshot rows with personal workspace but no actor", () => {
+		insertMemory("key-personal-no-actor", {
+			visibility: null,
+			workspaceKind: "personal",
+		});
+
+		const page = loadMemorySnapshotPageForPeer(db, {
+			generation: 4,
+			peerDeviceId: "peer-1",
+			scopeId: "work-scope",
+			snapshotId: "snapshot-4",
+			baselineCursor: "2026-01-01T00:00:01Z|base-op",
+		});
+		expect(page.items).toEqual([]);
 	});
 
 	it("does not return has_more without a next page token when only skipped rows remain", () => {
@@ -726,6 +1184,7 @@ describe("loadMemorySnapshotPageForPeer", () => {
 
 		const first = loadMemorySnapshotPageForPeer(db, {
 			limit: 1,
+			scopeId: "work-scope",
 			generation: 4,
 			snapshotId: "snapshot-4",
 			baselineCursor: "2026-01-01T00:00:01Z|base-op",
@@ -737,6 +1196,7 @@ describe("loadMemorySnapshotPageForPeer", () => {
 		const second = loadMemorySnapshotPageForPeer(db, {
 			limit: 1,
 			pageToken: first.nextPageToken,
+			scopeId: "work-scope",
 			generation: 4,
 			snapshotId: "snapshot-4",
 			baselineCursor: "2026-01-01T00:00:01Z|base-op",
@@ -751,6 +1211,7 @@ describe("loadMemorySnapshotPageForPeer", () => {
 		insertMemory("key-a", { visibility: "shared" });
 		process.env.CODEMEM_SYNC_PROJECTS_INCLUDE = "proj-a";
 		const page = loadMemorySnapshotPageForPeer(db, {
+			scopeId: "work-scope",
 			generation: 4,
 			snapshotId: "snapshot-4",
 			baselineCursor: "2026-01-01T00:00:01Z|base-op",
@@ -763,6 +1224,7 @@ describe("loadMemorySnapshotPageForPeer", () => {
 		expect(() =>
 			loadMemorySnapshotPageForPeer(db, {
 				generation: 4,
+				scopeId: "work-scope",
 				snapshotId: "wrong-snapshot",
 				baselineCursor: "2026-01-01T00:00:01Z|base-op",
 			}),
@@ -780,8 +1242,8 @@ describe("loadMemorySnapshotPageForPeer", () => {
 		const blockedSessionId = insertSessionWithProject("blocked-project");
 		const now = new Date().toISOString();
 		db.prepare(
-			`INSERT INTO memory_items(session_id, kind, title, body_text, created_at, updated_at, import_key, rev, active, visibility, metadata_json)
-			 VALUES (?, 'discovery', ?, 'body', ?, ?, ?, 1, 1, 'shared', ?)`,
+			`INSERT INTO memory_items(session_id, kind, title, body_text, created_at, updated_at, import_key, rev, active, visibility, scope_id, metadata_json)
+			 VALUES (?, 'discovery', ?, 'body', ?, ?, ?, 1, 1, 'shared', 'work-scope', ?)`,
 		).run(
 			blockedSessionId,
 			"key-blocked-1",
@@ -791,8 +1253,8 @@ describe("loadMemorySnapshotPageForPeer", () => {
 			toJson({ clock_device_id: "dev-a" }),
 		);
 		db.prepare(
-			`INSERT INTO memory_items(session_id, kind, title, body_text, created_at, updated_at, import_key, rev, active, visibility, metadata_json)
-			 VALUES (?, 'discovery', ?, 'body', ?, ?, ?, 1, 1, 'shared', ?)`,
+			`INSERT INTO memory_items(session_id, kind, title, body_text, created_at, updated_at, import_key, rev, active, visibility, scope_id, metadata_json)
+			 VALUES (?, 'discovery', ?, 'body', ?, ?, ?, 1, 1, 'shared', 'work-scope', ?)`,
 		).run(
 			blockedSessionId,
 			"key-blocked-2",
@@ -804,6 +1266,7 @@ describe("loadMemorySnapshotPageForPeer", () => {
 
 		const first = loadMemorySnapshotPageForPeer(db, {
 			limit: 1,
+			scopeId: "work-scope",
 			generation: 4,
 			snapshotId: "snapshot-4",
 			baselineCursor: "2026-01-01T00:00:01Z|base-op",
@@ -816,6 +1279,7 @@ describe("loadMemorySnapshotPageForPeer", () => {
 		const second = loadMemorySnapshotPageForPeer(db, {
 			limit: 1,
 			pageToken: first.nextPageToken,
+			scopeId: "work-scope",
 			generation: 4,
 			snapshotId: "snapshot-4",
 			baselineCursor: "2026-01-01T00:00:01Z|base-op",
@@ -837,8 +1301,8 @@ describe("loadMemorySnapshotPageForPeer", () => {
 		const blockedSessionId = insertSessionWithProject("blocked-project");
 		const now = new Date().toISOString();
 		db.prepare(
-			`INSERT INTO memory_items(session_id, kind, title, body_text, created_at, updated_at, import_key, rev, active, visibility, metadata_json)
-			 VALUES (?, 'discovery', ?, 'body', ?, ?, ?, 1, 1, 'shared', ?)`,
+			`INSERT INTO memory_items(session_id, kind, title, body_text, created_at, updated_at, import_key, rev, active, visibility, scope_id, metadata_json)
+			 VALUES (?, 'discovery', ?, 'body', ?, ?, ?, 1, 1, 'shared', 'work-scope', ?)`,
 		).run(
 			blockedSessionId,
 			"key-blocked",
@@ -849,6 +1313,7 @@ describe("loadMemorySnapshotPageForPeer", () => {
 		);
 
 		const page = loadMemorySnapshotPageForPeer(db, {
+			scopeId: "work-scope",
 			generation: 4,
 			snapshotId: "snapshot-4",
 			baselineCursor: "2026-01-01T00:00:01Z|base-op",
@@ -933,11 +1398,11 @@ describe("pruneReplicationOps", () => {
 		vi.useRealTimers();
 	});
 
-	function insertOp(opId: string, createdAt: string) {
+	function insertOp(opId: string, createdAt: string, scopeId: string | null = null) {
 		db.prepare(
-			`INSERT INTO replication_ops(op_id, entity_type, entity_id, op_type, payload_json, clock_rev, clock_updated_at, clock_device_id, device_id, created_at)
-			 VALUES (?, 'memory_item', ?, 'upsert', NULL, 1, ?, 'dev-a', 'dev-a', ?)`,
-		).run(opId, `ent-${opId}`, createdAt, createdAt);
+			`INSERT INTO replication_ops(op_id, entity_type, entity_id, op_type, payload_json, clock_rev, clock_updated_at, clock_device_id, device_id, created_at, scope_id)
+			 VALUES (?, 'memory_item', ?, 'upsert', NULL, 1, ?, 'dev-a', 'dev-a', ?, ?)`,
+		).run(opId, `ent-${opId}`, createdAt, createdAt, scopeId);
 	}
 
 	it("prunes oldest ops beyond size budget and updates retained floor", () => {
@@ -945,23 +1410,9 @@ describe("pruneReplicationOps", () => {
 		insertOp("op-2", "2026-01-01T00:00:02Z");
 		insertOp("op-3", "2026-01-01T00:00:03Z");
 
-		const estimatedBytes = Number(
-			(
-				db
-					.prepare(
-						`SELECT COALESCE(SUM(pgsize), 0) AS total_bytes
-						 FROM dbstat
-						 WHERE name = 'replication_ops'
-						    OR name LIKE 'idx_replication_ops_%'
-						    OR name LIKE 'sqlite_autoindex_replication_ops_%'`,
-					)
-					.get() as { total_bytes: number }
-			).total_bytes,
-		);
-
 		const result = pruneReplicationOps(db, {
 			maxAgeDays: 3650,
-			maxSizeBytes: Math.max(1, estimatedBytes - 1),
+			maxSizeBytes: 1,
 		});
 		expect(result.deleted).toBeGreaterThanOrEqual(1);
 		expect(result.retained_floor_cursor).toMatch(/^2026-01-01T00:00:0[1-3]Z\|op-[1-3]$/);
@@ -985,24 +1436,85 @@ describe("pruneReplicationOps", () => {
 		expect(getSyncResetState(db).retained_floor_cursor).toBe("2026-01-01T00:00:09Z|existing-floor");
 	});
 
+	it("prunes one scope without deleting ops or advancing floors in another scope", () => {
+		setSyncResetState(db, {
+			generation: 5,
+			snapshot_id: "snapshot-default",
+			baseline_cursor: "2026-01-01T00:00:01Z|default-base",
+			retained_floor_cursor: null,
+		});
+		setSyncResetState(
+			db,
+			{
+				generation: 6,
+				snapshot_id: "snapshot-work",
+				baseline_cursor: "2026-01-01T00:00:01Z|work-base",
+				retained_floor_cursor: null,
+			},
+			"work-scope",
+		);
+		insertOp("op-default", "2026-01-01T00:00:01Z");
+		insertOp("op-work", "2026-01-01T00:00:02Z", "work-scope");
+
+		const result = pruneReplicationOps(db, {
+			maxAgeDays: 30,
+			maxSizeBytes: 1_000_000,
+			maxDeleteOps: 10,
+			maxRuntimeMs: 60_000,
+			scopeId: "work-scope",
+		});
+
+		expect(result.deleted).toBe(1);
+		expect(result.retained_floor_cursor).toBe("2026-01-01T00:00:02Z|op-work");
+		expect(getSyncResetState(db).retained_floor_cursor).toBeNull();
+		expect(getSyncResetState(db, "work-scope").retained_floor_cursor).toBe(
+			"2026-01-01T00:00:02Z|op-work",
+		);
+		const remaining = db
+			.prepare("SELECT op_id FROM replication_ops ORDER BY created_at, op_id")
+			.all() as Array<{ op_id: string }>;
+		expect(remaining.map((row) => row.op_id)).toEqual(["op-default"]);
+	});
+
+	it("does not size-prune a scope because another scope is large", () => {
+		setSyncResetState(
+			db,
+			{
+				generation: 6,
+				snapshot_id: "snapshot-work",
+				baseline_cursor: "2026-01-01T00:00:01Z|work-base",
+				retained_floor_cursor: null,
+			},
+			"work-scope",
+		);
+		insertOp("op-work", "2026-03-20T00:00:01Z", "work-scope");
+		db.prepare(
+			`INSERT INTO replication_ops(op_id, entity_type, entity_id, op_type, payload_json, clock_rev, clock_updated_at, clock_device_id, device_id, created_at, scope_id)
+			 VALUES ('op-other-large', 'memory_item', 'ent-other', 'upsert', ?, 1, '2026-03-20T00:00:02Z', 'dev-a', 'dev-a', '2026-03-20T00:00:02Z', 'other-scope')`,
+		).run("x".repeat(50_000));
+
+		const result = pruneReplicationOps(db, {
+			maxAgeDays: 3650,
+			maxSizeBytes: 10_000,
+			maxDeleteOps: 10,
+			maxRuntimeMs: 60_000,
+			scopeId: "work-scope",
+		});
+
+		expect(result.deleted).toBe(0);
+		expect(result.retained_floor_cursor).toBeNull();
+		expect(getSyncResetState(db, "work-scope").retained_floor_cursor).toBeNull();
+		const remaining = db
+			.prepare("SELECT op_id FROM replication_ops ORDER BY created_at, op_id")
+			.all() as Array<{ op_id: string }>;
+		expect(remaining.map((row) => row.op_id)).toEqual(["op-work", "op-other-large"]);
+	});
+
 	it("accepts a cursor equal to the retained floor as still replayable", () => {
 		insertOp("op-1", "2026-01-01T00:00:01Z");
 		insertOp("op-2", "2026-01-01T00:00:02Z");
 		insertOp("op-3", "2026-01-01T00:00:03Z");
-		const estimatedBytes = Number(
-			(
-				db
-					.prepare(
-						`SELECT COALESCE(SUM(pgsize), 0) AS total_bytes
-						 FROM dbstat
-						 WHERE name = 'replication_ops'
-						    OR name LIKE 'idx_replication_ops_%'
-						    OR name LIKE 'sqlite_autoindex_replication_ops_%'`,
-					)
-					.get() as { total_bytes: number }
-			).total_bytes,
-		);
-		pruneReplicationOps(db, { maxAgeDays: 3650, maxSizeBytes: Math.max(1, estimatedBytes - 1) });
+		pruneReplicationOps(db, { maxAgeDays: 3650, maxSizeBytes: 1 });
 
 		const result = loadReplicationOpsForPeer(db, {
 			since: getSyncResetState(db).retained_floor_cursor,
@@ -1116,23 +1628,9 @@ describe("pruneReplicationOps", () => {
 		insertOp("op-3", "2026-03-20T00:00:03Z");
 		insertOp("op-4", "2026-03-20T00:00:04Z");
 
-		const estimatedBytes = Number(
-			(
-				db
-					.prepare(
-						`SELECT COALESCE(SUM(pgsize), 0) AS total_bytes
-						 FROM dbstat
-						 WHERE name = 'replication_ops'
-						    OR name LIKE 'idx_replication_ops_%'
-						    OR name LIKE 'sqlite_autoindex_replication_ops_%'`,
-					)
-					.get() as { total_bytes: number }
-			).total_bytes,
-		);
-
 		const result = pruneReplicationOps(db, {
 			maxAgeDays: 3650,
-			maxSizeBytes: Math.max(1, estimatedBytes - 1),
+			maxSizeBytes: 1,
 			maxDeleteOps: 2,
 			maxRuntimeMs: 60_000,
 		});
@@ -1153,23 +1651,9 @@ describe("pruneReplicationOps", () => {
 		insertOp("op-4", "2026-03-20T00:00:04Z");
 		insertOp("op-5", "2026-03-20T00:00:05Z");
 
-		const estimatedBytes = Number(
-			(
-				db
-					.prepare(
-						`SELECT COALESCE(SUM(pgsize), 0) AS total_bytes
-						 FROM dbstat
-						 WHERE name = 'replication_ops'
-						    OR name LIKE 'idx_replication_ops_%'
-						    OR name LIKE 'sqlite_autoindex_replication_ops_%'`,
-					)
-					.get() as { total_bytes: number }
-			).total_bytes,
-		);
-
 		const result = pruneReplicationOps(db, {
 			maxAgeDays: 3650,
-			maxSizeBytes: Math.max(1, estimatedBytes - 1),
+			maxSizeBytes: 1,
 			maxDeleteOps: 4,
 			maxRuntimeMs: 60_000,
 		});
@@ -1297,31 +1781,123 @@ describe("legacy key migration + replication backfill", () => {
 		const now = "2026-01-02T00:00:00Z";
 
 		db.prepare(
-			`INSERT INTO memory_items(session_id, kind, title, body_text, created_at, updated_at, import_key, rev, active, metadata_json)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		).run(sessionId, "feature", "Live row", "live", now, now, "key:live", 1, 1, toJson({}));
+			`INSERT INTO memory_items(session_id, kind, title, body_text, created_at, updated_at, import_key, rev, active, metadata_json, scope_id)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		).run(
+			sessionId,
+			"feature",
+			"Live row",
+			"live",
+			now,
+			now,
+			"key:live",
+			1,
+			1,
+			toJson({}),
+			"local-default",
+		);
 
 		db.prepare(
-			`INSERT INTO memory_items(session_id, kind, title, body_text, created_at, updated_at, import_key, rev, active, deleted_at, metadata_json)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		).run(sessionId, "bugfix", "Deleted row", "gone", now, now, "key:gone", 2, 0, now, toJson({}));
+			`INSERT INTO memory_items(session_id, kind, title, body_text, created_at, updated_at, import_key, rev, active, deleted_at, metadata_json, scope_id)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		).run(
+			sessionId,
+			"bugfix",
+			"Deleted row",
+			"gone",
+			now,
+			now,
+			"key:gone",
+			2,
+			0,
+			now,
+			toJson({}),
+			"legacy-shared-review",
+		);
 
 		const first = backfillReplicationOps(db, 10);
 		expect(first).toBe(2);
 
 		const ops = db
 			.prepare(
-				"SELECT op_id, entity_id, op_type, clock_rev FROM replication_ops ORDER BY op_type, entity_id",
+				"SELECT op_id, entity_id, op_type, clock_rev, scope_id, payload_json FROM replication_ops ORDER BY op_type, entity_id",
 			)
-			.all() as Array<{ op_id: string; entity_id: string; op_type: string; clock_rev: number }>;
+			.all() as Array<{
+			op_id: string;
+			entity_id: string;
+			op_type: string;
+			clock_rev: number;
+			scope_id: string | null;
+			payload_json: string;
+		}>;
 		expect(ops).toHaveLength(2);
 		expect(ops.map((op) => op.op_type).sort()).toEqual(["delete", "upsert"]);
+		expect(new Set(ops.map((op) => op.scope_id))).toEqual(
+			new Set(["legacy-shared-review", "local-default"]),
+		);
+		expect(new Set(ops.map((op) => JSON.parse(op.payload_json).scope_id))).toEqual(
+			new Set(["legacy-shared-review", "local-default"]),
+		);
 		expect(ops[0]?.op_id).toContain("backfill:memory_item:");
 
 		const second = backfillReplicationOps(db, 10);
 		expect(second).toBe(0);
 		const count = db.prepare("SELECT COUNT(*) AS n FROM replication_ops").get() as { n: number };
 		expect(count.n).toBe(2);
+	});
+
+	it("stamps missing memory scope before backfilling replication ops", () => {
+		db.prepare(
+			"INSERT INTO sync_device(device_id, public_key, fingerprint, created_at) VALUES (?, ?, ?, ?)",
+		).run("dev-local", "pub", "fp", "2026-01-01T00:00:00Z");
+		const sessionId = insertTestSession(db);
+		db.prepare("UPDATE sessions SET cwd = ?, project = ? WHERE id = ?").run(
+			"/work/acme/service",
+			"service",
+			sessionId,
+		);
+		db.prepare(
+			`INSERT INTO project_scope_mappings(
+				workspace_identity, project_pattern, scope_id, priority, source, created_at, updated_at
+			 ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		).run(
+			"/work/acme/service",
+			"/work/acme/*",
+			"acme-work",
+			10,
+			"user",
+			"2026-05-01T00:00:00Z",
+			"2026-05-01T00:00:00Z",
+		);
+		const now = "2026-01-02T00:00:00Z";
+		db.prepare(
+			`INSERT INTO memory_items(session_id, kind, title, body_text, created_at, updated_at, import_key, rev, active, metadata_json)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		).run(
+			sessionId,
+			"feature",
+			"Live row",
+			"live",
+			now,
+			now,
+			"key:missing-scope",
+			1,
+			1,
+			toJson({}),
+		);
+
+		const inserted = backfillReplicationOps(db, 10);
+
+		expect(inserted).toBe(1);
+		const memory = db
+			.prepare("SELECT scope_id FROM memory_items WHERE import_key = ?")
+			.get("key:missing-scope") as { scope_id: string | null };
+		expect(memory.scope_id).toBe("acme-work");
+		const op = db
+			.prepare("SELECT scope_id, payload_json FROM replication_ops WHERE entity_id = ?")
+			.get("key:missing-scope") as { scope_id: string | null; payload_json: string };
+		expect(op.scope_id).toBe("acme-work");
+		expect(JSON.parse(op.payload_json).scope_id).toBe("acme-work");
 	});
 
 	it("does not mint legacy:local import keys before device identity exists", () => {
@@ -1356,6 +1932,7 @@ describe("filterReplicationOpsForSyncWithStatus", () => {
 	beforeEach(() => {
 		db = new Database(":memory:");
 		initTestSchema(db);
+		grantScope("work-scope", ["peer-1", "local-device"]);
 		prevInclude = process.env.CODEMEM_SYNC_PROJECTS_INCLUDE;
 		prevExclude = process.env.CODEMEM_SYNC_PROJECTS_EXCLUDE;
 	});
@@ -1375,14 +1952,39 @@ describe("filterReplicationOpsForSyncWithStatus", () => {
 			entity_type: "memory_item",
 			entity_id: "key-1",
 			op_type: "upsert",
-			payload_json: toJson({ project: "proj-a", visibility: "shared" }),
+			payload_json: toJson({
+				project: "proj-a",
+				scope_id: "work-scope",
+				visibility: "shared",
+			}),
 			clock_rev: 1,
 			clock_updated_at: "2026-01-01T00:00:00Z",
 			clock_device_id: "peer-1",
 			device_id: "peer-1",
 			created_at: "2026-01-01T00:00:00Z",
+			scope_id: "work-scope",
 			...overrides,
 		};
+	}
+
+	function grantScope(scopeId: string, deviceIds: string[], authorityType = "coordinator") {
+		const now = new Date().toISOString();
+		db.prepare(
+			`INSERT OR IGNORE INTO replication_scopes(
+				scope_id, label, kind, authority_type, membership_epoch, status, created_at, updated_at
+			 ) VALUES (?, ?, 'user', ?, 1, 'active', ?, ?)`,
+		).run(scopeId, scopeId, authorityType, now, now);
+		for (const deviceId of deviceIds) {
+			db.prepare(
+				`INSERT OR REPLACE INTO scope_memberships(
+					scope_id, device_id, role, status, membership_epoch, updated_at
+				 ) VALUES (?, ?, 'member', 'active', 1, ?)`,
+			).run(scopeId, deviceId, now);
+		}
+	}
+
+	function grantPersonalScope(scopeId: string, peerDeviceId: string) {
+		grantScope(scopeId, [peerDeviceId]);
 	}
 
 	it("filters by peer include scope and advances cursor past skipped ops", () => {
@@ -1416,14 +2018,211 @@ describe("filterReplicationOpsForSyncWithStatus", () => {
 		expect(nextOnly).toBe("2026-01-01T00:00:02Z|op-2");
 	});
 
-	it("filters private visibility unless peer is claimed local actor", () => {
+	it("applies scope membership before broad project filters", () => {
+		db.prepare(
+			"INSERT INTO sync_peers(peer_device_id, projects_include_json, projects_exclude_json, created_at) VALUES (?, ?, ?, ?)",
+		).run("peer-1", toJson(["proj-a"]), toJson([]), "2026-01-01T00:00:00Z");
+		grantScope("acme-work", ["local-device"]);
+		const scopedOp = makeOp({
+			op_id: "op-scoped",
+			payload_json: toJson({ project: "proj-a", scope_id: "acme-work", visibility: "shared" }),
+			scope_id: "acme-work",
+		});
+
+		const [blockedOps, blockedCursor, blockedMeta] = filterReplicationOpsForSyncWithStatus(
+			db,
+			[scopedOp],
+			"peer-1",
+			{ localDeviceId: "local-device" },
+		);
+		expect(blockedOps).toEqual([]);
+		expect(blockedCursor).toBe("2026-01-01T00:00:00Z|op-scoped");
+		expect(blockedMeta).toMatchObject({ reason: "scope_filter", scope_id: "acme-work" });
+
+		grantScope("acme-work", ["local-device", "peer-1"]);
+		const [allowedOps, allowedCursor, allowedMeta] = filterReplicationOpsForSyncWithStatus(
+			db,
+			[scopedOp],
+			"peer-1",
+			{ localDeviceId: "local-device" },
+		);
+		expect(allowedOps.map((op) => op.op_id)).toEqual(["op-scoped"]);
+		expect(allowedCursor).toBe("2026-01-01T00:00:00Z|op-scoped");
+		expect(allowedMeta).toBeNull();
+	});
+
+	it("blocks null and local-default regular ops before legacy project filtering", () => {
+		db.prepare(
+			"INSERT INTO sync_peers(peer_device_id, projects_include_json, projects_exclude_json, created_at) VALUES (?, ?, ?, ?)",
+		).run("peer-1", toJson(["proj-a"]), toJson([]), "2026-01-01T00:00:00Z");
+		const nullScopeOp = makeOp({
+			op_id: "op-null-scope",
+			scope_id: null,
+			payload_json: toJson({ project: "proj-a", visibility: "shared" }),
+		});
+		const localDefaultOp = makeOp({
+			op_id: "op-local-default-scope",
+			scope_id: DEFAULT_SYNC_SCOPE_ID,
+			payload_json: toJson({
+				project: "proj-a",
+				scope_id: DEFAULT_SYNC_SCOPE_ID,
+				visibility: "shared",
+			}),
+			created_at: "2026-01-01T00:00:01Z",
+		});
+		const scopedOp = makeOp({
+			op_id: "op-explicit-scope",
+			scope_id: "acme-work",
+			payload_json: toJson({ project: "proj-a", scope_id: "acme-work", visibility: "shared" }),
+			created_at: "2026-01-01T00:00:02Z",
+		});
+
+		const [allowed, cursor, skipped] = filterReplicationOpsForSyncWithStatus(
+			db,
+			[nullScopeOp, localDefaultOp, scopedOp],
+			"peer-1",
+			{ applyScopeFilter: false },
+		);
+
+		expect(allowed.map((op) => op.op_id)).toEqual(["op-explicit-scope"]);
+		expect(cursor).toBe("2026-01-01T00:00:02Z|op-explicit-scope");
+		expect(skipped).toMatchObject({ reason: "scope_filter", skipped_count: 2 });
+	});
+
+	it("keeps targeted cleanup and valid old-side reassignment as control exceptions", () => {
+		const untargetedCleanup = makeOp({
+			op_id: "op-untargeted-cleanup",
+			op_type: "access_cleanup",
+			scope_id: DEFAULT_SYNC_SCOPE_ID,
+			payload_json: toJson({
+				cleanup_scope_id: "acme-work",
+			}),
+		});
+		const targetedCleanup = makeOp({
+			op_id: "op-targeted-cleanup",
+			op_type: "access_cleanup",
+			scope_id: DEFAULT_SYNC_SCOPE_ID,
+			payload_json: toJson({
+				cleanup_scope_id: "acme-work",
+				target_peer_device_id: "peer-1",
+			}),
+			created_at: "2026-01-01T00:00:01Z",
+		});
+		const otherPeerCleanup = makeOp({
+			op_id: "op-other-peer-cleanup",
+			op_type: "access_cleanup",
+			scope_id: DEFAULT_SYNC_SCOPE_ID,
+			payload_json: toJson({
+				cleanup_scope_id: "acme-work",
+				target_peer_device_id: "peer-2",
+			}),
+			created_at: "2026-01-01T00:00:02Z",
+		});
+		const malformedCleanup = makeOp({
+			op_id: "op-malformed-cleanup",
+			op_type: "access_cleanup",
+			scope_id: DEFAULT_SYNC_SCOPE_ID,
+			payload_json: toJson({}),
+			created_at: "2026-01-01T00:00:03Z",
+		});
+		const oldSideReassignment = makeOp({
+			op_id: "op-old-side-reassignment",
+			op_type: "reassign_scope",
+			scope_id: DEFAULT_SYNC_SCOPE_ID,
+			payload_json: toJson({
+				operation_id: "share-op",
+				memory_id: "key-1",
+				old_scope_id: DEFAULT_SYNC_SCOPE_ID,
+				new_scope_id: "acme-work",
+				revision: 2,
+				side: "old",
+			}),
+			clock_rev: 2,
+			created_at: "2026-01-01T00:00:04Z",
+		});
+
+		const [allowed, cursor, skipped] = filterReplicationOpsForSyncWithStatus(
+			db,
+			[untargetedCleanup, targetedCleanup, otherPeerCleanup, malformedCleanup, oldSideReassignment],
+			"peer-1",
+			{ applyScopeFilter: false, supportsReassignScope: true },
+		);
+
+		expect(allowed.map((op) => op.op_id)).toEqual([
+			"op-untargeted-cleanup",
+			"op-targeted-cleanup",
+			"op-old-side-reassignment",
+		]);
+		expect(cursor).toBe("2026-01-01T00:00:04Z|op-old-side-reassignment");
+		expect(skipped).toMatchObject({ reason: "scope_filter", skipped_count: 2 });
+	});
+
+	it("never sends local-authority scopes outbound", () => {
+		grantScope("local-only", ["local-device", "peer-1"], "local");
+		const localOnlyOp = makeOp({
+			op_id: "op-local-only",
+			payload_json: toJson({ project: "proj-a", scope_id: "local-only", visibility: "shared" }),
+			scope_id: "local-only",
+		});
+		const defaultScopeOp = makeOp({
+			op_id: "op-local-default",
+			payload_json: toJson({
+				project: "proj-a",
+				scope_id: DEFAULT_SYNC_SCOPE_ID,
+				visibility: "shared",
+			}),
+			scope_id: DEFAULT_SYNC_SCOPE_ID,
+			created_at: "2026-01-01T00:00:01Z",
+		});
+
+		const [allowed, cursor, skipped] = filterReplicationOpsForSyncWithStatus(
+			db,
+			[localOnlyOp, defaultScopeOp],
+			"peer-1",
+			{ localDeviceId: "local-device" },
+		);
+
+		expect(allowed).toEqual([]);
+		expect(cursor).toBe("2026-01-01T00:00:01Z|op-local-default");
+		expect(skipped).toMatchObject({ reason: "scope_filter", skipped_count: 2 });
+	});
+
+	it("requires the local device to remain a scope member before outbound sync", () => {
+		grantScope("acme-work", ["peer-1"]);
+		const scopedOp = makeOp({
+			op_id: "op-local-revoked",
+			payload_json: toJson({ project: "proj-a", scope_id: "acme-work", visibility: "shared" }),
+			scope_id: "acme-work",
+		});
+
+		const [allowed, cursor, skipped] = filterReplicationOpsForSyncWithStatus(
+			db,
+			[scopedOp],
+			"peer-1",
+			{ localDeviceId: "local-device" },
+		);
+
+		expect(allowed).toEqual([]);
+		expect(cursor).toBe("2026-01-01T00:00:00Z|op-local-revoked");
+		expect(skipped?.reason).toBe("scope_filter");
+	});
+
+	it("requires a matching personal scope grant instead of a claimed local actor flag", () => {
 		db.prepare(
 			"INSERT INTO sync_peers(peer_device_id, projects_include_json, projects_exclude_json, claimed_local_actor, created_at) VALUES (?, ?, ?, ?, ?)",
 		).run("peer-1", toJson([]), toJson([]), 0, "2026-01-01T00:00:00Z");
 
 		const privateOp = makeOp({
 			op_id: "op-private",
-			payload_json: toJson({ project: "proj-a", visibility: "private" }),
+			scope_id: "personal:actor-1",
+			payload_json: toJson({
+				actor_id: "actor-1",
+				project: "proj-a",
+				scope_id: "personal:actor-1",
+				visibility: "private",
+				workspace_id: "personal:actor-1",
+				workspace_kind: "personal",
+			}),
 		});
 
 		const [blockedOps, blockedCursor, blockedMeta] = filterReplicationOpsForSyncWithStatus(
@@ -1433,9 +2232,20 @@ describe("filterReplicationOpsForSyncWithStatus", () => {
 		);
 		expect(blockedOps).toEqual([]);
 		expect(blockedCursor).toBe("2026-01-01T00:00:00Z|op-private");
-		expect(blockedMeta?.reason).toBe("visibility_filter");
+		expect(blockedMeta?.reason).toBe("scope_filter");
 
 		db.prepare("UPDATE sync_peers SET claimed_local_actor = 1 WHERE peer_device_id = ?").run(
+			"peer-1",
+		);
+		grantPersonalScope("personal:actor-other", "peer-1");
+		const [stillBlockedOps, stillBlockedCursor, stillBlockedMeta] =
+			filterReplicationOpsForSyncWithStatus(db, [privateOp], "peer-1");
+		expect(stillBlockedOps).toEqual([]);
+		expect(stillBlockedCursor).toBe("2026-01-01T00:00:00Z|op-private");
+		expect(stillBlockedMeta?.reason).toBe("scope_filter");
+
+		grantPersonalScope("personal:actor-1", "peer-1");
+		db.prepare("UPDATE sync_peers SET claimed_local_actor = 0 WHERE peer_device_id = ?").run(
 			"peer-1",
 		);
 		const [allowedOps, allowedCursor, allowedMeta] = filterReplicationOpsForSyncWithStatus(
@@ -1446,6 +2256,109 @@ describe("filterReplicationOpsForSyncWithStatus", () => {
 		expect(allowedOps.map((op) => op.op_id)).toEqual(["op-private"]);
 		expect(allowedCursor).toBe("2026-01-01T00:00:00Z|op-private");
 		expect(allowedMeta).toBeNull();
+	});
+
+	it("does not let personal grants make private payloads leave through org scopes", () => {
+		grantScope("acme-work", ["local-device", "peer-1"]);
+		grantScope("personal:actor-1", ["local-device", "peer-1"]);
+		const privateOrgOp = makeOp({
+			op_id: "op-private-org",
+			payload_json: toJson({
+				actor_id: "actor-1",
+				project: "proj-a",
+				scope_id: "acme-work",
+				visibility: "private",
+				workspace_id: "personal:actor-1",
+				workspace_kind: "personal",
+			}),
+			scope_id: "acme-work",
+		});
+
+		const [allowed, cursor, skipped] = filterReplicationOpsForSyncWithStatus(
+			db,
+			[privateOrgOp],
+			"peer-1",
+			{ localDeviceId: "local-device" },
+		);
+
+		expect(allowed).toEqual([]);
+		expect(cursor).toBe("2026-01-01T00:00:00Z|op-private-org");
+		expect(skipped?.reason).toBe("scope_filter");
+	});
+
+	it("requires a personal scope grant when visibility is missing but scope is personal", () => {
+		const personalOp = makeOp({
+			op_id: "op-personal-no-visibility",
+			scope_id: "personal:actor-1",
+			payload_json: toJson({
+				actor_id: "actor-1",
+				project: "proj-a",
+				scope_id: "personal:actor-1",
+				workspace_id: "personal:actor-1",
+				workspace_kind: "personal",
+			}),
+		});
+
+		const [blockedOps, blockedCursor, blockedMeta] = filterReplicationOpsForSyncWithStatus(
+			db,
+			[personalOp],
+			"peer-1",
+		);
+		expect(blockedOps).toEqual([]);
+		expect(blockedCursor).toBe("2026-01-01T00:00:00Z|op-personal-no-visibility");
+		expect(blockedMeta?.reason).toBe("scope_filter");
+
+		grantPersonalScope("personal:actor-1", "peer-1");
+		const [allowedOps, allowedCursor, allowedMeta] = filterReplicationOpsForSyncWithStatus(
+			db,
+			[personalOp],
+			"peer-1",
+		);
+		expect(allowedOps.map((op) => op.op_id)).toEqual(["op-personal-no-visibility"]);
+		expect(allowedCursor).toBe("2026-01-01T00:00:00Z|op-personal-no-visibility");
+		expect(allowedMeta).toBeNull();
+	});
+
+	it("fails closed for personal workspace markers without a derivable personal scope", () => {
+		const personalWorkspaceOp = makeOp({
+			op_id: "op-personal-workspace-no-actor",
+			payload_json: toJson({
+				metadata_json: { workspace_kind: "personal" },
+				project: "proj-a",
+				workspace_kind: "personal",
+			}),
+		});
+
+		const [blockedOps, blockedCursor, blockedMeta] = filterReplicationOpsForSyncWithStatus(
+			db,
+			[personalWorkspaceOp],
+			"peer-1",
+		);
+		expect(blockedOps).toEqual([]);
+		expect(blockedCursor).toBe("2026-01-01T00:00:00Z|op-personal-workspace-no-actor");
+		expect(blockedMeta?.reason).toBe("visibility_filter");
+	});
+
+	it("does not treat ordinary shared rows with actor_id as personal-scope rows", () => {
+		const sharedActorOp = makeOp({
+			op_id: "op-shared-actor",
+			payload_json: toJson({
+				actor_id: "actor-1",
+				project: "proj-a",
+				visibility: "shared",
+				workspace_id: "shared:default",
+				workspace_kind: "shared",
+			}),
+		});
+
+		const [allowedOps, nextCursor, skipped] = filterReplicationOpsForSyncWithStatus(
+			db,
+			[sharedActorOp],
+			"peer-1",
+		);
+		expect(allowedOps.map((op) => op.op_id)).toEqual(["op-shared-actor"]);
+		expect(nextCursor).toBe("2026-01-01T00:00:00Z|op-shared-actor");
+		expect(skipped).toBeNull();
 	});
 
 	it("keeps delete tombstones with null payload_json", () => {
@@ -1468,6 +2381,79 @@ describe("filterReplicationOpsForSyncWithStatus", () => {
 		expect(allowed.map((op) => op.op_id)).toEqual(["op-del"]);
 		expect(cursor).toBe("2026-01-01T00:00:05Z|op-del");
 		expect(skipped).toBeNull();
+
+		const personalTombstone = makeOp({
+			op_id: "op-personal-del",
+			op_type: "delete",
+			payload_json: null,
+			created_at: "2026-01-01T00:00:06Z",
+			scope_id: "personal:actor-1",
+		});
+		const [blockedPersonal, blockedCursor, blockedMeta] = filterReplicationOpsForSyncWithStatus(
+			db,
+			[personalTombstone],
+			"peer-1",
+		);
+		expect(blockedPersonal).toEqual([]);
+		expect(blockedCursor).toBe("2026-01-01T00:00:06Z|op-personal-del");
+		expect(blockedMeta?.reason).toBe("scope_filter");
+
+		grantPersonalScope("personal:actor-1", "peer-1");
+		const [allowedPersonal, allowedCursor, allowedMeta] = filterReplicationOpsForSyncWithStatus(
+			db,
+			[personalTombstone],
+			"peer-1",
+		);
+		expect(allowedPersonal.map((op) => op.op_id)).toEqual(["op-personal-del"]);
+		expect(allowedCursor).toBe("2026-01-01T00:00:06Z|op-personal-del");
+		expect(allowedMeta).toBeNull();
+	});
+
+	it("applies project filters to null-payload deletes when local context exists", () => {
+		db.prepare(
+			"INSERT INTO sync_peers(peer_device_id, projects_include_json, projects_exclude_json, created_at) VALUES (?, ?, ?, ?)",
+		).run("peer-1", toJson(["allowed-project"]), toJson([]), "2026-01-01T00:00:00Z");
+		grantScope("acme-work", ["local-device", "peer-1"]);
+		const sessionId = insertTestSession(db);
+		db.prepare("UPDATE sessions SET project = ? WHERE id = ?").run("blocked-project", sessionId);
+		db.prepare(
+			`INSERT INTO memory_items(
+				session_id, kind, title, body_text, created_at, updated_at, import_key, rev,
+				active, visibility, metadata_json, scope_id
+			 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		).run(
+			sessionId,
+			"discovery",
+			"Blocked delete target",
+			"Blocked delete target",
+			"2026-01-01T00:00:00Z",
+			"2026-01-01T00:00:00Z",
+			"blocked-delete-key",
+			1,
+			1,
+			"shared",
+			toJson({}),
+			"acme-work",
+		);
+		const deleteOp = makeOp({
+			op_id: "op-blocked-delete",
+			entity_id: "blocked-delete-key",
+			op_type: "delete",
+			payload_json: null,
+			created_at: "2026-01-01T00:00:05Z",
+			scope_id: "acme-work",
+		});
+
+		const [allowed, cursor, skipped] = filterReplicationOpsForSyncWithStatus(
+			db,
+			[deleteOp],
+			"peer-1",
+			{ localDeviceId: "local-device" },
+		);
+
+		expect(allowed).toEqual([]);
+		expect(cursor).toBe("2026-01-01T00:00:05Z|op-blocked-delete");
+		expect(skipped).toMatchObject({ reason: "project_filter", project: "blocked-project" });
 	});
 
 	it("respects CODEMEM_SYNC_PROJECTS_* env overrides", () => {
@@ -1489,6 +2475,7 @@ describe("filterReplicationOpsForSyncWithStatus", () => {
 			db,
 			[allowedOp, blockedOp],
 			null,
+			{ applyScopeFilter: false },
 		);
 		expect(allowed.map((op) => op.op_id)).toEqual(["op-env-allow"]);
 		expect(cursor).toBe("2026-01-01T00:00:11Z|op-env-block");
@@ -1533,8 +2520,91 @@ describe("applyReplicationOps", () => {
 			clock_device_id: "dev-remote",
 			device_id: "dev-remote",
 			created_at: "2026-01-01T00:00:00Z",
+			scope_id: null,
 			...overrides,
 		};
+	}
+
+	function grantScope(
+		scopeId: string,
+		deviceIds: string[],
+		overrides: {
+			authorityType?: "coordinator" | "local";
+			scopeEpoch?: number;
+			membershipEpoch?: number;
+			status?: string;
+		} = {},
+	): void {
+		const now = "2026-01-01T00:00:00Z";
+		const scopeEpoch = overrides.scopeEpoch ?? 1;
+		db.prepare(
+			`INSERT INTO replication_scopes(
+				scope_id, label, kind, authority_type, membership_epoch, status, created_at, updated_at
+			 ) VALUES (?, ?, 'team', ?, ?, 'active', ?, ?)
+			 ON CONFLICT(scope_id) DO UPDATE SET
+				authority_type = excluded.authority_type,
+				membership_epoch = excluded.membership_epoch,
+				status = excluded.status,
+				updated_at = excluded.updated_at`,
+		).run(scopeId, scopeId, overrides.authorityType ?? "coordinator", scopeEpoch, now, now);
+		for (const deviceId of deviceIds) {
+			db.prepare(
+				`INSERT INTO scope_memberships(
+					scope_id, device_id, role, status, membership_epoch, updated_at
+				 ) VALUES (?, ?, 'member', ?, ?, ?)
+				 ON CONFLICT(scope_id, device_id) DO UPDATE SET
+					status = excluded.status,
+					membership_epoch = excluded.membership_epoch,
+					updated_at = excluded.updated_at`,
+			).run(
+				scopeId,
+				deviceId,
+				overrides.status ?? "active",
+				overrides.membershipEpoch ?? scopeEpoch,
+				now,
+			);
+		}
+	}
+
+	function applyWithScopeValidation(op: ReplicationOp) {
+		return applyReplicationOps(db, [op], "dev-local", undefined, {
+			inboundScopeValidation: { peerDeviceId: "dev-remote" },
+		});
+	}
+
+	function memoryExists(importKey: string): boolean {
+		return Boolean(db.prepare("SELECT 1 FROM memory_items WHERE import_key = ?").get(importKey));
+	}
+
+	function insertReplicatedMemory(
+		input: {
+			importKey?: string | null;
+			originDeviceId?: string | null;
+			scopeId?: string | null;
+			title?: string;
+		} = {},
+	): number {
+		const sessionId = insertTestSession(db);
+		const result = db
+			.prepare(
+				`INSERT INTO memory_items(
+					session_id, kind, title, body_text, created_at, updated_at,
+					import_key, rev, active, metadata_json, origin_device_id, scope_id
+				 ) VALUES (?, 'discovery', ?, 'Body', ?, ?, ?, 1, 1, ?, ?, ?)`,
+			)
+			.run(
+				sessionId,
+				input.title ?? "Replicated row",
+				"2026-01-01T00:00:00Z",
+				"2026-01-01T00:00:00Z",
+				input.importKey === undefined ? "key:test-1" : input.importKey,
+				toJson({
+					clock_device_id: input.originDeviceId === undefined ? "dev-remote" : input.originDeviceId,
+				}),
+				input.originDeviceId === undefined ? "dev-remote" : input.originDeviceId,
+				input.scopeId === undefined ? "acme-work" : input.scopeId,
+			);
+		return Number(result.lastInsertRowid);
 	}
 
 	it("skips ops from the local device", () => {
@@ -1581,6 +2651,39 @@ describe("applyReplicationOps", () => {
 		expect(r2.applied).toBe(0);
 	});
 
+	it("records malformed-payload upserts so they are not reprocessed every pass", () => {
+		// A structurally-invalid payload can never be applied. It must still be
+		// recorded so it is acknowledged exactly once instead of being re-parsed
+		// (and re-errored) on every subsequent sync pass. Without recording, the
+		// inbound cursor could never safely advance past it.
+		const op = makeReplicationOp({
+			op_id: "bad-payload",
+			payload_json: JSON.stringify("not-an-object"),
+		});
+		const r1 = applyReplicationOps(db, [op], "dev-local");
+		expect(r1.errors.length).toBe(1);
+		expect(memoryExists("key:test-1")).toBe(false);
+
+		// Second pass: the op is already recorded, so it is idempotently skipped
+		// with no repeated error.
+		const r2 = applyReplicationOps(db, [op], "dev-local");
+		expect(r2.skipped).toBe(1);
+		expect(r2.applied).toBe(0);
+		expect(r2.errors.length).toBe(0);
+	});
+
+	it("does not count a delete for an unknown memory as applied", () => {
+		const deleteOp = makeReplicationOp({
+			op_id: "del-unknown",
+			op_type: "delete",
+			entity_id: "key:missing",
+			payload_json: toJson({}),
+		});
+		const result = applyReplicationOps(db, [deleteOp], "dev-local");
+		expect(result.applied).toBe(0);
+		expect(result.skipped).toBe(1);
+	});
+
 	it("inserts a new memory item on upsert", () => {
 		const op = makeReplicationOp();
 		const result = applyReplicationOps(db, [op], "dev-local");
@@ -1594,6 +2697,1166 @@ describe("applyReplicationOps", () => {
 		expect(mem.rev).toBe(1);
 		expect(result.vectorWork.upsertMemoryIds).toEqual([Number(mem.id)]);
 		expect(result.vectorWork.deleteMemoryIds).toEqual([]);
+	});
+
+	it("preserves authoritative inbound scope_id on inserted memories and recorded ops", () => {
+		const op = makeReplicationOp({ scope_id: "acme-work" });
+
+		const result = applyReplicationOps(db, [op], "dev-local");
+
+		expect(result.applied).toBe(1);
+		const mem = db
+			.prepare("SELECT scope_id FROM memory_items WHERE import_key = ?")
+			.get(op.entity_id) as { scope_id: string | null };
+		expect(mem.scope_id).toBe("acme-work");
+		const recordedOp = db
+			.prepare("SELECT scope_id FROM replication_ops WHERE op_id = ?")
+			.get(op.op_id) as { scope_id: string | null };
+		expect(recordedOp.scope_id).toBe("acme-work");
+	});
+
+	it("preserves authoritative inbound scope_id on existing upserts and deletes", () => {
+		const sessionId = insertTestSession(db);
+		db.prepare(
+			`INSERT INTO memory_items(
+				session_id, kind, title, body_text, created_at, updated_at, import_key, rev, active, metadata_json, scope_id
+			 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		).run(
+			sessionId,
+			"discovery",
+			"Local old title",
+			"Local old body",
+			"2026-01-01T00:00:00Z",
+			"2026-01-01T00:00:00Z",
+			"key:test-1",
+			0,
+			1,
+			toJson({ clock_device_id: "dev-local" }),
+			"local-default",
+		);
+		const updateOp = makeReplicationOp({ scope_id: "acme-work", clock_rev: 2 });
+		const deleteOp = makeReplicationOp({
+			op_id: "delete-scoped-op",
+			op_type: "delete",
+			payload_json: null,
+			scope_id: "client-a",
+			clock_rev: 3,
+			clock_updated_at: "2026-01-01T00:00:01Z",
+		});
+
+		const updateResult = applyReplicationOps(db, [updateOp], "dev-local");
+		const deleteResult = applyReplicationOps(db, [deleteOp], "dev-local");
+
+		expect(updateResult.applied).toBe(1);
+		expect(deleteResult.applied).toBe(1);
+		const mem = db
+			.prepare("SELECT title, active, scope_id FROM memory_items WHERE import_key = ?")
+			.get(updateOp.entity_id) as { title: string; active: number; scope_id: string | null };
+		expect(mem.title).toBe("Remote memory");
+		expect(mem.active).toBe(0);
+		expect(mem.scope_id).toBe("client-a");
+		const recordedScopes = db
+			.prepare("SELECT scope_id FROM replication_ops ORDER BY clock_rev")
+			.all() as Array<{ scope_id: string | null }>;
+		expect(recordedScopes).toEqual([{ scope_id: "acme-work" }, { scope_id: "client-a" }]);
+	});
+
+	it("applies scoped inbound ops only when sender and receiver are members", () => {
+		grantScope("acme-work", ["dev-remote", "dev-local"]);
+		const op = makeReplicationOp({
+			scope_id: "acme-work",
+			payload_json: toJson({
+				kind: "discovery",
+				title: "Authorized scope",
+				body_text: "Remote body",
+				scope_id: "acme-work",
+			}),
+		});
+
+		const result = applyWithScopeValidation(op);
+
+		expect(result.applied).toBe(1);
+		expect(result.rejected).toBe(0);
+		expect(memoryExists(op.entity_id)).toBe(true);
+	});
+
+	it("rejects inbound ops for local-authority scopes even when both devices are members", () => {
+		grantScope("local-notes", ["dev-remote", "dev-local"], { authorityType: "local" });
+		const op = makeReplicationOp({
+			scope_id: "local-notes",
+			payload_json: toJson({
+				kind: "discovery",
+				title: "Blocked local scope",
+				body_text: "Remote body",
+				scope_id: "local-notes",
+			}),
+		});
+
+		const result = applyWithScopeValidation(op);
+
+		expect(result.applied).toBe(0);
+		expect(result.rejected).toBe(1);
+		expect(result.rejections[0]).toMatchObject({ op_id: op.op_id, reason: "missing_scope" });
+		expect(memoryExists(op.entity_id)).toBe(false);
+	});
+
+	it("rejects inbound local-authority ops when strict scope validation is disabled", () => {
+		grantScope("local-notes", ["dev-remote", "dev-local"], { authorityType: "local" });
+		const op = makeReplicationOp({ scope_id: "local-notes" });
+
+		const result = applyReplicationOps(db, [op], "dev-local", undefined, {
+			inboundScopeValidation: { peerDeviceId: "dev-remote", enabled: false },
+		});
+
+		expect(result.applied).toBe(0);
+		expect(result.rejected).toBe(1);
+		expect(result.rejections[0]).toMatchObject({ op_id: op.op_id, reason: "missing_scope" });
+		expect(memoryExists(op.entity_id)).toBe(false);
+	});
+
+	it("rejects unknown non-default scopes when strict scope validation is disabled", () => {
+		const op = makeReplicationOp({ scope_id: "peer-local-unknown" });
+
+		const result = applyReplicationOps(db, [op], "dev-local", undefined, {
+			inboundScopeValidation: { peerDeviceId: "dev-remote", enabled: false },
+		});
+
+		expect(result.applied).toBe(0);
+		expect(result.rejected).toBe(1);
+		expect(result.rejections[0]).toMatchObject({ op_id: op.op_id, reason: "missing_scope" });
+		expect(memoryExists(op.entity_id)).toBe(false);
+	});
+
+	it.each([
+		{ name: "null scope", scopeId: null, reason: "missing_scope" },
+		{ name: "local-default scope", scopeId: DEFAULT_SYNC_SCOPE_ID, reason: "scope_mismatch" },
+	] as const)("rejects regular inbound ops with $name when legacy scope validation is disabled", ({
+		scopeId,
+		reason,
+	}) => {
+		const op = makeReplicationOp({
+			op_id: `legacy-disabled-${reason}`,
+			scope_id: scopeId,
+			payload_json: toJson({
+				kind: "discovery",
+				title: "Blocked local-only memory",
+				body_text: "Remote body",
+				scope_id: scopeId,
+			}),
+		});
+
+		const result = applyReplicationOps(db, [op], "dev-local", undefined, {
+			inboundScopeValidation: { peerDeviceId: "dev-remote", enabled: false },
+		});
+
+		expect(result.applied).toBe(0);
+		expect(result.rejected).toBe(1);
+		expect(result.rejections[0]).toMatchObject({ op_id: op.op_id, reason });
+		expect(memoryExists(op.entity_id)).toBe(false);
+		expect(
+			db.prepare("SELECT 1 FROM replication_ops WHERE op_id = ?").get(op.op_id),
+		).toBeUndefined();
+	});
+
+	function makeUnsupportedOldSideReassignment(importKey: string): ReplicationOp {
+		return makeReplicationOp({
+			op_id: `unsupported-old-side-${importKey}`,
+			entity_id: importKey,
+			op_type: "reassign_scope",
+			payload_json: toJson({
+				operation_id: `share-${importKey}`,
+				memory_id: importKey,
+				old_scope_id: DEFAULT_SYNC_SCOPE_ID,
+				new_scope_id: "managed-project",
+				revision: 2,
+				side: "old",
+			}),
+			clock_rev: 2,
+			clock_updated_at: "2026-01-01T00:00:01Z",
+			created_at: "2026-01-01T00:00:01Z",
+			scope_id: DEFAULT_SYNC_SCOPE_ID,
+		});
+	}
+
+	it("allows sender-origin old-side reassignment when strict validation is disabled", () => {
+		const importKey = "key:unsupported-sender-origin";
+		insertReplicatedMemory({
+			importKey,
+			originDeviceId: "dev-remote",
+			scopeId: DEFAULT_SYNC_SCOPE_ID,
+		});
+		const op = makeUnsupportedOldSideReassignment(importKey);
+
+		const result = applyReplicationOps(db, [op], "dev-local", undefined, {
+			inboundScopeValidation: { peerDeviceId: "dev-remote", enabled: false },
+		});
+
+		expect(result).toMatchObject({ applied: 1, rejected: 0 });
+		expect(
+			db.prepare("SELECT active FROM memory_items WHERE import_key = ?").pluck().get(importKey),
+		).toBe(0);
+	});
+
+	it("accepts an absent-row old-side reassignment as a vacuous control operation", () => {
+		const importKey = "key:unsupported-absent-row";
+		const op = makeUnsupportedOldSideReassignment(importKey);
+
+		const result = applyReplicationOps(db, [op], "dev-local", undefined, {
+			inboundScopeValidation: { peerDeviceId: "dev-remote", enabled: false },
+		});
+
+		expect(result).toMatchObject({ applied: 0, rejected: 0, skipped: 1, errors: [] });
+		expect(memoryExists(importKey)).toBe(false);
+		expect(db.prepare("SELECT 1 FROM replication_ops WHERE op_id = ?").get(op.op_id)).toBeTruthy();
+	});
+
+	it.each([
+		{ name: "foreign", originDeviceId: "dev-other" },
+		{ name: "local", originDeviceId: "dev-local" },
+		{ name: "ambiguous", originDeviceId: null },
+	] as const)("rejects $name-origin old-side reassignment when strict validation is disabled", ({
+		name,
+		originDeviceId,
+	}) => {
+		const importKey = `key:unsupported-${name}-origin`;
+		insertReplicatedMemory({
+			importKey,
+			originDeviceId,
+			scopeId: DEFAULT_SYNC_SCOPE_ID,
+		});
+		const op = makeUnsupportedOldSideReassignment(importKey);
+
+		const result = applyReplicationOps(db, [op], "dev-local", undefined, {
+			inboundScopeValidation: { peerDeviceId: "dev-remote", enabled: false },
+		});
+
+		expect(result.applied).toBe(0);
+		expect(result.rejected).toBe(1);
+		expect(result.rejections[0]).toMatchObject({ reason: "sender_not_member" });
+		expect(
+			db.prepare("SELECT active FROM memory_items WHERE import_key = ?").pluck().get(importKey),
+		).toBe(1);
+	});
+
+	it("allows sender-owned local-default cleanup for a prior recipient outside the destination", () => {
+		const importKey = "key:default-reassign";
+		insertReplicatedMemory({
+			importKey,
+			originDeviceId: "dev-remote",
+			scopeId: DEFAULT_SYNC_SCOPE_ID,
+		});
+		grantScope("managed-project", ["dev-remote"]);
+		const op = makeReplicationOp({
+			op_id: "default-reassign-old",
+			entity_id: importKey,
+			op_type: "reassign_scope",
+			payload_json: toJson({
+				operation_id: "share_default",
+				memory_id: importKey,
+				old_scope_id: DEFAULT_SYNC_SCOPE_ID,
+				new_scope_id: "managed-project",
+				revision: 2,
+				side: "old",
+			}),
+			clock_rev: 2,
+			clock_updated_at: "2026-01-01T00:00:01Z",
+			created_at: "2026-01-01T00:00:01Z",
+			scope_id: DEFAULT_SYNC_SCOPE_ID,
+		});
+
+		const result = applyWithScopeValidation(op);
+
+		expect(result).toMatchObject({ applied: 1, rejected: 0 });
+		expect(
+			db.prepare("SELECT active, scope_id FROM memory_items WHERE import_key = ?").get(importKey),
+		).toEqual({ active: 0, scope_id: DEFAULT_SYNC_SCOPE_ID });
+		expect(
+			db
+				.prepare("SELECT COUNT(*) FROM memory_items WHERE import_key = ? AND scope_id = ?")
+				.pluck()
+				.get(importKey, "managed-project"),
+		).toBe(0);
+	});
+
+	it("allows sender-owned local-default cleanup into a local-authority destination", () => {
+		const importKey = "key:default-reassign-local-destination";
+		insertReplicatedMemory({
+			importKey,
+			originDeviceId: "dev-remote",
+			scopeId: DEFAULT_SYNC_SCOPE_ID,
+		});
+		grantScope("local-project", ["dev-remote"], { authorityType: "local" });
+		const op = makeReplicationOp({
+			op_id: "default-reassign-local-destination-old",
+			entity_id: importKey,
+			op_type: "reassign_scope",
+			payload_json: toJson({
+				operation_id: "share_local_destination",
+				memory_id: importKey,
+				old_scope_id: DEFAULT_SYNC_SCOPE_ID,
+				new_scope_id: "local-project",
+				revision: 2,
+				side: "old",
+			}),
+			clock_rev: 2,
+			clock_updated_at: "2026-01-01T00:00:01Z",
+			created_at: "2026-01-01T00:00:01Z",
+			scope_id: DEFAULT_SYNC_SCOPE_ID,
+		});
+
+		const result = applyWithScopeValidation(op);
+
+		expect(result).toMatchObject({ applied: 1, rejected: 0 });
+		expect(
+			db.prepare("SELECT active, scope_id FROM memory_items WHERE import_key = ?").get(importKey),
+		).toEqual({ active: 0, scope_id: DEFAULT_SYNC_SCOPE_ID });
+		expect(
+			db
+				.prepare("SELECT COUNT(*) FROM memory_items WHERE import_key = ? AND scope_id = ?")
+				.pluck()
+				.get(importKey, "local-project"),
+		).toBe(0);
+	});
+
+	it("allows sender-owned local-default cleanup into an unknown destination", () => {
+		const importKey = "key:default-reassign-unknown-destination";
+		insertReplicatedMemory({
+			importKey,
+			originDeviceId: "dev-remote",
+			scopeId: DEFAULT_SYNC_SCOPE_ID,
+		});
+		const op = makeReplicationOp({
+			op_id: "default-reassign-unknown-destination-old",
+			entity_id: importKey,
+			op_type: "reassign_scope",
+			payload_json: toJson({
+				operation_id: "share_unknown_destination",
+				memory_id: importKey,
+				old_scope_id: DEFAULT_SYNC_SCOPE_ID,
+				new_scope_id: "sender-local-project",
+				revision: 2,
+				side: "old",
+			}),
+			clock_rev: 2,
+			clock_updated_at: "2026-01-01T00:00:01Z",
+			created_at: "2026-01-01T00:00:01Z",
+			scope_id: DEFAULT_SYNC_SCOPE_ID,
+		});
+
+		const result = applyWithScopeValidation(op);
+
+		expect(result).toMatchObject({ applied: 1, rejected: 0 });
+		expect(
+			db.prepare("SELECT active, scope_id FROM memory_items WHERE import_key = ?").get(importKey),
+		).toEqual({ active: 0, scope_id: DEFAULT_SYNC_SCOPE_ID });
+		expect(
+			db
+				.prepare("SELECT COUNT(*) FROM memory_items WHERE import_key = ? AND scope_id = ?")
+				.pluck()
+				.get(importKey, "sender-local-project"),
+		).toBe(0);
+	});
+
+	it("rejects local-default reassignment when the sender lacks destination access", () => {
+		const importKey = "key:default-reassign-sender-not-member";
+		insertReplicatedMemory({
+			importKey,
+			originDeviceId: "dev-remote",
+			scopeId: DEFAULT_SYNC_SCOPE_ID,
+		});
+		grantScope("managed-project", ["dev-local"]);
+		const op = makeReplicationOp({
+			entity_id: importKey,
+			op_type: "reassign_scope",
+			payload_json: toJson({
+				operation_id: "share_default",
+				memory_id: importKey,
+				old_scope_id: DEFAULT_SYNC_SCOPE_ID,
+				new_scope_id: "managed-project",
+				revision: 2,
+				side: "old",
+			}),
+			clock_rev: 2,
+			clock_updated_at: "2026-01-01T00:00:01Z",
+			created_at: "2026-01-01T00:00:01Z",
+			scope_id: DEFAULT_SYNC_SCOPE_ID,
+		});
+
+		const result = applyWithScopeValidation(op);
+
+		expect(result.rejections[0]?.reason).toBe("sender_not_member");
+		expect(
+			db.prepare("SELECT active FROM memory_items WHERE import_key = ?").pluck().get(importKey),
+		).toBe(1);
+	});
+
+	it("rejects local-default reassignment for an unknown-origin memory", () => {
+		const importKey = "key:unknown-origin-default";
+		insertReplicatedMemory({
+			importKey,
+			originDeviceId: null,
+			scopeId: DEFAULT_SYNC_SCOPE_ID,
+		});
+		grantScope("managed-project", ["dev-remote"]);
+		const op = makeReplicationOp({
+			entity_id: importKey,
+			op_type: "reassign_scope",
+			payload_json: toJson({
+				operation_id: "share_default",
+				memory_id: importKey,
+				old_scope_id: DEFAULT_SYNC_SCOPE_ID,
+				new_scope_id: "managed-project",
+				revision: 2,
+				side: "old",
+			}),
+			clock_rev: 2,
+			clock_updated_at: "2026-01-01T00:00:01Z",
+			created_at: "2026-01-01T00:00:01Z",
+			scope_id: DEFAULT_SYNC_SCOPE_ID,
+		});
+
+		const result = applyWithScopeValidation(op);
+
+		expect(result.rejections[0]?.reason).toBe("sender_not_member");
+		expect(
+			db.prepare("SELECT active FROM memory_items WHERE import_key = ?").pluck().get(importKey),
+		).toBe(1);
+	});
+
+	it("rejects local-default reassignment for a receiver-owned memory", () => {
+		const importKey = "key:receiver-owned-default";
+		insertReplicatedMemory({
+			importKey,
+			originDeviceId: "dev-local",
+			scopeId: DEFAULT_SYNC_SCOPE_ID,
+		});
+		grantScope("managed-project", ["dev-remote", "dev-local"]);
+		const op = makeReplicationOp({
+			entity_id: importKey,
+			op_type: "reassign_scope",
+			payload_json: toJson({
+				operation_id: "share_default",
+				memory_id: importKey,
+				old_scope_id: DEFAULT_SYNC_SCOPE_ID,
+				new_scope_id: "managed-project",
+				revision: 2,
+				side: "old",
+			}),
+			clock_rev: 2,
+			clock_updated_at: "2026-01-01T00:00:01Z",
+			created_at: "2026-01-01T00:00:01Z",
+			scope_id: DEFAULT_SYNC_SCOPE_ID,
+		});
+
+		const result = applyWithScopeValidation(op);
+
+		expect(result.rejections[0]?.reason).toBe("sender_not_member");
+		expect(
+			db.prepare("SELECT active FROM memory_items WHERE import_key = ?").pluck().get(importKey),
+		).toBe(1);
+	});
+
+	it.each([
+		{
+			name: "missing op-row scope_id",
+			op: () => makeReplicationOp({ scope_id: null }),
+			setup: () => grantScope("acme-work", ["dev-remote", "dev-local"]),
+			reason: "missing_scope",
+		},
+		{
+			name: "sender is not a scope member",
+			op: () => makeReplicationOp({ scope_id: "acme-work" }),
+			setup: () => grantScope("acme-work", ["dev-local"]),
+			reason: "sender_not_member",
+		},
+		{
+			name: "sender spoofs the receiver device id",
+			op: () =>
+				makeReplicationOp({
+					device_id: "dev-local",
+					clock_device_id: "dev-remote",
+					scope_id: "acme-work",
+				}),
+			setup: () => grantScope("acme-work", ["dev-remote", "dev-local"]),
+			reason: "sender_not_member",
+		},
+		{
+			name: "receiver is not a scope member",
+			op: () => makeReplicationOp({ scope_id: "acme-work" }),
+			setup: () => grantScope("acme-work", ["dev-remote"]),
+			reason: "receiver_not_member",
+		},
+		{
+			name: "revoked or stale sender membership",
+			op: () => makeReplicationOp({ scope_id: "acme-work" }),
+			setup: () => {
+				grantScope("acme-work", ["dev-local"], { scopeEpoch: 3 });
+				grantScope("acme-work", ["dev-remote"], {
+					scopeEpoch: 3,
+					membershipEpoch: 2,
+				});
+			},
+			reason: "stale_epoch",
+		},
+		{
+			name: "no cached membership manifest",
+			op: () => makeReplicationOp({ scope_id: "ghost-scope" }),
+			setup: () => {},
+			reason: "stale_epoch",
+		},
+		{
+			name: "payload scope contradicts op-row scope",
+			op: () =>
+				makeReplicationOp({
+					scope_id: "acme-work",
+					payload_json: toJson({
+						kind: "discovery",
+						title: "Contradiction",
+						body_text: "Remote body",
+						workspace_id: "personal:actor-1",
+						workspace_kind: "personal",
+						actor_id: "actor-1",
+					}),
+				}),
+			setup: () => grantScope("acme-work", ["dev-remote", "dev-local"]),
+			reason: "scope_mismatch",
+		},
+		{
+			name: "local-default inbound scope",
+			op: () => makeReplicationOp({ scope_id: DEFAULT_SYNC_SCOPE_ID }),
+			setup: () => grantScope(DEFAULT_SYNC_SCOPE_ID, ["dev-remote", "dev-local"]),
+			reason: "scope_mismatch",
+		},
+	] as const)("rejects inbound ops before mutation when $name", ({ op, setup, reason }) => {
+		setup();
+		const inbound = op();
+
+		const result = applyWithScopeValidation(inbound);
+
+		expect(result.applied).toBe(0);
+		expect(result.rejected).toBe(1);
+		expect(result.rejections).toEqual([
+			expect.objectContaining({
+				op_id: inbound.op_id,
+				peer_device_id: "dev-remote",
+				reason,
+			}),
+		]);
+		expect(memoryExists(inbound.entity_id)).toBe(false);
+		expect(
+			db.prepare("SELECT 1 FROM replication_ops WHERE op_id = ?").get(inbound.op_id),
+		).toBeUndefined();
+		const logged = db
+			.prepare("SELECT op_id, reason FROM sync_scope_rejections WHERE op_id = ?")
+			.get(inbound.op_id) as { op_id: string; reason: string } | undefined;
+		expect(logged).toEqual({ op_id: inbound.op_id, reason });
+	});
+
+	it("rejects a replayed duplicate op after revocation instead of idempotently accepting it", () => {
+		grantScope("acme-work", ["dev-remote", "dev-local"]);
+		const op = makeReplicationOp({ op_id: "replayed-op", scope_id: "acme-work" });
+		expect(applyWithScopeValidation(op).applied).toBe(1);
+		grantScope("acme-work", ["dev-remote"], { status: "revoked", membershipEpoch: 2 });
+
+		const replay = applyWithScopeValidation(op);
+
+		expect(replay.applied).toBe(0);
+		expect(replay.rejections[0]?.reason).toBe("stale_epoch");
+	});
+
+	it("allows non-personal null-payload deletes when the op row carries an authorized scope", () => {
+		grantScope("acme-work", ["dev-remote", "dev-local"]);
+		const insert = makeReplicationOp({ scope_id: "acme-work" });
+		expect(applyWithScopeValidation(insert).applied).toBe(1);
+		const deleteOp = makeReplicationOp({
+			op_id: "scoped-delete",
+			op_type: "delete",
+			payload_json: null,
+			scope_id: "acme-work",
+			clock_rev: 2,
+			clock_updated_at: "2026-01-01T00:00:01Z",
+		});
+
+		const result = applyWithScopeValidation(deleteOp);
+
+		expect(result.applied).toBe(1);
+		expect(result.rejected).toBe(0);
+		const mem = db
+			.prepare("SELECT active, scope_id FROM memory_items WHERE import_key = ?")
+			.get(deleteOp.entity_id) as { active: number; scope_id: string | null };
+		expect(mem).toMatchObject({ active: 0, scope_id: "acme-work" });
+	});
+
+	it("physically deletes matching peer-received rows when access cleanup arrives", () => {
+		setReplicationCursor(
+			db,
+			"dev-remote",
+			{ lastApplied: "scoped-applied", lastAcked: "scoped-acked" },
+			"acme-work",
+		);
+		setReplicationCursor(db, "dev-remote", {
+			lastApplied: "default-applied",
+			lastAcked: "default-acked",
+		});
+		const memoryId = insertReplicatedMemory({
+			importKey: "key:cleanup",
+			originDeviceId: "dev-remote",
+			scopeId: "acme-work",
+		});
+		const op = makeReplicationOp({
+			op_id: "cleanup-op",
+			entity_id: "key:cleanup",
+			op_type: "access_cleanup",
+			payload_json: toJson({ cleanup_scope_id: "acme-work", reason: "scope_revoked" }),
+			clock_rev: 2,
+			clock_updated_at: "2026-01-01T00:00:01Z",
+			scope_id: DEFAULT_SYNC_SCOPE_ID,
+		});
+
+		const result = applyReplicationOps(db, [op], "dev-local");
+
+		expect(result.applied).toBe(1);
+		expect(db.prepare("SELECT 1 FROM memory_items WHERE id = ?").get(memoryId)).toBeUndefined();
+		expect(result.vectorWork.deleteMemoryIds).toEqual([memoryId]);
+		expect(
+			db.prepare("SELECT op_type, scope_id FROM replication_ops WHERE op_id = ?").get(op.op_id),
+		).toMatchObject({ op_type: "access_cleanup", scope_id: DEFAULT_SYNC_SCOPE_ID });
+		expect(getReplicationCursor(db, "dev-remote", "acme-work")).toEqual([
+			"scoped-applied",
+			"scoped-acked",
+		]);
+		expect(getReplicationCursor(db, "dev-remote")).toEqual(["default-applied", "default-acked"]);
+	});
+
+	it("does not let access cleanup delete local or differently scoped rows", () => {
+		const localMemoryId = insertReplicatedMemory({
+			importKey: "key:local-row",
+			originDeviceId: "dev-local",
+			scopeId: "acme-work",
+			title: "Local row",
+		});
+		const otherScopeMemoryId = insertReplicatedMemory({
+			importKey: "key:other-scope",
+			originDeviceId: "dev-remote",
+			scopeId: "client-work",
+			title: "Other scope row",
+		});
+		const cleanupLocal = makeReplicationOp({
+			op_id: "cleanup-local",
+			entity_id: "key:local-row",
+			op_type: "access_cleanup",
+			payload_json: toJson({ cleanup_scope_id: "acme-work", reason: "scope_revoked" }),
+			scope_id: DEFAULT_SYNC_SCOPE_ID,
+		});
+		const cleanupOtherScope = makeReplicationOp({
+			op_id: "cleanup-other-scope",
+			entity_id: "key:other-scope",
+			op_type: "access_cleanup",
+			payload_json: toJson({ cleanup_scope_id: "acme-work", reason: "scope_revoked" }),
+			scope_id: DEFAULT_SYNC_SCOPE_ID,
+		});
+
+		const result = applyReplicationOps(db, [cleanupLocal, cleanupOtherScope], "dev-local");
+
+		expect(result.applied).toBe(0);
+		expect(result.skipped).toBe(2);
+		expect(db.prepare("SELECT 1 FROM memory_items WHERE id = ?").get(localMemoryId)).toBeDefined();
+		expect(
+			db.prepare("SELECT 1 FROM memory_items WHERE id = ?").get(otherScopeMemoryId),
+		).toBeDefined();
+		expect(result.vectorWork.deleteMemoryIds).toEqual([]);
+	});
+
+	it("reconciles provably stale peer-received rows without deleting receiver-owned rows", () => {
+		grantScope("acme-work", ["dev-remote"]);
+		setReplicationCursor(
+			db,
+			"dev-remote",
+			{ lastApplied: "stale-applied", lastAcked: "stale-acked" },
+			"acme-work",
+		);
+		const stalePeerMemoryId = insertReplicatedMemory({
+			importKey: "key:stale-peer",
+			originDeviceId: "dev-remote",
+			scopeId: "acme-work",
+		});
+		const localMemoryId = insertReplicatedMemory({
+			importKey: "key:local-owned",
+			originDeviceId: "dev-local",
+			scopeId: "acme-work",
+		});
+		const missingOriginMemoryId = insertReplicatedMemory({
+			importKey: "key:missing-origin",
+			originDeviceId: null,
+			scopeId: "acme-work",
+		});
+
+		const result = reconcileStalePeerReceivedRows(db, { localDeviceId: "dev-local" });
+
+		expect(result.deleted).toBe(1);
+		expect(result.deleted_memory_ids).toEqual([stalePeerMemoryId]);
+		expect(
+			db.prepare("SELECT 1 FROM memory_items WHERE id = ?").get(stalePeerMemoryId),
+		).toBeUndefined();
+		expect(db.prepare("SELECT 1 FROM memory_items WHERE id = ?").get(localMemoryId)).toBeDefined();
+		expect(
+			db.prepare("SELECT 1 FROM memory_items WHERE id = ?").get(missingOriginMemoryId),
+		).toBeDefined();
+		expect(getReplicationCursor(db, "dev-remote", "acme-work")).toEqual([null, null]);
+		expect(result.ambiguous).toEqual([
+			expect.objectContaining({
+				memory_id: missingOriginMemoryId,
+				reason: "missing_origin_device",
+			}),
+		]);
+	});
+
+	it("removes remote-origin local-only rows conservatively and idempotently", () => {
+		setReplicationCursor(db, "dev-remote", {
+			lastApplied: "default-applied",
+			lastAcked: "default-acked",
+		});
+		const remoteNullId = insertReplicatedMemory({
+			importKey: "key:remote-null",
+			originDeviceId: "dev-remote",
+			scopeId: null,
+		});
+		const remoteDefaultId = insertReplicatedMemory({
+			importKey: "key:remote-default",
+			originDeviceId: "dev-remote",
+			scopeId: DEFAULT_SYNC_SCOPE_ID,
+		});
+		const localDefaultId = insertReplicatedMemory({
+			importKey: "key:local-default",
+			originDeviceId: "dev-local",
+			scopeId: DEFAULT_SYNC_SCOPE_ID,
+		});
+		const ambiguousNullId = insertReplicatedMemory({
+			importKey: "key:ambiguous-null",
+			originDeviceId: null,
+			scopeId: null,
+		});
+		db.prepare("INSERT INTO memory_file_refs(memory_id, file_path, relation) VALUES (?, ?, ?)").run(
+			remoteNullId,
+			"src/remote-null.ts",
+			"read",
+		);
+		db.prepare("INSERT INTO memory_concept_refs(memory_id, concept) VALUES (?, ?)").run(
+			remoteDefaultId,
+			"remote-default",
+		);
+
+		const first = reconcileStalePeerReceivedRows(db, { localDeviceId: "dev-local" });
+		const second = reconcileStalePeerReceivedRows(db, { localDeviceId: "dev-local" });
+
+		expect(first.deleted).toBe(2);
+		expect(first.deleted_memory_ids).toEqual([remoteNullId, remoteDefaultId]);
+		expect(
+			db
+				.prepare("SELECT COUNT(*) FROM memory_file_refs WHERE memory_id = ?")
+				.pluck()
+				.get(remoteNullId),
+		).toBe(0);
+		expect(
+			db
+				.prepare("SELECT COUNT(*) FROM memory_concept_refs WHERE memory_id = ?")
+				.pluck()
+				.get(remoteDefaultId),
+		).toBe(0);
+		expect(db.prepare("SELECT 1 FROM memory_items WHERE id = ?").get(localDefaultId)).toBeDefined();
+		expect(
+			db.prepare("SELECT 1 FROM memory_items WHERE id = ?").get(ambiguousNullId),
+		).toBeDefined();
+		expect(first.ambiguous).toContainEqual(
+			expect.objectContaining({
+				memory_id: ambiguousNullId,
+				reason: "missing_origin_device",
+			}),
+		);
+		expect(second.deleted).toBe(0);
+		expect(second.deleted_memory_ids).toEqual([]);
+		expect(getReplicationCursor(db, "dev-remote")).toEqual(["default-applied", "default-acked"]);
+	});
+
+	it("limits local-only cleanup to rows proven to originate from the syncing peer", () => {
+		const syncingPeerId = insertReplicatedMemory({
+			importKey: "key:syncing-peer-default",
+			originDeviceId: "dev-remote",
+			scopeId: DEFAULT_SYNC_SCOPE_ID,
+		});
+		const otherPeerId = insertReplicatedMemory({
+			importKey: "key:other-peer-default",
+			originDeviceId: "dev-other",
+			scopeId: DEFAULT_SYNC_SCOPE_ID,
+		});
+
+		const result = reconcileStalePeerReceivedRows(db, {
+			localDeviceId: "dev-local",
+			peerDeviceId: "dev-remote",
+		});
+
+		expect(result.deleted_memory_ids).toEqual([syncingPeerId]);
+		expect(
+			db.prepare("SELECT 1 FROM memory_items WHERE id = ?").get(syncingPeerId),
+		).toBeUndefined();
+		expect(db.prepare("SELECT 1 FROM memory_items WHERE id = ?").get(otherPeerId)).toBeDefined();
+	});
+
+	it("leaves authorized and ambiguous stale-scope candidates intact with diagnostics", () => {
+		grantScope("acme-work", ["dev-local", "dev-remote"]);
+		const authorizedPeerMemoryId = insertReplicatedMemory({
+			importKey: "key:authorized-peer",
+			originDeviceId: "dev-remote",
+			scopeId: "acme-work",
+		});
+		const missingImportKeyMemoryId = insertReplicatedMemory({
+			importKey: null,
+			originDeviceId: "dev-remote",
+			scopeId: "ghost-scope",
+		});
+		const unknownScopeMemoryId = insertReplicatedMemory({
+			importKey: "key:unknown-scope",
+			originDeviceId: "dev-remote",
+			scopeId: "ghost-scope",
+		});
+
+		const result = reconcileStalePeerReceivedRows(db, { localDeviceId: "dev-local" });
+
+		expect(result.deleted).toBe(0);
+		expect(result.retained).toBeGreaterThanOrEqual(1);
+		expect(
+			db.prepare("SELECT 1 FROM memory_items WHERE id = ?").get(authorizedPeerMemoryId),
+		).toBeDefined();
+		expect(
+			db.prepare("SELECT 1 FROM memory_items WHERE id = ?").get(missingImportKeyMemoryId),
+		).toBeDefined();
+		expect(
+			db.prepare("SELECT 1 FROM memory_items WHERE id = ?").get(unknownScopeMemoryId),
+		).toBeDefined();
+		expect(result.ambiguous).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					memory_id: missingImportKeyMemoryId,
+					reason: "missing_import_key",
+				}),
+				expect.objectContaining({
+					memory_id: unknownScopeMemoryId,
+					reason: "authorization_unknown",
+				}),
+			]),
+		);
+	});
+
+	it("reconciles stale-epoch peer rows as stale retention", () => {
+		grantScope("acme-work", ["dev-remote"], { scopeEpoch: 3 });
+		grantScope("acme-work", ["dev-local"], { scopeEpoch: 3, membershipEpoch: 2 });
+		const stalePeerMemoryId = insertReplicatedMemory({
+			importKey: "key:stale-epoch-peer",
+			originDeviceId: "dev-remote",
+			scopeId: "acme-work",
+		});
+
+		const result = reconcileStalePeerReceivedRows(db, { localDeviceId: "dev-local" });
+
+		expect(result.deleted_memory_ids).toEqual([stalePeerMemoryId]);
+		expect(result.deleted).toBe(1);
+	});
+
+	it("retains pending membership peer rows as ambiguous", () => {
+		grantScope("acme-work", ["dev-local", "dev-remote"], { status: "pending" });
+		const pendingPeerMemoryId = insertReplicatedMemory({
+			importKey: "key:pending-peer",
+			originDeviceId: "dev-remote",
+			scopeId: "acme-work",
+		});
+
+		const result = reconcileStalePeerReceivedRows(db, { localDeviceId: "dev-local" });
+
+		expect(result.deleted).toBe(0);
+		expect(result.ambiguous).toEqual([
+			expect.objectContaining({
+				memory_id: pendingPeerMemoryId,
+				reason: "authorization_unknown",
+			}),
+		]);
+		expect(
+			db.prepare("SELECT 1 FROM memory_items WHERE id = ?").get(pendingPeerMemoryId),
+		).toBeDefined();
+	});
+
+	it("diagnoses stale peer-received rows without deleting them", () => {
+		grantScope("acme-work", ["dev-remote"]);
+		const stalePeerMemoryId = insertReplicatedMemory({
+			importKey: "key:diagnose-stale-peer",
+			originDeviceId: "dev-remote",
+			scopeId: "acme-work",
+		});
+
+		const result = diagnoseStalePeerReceivedRows(db, { localDeviceId: "dev-local" });
+
+		expect(result.would_delete).toBe(1);
+		expect(result.would_delete_memory_ids).toEqual([stalePeerMemoryId]);
+		expect(
+			db.prepare("SELECT 1 FROM memory_items WHERE id = ?").get(stalePeerMemoryId),
+		).toBeDefined();
+	});
+
+	it("bounds stale peer diagnostic scans", () => {
+		grantScope("acme-work", ["dev-remote"]);
+		insertReplicatedMemory({
+			importKey: "key:diagnose-stale-peer-1",
+			originDeviceId: "dev-remote",
+			scopeId: "acme-work",
+		});
+		insertReplicatedMemory({
+			importKey: "key:diagnose-stale-peer-2",
+			originDeviceId: "dev-remote",
+			scopeId: "acme-work",
+		});
+
+		const result = diagnoseStalePeerReceivedRows(db, { localDeviceId: "dev-local", maxRows: 1 });
+
+		expect(result.checked).toBe(1);
+		expect(result.would_delete).toBe(1);
+	});
+
+	it("redacts secrets in inbound peer payloads on insert", () => {
+		const pat = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+		const awsId = "AKIAIOSFODNN7EXAMPLE";
+		const op = makeReplicationOp({
+			payload_json: toJson({
+				kind: "discovery",
+				title: `peer title ${pat}`,
+				body_text: `peer body ${awsId}`,
+				narrative: `peer narrative ${pat}`,
+				tags_text: pat,
+				facts: [`fact contains ${pat}`],
+				concepts: ["clean"],
+				metadata_json: { password: "supersecretvalue123", note: "harmless" },
+			}),
+		});
+		const result = applyReplicationOps(db, [op], "dev-local");
+		expect(result.applied).toBe(1);
+		const mem = db
+			.prepare(
+				"SELECT title, body_text, narrative, tags_text, facts, metadata_json FROM memory_items WHERE import_key = ?",
+			)
+			.get("key:test-1") as {
+			title: string;
+			body_text: string;
+			narrative: string | null;
+			tags_text: string | null;
+			facts: string | null;
+			metadata_json: string | null;
+		};
+		expect(mem.title).not.toContain(pat);
+		expect(mem.title).toContain("[REDACTED:github_pat_classic]");
+		expect(mem.body_text).not.toContain(awsId);
+		expect(mem.body_text).toContain("[REDACTED:aws_access_key_id]");
+		expect(mem.narrative).not.toContain(pat);
+		expect(mem.tags_text ?? "").not.toContain(pat);
+		expect(mem.facts ?? "").not.toContain(pat);
+		const meta = JSON.parse(mem.metadata_json ?? "{}");
+		expect(meta.password).toBe("[REDACTED:context_secret]");
+		expect(meta.note).toBe("harmless");
+	});
+
+	it("applies a custom scanner's extra rules to inbound peer payloads", () => {
+		const op = makeReplicationOp({
+			payload_json: toJson({
+				kind: "discovery",
+				title: "internal token ACME-XYZ12 in title",
+				body_text: "ACME-XYZ12 in body",
+			}),
+		});
+		const customScanner = new SecretScanner({
+			rules: [{ kind: "internal_acme_token", pattern: /\bACME-[A-Z0-9]{5}\b/g }],
+		});
+		const result = applyReplicationOps(db, [op], "dev-local", customScanner);
+		expect(result.applied).toBe(1);
+		const mem = db
+			.prepare("SELECT title, body_text FROM memory_items WHERE import_key = ?")
+			.get("key:test-1") as { title: string; body_text: string };
+		expect(mem.title).toContain("[REDACTED:internal_acme_token]");
+		expect(mem.title).not.toContain("ACME-XYZ12");
+		expect(mem.body_text).toContain("[REDACTED:internal_acme_token]");
+	});
+
+	it("redacts peer-controlled actor_display_name and origin_source", () => {
+		const pat = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+		const op = makeReplicationOp({
+			payload_json: toJson({
+				kind: "discovery",
+				title: "Title",
+				body_text: "Body",
+				actor_display_name: `Peer ${pat}`,
+				origin_source: `tool ${pat}`,
+			}),
+		});
+		const result = applyReplicationOps(db, [op], "dev-local");
+		expect(result.applied).toBe(1);
+		const mem = db
+			.prepare("SELECT actor_display_name, origin_source FROM memory_items WHERE import_key = ?")
+			.get("key:test-1") as { actor_display_name: string | null; origin_source: string | null };
+		expect(mem.actor_display_name ?? "").not.toContain(pat);
+		expect(mem.actor_display_name ?? "").toContain("[REDACTED:github_pat_classic]");
+		expect(mem.origin_source ?? "").not.toContain(pat);
+	});
+
+	it("redacts secrets in inbound peer payloads on update of existing row", () => {
+		// Insert a baseline row
+		const baselineOp = makeReplicationOp({ op_id: "op-baseline" });
+		applyReplicationOps(db, [baselineOp], "dev-local");
+
+		// Replicate an update that contains a secret
+		const pat = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+		const updateOp = makeReplicationOp({
+			op_id: "op-update",
+			clock_rev: 2,
+			clock_updated_at: "2026-01-02T00:00:00Z",
+			payload_json: toJson({
+				kind: "discovery",
+				title: `updated ${pat}`,
+				body_text: `updated body ${pat}`,
+				updated_at: "2026-01-02T00:00:00Z",
+			}),
+		});
+		const result = applyReplicationOps(db, [updateOp], "dev-local");
+		expect(result.applied).toBe(1);
+		const mem = db
+			.prepare("SELECT title, body_text FROM memory_items WHERE import_key = ?")
+			.get("key:test-1") as { title: string; body_text: string };
+		expect(mem.title).not.toContain(pat);
+		expect(mem.title).toContain("[REDACTED:github_pat_classic]");
+		expect(mem.body_text).not.toContain(pat);
+	});
+
+	it("uses authoritative inbound op scope_id when updating existing memories", () => {
+		const sessionId = insertTestSession(db);
+		db.prepare(
+			`INSERT INTO memory_items(
+				session_id, kind, title, body_text, created_at, updated_at, import_key, rev, metadata_json, scope_id
+			 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		).run(
+			sessionId,
+			"discovery",
+			"Local old title",
+			"Local old body",
+			"2026-01-01T00:00:00Z",
+			"2026-01-01T00:00:00Z",
+			"key:test-1",
+			0,
+			toJson({ clock_device_id: "dev-local" }),
+			"local-default",
+		);
+		const op = makeReplicationOp({ scope_id: "acme-work", clock_rev: 2 });
+
+		const result = applyReplicationOps(db, [op], "dev-local");
+
+		expect(result.applied).toBe(1);
+		const mem = db
+			.prepare("SELECT title, scope_id FROM memory_items WHERE import_key = ?")
+			.get(op.entity_id) as { title: string; scope_id: string | null };
+		expect(mem.title).toBe("Remote memory");
+		expect(mem.scope_id).toBe("acme-work");
+		const recordedOp = db
+			.prepare("SELECT scope_id FROM replication_ops WHERE op_id = ?")
+			.get(op.op_id) as { scope_id: string | null };
+		expect(recordedOp.scope_id).toBe("acme-work");
+	});
+
+	it("uses authoritative inbound op scope_id when deleting existing memories", () => {
+		const sessionId = insertTestSession(db);
+		db.prepare(
+			`INSERT INTO memory_items(
+				session_id, kind, title, body_text, created_at, updated_at, import_key, rev, active, metadata_json, scope_id
+			 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		).run(
+			sessionId,
+			"discovery",
+			"Local old title",
+			"Local old body",
+			"2026-01-01T00:00:00Z",
+			"2026-01-01T00:00:00Z",
+			"key:test-1",
+			0,
+			1,
+			toJson({ clock_device_id: "dev-local" }),
+			"local-default",
+		);
+		const op = makeReplicationOp({
+			op_type: "delete",
+			payload_json: null,
+			scope_id: "acme-work",
+			clock_rev: 2,
+		});
+
+		const result = applyReplicationOps(db, [op], "dev-local");
+
+		expect(result.applied).toBe(1);
+		const mem = db
+			.prepare("SELECT active, scope_id FROM memory_items WHERE import_key = ?")
+			.get(op.entity_id) as { active: number; scope_id: string | null };
+		expect(mem.active).toBe(0);
+		expect(mem.scope_id).toBe("acme-work");
+		const recordedOp = db
+			.prepare("SELECT scope_id FROM replication_ops WHERE op_id = ?")
+			.get(op.op_id) as { scope_id: string | null };
+		expect(recordedOp.scope_id).toBe("acme-work");
+	});
+
+	it("uses inbound delete clock device metadata for later Lamport tie-breaks", () => {
+		const sessionId = insertTestSession(db);
+		db.prepare(
+			`INSERT INTO memory_items(
+				session_id, kind, title, body_text, created_at, updated_at, import_key, rev, active, metadata_json, scope_id
+			 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		).run(
+			sessionId,
+			"discovery",
+			"Local old title",
+			"Local old body",
+			"2026-01-01T00:00:00Z",
+			"2026-01-01T00:00:00Z",
+			"key:test-1",
+			1,
+			1,
+			toJson({ clock_device_id: "a-local" }),
+			"local-default",
+		);
+
+		const deleteOp = makeReplicationOp({
+			op_id: "delete-lamport-op",
+			op_type: "delete",
+			payload_json: null,
+			clock_rev: 2,
+			clock_updated_at: "2026-01-02T00:00:00Z",
+			clock_device_id: "z-delete-device",
+		});
+		const staleTieUpsert = makeReplicationOp({
+			op_id: "stale-tie-upsert-op",
+			clock_rev: 2,
+			clock_updated_at: "2026-01-02T00:00:00Z",
+			clock_device_id: "m-upsert-device",
+			payload_json: toJson({
+				kind: "discovery",
+				title: "Should not resurrect",
+				body_text: "Remote body",
+				active: 1,
+			}),
+		});
+
+		const deleteResult = applyReplicationOps(db, [deleteOp], "dev-local");
+		const tieResult = applyReplicationOps(db, [staleTieUpsert], "dev-local");
+
+		expect(deleteResult.applied).toBe(1);
+		expect(tieResult.conflicts).toBe(1);
+		const mem = db
+			.prepare("SELECT title, active, metadata_json FROM memory_items WHERE import_key = ?")
+			.get(deleteOp.entity_id) as { title: string; active: number; metadata_json: string };
+		expect(mem.title).toBe("Local old title");
+		expect(mem.active).toBe(0);
+		expect(JSON.parse(mem.metadata_json).clock_device_id).toBe("z-delete-device");
 	});
 
 	it("populates ref tables when inserting a new memory with files and concepts", () => {
@@ -1999,6 +4262,55 @@ describe("applyReplicationOps", () => {
 		expect(mem.active).toBe(1);
 		expect(mem.deleted_at).toBeNull();
 	});
+
+	it("does not resurrect a tombstone when an upsert omits deleted_at but sets active=1", () => {
+		const sessionId = insertTestSession(db);
+		const deletedAt = "2026-01-01T00:00:00Z";
+		db.prepare(
+			`INSERT INTO memory_items(session_id, kind, title, body_text, active, deleted_at, created_at, updated_at, import_key, rev, metadata_json)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		).run(
+			sessionId,
+			"discovery",
+			"Stable title",
+			"stable body",
+			0,
+			deletedAt,
+			deletedAt,
+			deletedAt,
+			"key:no-resurrect",
+			1,
+			toJson({ clock_device_id: "dev-remote" }),
+		);
+
+		// Newer upsert carrying active=1 but OMITTING deleted_at (has_deleted_at
+		// is false). The tombstone must be preserved and the row must stay
+		// inactive — a field-omitting upsert must not resurrect a deleted memory.
+		const op = makeReplicationOp({
+			entity_id: "key:no-resurrect",
+			clock_rev: 2,
+			clock_updated_at: "2026-01-02T00:00:00Z",
+			payload_json: toJson({
+				kind: "discovery",
+				title: "Changed title",
+				body_text: "changed body",
+				active: 1,
+				updated_at: "2026-01-02T00:00:00Z",
+			}),
+		});
+
+		const result = applyReplicationOps(db, [op], "dev-local");
+		expect(result.applied).toBe(1);
+
+		const mem = db
+			.prepare("SELECT id, active, deleted_at FROM memory_items WHERE import_key = ?")
+			.get("key:no-resurrect") as { id: number; active: number; deleted_at: string | null };
+		expect(mem.active).toBe(0);
+		expect(mem.deleted_at).toBe(deletedAt);
+		// Stays tombstoned → embeddings must be queued for deletion, not upsert.
+		expect(result.vectorWork.deleteMemoryIds).toContain(mem.id);
+		expect(result.vectorWork.upsertMemoryIds).not.toContain(mem.id);
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -2061,12 +4373,24 @@ describe("replication payload round-trip parity", () => {
 
 		// Read the op back
 		const op = db.prepare("SELECT * FROM replication_ops WHERE op_id = ?").get(opId) as {
+			clock_rev: number;
+			clock_updated_at: string;
+			created_at: string;
 			payload_json: string;
+			scope_id: string | null;
 		};
 		const payload = JSON.parse(op.payload_json) as Record<string, unknown>;
 
 		// Verify the payload includes all the fields we care about
 		expect(payload.project).toBe("test-project");
+		// Privacy invariant: session-level provenance that is meaningful only
+		// on the originating device must NOT leak in the wire payload.
+		// memories are portable; session context (cwd, git_remote, git_branch,
+		// started_at) is device-local by design.
+		expect(payload).not.toHaveProperty("cwd");
+		expect(payload).not.toHaveProperty("git_remote");
+		expect(payload).not.toHaveProperty("git_branch");
+		expect(payload).not.toHaveProperty("started_at");
 		expect(payload.kind).toBe("decision");
 		expect(payload.title).toBe("Round Trip Title");
 		expect(payload.subtitle).toBe("Sub");
@@ -2100,6 +4424,7 @@ describe("replication payload round-trip parity", () => {
 			clock_device_id: "remote-device",
 			device_id: "remote-device",
 			created_at: op.created_at,
+			scope_id: op.scope_id,
 		};
 
 		const result = applyReplicationOps(db, [replicationOp], "target-device");
@@ -2114,6 +4439,9 @@ describe("replication payload round-trip parity", () => {
 
 		expect(applied).toBeTruthy();
 		expect(applied.session_project).toBe("test-project");
+		// memory_items.project is denormalized at apply time so the read model
+		// can reach the originating project without a session join.
+		expect(applied.project).toBe("test-project");
 		expect(applied.kind).toBe("decision");
 		expect(applied.title).toBe("Round Trip Title");
 		expect(applied.subtitle).toBe("Sub");
@@ -2148,7 +4476,11 @@ describe("bootstrap snapshot round-trip parity", () => {
 		db = new Database(":memory:");
 		initTestSchema(db);
 		sessionId = insertTestSession(db);
-		setSyncResetState(db, { generation: 1, snapshot_id: "snap-bs", baseline_cursor: null });
+		setSyncResetState(
+			db,
+			{ generation: 1, snapshot_id: "snap-bs", baseline_cursor: null },
+			"bootstrap-work",
+		);
 	});
 
 	afterEach(() => db.close());
@@ -2167,14 +4499,14 @@ describe("bootstrap snapshot round-trip parity", () => {
 				actor_id, actor_display_name, visibility, workspace_id,
 				workspace_kind, origin_device_id, origin_source, trust_state,
 				narrative, facts, concepts, files_read, files_modified,
-				user_prompt_id, prompt_number, import_key, rev
+				user_prompt_id, prompt_number, import_key, rev, scope_id
 			) VALUES (
 				?, 'feature', 'Bootstrap Title', 'BSub', 'Bootstrap body', 0.9,
 				'btag-a btag-b', 1, ?, ?, '{"bs_key":"bs_val"}',
 				'actor-bs', 'Bootstrap Actor', 'shared', 'ws-bs',
 				'shared', 'device-bs-origin', 'bootstrap-test', 'trusted',
 				'Bootstrap narrative', '["bs-fact"]', '["bs-concept"]', '["bs-file-r"]', '["bs-file-w"]',
-				99, 3, 'bootstrap-roundtrip-key', 2
+				99, 3, 'bootstrap-roundtrip-key', 2, 'bootstrap-work'
 			)
 		`).run(sessionId, now, now);
 
@@ -2182,6 +4514,7 @@ describe("bootstrap snapshot round-trip parity", () => {
 		const { applyBootstrapSnapshot } = await import("./sync-bootstrap.js");
 
 		const page = loadMemorySnapshotPageForPeer(db, {
+			scopeId: "bootstrap-work",
 			generation: 1,
 			snapshotId: "snap-bs",
 			baselineCursor: null,
@@ -2197,6 +4530,7 @@ describe("bootstrap snapshot round-trip parity", () => {
 		db.prepare("DELETE FROM sessions WHERE id = ?").run(sessionId);
 
 		const resetInfo = {
+			scope_id: "bootstrap-work",
 			generation: 1,
 			snapshot_id: "snap-bs",
 			baseline_cursor: null,
@@ -2234,5 +4568,223 @@ describe("bootstrap snapshot round-trip parity", () => {
 		expect(applied.narrative).toBe("Bootstrap narrative");
 		expect(applied.user_prompt_id).toBe(99);
 		expect(applied.prompt_number).toBe(3);
+	});
+
+	it("records a scoped cursor marker for empty scoped bootstrap snapshots", async () => {
+		const { applyBootstrapSnapshot } = await import("./sync-bootstrap.js");
+		const resetInfo = {
+			scope_id: "empty-work",
+			generation: 1,
+			snapshot_id: "snap-empty",
+			baseline_cursor: null,
+			retained_floor_cursor: null,
+			reset_required: true as const,
+			reason: "initial_bootstrap" as const,
+		};
+
+		const result = applyBootstrapSnapshot(db, "target-peer", [], resetInfo);
+
+		expect(result.ok).toBe(true);
+		expect(result.applied).toBe(0);
+		const row = db
+			.prepare(
+				`SELECT last_applied_cursor, last_acked_cursor
+				   FROM replication_cursors_v2
+				  WHERE peer_device_id = ? AND scope_id = ?`,
+			)
+			.get("target-peer", "empty-work") as
+			| { last_applied_cursor: string | null; last_acked_cursor: string | null }
+			| undefined;
+		expect(row).toEqual({
+			last_applied_cursor: null,
+			last_acked_cursor: SCOPED_NULL_BASELINE_BOOTSTRAP_CURSOR_MARKER,
+		});
+	});
+
+	it("clears stale scoped cursors before writing a null-baseline bootstrap marker", async () => {
+		setReplicationCursor(
+			db,
+			"target-peer",
+			{ lastApplied: "2026-01-01T00:00:00Z|stale-cursor", lastAcked: "old-ack" },
+			"empty-work",
+		);
+		const { applyBootstrapSnapshot } = await import("./sync-bootstrap.js");
+		const resetInfo = {
+			scope_id: "empty-work",
+			generation: 2,
+			snapshot_id: "snap-empty-2",
+			baseline_cursor: null,
+			retained_floor_cursor: null,
+			reset_required: true as const,
+			reason: "initial_bootstrap" as const,
+		};
+
+		const result = applyBootstrapSnapshot(db, "target-peer", [], resetInfo);
+
+		expect(result.ok).toBe(true);
+		const row = db
+			.prepare(
+				`SELECT last_applied_cursor, last_acked_cursor
+				   FROM replication_cursors_v2
+				  WHERE peer_device_id = ? AND scope_id = ?`,
+			)
+			.get("target-peer", "empty-work") as
+			| { last_applied_cursor: string | null; last_acked_cursor: string | null }
+			| undefined;
+		expect(row).toEqual({
+			last_applied_cursor: null,
+			last_acked_cursor: SCOPED_NULL_BASELINE_BOOTSTRAP_CURSOR_MARKER,
+		});
+	});
+
+	it("clears scoped null-baseline bootstrap markers when a scoped reset is required", () => {
+		setReplicationCursor(
+			db,
+			"target-peer",
+			{ lastAcked: SCOPED_NULL_BASELINE_BOOTSTRAP_CURSOR_MARKER },
+			"empty-work",
+		);
+
+		clearReplicationCursorLastApplied(db, "target-peer", "empty-work");
+
+		const row = db
+			.prepare(
+				`SELECT last_applied_cursor, last_acked_cursor
+				   FROM replication_cursors_v2
+				  WHERE peer_device_id = ? AND scope_id = ?`,
+			)
+			.get("target-peer", "empty-work") as
+			| { last_applied_cursor: string | null; last_acked_cursor: string | null }
+			| undefined;
+		expect(row).toEqual({ last_applied_cursor: null, last_acked_cursor: null });
+	});
+});
+
+describe("inbound scope rejection diagnostics", () => {
+	let db: InstanceType<typeof Database>;
+
+	beforeEach(() => {
+		db = new Database(":memory:");
+		initTestSchema(db);
+	});
+
+	afterEach(() => {
+		db.close();
+	});
+
+	function insertRejection(
+		peerDeviceId: string | null,
+		reason: string,
+		opts: {
+			opId?: string;
+			scopeId?: string | null;
+			createdAt?: string;
+			entityId?: string;
+		} = {},
+	): void {
+		db.exec(`
+			CREATE TABLE IF NOT EXISTS sync_scope_rejections (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				peer_device_id TEXT,
+				op_id TEXT NOT NULL,
+				entity_type TEXT NOT NULL,
+				entity_id TEXT NOT NULL,
+				scope_id TEXT,
+				reason TEXT NOT NULL,
+				created_at TEXT NOT NULL
+			);
+		`);
+		db.prepare(
+			`INSERT INTO sync_scope_rejections(
+				peer_device_id, op_id, entity_type, entity_id, scope_id, reason, created_at
+			 ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		).run(
+			peerDeviceId,
+			opts.opId ?? `op-${Math.random().toString(36).slice(2, 8)}`,
+			"memory_item",
+			opts.entityId ?? "key:test",
+			opts.scopeId ?? "acme-work",
+			reason,
+			opts.createdAt ?? "2026-01-02T00:00:00Z",
+		);
+	}
+
+	it("returns an empty summary when the rejection log table does not exist", () => {
+		expect(summarizeInboundScopeRejections(db)).toEqual([]);
+		expect(listInboundScopeRejections(db)).toEqual([]);
+	});
+
+	it("groups rejection counts by peer and reason", () => {
+		insertRejection("dev-remote-a", "missing_scope", { createdAt: "2026-01-02T00:00:00Z" });
+		insertRejection("dev-remote-a", "missing_scope", { createdAt: "2026-01-02T00:00:01Z" });
+		insertRejection("dev-remote-a", "stale_epoch", { createdAt: "2026-01-02T00:00:02Z" });
+		insertRejection("dev-remote-b", "scope_mismatch", { createdAt: "2026-01-02T00:00:03Z" });
+
+		const summaries = summarizeInboundScopeRejections(db);
+		const byPeer = new Map(summaries.map((entry) => [entry.peer_device_id, entry]));
+
+		expect(byPeer.get("dev-remote-a")).toEqual({
+			peer_device_id: "dev-remote-a",
+			total: 3,
+			by_reason: { missing_scope: 2, stale_epoch: 1 },
+			last_at: "2026-01-02T00:00:02Z",
+		});
+		expect(byPeer.get("dev-remote-b")).toEqual({
+			peer_device_id: "dev-remote-b",
+			total: 1,
+			by_reason: { scope_mismatch: 1 },
+			last_at: "2026-01-02T00:00:03Z",
+		});
+	});
+
+	it("filters rejections by peer and time window", () => {
+		insertRejection("dev-remote-a", "missing_scope", { createdAt: "2026-01-01T00:00:00Z" });
+		insertRejection("dev-remote-a", "stale_epoch", { createdAt: "2026-01-03T00:00:00Z" });
+		insertRejection("dev-remote-b", "stale_epoch", { createdAt: "2026-01-03T00:00:00Z" });
+
+		const recent = summarizeInboundScopeRejections(db, {
+			sinceIso: "2026-01-02T00:00:00Z",
+			peerDeviceId: "dev-remote-a",
+		});
+		expect(recent).toEqual([
+			{
+				peer_device_id: "dev-remote-a",
+				total: 1,
+				by_reason: { stale_epoch: 1 },
+				last_at: "2026-01-03T00:00:00Z",
+			},
+		]);
+	});
+
+	it("lists rejection records newest-first without exposing payloads", () => {
+		insertRejection("dev-remote", "missing_scope", {
+			opId: "op-old",
+			scopeId: null,
+			createdAt: "2026-01-02T00:00:00Z",
+		});
+		insertRejection("dev-remote", "stale_epoch", {
+			opId: "op-new",
+			scopeId: "acme-work",
+			createdAt: "2026-01-03T00:00:00Z",
+		});
+
+		const records = listInboundScopeRejections(db, { peerDeviceId: "dev-remote", limit: 10 });
+		expect(records.map((r) => r.op_id)).toEqual(["op-new", "op-old"]);
+		for (const record of records) {
+			expect(record).not.toHaveProperty("payload_json");
+			expect(record.peer_device_id).toBe("dev-remote");
+		}
+	});
+
+	it("clamps the list limit to a sensible maximum", () => {
+		for (let i = 0; i < 10; i++) {
+			insertRejection("dev-remote", "missing_scope", {
+				opId: `op-${i}`,
+				createdAt: `2026-01-02T00:00:${String(i).padStart(2, "0")}Z`,
+			});
+		}
+		expect(listInboundScopeRejections(db, { limit: 3 })).toHaveLength(3);
+		expect(listInboundScopeRejections(db, { limit: 0 })).toHaveLength(1);
+		expect(listInboundScopeRejections(db, { limit: 10_000 }).length).toBeLessThanOrEqual(500);
 	});
 });

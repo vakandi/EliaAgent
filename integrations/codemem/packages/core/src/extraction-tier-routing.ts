@@ -32,30 +32,32 @@ export interface TieredObserverConfigSelection {
 
 export const SIMPLE_TIER_DEFAULTS: Partial<ObserverConfig> = {
 	observerProvider: "openai",
-	observerModel: "gpt-5.4-mini",
+	observerModel: "gpt-5.6-luna",
 	observerTemperature: 0.2,
+	observerReasoningEffort: "medium",
 };
 
 export const RICH_TIER_DEFAULTS: Partial<ObserverConfig> = {
 	observerProvider: "openai",
-	observerModel: "gpt-5.4",
+	observerModel: "gpt-5.6-terra",
 	observerTemperature: 0.2,
 	observerOpenAIUseResponses: true,
-	observerReasoningEffort: null,
+	observerReasoningEffort: "medium",
 	observerReasoningSummary: null,
 	observerMaxOutputTokens: 12000,
 };
 
+// No temperature on the Anthropic tiers: the Anthropic request builders and
+// the sidecar runtimes never send a sampling temperature, and newer Claude
+// models reject non-default values outright.
 export const SIMPLE_TIER_ANTHROPIC_DEFAULTS: Partial<ObserverConfig> = {
 	observerProvider: "anthropic",
 	observerModel: "claude-haiku-4-5",
-	observerTemperature: 0.2,
 };
 
 export const RICH_TIER_ANTHROPIC_DEFAULTS: Partial<ObserverConfig> = {
 	observerProvider: "anthropic",
 	observerModel: "claude-sonnet-4-6",
-	observerTemperature: 0.2,
 	observerMaxOutputTokens: 12000,
 };
 
@@ -84,13 +86,26 @@ function resolveRichTierDefaults(provider: KnownTierProvider): Partial<ObserverC
 }
 
 function normalizeRuntime(value: string | null | undefined): string {
-	return typeof value === "string" && value.trim().toLowerCase() === "claude_sidecar"
-		? "claude_sidecar"
-		: "api_http";
+	const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+	if (normalized === "claude_sidecar" || normalized === "codex_sidecar") return normalized;
+	return "api_http";
 }
 
 function nullIfUndefined<T>(value: T | undefined): T | null {
 	return value === undefined ? null : value;
+}
+
+function shouldUseOpenAIResponses(
+	config: ObserverConfig,
+	explicitConfigKeys: Set<string>,
+): boolean {
+	const hasCustomBaseUrl =
+		typeof config.observerBaseUrl === "string" && config.observerBaseUrl.trim().length > 0;
+	return !(
+		hasCustomBaseUrl &&
+		explicitConfigKeys.has("observerOpenAIUseResponses") &&
+		config.observerOpenAIUseResponses === false
+	);
 }
 
 function requestedMetadata(
@@ -173,6 +188,52 @@ export function buildTieredObserverSelection(
 			),
 		};
 	}
+	if (normalizedRuntime === "codex_sidecar") {
+		const sidecarProviderKey =
+			decision.tier === "simple" ? "observerSimpleProvider" : "observerRichProvider";
+		const hasExplicitProviderOverride =
+			explicitConfigKeys.has(sidecarProviderKey) || explicitConfigKeys.has("observerProvider");
+		const requestedProvider =
+			(sidecarProviderKey === "observerSimpleProvider"
+				? trimmedProvider(baseConfig.observerSimpleProvider)
+				: trimmedProvider(baseConfig.observerRichProvider)) ??
+			trimmedProvider(baseConfig.observerProvider);
+		const observer = {
+			...baseConfig,
+			observerProvider: "openai",
+			observerModel:
+				decision.tier === "simple"
+					? (baseConfig.observerSimpleModel ?? baseConfig.observerModel)
+					: (baseConfig.observerRichModel ?? baseConfig.observerModel),
+			observerTemperature:
+				decision.tier === "simple"
+					? (baseConfig.observerSimpleTemperature ?? baseConfig.observerTemperature)
+					: (baseConfig.observerRichTemperature ?? baseConfig.observerTemperature),
+			observerOpenAIUseResponses: undefined,
+			observerReasoningEffort: null,
+			observerReasoningSummary: null,
+			observerMaxOutputTokens:
+				decision.tier === "simple"
+					? baseConfig.observerMaxTokens
+					: (baseConfig.observerRichMaxOutputTokens ?? baseConfig.observerMaxTokens),
+		};
+		const fallbackReason =
+			hasExplicitProviderOverride && requestedProvider && requestedProvider !== "openai"
+				? "unsupported tier override for runtime"
+				: null;
+		return {
+			observer,
+			metadata: requestedMetadata(
+				decision,
+				{
+					...observer,
+					observerProvider: requestedProvider ?? observer.observerProvider,
+					observerRuntime: normalizedRuntime,
+				},
+				fallbackReason,
+			),
+		};
+	}
 
 	if (decision.tier === "simple") {
 		const knownProvider =
@@ -180,7 +241,8 @@ export function buildTieredObserverSelection(
 			normalizeKnownProvider(baseConfig.observerProvider);
 		if (knownProvider) {
 			const tierDefaults = resolveSimpleTierDefaults(knownProvider);
-			const hasExplicitBaseResponsesSetting = explicitConfigKeys.has("observerOpenAIUseResponses");
+			const useOpenAIResponses =
+				knownProvider === "openai" && shouldUseOpenAIResponses(baseConfig, explicitConfigKeys);
 			const observer = {
 				...baseConfig,
 				observerProvider: knownProvider,
@@ -190,15 +252,14 @@ export function buildTieredObserverSelection(
 					baseConfig.observerSimpleTemperature ??
 					tierDefaults.observerTemperature ??
 					baseConfig.observerTemperature,
-				observerOpenAIUseResponses:
-					knownProvider === "openai"
-						? hasExplicitBaseResponsesSetting
-							? baseConfig.observerOpenAIUseResponses === true
-							: true
-						: undefined,
-				observerReasoningEffort: null,
-				observerReasoningSummary: null,
-				observerMaxOutputTokens: baseConfig.observerMaxTokens,
+				observerOpenAIUseResponses: knownProvider === "openai" ? useOpenAIResponses : undefined,
+				observerReasoningEffort: useOpenAIResponses
+					? (baseConfig.observerReasoningEffort ?? tierDefaults.observerReasoningEffort ?? null)
+					: null,
+				observerReasoningSummary: useOpenAIResponses
+					? (baseConfig.observerReasoningSummary ?? tierDefaults.observerReasoningSummary ?? null)
+					: null,
+				observerMaxOutputTokens: baseConfig.observerMaxOutputTokens ?? baseConfig.observerMaxTokens,
 			};
 			return {
 				observer,
@@ -221,7 +282,7 @@ export function buildTieredObserverSelection(
 			observerOpenAIUseResponses: undefined,
 			observerReasoningEffort: null,
 			observerReasoningSummary: null,
-			observerMaxOutputTokens: baseConfig.observerMaxTokens,
+			observerMaxOutputTokens: baseConfig.observerMaxOutputTokens ?? baseConfig.observerMaxTokens,
 		};
 		return {
 			observer,
@@ -238,6 +299,7 @@ export function buildTieredObserverSelection(
 	if (knownProvider) {
 		const tierDefaults = resolveRichTierDefaults(knownProvider);
 		const isOpenAI = knownProvider === "openai";
+		const useOpenAIResponses = isOpenAI && shouldUseOpenAIResponses(baseConfig, explicitConfigKeys);
 		const observer = {
 			...baseConfig,
 			observerProvider: knownProvider,
@@ -247,15 +309,24 @@ export function buildTieredObserverSelection(
 				baseConfig.observerRichTemperature ??
 				tierDefaults.observerTemperature ??
 				baseConfig.observerTemperature,
-			observerOpenAIUseResponses: isOpenAI ? true : undefined,
-			observerReasoningEffort: isOpenAI
-				? (baseConfig.observerRichReasoningEffort ?? tierDefaults.observerReasoningEffort ?? null)
+			observerOpenAIUseResponses: isOpenAI ? useOpenAIResponses : undefined,
+			observerReasoningEffort: useOpenAIResponses
+				? (baseConfig.observerRichReasoningEffort ??
+					baseConfig.observerReasoningEffort ??
+					tierDefaults.observerReasoningEffort ??
+					null)
 				: null,
-			observerReasoningSummary: isOpenAI
-				? (baseConfig.observerRichReasoningSummary ?? tierDefaults.observerReasoningSummary ?? null)
+			observerReasoningSummary: useOpenAIResponses
+				? (baseConfig.observerRichReasoningSummary ??
+					baseConfig.observerReasoningSummary ??
+					tierDefaults.observerReasoningSummary ??
+					null)
 				: null,
 			observerMaxOutputTokens:
 				baseConfig.observerRichMaxOutputTokens ??
+				(explicitConfigKeys.has("observerMaxOutputTokens")
+					? baseConfig.observerMaxOutputTokens
+					: undefined) ??
 				tierDefaults.observerMaxOutputTokens ??
 				baseConfig.observerMaxTokens,
 		};
@@ -279,7 +350,12 @@ export function buildTieredObserverSelection(
 		observerOpenAIUseResponses: undefined,
 		observerReasoningEffort: null,
 		observerReasoningSummary: null,
-		observerMaxOutputTokens: baseConfig.observerRichMaxOutputTokens ?? baseConfig.observerMaxTokens,
+		observerMaxOutputTokens:
+			baseConfig.observerRichMaxOutputTokens ??
+			(explicitConfigKeys.has("observerMaxOutputTokens")
+				? baseConfig.observerMaxOutputTokens
+				: undefined) ??
+			baseConfig.observerMaxTokens,
 	};
 	return {
 		observer,

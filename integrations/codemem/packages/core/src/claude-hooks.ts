@@ -12,9 +12,15 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, resolve } from "node:path";
+import {
+	extractHookTranscriptWithOutcome,
+	type HookTranscriptOutcome,
+	type HookTranscriptPolicy,
+	TRUSTED_HOOK_TRANSCRIPT_POLICY,
+} from "./hook-transcript.js";
 
 // ---------------------------------------------------------------------------
 // Path helpers
@@ -38,6 +44,9 @@ export const MAPPABLE_CLAUDE_HOOK_EVENTS = new Set([
 	"Stop",
 	"SessionEnd",
 ]);
+
+/** Frozen discriminator for Claude's derived event identity contract. */
+export const CLAUDE_EVENT_ID_ALGO = "claude/1";
 
 // ---------------------------------------------------------------------------
 // Timestamp helpers
@@ -116,7 +125,18 @@ function stableEventId(...parts: string[]): string {
 /** Normalize a raw label value to a plain project name (basename if path). */
 export function normalizeProjectLabel(value: unknown): string | null {
 	if (typeof value !== "string") return null;
-	const cleaned = value.trim().replace(/[\\/]+$/, "");
+	// Strip trailing path separators with a linear scan rather than a regex.
+	// The previous `/[\\/]+$/` pattern backtracks quadratically on adversarial
+	// inputs (a long run of separators followed by a non-separator), and this
+	// value can originate from uncontrolled hook payloads.
+	const trimmed = value.trim();
+	let end = trimmed.length;
+	while (end > 0) {
+		const code = trimmed.charCodeAt(end - 1);
+		if (code === 47 /* / */ || code === 92 /* \\ */) end -= 1;
+		else break;
+	}
+	const cleaned = trimmed.slice(0, end);
 	if (!cleaned) return null;
 	if (cleaned.includes("/") || cleaned.includes("\\")) {
 		// Windows-style path (drive letter or backslash)
@@ -272,124 +292,39 @@ function normalizeUsage(value: unknown): Record<string, number> | null {
 }
 
 // ---------------------------------------------------------------------------
-// Text extraction from content blocks
-// ---------------------------------------------------------------------------
-
-function textFromContent(value: unknown): string {
-	if (typeof value === "string") return value.trim();
-	if (Array.isArray(value)) {
-		const parts = value.map(textFromContent).filter(Boolean);
-		return parts.join("\n").trim();
-	}
-	if (value != null && typeof value === "object") {
-		const v = value as Record<string, unknown>;
-		if (typeof v.text === "string") return v.text.trim();
-		return textFromContent(v.content);
-	}
-	return "";
-}
-
-// ---------------------------------------------------------------------------
 // Transcript extraction (for Stop events without last_assistant_message)
 // ---------------------------------------------------------------------------
 
 /**
  * Read the transcript JSONL and return the last assistant message text + usage.
  * Returns [null, null] on any read or parse failure.
+ *
+ * Exported so other adapter mappers (e.g. Codex) can reuse the same
+ * transcript fallback for Stop events that omit `last_assistant_message`.
  */
-function extractFromTranscript(
+export function extractFromTranscript(
 	transcriptPath: unknown,
 	cwdHint?: string | null,
+	policy: HookTranscriptPolicy = { trust: "restricted", approvedRoots: [] },
+	onTranscriptOutcome?: (outcome: HookTranscriptOutcome) => void,
 ): [string | null, Record<string, number> | null] {
-	if (typeof transcriptPath !== "string") return [null, null];
-	const raw = expandUser(transcriptPath.trim());
-	if (!raw) return [null, null];
-
-	let resolvedPath: string;
-	if (isAbsolute(raw)) {
-		resolvedPath = raw;
-	} else {
-		if (typeof cwdHint !== "string" || !cwdHint.trim()) return [null, null];
-		const base = expandUser(cwdHint.trim());
-		if (!isAbsolute(base)) return [null, null];
-		try {
-			const stat = statSync(base, { throwIfNoEntry: false });
-			if (!stat?.isDirectory()) return [null, null];
-		} catch {
-			return [null, null];
-		}
-		resolvedPath = resolve(base, raw);
-	}
-
+	const result = extractHookTranscriptWithOutcome(transcriptPath, { policy, cwd: cwdHint });
 	try {
-		const stat = statSync(resolvedPath, { throwIfNoEntry: false });
-		if (!stat?.isFile()) return [null, null];
+		onTranscriptOutcome?.(result.outcome);
 	} catch {
-		return [null, null];
+		// Diagnostics are best-effort and must never change hook mapping.
 	}
-
-	let assistantText: string | null = null;
-	let assistantUsage: Record<string, number> | null = null;
-
-	try {
-		const content = readFileSync(resolvedPath, "utf-8");
-		for (const rawLine of content.split("\n")) {
-			const line = rawLine.trim();
-			if (!line) continue;
-			let record: unknown;
-			try {
-				record = JSON.parse(line);
-			} catch {
-				continue;
-			}
-			if (record == null || typeof record !== "object" || Array.isArray(record)) continue;
-			const r = record as Record<string, unknown>;
-
-			// A line may be the record itself or have a nested `message` field
-			const candidates: Record<string, unknown>[] = [r];
-			if (r.message != null && typeof r.message === "object" && !Array.isArray(r.message)) {
-				candidates.push(r.message as Record<string, unknown>);
-			}
-
-			let role = "";
-			let contentValue: unknown = null;
-			let usageValue: unknown = null;
-
-			for (const c of candidates) {
-				if (!role) {
-					if (typeof c.role === "string") role = c.role.trim().toLowerCase();
-					else if (c.type === "assistant") role = "assistant";
-				}
-				if (contentValue == null) {
-					for (const field of ["content", "text"]) {
-						if (field in c) {
-							contentValue = c[field];
-							break;
-						}
-					}
-				}
-				if (usageValue == null) {
-					for (const field of ["usage", "token_usage", "tokenUsage"]) {
-						if (field in c) {
-							usageValue = c[field];
-							break;
-						}
-					}
-				}
-			}
-
-			if (role !== "assistant") continue;
-			const text = textFromContent(contentValue);
-			if (!text) continue;
-			assistantText = text;
-			assistantUsage = normalizeUsage(usageValue);
-		}
-	} catch {
-		return [null, null];
-	}
-
-	return [assistantText, assistantUsage];
+	return result.extraction;
 }
+
+export interface HookMapperOptions {
+	transcriptPolicy: HookTranscriptPolicy;
+	onTranscriptOutcome?: (outcome: HookTranscriptOutcome) => void;
+}
+
+export const TRUSTED_HOOK_MAPPER_OPTIONS: HookMapperOptions = {
+	transcriptPolicy: TRUSTED_HOOK_TRANSCRIPT_POLICY,
+};
 
 // ---------------------------------------------------------------------------
 // Session id
@@ -425,6 +360,7 @@ export interface ClaudeHookAdapterEvent {
  */
 export function mapClaudeHookPayload(
 	payload: Record<string, unknown>,
+	options: HookMapperOptions,
 ): ClaudeHookAdapterEvent | null {
 	const hookEvent = String(payload.hook_event_name ?? "").trim();
 	if (!MAPPABLE_CLAUDE_HOOK_EVENTS.has(hookEvent)) return null;
@@ -532,7 +468,12 @@ export function mapClaudeHookPayload(
 
 		if (!assistantText || usage === null) {
 			const cwd = typeof payload.cwd === "string" ? payload.cwd : null;
-			const [transcriptText, transcriptUsage] = extractFromTranscript(payload.transcript_path, cwd);
+			const [transcriptText, transcriptUsage] = extractFromTranscript(
+				payload.transcript_path,
+				cwd,
+				options.transcriptPolicy,
+				options.onTranscriptOutcome,
+			);
 			if (!assistantText && transcriptText) assistantText = transcriptText;
 			if (usage === null && transcriptUsage !== null) usage = transcriptUsage;
 		}
@@ -564,6 +505,7 @@ export function mapClaudeHookPayload(
 
 	// Build meta — forward unknown fields as hook_fields
 	const meta: Record<string, unknown> = {
+		event_id_algo: CLAUDE_EVENT_ID_ALGO,
 		hook_event_name: hookEvent,
 		ordering_confidence: "low",
 	};
@@ -644,8 +586,9 @@ export interface ClaudeHookRawEventEnvelope {
  */
 export function buildRawEventEnvelopeFromHook(
 	hookPayload: Record<string, unknown>,
+	options: HookMapperOptions,
 ): ClaudeHookRawEventEnvelope | null {
-	const adapterEvent = mapClaudeHookPayload(hookPayload);
+	const adapterEvent = mapClaudeHookPayload(hookPayload, options);
 	if (adapterEvent === null) return null;
 
 	const sessionId = adapterEvent.session_id.trim();
@@ -693,8 +636,9 @@ export function buildRawEventEnvelopeFromHook(
  */
 export function buildIngestPayloadFromHook(
 	hookPayload: Record<string, unknown>,
+	options: HookMapperOptions,
 ): Record<string, unknown> | null {
-	const adapterEvent = mapClaudeHookPayload(hookPayload);
+	const adapterEvent = mapClaudeHookPayload(hookPayload, options);
 	if (adapterEvent === null) return null;
 
 	const sessionId = adapterEvent.session_id;

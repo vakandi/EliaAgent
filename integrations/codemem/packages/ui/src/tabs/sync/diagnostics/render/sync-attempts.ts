@@ -20,6 +20,13 @@ import {
 } from "../helpers";
 import type { SyncAttemptState } from "../types";
 
+export function shouldShowSyncAttemptRedactionHint(
+	attempt: Pick<SyncAttemptState, "error_redacted">,
+	redact: boolean,
+): boolean {
+	return redact && attempt.error_redacted === true;
+}
+
 export function renderSyncAttempts() {
 	const syncAttempts = document.getElementById("syncAttempts");
 	if (!syncAttempts) return;
@@ -55,6 +62,9 @@ export function renderSyncAttempts() {
 			// doesn't leak private addresses.
 			const errText = String(attempt.error);
 			detailParts.push(redact ? redactIpOctets(errText) : errText);
+			if (shouldShowSyncAttemptRedactionHint(attempt, redact)) {
+				detailParts.push("Turn off Redact in Advanced diagnostics to reveal the full error.");
+			}
 		}
 		if (!isError && (attempt.ops_in || attempt.ops_out)) {
 			detailParts.push(`${attempt.ops_in ?? 0} in · ${attempt.ops_out ?? 0} out`);
@@ -68,6 +78,12 @@ export function renderSyncAttempts() {
 			peerLabel,
 			detail: detailParts.join(" · "),
 			startedAt: time ? formatTimestamp(time) : "",
+			...(shouldShowSyncAttemptRedactionHint(attempt, redact)
+				? {
+						actionHref: "#sync/diagnostics",
+						actionLabel: "Open Advanced diagnostics Redact setting",
+					}
+				: {}),
 		};
 	});
 

@@ -1,18 +1,26 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryStore } from "@codemem/core";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	buildForegroundRunnerArgs,
+	buildMaintenanceWorkerArgs,
+	commandHasExactDbPath,
 	extractViewerPid,
+	isLikelyMaintenanceWorkerCommand,
 	isLikelyViewerCommand,
 	isLocalHost,
 	isLoopbackOnlyHost,
 	isSqliteVecLoadFailure,
+	maintenanceWorkerPidFilePath,
 	pickViewerPidCandidate,
 	prepareViewerDatabase,
+	respondsLikeCodememViewer,
+	runServeCoordinatorMaintenance,
 	sqliteVecFailureDiagnostics,
+	terminateTrustedMaintenanceWorker,
+	terminateTrustedViewerPid,
 } from "./serve.js";
 import {
 	resolveLegacyServeInvocation,
@@ -22,6 +30,10 @@ import {
 } from "./serve-invocation.js";
 
 describe("serve command option resolution", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
 	it("treats bare serve as a foreground start", () => {
 		const resolved = resolveLegacyServeInvocation({ host: "127.0.0.1", port: "38888" });
 		expect(resolved).toEqual({
@@ -150,6 +162,134 @@ describe("serve command option resolution", () => {
 		]);
 	});
 
+	it("builds maintenance worker args from the current runner", () => {
+		const args = buildMaintenanceWorkerArgs(
+			"/repo/packages/cli/src/index.ts",
+			{
+				mode: "start",
+				dbPath: "/tmp/test.sqlite",
+				configPath: "/tmp/codemem.jsonc",
+				host: "127.0.0.1",
+				port: 38991,
+				background: false,
+			},
+			["--conditions", "source"],
+		);
+		expect(args).toEqual([
+			"--conditions",
+			"source",
+			"/repo/packages/cli/src/index.ts",
+			"maintenance",
+			"worker",
+			"--db-path",
+			"/tmp/test.sqlite",
+			"--config",
+			"/tmp/codemem.jsonc",
+		]);
+	});
+
+	it("surfaces recipient-policy failures after running every maintenance stage", async () => {
+		const calls: string[] = [];
+		const store = {} as MemoryStore;
+		await expect(
+			runServeCoordinatorMaintenance(store, {
+				advancePendingProjectShares: vi.fn(async (_store, options) => {
+					calls.push(`shares:${options.limit}`);
+					return { processed: 1, failed: 0 };
+				}),
+				reconcileConfiguredCoordinatorEnrollment: vi.fn(async () => {
+					calls.push("enrollment");
+					return { groupsProcessed: 1, failedGroups: 0 };
+				}),
+				reconcileRecipientPolicyProjects: vi.fn(async (_store, options) => {
+					calls.push(`policies:${options.limit}`);
+					return { processed: 2, failed: 1 };
+				}),
+			}),
+		).rejects.toThrow("recipient policy maintenance failed for 1 of 2 projects");
+
+		expect(calls).toEqual(["shares:3", "enrollment", "policies:3"]);
+	});
+
+	it("runs enrollment and policy reconciliation before surfacing share maintenance failures", async () => {
+		const reconcileConfiguredCoordinatorEnrollment = vi.fn(async () => ({
+			groupsProcessed: 0,
+			failedGroups: 0,
+		}));
+		const reconcileRecipientPolicyProjects = vi.fn(async () => ({ processed: 0, failed: 0 }));
+
+		await expect(
+			runServeCoordinatorMaintenance({} as MemoryStore, {
+				advancePendingProjectShares: vi.fn(async () => ({ processed: 2, failed: 1 })),
+				reconcileConfiguredCoordinatorEnrollment,
+				reconcileRecipientPolicyProjects,
+			}),
+		).rejects.toThrow("share operation maintenance failed for 1 of 2 operations");
+		expect(reconcileConfiguredCoordinatorEnrollment).toHaveBeenCalledOnce();
+		expect(reconcileRecipientPolicyProjects).toHaveBeenCalledOnce();
+	});
+
+	it("runs policy reconciliation before surfacing incomplete enrollment reconciliation", async () => {
+		const reconcileRecipientPolicyProjects = vi.fn(async () => ({ processed: 0, failed: 0 }));
+
+		await expect(
+			runServeCoordinatorMaintenance({} as MemoryStore, {
+				advancePendingProjectShares: vi.fn(async () => ({ processed: 0, failed: 0 })),
+				reconcileConfiguredCoordinatorEnrollment: vi.fn(async () => ({
+					groupsProcessed: 1,
+					failedGroups: 1,
+					issues: 2,
+					failures: [
+						{
+							groupId: "group-a",
+							stage: "list_consumed_team_invites" as const,
+							code: "http_404",
+						},
+					],
+				})),
+				reconcileRecipientPolicyProjects,
+			}),
+		).rejects.toThrow(
+			"coordinator enrollment maintenance failed for 1 group with 2 reconciliation issues [group-a:list_consumed_team_invites:http_404]",
+		);
+		expect(reconcileRecipientPolicyProjects).toHaveBeenCalledOnce();
+	});
+
+	it("bounds enrollment failure details", async () => {
+		await expect(
+			runServeCoordinatorMaintenance({} as MemoryStore, {
+				advancePendingProjectShares: vi.fn(async () => ({ processed: 0, failed: 0 })),
+				reconcileConfiguredCoordinatorEnrollment: vi.fn(async () => ({
+					groupsProcessed: 0,
+					failedGroups: 4,
+					issues: 0,
+					failures: ["a", "b", "c", "d"].map((groupId) => ({
+						groupId,
+						stage: "list_devices" as const,
+						code: "coordinator_device_list_malformed",
+					})),
+				})),
+				reconcileRecipientPolicyProjects: vi.fn(async () => ({ processed: 0, failed: 0 })),
+			}),
+		).rejects.toThrow(
+			"[a:list_devices:coordinator_device_list_malformed, b:list_devices:coordinator_device_list_malformed, c:list_devices:coordinator_device_list_malformed, +1 more]",
+		);
+	});
+
+	it("reports reconciliation issues without claiming a group failure", async () => {
+		await expect(
+			runServeCoordinatorMaintenance({} as MemoryStore, {
+				advancePendingProjectShares: vi.fn(async () => ({ processed: 0, failed: 0 })),
+				reconcileConfiguredCoordinatorEnrollment: vi.fn(async () => ({
+					groupsProcessed: 1,
+					failedGroups: 0,
+					issues: 1,
+				})),
+				reconcileRecipientPolicyProjects: vi.fn(async () => ({ processed: 0, failed: 0 })),
+			}),
+		).rejects.toThrow("coordinator enrollment reconciliation found 1 issue");
+	});
+
 	it("detects sqlite-vec load errors for viewer startup fallback", () => {
 		expect(isSqliteVecLoadFailure(new Error("sqlite-vec loaded but version check failed"))).toBe(
 			true,
@@ -168,9 +308,55 @@ describe("serve command option resolution", () => {
 
 	it("extracts viewer_pid from stats payload", () => {
 		expect(extractViewerPid({ viewer_pid: 12345 })).toBe(12345);
+		expect(extractViewerPid({ pid: 54321 })).toBeNull();
 		expect(extractViewerPid({ viewer_pid: -1 })).toBeNull();
 		expect(extractViewerPid({ viewer_pid: "12345" })).toBeNull();
 		expect(extractViewerPid({})).toBeNull();
+	});
+
+	it("uses degraded health for liveness without treating health pid as a stop candidate", async () => {
+		const timeoutSpy = vi
+			.spyOn(AbortSignal, "timeout")
+			.mockReturnValue(new AbortController().signal);
+		const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+			new Response(
+				JSON.stringify({
+					service: "codemem-viewer",
+					pid: 54321,
+					ready: false,
+					database: { reachable: false },
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			),
+		);
+
+		await expect(
+			respondsLikeCodememViewer({ pid: 12345, host: "127.0.0.1", port: 38_888 }, fetchMock),
+		).resolves.toBe(true);
+		expect(fetchMock).toHaveBeenCalledOnce();
+		expect(fetchMock.mock.calls[0]?.[0]).toBe("http://127.0.0.1:38888/api/health");
+		expect(timeoutSpy).toHaveBeenCalledWith(1000);
+		expect(extractViewerPid({ pid: 54321 })).toBeNull();
+	});
+
+	it("accepts an old viewer through the 404 stats fallback", async () => {
+		const fetchMock = vi
+			.fn<typeof fetch>()
+			.mockResolvedValueOnce(new Response(null, { status: 404 }))
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ viewer_pid: 12345 }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+			);
+
+		await expect(
+			respondsLikeCodememViewer({ pid: 12345, host: "127.0.0.1", port: 38_888 }, fetchMock),
+		).resolves.toBe(true);
+		expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+			"http://127.0.0.1:38888/api/health",
+			"http://127.0.0.1:38888/api/stats",
+		]);
 	});
 
 	it("selects pid candidate from stats and listener with mismatch protection", () => {
@@ -229,6 +415,116 @@ describe("serve command option resolution", () => {
 		expect(
 			isLikelyViewerCommand("node /repo/packages/cli/dist/index.js serve start --foreground"),
 		).toBe(true);
+		expect(isLikelyViewerCommand("node /repo/packages/cli/src/index.ts serve start")).toBe(true);
 		expect(isLikelyViewerCommand("node /usr/bin/python -m http.server 38888")).toBe(false);
+	});
+
+	it("matches likely codemem maintenance worker command lines", () => {
+		expect(
+			isLikelyMaintenanceWorkerCommand(
+				"node /repo/packages/cli/src/index.ts maintenance worker --db-path /tmp/test.sqlite",
+			),
+		).toBe(true);
+		expect(
+			isLikelyMaintenanceWorkerCommand(
+				"node /repo/packages/cli/dist/index.js maintenance worker --db-path /tmp/test.sqlite",
+			),
+		).toBe(true);
+		expect(isLikelyMaintenanceWorkerCommand("node /tmp/other.js maintenance worker")).toBe(false);
+	});
+
+	it("requires exact maintenance worker db-path command ownership", () => {
+		expect(
+			commandHasExactDbPath(
+				"node /repo/packages/cli/src/index.ts maintenance worker --db-path /tmp/mem.sqlite",
+				"/tmp/mem.sqlite",
+			),
+		).toBe(true);
+		expect(
+			commandHasExactDbPath(
+				"node /repo/packages/cli/src/index.ts maintenance worker --db-path=/tmp/mem.sqlite",
+				"/tmp/mem.sqlite",
+			),
+		).toBe(true);
+		expect(
+			commandHasExactDbPath(
+				"node /repo/packages/cli/src/index.ts maintenance worker --db-path /tmp/mem.sqlite.bak",
+				"/tmp/mem.sqlite",
+			),
+		).toBe(false);
+	});
+
+	it("cleans stale maintenance worker pidfiles", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "codemem-worker-pid-"));
+		const dbPath = join(dir, "viewer.sqlite");
+		const pidPath = maintenanceWorkerPidFilePath(dbPath);
+		writeFileSync(pidPath, JSON.stringify({ pid: 999_999_999 }), "utf-8");
+		try {
+			await expect(terminateTrustedMaintenanceWorker(dbPath)).resolves.toBe(true);
+			expect(existsSync(pidPath)).toBe(false);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not stop a maintenance worker pidfile for another database", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "codemem-worker-pid-"));
+		const dbPath = join(dir, "viewer.sqlite");
+		const pidPath = maintenanceWorkerPidFilePath(dbPath);
+		writeFileSync(
+			pidPath,
+			JSON.stringify({ pid: 999_999_999, dbPath: join(dir, "other.sqlite") }),
+			"utf-8",
+		);
+		try {
+			await expect(terminateTrustedMaintenanceWorker(dbPath)).resolves.toBe(false);
+			expect(existsSync(pidPath)).toBe(true);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses running legacy maintenance worker pidfiles without database ownership", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "codemem-worker-pid-"));
+		const dbPath = join(dir, "viewer.sqlite");
+		const pidPath = maintenanceWorkerPidFilePath(dbPath);
+		writeFileSync(pidPath, JSON.stringify({ pid: 12345 }), "utf-8");
+		const signals: string[] = [];
+		const killSpy = vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+			expect(pid).toBe(12345);
+			if (signal === 0) return true;
+			signals.push(String(signal));
+			return true;
+		});
+		try {
+			await expect(terminateTrustedMaintenanceWorker(dbPath)).resolves.toBe(false);
+			expect(signals).toEqual([]);
+			expect(existsSync(pidPath)).toBe(true);
+			expect(killSpy).toHaveBeenCalled();
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("escalates trusted viewer shutdown when graceful SIGTERM stalls", async () => {
+		const signals: string[] = [];
+		let running = true;
+		const killSpy = vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+			expect(pid).toBe(12345);
+			if (signal === 0) {
+				if (!running) throw new Error("not running");
+				return true;
+			}
+			signals.push(String(signal));
+			if (signal === "SIGKILL") running = false;
+			return true;
+		});
+
+		await expect(terminateTrustedViewerPid(12345, { gracefulMs: 1, forceMs: 50 })).resolves.toBe(
+			true,
+		);
+
+		expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+		expect(killSpy).toHaveBeenCalled();
 	});
 });

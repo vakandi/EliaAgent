@@ -1,12 +1,19 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+	buildTieredObserverConfig,
+	type ExtractionReplayTierRoutingDecision,
+} from "./extraction-tier-routing.js";
+import {
+	isCodexSidecarAuthError,
+	isCodexSidecarModelError,
 	isSidecarAuthError,
 	isSidecarModelError,
 	loadObserverConfig,
 	ObserverClient,
+	shouldAutoSelectCodexSidecar,
 } from "./observer-client.js";
 
 function fixtureToken(label: string): string {
@@ -199,6 +206,30 @@ describe("loadObserverConfig", () => {
 			process.env.CODEMEM_CONFIG = configPath;
 			const cfg = loadObserverConfig();
 			expect(cfg.observerOpenAIUseResponses).toBe(true);
+			expect(cfg.observerExplicitConfigKeys).toEqual(
+				expect.arrayContaining(["observerOpenAIUseResponses"]),
+			);
+		} finally {
+			rmSync(tmpDir, { recursive: true, force: true });
+		}
+	});
+
+	it("preserves an explicit false Responses setting for custom-gateway compatibility", () => {
+		const tmpDir = mkdtempSync(join(tmpdir(), "codemem-config-test-"));
+		const configPath = join(tmpDir, "config.json");
+		writeFileSync(
+			configPath,
+			JSON.stringify({
+				observer_provider: "openai",
+				observer_base_url: "https://gateway.example.test/v1",
+				observer_openai_use_responses: false,
+			}),
+		);
+		try {
+			process.env.CODEMEM_CONFIG = configPath;
+			const cfg = loadObserverConfig();
+			expect(cfg.observerBaseUrl).toBe("https://gateway.example.test/v1");
+			expect(cfg.observerOpenAIUseResponses).toBe(false);
 			expect(cfg.observerExplicitConfigKeys).toEqual(
 				expect.arrayContaining(["observerOpenAIUseResponses"]),
 			);
@@ -439,7 +470,7 @@ describe("ObserverClient", () => {
 			expect(client.openaiUseResponses).toBe(true);
 		});
 
-		it("honors explicit false for OpenAI api_http Responses usage", () => {
+		it("ignores explicit false for official OpenAI api_http Responses usage", () => {
 			const observerApiKey = fixtureToken("openai-responses-disabled");
 			const client = new ObserverClient({
 				observerProvider: "openai",
@@ -459,7 +490,7 @@ describe("ObserverClient", () => {
 				observerAuthTimeoutMs: 1500,
 				observerAuthCacheTtlS: 300,
 			});
-			expect(client.openaiUseResponses).toBe(false);
+			expect(client.openaiUseResponses).toBe(true);
 		});
 
 		it("round-trips per-tier provider overrides through toConfig", () => {
@@ -885,9 +916,36 @@ describe("ObserverClient.observe()", () => {
 		expect(capturedHeaders?.["x-api-key"]).toBe(apiKey);
 		expect(result.raw).toBe("test response");
 		expect(result.provider).toBe("anthropic");
+		expect(result.usage).toBeNull();
 	});
 
-	it("routes OpenAI to chat/completions when user explicitly disables Responses", async () => {
+	it("normalizes Anthropic token usage including cache fields", async () => {
+		const apiKey = fixtureToken("anthropic-usage");
+		globalThis.fetch = (async () =>
+			new Response(
+				JSON.stringify({
+					content: [{ type: "text", text: "anthropic response" }],
+					usage: {
+						input_tokens: 101,
+						output_tokens: 23,
+						cache_read_input_tokens: 17,
+						cache_creation_input_tokens: 11,
+					},
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			)) as typeof globalThis.fetch;
+
+		const result = await makeClient("anthropic", apiKey).observe("system", "user");
+
+		expect(result.usage).toEqual({
+			inputTokens: 101,
+			outputTokens: 23,
+			cacheReadInputTokens: 17,
+			cacheCreationInputTokens: 11,
+		});
+	});
+
+	it("keeps official OpenAI on Responses when legacy config explicitly disables it", async () => {
 		const observerApiKey = fixtureToken("openai-chat-completions");
 		let capturedUrl: string | undefined;
 
@@ -895,7 +953,12 @@ describe("ObserverClient.observe()", () => {
 			capturedUrl = String(input);
 			return new Response(
 				JSON.stringify({
-					choices: [{ message: { content: "chat completions response" } }],
+					output: [
+						{
+							type: "message",
+							content: [{ type: "output_text", text: "responses response" }],
+						},
+					],
 				}),
 				{ status: 200, headers: { "content-type": "application/json" } },
 			);
@@ -920,9 +983,83 @@ describe("ObserverClient.observe()", () => {
 		});
 		const result = await client.observe("system", "user");
 
-		expect(capturedUrl).toContain("/chat/completions");
-		expect(capturedUrl).not.toContain("/responses");
+		expect(capturedUrl).toContain("/responses");
+		expect(capturedUrl).not.toContain("/chat/completions");
+		expect(result.raw).toBe("responses response");
+	});
+
+	it("routes an explicit custom OpenAI-compatible base URL to chat without reasoning", async () => {
+		const observerApiKey = fixtureToken("custom-openai-chat-completions");
+		let capturedUrl: string | undefined;
+
+		globalThis.fetch = (async (input: string | URL | Request) => {
+			capturedUrl = String(input);
+			return new Response(
+				JSON.stringify({
+					choices: [{ message: { content: "chat completions response" } }],
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		}) as typeof globalThis.fetch;
+
+		const client = new ObserverClient({
+			observerProvider: "openai",
+			observerModel: "gateway-model",
+			observerRuntime: "api_http",
+			observerApiKey,
+			observerBaseUrl: "https://gateway.example.test/v1",
+			observerOpenAIUseResponses: false,
+			observerReasoningEffort: "high",
+			observerReasoningSummary: "detailed",
+			observerMaxChars: 12_000,
+			observerMaxTokens: 4_000,
+			observerHeaders: {},
+			observerAuthSource: "auto",
+			observerAuthFile: null,
+			observerAuthCommand: [],
+			observerAuthTimeoutMs: 1500,
+			observerAuthCacheTtlS: 300,
+			observerExplicitConfigKeys: ["observerOpenAIUseResponses"],
+		});
+		const result = await client.observe("system", "user");
+
+		expect(capturedUrl).toBe("https://gateway.example.test/v1/chat/completions");
+		expect(client.openaiUseResponses).toBe(false);
+		expect(client.reasoningEffort).toBeNull();
+		expect(client.reasoningSummary).toBeNull();
 		expect(result.raw).toBe("chat completions response");
+	});
+
+	it("normalizes OpenAI chat token usage", async () => {
+		const observerApiKey = fixtureToken("openai-chat-usage");
+		globalThis.fetch = (async () =>
+			new Response(
+				JSON.stringify({
+					choices: [{ message: { content: "chat response" } }],
+					usage: {
+						prompt_tokens: 73,
+						completion_tokens: 19,
+						total_tokens: 92,
+						prompt_tokens_details: { cached_tokens: 31 },
+					},
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			)) as typeof globalThis.fetch;
+		const client = new ObserverClient({
+			...makeClient("openai", observerApiKey).toConfig(),
+			observerBaseUrl: "https://gateway.example.test/v1",
+			observerOpenAIUseResponses: false,
+			observerExplicitConfigKeys: ["observerOpenAIUseResponses"],
+		});
+
+		const result = await client.observe("system", "user");
+
+		expect(result.usage).toEqual({
+			inputTokens: 73,
+			outputTokens: 19,
+			totalTokens: 92,
+			cacheReadInputTokens: 31,
+		});
 	});
 
 	it("calls OpenAI Responses endpoint by default", async () => {
@@ -945,20 +1082,400 @@ describe("ObserverClient.observe()", () => {
 							content: [{ type: "output_text", text: "openai response text" }],
 						},
 					],
+					usage: { input_tokens: 211, output_tokens: 37, total_tokens: 248 },
 				}),
 				{ status: 200, headers: { "content-type": "application/json" } },
 			);
 		}) as typeof globalThis.fetch;
 
-		const client = makeClient("openai", apiKey);
+		const client = new ObserverClient({
+			...makeClient("openai", apiKey).toConfig(),
+			observerReasoningEffort: "medium",
+		});
 		const result = await client.observe("system", "user");
 
 		expect(capturedUrl).toContain("openai.com");
 		expect(capturedUrl).toContain("/responses");
 		expect(capturedHeaders?.authorization).toBe(`Bearer ${apiKey}`);
 		expect(capturedBody?.input).toBeDefined();
+		expect(capturedBody?.reasoning).toEqual({ effort: "medium" });
+		expect(capturedBody?.temperature).toBeUndefined();
+		expect(client.temperature).toBeNull();
 		expect(result.raw).toBe("openai response text");
 		expect(result.provider).toBe("openai");
+		expect(result.elapsedMs).toBeGreaterThanOrEqual(0);
+		expect(result.usage).toEqual({ inputTokens: 211, outputTokens: 37, totalTokens: 248 });
+
+		const noReasoningClient = new ObserverClient({
+			...makeClient("openai", apiKey).toConfig(),
+			observerReasoningEffort: "none",
+		});
+		expect(noReasoningClient.temperature).toBe(0.2);
+	});
+
+	it.each([
+		{ tier: "simple", expectedModel: "gpt-5.6-luna" },
+		{ tier: "rich", expectedModel: "gpt-5.6-terra" },
+	] as const)("sends the shipped $tier tier over OAuth codex_consumer", async (scenario) => {
+		const prevHome = process.env.HOME;
+		const savedApiKeys = {
+			OPENCODE_API_KEY: process.env.OPENCODE_API_KEY,
+			OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+			CODEX_API_KEY: process.env.CODEX_API_KEY,
+		};
+		delete process.env.OPENCODE_API_KEY;
+		delete process.env.OPENAI_API_KEY;
+		delete process.env.CODEX_API_KEY;
+		const tmpDir = mkdtempSync(join(tmpdir(), `codemem-${scenario.tier}-oauth-tier-test-`));
+		mkdirSync(join(tmpDir, ".local", "share", "opencode"), { recursive: true });
+		writeFileSync(
+			join(tmpDir, ".local", "share", "opencode", "auth.json"),
+			JSON.stringify({
+				openai: {
+					access: "oauth-test-token",
+					accountId: "acct-test",
+					expires: Date.now() + 60_000,
+				},
+			}),
+		);
+		let capturedUrl: string | undefined;
+		let capturedBody: Record<string, unknown> | undefined;
+		globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+			capturedUrl = String(input);
+			capturedBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+			return new Response(
+				['data: {"type":"response.output_text.delta","delta":"ok"}', ""].join("\n\n"),
+				{ status: 200, headers: { "content-type": "text/event-stream" } },
+			);
+		}) as typeof globalThis.fetch;
+		const decision: ExtractionReplayTierRoutingDecision = {
+			tier: scenario.tier,
+			reasons: ["test selection"],
+			observer: {},
+		};
+
+		try {
+			process.env.HOME = tmpDir;
+			const config = buildTieredObserverConfig(
+				{
+					observerProvider: "openai",
+					observerModel: "gpt-5.4-mini",
+					observerRuntime: "api_http",
+					observerApiKey: null,
+					observerBaseUrl: null,
+					observerTemperature: 0.2,
+					observerSimpleModel: null,
+					observerRichModel: null,
+					observerReasoningEffort: null,
+					observerRichReasoningEffort: null,
+					observerMaxChars: 12_000,
+					observerMaxTokens: 4_000,
+					observerHeaders: {},
+					observerAuthSource: "auto",
+					observerAuthFile: null,
+					observerAuthCommand: [],
+					observerAuthTimeoutMs: 1_500,
+					observerAuthCacheTtlS: 300,
+					observerExplicitConfigKeys: [],
+				},
+				decision,
+			);
+
+			const client = new ObserverClient(config);
+			await client.observe("system", "user");
+
+			expect(client.getStatus().auth.type).toBe("codex_consumer");
+			expect(capturedUrl).toContain("chatgpt.com/backend-api/codex/responses");
+			expect(capturedBody?.model).toBe(scenario.expectedModel);
+			expect(capturedBody?.reasoning).toEqual({ effort: "medium" });
+			expect(capturedBody?.max_output_tokens).toBeUndefined();
+			expect(capturedBody?.temperature).toBeUndefined();
+		} finally {
+			if (prevHome == null) delete process.env.HOME;
+			else process.env.HOME = prevHome;
+			for (const [key, value] of Object.entries(savedApiKeys)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+			rmSync(tmpDir, { recursive: true, force: true });
+		}
+	});
+
+	it("normalizes unpaired UTF-16 surrogates after prompt clipping", async () => {
+		const apiKey = fixtureToken("openai-well-formed-unicode");
+		let capturedInput: Array<{ role: string; content: Array<{ text: string }> }> = [];
+		globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+			const body = JSON.parse(String(init?.body ?? "{}")) as {
+				input?: Array<{ role: string; content: Array<{ text: string }> }>;
+			};
+			capturedInput = body.input ?? [];
+			return new Response(JSON.stringify({ output_text: "ok" }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		}) as typeof globalThis.fetch;
+		const client = new ObserverClient({
+			...makeClient("openai", apiKey).toConfig(),
+			observerMaxChars: 100,
+		});
+
+		// A 100-char budget gives the system prompt 75 UTF-16 units; the emoji is split at 75.
+		await client.observe(`${"s".repeat(74)}😀`, "user\uDC00");
+
+		const texts = capturedInput.flatMap((item) => item.content.map((content) => content.text));
+		expect(texts).toHaveLength(2);
+		expect(texts.every((text) => text.isWellFormed())).toBe(true);
+		expect(texts.join("\n")).toContain("�");
+	});
+
+	it("keeps token usage isolated across concurrent observe calls", async () => {
+		const apiKey = fixtureToken("openai-concurrent-usage");
+		globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+			const request = JSON.parse(String(init?.body)) as {
+				input: Array<{ role: string; content: Array<{ text: string }> }>;
+			};
+			const userText = request.input.find((item) => item.role === "user")?.content[0]?.text;
+			const inputTokens = userText === "slow" ? 10 : 20;
+			if (userText === "slow") await new Promise((resolve) => setTimeout(resolve, 5));
+			return new Response(
+				JSON.stringify({
+					output_text: userText,
+					usage: { input_tokens: inputTokens, output_tokens: 1 },
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		}) as typeof globalThis.fetch;
+		const client = makeClient("openai", apiKey);
+
+		const [slow, fast] = await Promise.all([
+			client.observe("system", "slow"),
+			client.observe("system", "fast"),
+		]);
+
+		expect(slow.usage).toEqual({ inputTokens: 10, outputTokens: 1 });
+		expect(fast.usage).toEqual({ inputTokens: 20, outputTokens: 1 });
+	});
+
+	it("allows no-auth calls to explicit OpenAI-compatible base URLs", async () => {
+		let capturedUrl: string | undefined;
+		let capturedHeaders: Record<string, string> | undefined;
+
+		globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+			capturedUrl = String(input);
+			capturedHeaders = Object.fromEntries(
+				Object.entries((init?.headers as Record<string, string>) ?? {}),
+			);
+			return new Response(
+				JSON.stringify({
+					choices: [{ message: { content: "local model response" } }],
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		}) as typeof globalThis.fetch;
+
+		const client = new ObserverClient({
+			observerProvider: "lms-200",
+			observerModel: "qwopus-glm-18b-merged",
+			observerRuntime: "api_http",
+			observerApiKey: null,
+			observerBaseUrl: "http://127.0.0.1:1234/v1",
+			observerMaxChars: 12_000,
+			observerMaxTokens: 4_000,
+			observerHeaders: {},
+			observerAuthSource: "none",
+			observerAuthFile: null,
+			observerAuthCommand: [],
+			observerAuthTimeoutMs: 1500,
+			observerAuthCacheTtlS: 300,
+		});
+
+		const result = await client.observe("system", "user");
+
+		expect(capturedUrl).toBe("http://127.0.0.1:1234/v1/chat/completions");
+		expect(capturedHeaders?.authorization).toBeUndefined();
+		expect(result.raw).toBe("local model response");
+	});
+
+	it("parses OpenAI-compatible chat content blocks", async () => {
+		const observerApiKey = fixtureToken("openai-content-blocks");
+		globalThis.fetch = (async () => {
+			return new Response(
+				JSON.stringify({
+					choices: [
+						{
+							message: {
+								content: [
+									{ type: "text", text: "first" },
+									{ type: "output_text", text: " second" },
+								],
+							},
+						},
+					],
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		}) as typeof globalThis.fetch;
+
+		const client = new ObserverClient({
+			observerProvider: "openai",
+			observerModel: "gpt-5.4-mini",
+			observerRuntime: "api_http",
+			observerApiKey,
+			observerBaseUrl: "https://gateway.example.test/v1",
+			observerOpenAIUseResponses: false,
+			observerMaxChars: 12_000,
+			observerMaxTokens: 4_000,
+			observerHeaders: {},
+			observerAuthSource: "auto",
+			observerAuthFile: null,
+			observerAuthCommand: [],
+			observerAuthTimeoutMs: 1500,
+			observerAuthCacheTtlS: 300,
+			observerExplicitConfigKeys: ["observerOpenAIUseResponses"],
+		});
+
+		const result = await client.observe("system", "user");
+
+		expect(result.raw).toBe("first second");
+	});
+
+	it("allows no-auth calls to custom OpenCode provider base URLs", async () => {
+		const prevHome = process.env.HOME;
+		const tmpDir = mkdtempSync(join(tmpdir(), "codemem-custom-no-auth-provider-test-"));
+		const configDir = join(tmpDir, ".config", "opencode");
+		mkdirSync(configDir, { recursive: true });
+		let capturedUrl: string | undefined;
+		let capturedHeaders: Record<string, string> | undefined;
+
+		writeFileSync(
+			join(configDir, "opencode.jsonc"),
+			JSON.stringify({
+				provider: {
+					work: {
+						options: {
+							baseURL: "https://gateway.example.test/v1",
+						},
+						models: {
+							fast: { id: "gateway-fast" },
+						},
+					},
+				},
+			}),
+		);
+
+		globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+			capturedUrl = String(input);
+			capturedHeaders = Object.fromEntries(
+				Object.entries((init?.headers as Record<string, string>) ?? {}),
+			);
+			return new Response(
+				JSON.stringify({
+					choices: [{ message: { content: "gateway response" } }],
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		}) as typeof globalThis.fetch;
+
+		try {
+			process.env.HOME = tmpDir;
+			const client = new ObserverClient({
+				observerProvider: "work",
+				observerModel: "work/fast",
+				observerRuntime: null,
+				observerApiKey: null,
+				observerBaseUrl: null,
+				observerMaxChars: 12_000,
+				observerMaxTokens: 4_000,
+				observerHeaders: {},
+				observerAuthSource: "none",
+				observerAuthFile: null,
+				observerAuthCommand: [],
+				observerAuthTimeoutMs: 1500,
+				observerAuthCacheTtlS: 300,
+			});
+			expect(client.requestedModel).toBe("work/fast");
+			expect(client.model).toBe("gateway-fast");
+
+			const result = await client.observe("system", "user");
+
+			expect(capturedUrl).toBe("https://gateway.example.test/v1/chat/completions");
+			expect(capturedHeaders?.authorization).toBeUndefined();
+			expect(result.model).toBe("gateway-fast");
+			expect(result.raw).toBe("gateway response");
+		} finally {
+			if (prevHome == null) delete process.env.HOME;
+			else process.env.HOME = prevHome;
+			rmSync(tmpDir, { recursive: true, force: true });
+		}
+	});
+
+	it("still requires auth for the built-in opencode provider", async () => {
+		let fetchCalls = 0;
+		globalThis.fetch = (async () => {
+			fetchCalls += 1;
+			return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+		}) as typeof globalThis.fetch;
+
+		const client = new ObserverClient({
+			observerProvider: "opencode",
+			observerModel: "opencode/gpt-5.4-mini",
+			observerRuntime: "api_http",
+			observerApiKey: null,
+			observerBaseUrl: null,
+			observerMaxChars: 12_000,
+			observerMaxTokens: 4_000,
+			observerHeaders: {},
+			observerAuthSource: "none",
+			observerAuthFile: null,
+			observerAuthCommand: [],
+			observerAuthTimeoutMs: 1500,
+			observerAuthCacheTtlS: 300,
+		});
+
+		const result = await client.observe("system", "user");
+
+		expect(result.raw).toBeNull();
+		expect(fetchCalls).toBe(0);
+	});
+
+	it("allows no-auth calls for opencode when observer_base_url is explicit", async () => {
+		let capturedUrl: string | undefined;
+		let capturedHeaders: Record<string, string> | undefined;
+
+		globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+			capturedUrl = String(input);
+			capturedHeaders = Object.fromEntries(
+				Object.entries((init?.headers as Record<string, string>) ?? {}),
+			);
+			return new Response(
+				JSON.stringify({
+					choices: [{ message: { content: "explicit opencode gateway response" } }],
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		}) as typeof globalThis.fetch;
+
+		const client = new ObserverClient({
+			observerProvider: "opencode",
+			observerModel: "opencode/gpt-5.4-mini",
+			observerRuntime: "api_http",
+			observerApiKey: null,
+			observerBaseUrl: "http://127.0.0.1:1234/v1",
+			observerMaxChars: 12_000,
+			observerMaxTokens: 4_000,
+			observerHeaders: {},
+			observerAuthSource: "none",
+			observerAuthFile: null,
+			observerAuthCommand: [],
+			observerAuthTimeoutMs: 1500,
+			observerAuthCacheTtlS: 300,
+		});
+
+		const result = await client.observe("system", "user");
+
+		expect(capturedUrl).toBe("http://127.0.0.1:1234/v1/chat/completions");
+		expect(capturedHeaders?.authorization).toBeUndefined();
+		expect(result.raw).toBe("explicit opencode gateway response");
 	});
 
 	it("dedupes authorization headers case-insensitively for custom providers", async () => {
@@ -1105,7 +1622,7 @@ describe("ObserverClient.observe()", () => {
 		expect(result.raw).toBe("retry success");
 	});
 
-	it("passes the full system prompt to the codex consumer instructions field", async () => {
+	it("passes configured reasoning overrides to the codex consumer request", async () => {
 		const prevHome = process.env.HOME;
 		const tmpDir = mkdtempSync(join(tmpdir(), "codemem-codex-consumer-test-"));
 		mkdirSync(join(tmpDir, ".local", "share", "opencode"), { recursive: true });
@@ -1124,7 +1641,11 @@ describe("ObserverClient.observe()", () => {
 		globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
 			capturedBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
 			return new Response(
-				'data: {"type":"response.output_text.delta","delta":"<summary><request>ok</request></summary>"}\n\n',
+				[
+					'data: {"type":"response.output_text.delta","delta":"<summary><request>ok</request></summary>"}',
+					'data: {"type":"response.completed","response":{"usage":{"input_tokens":211,"output_tokens":37,"total_tokens":248}}}',
+					"",
+				].join("\n\n"),
 				{ status: 200, headers: { "content-type": "text/event-stream" } },
 			);
 		}) as typeof globalThis.fetch;
@@ -1137,6 +1658,8 @@ describe("ObserverClient.observe()", () => {
 				observerRuntime: null,
 				observerApiKey: null,
 				observerBaseUrl: null,
+				observerReasoningEffort: "medium",
+				observerReasoningSummary: "auto",
 				observerMaxChars: 12_000,
 				observerMaxTokens: 4_000,
 				observerHeaders: {},
@@ -1147,10 +1670,15 @@ describe("ObserverClient.observe()", () => {
 				observerAuthCacheTtlS: 300,
 			});
 
-			await client.observe("SYSTEM XML CONTRACT", "USER SESSION TRANSCRIPT");
+			const result = await client.observe("SYSTEM XML CONTRACT", "USER SESSION TRANSCRIPT");
 
 			expect(client.getStatus().auth.type).toBe("codex_consumer");
 			expect(capturedBody?.instructions).toBe("SYSTEM XML CONTRACT");
+			expect(capturedBody?.reasoning).toEqual({
+				effort: "medium",
+				summary: "auto",
+			});
+			expect(result.usage).toEqual({ inputTokens: 211, outputTokens: 37, totalTokens: 248 });
 		} finally {
 			if (prevHome == null) delete process.env.HOME;
 			else process.env.HOME = prevHome;
@@ -1375,5 +1903,310 @@ describe("ObserverClient.observe()", () => {
 		expect(status.modelFallbackReason).toBe(
 			"configured sidecar tier model unavailable; retried with default Claude model",
 		);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// codex_sidecar runtime
+// ---------------------------------------------------------------------------
+
+type CodexInvoker = (
+	systemPrompt: string,
+	userPrompt: string,
+	useModel: boolean,
+) => Promise<{ output: string | null; error: string | null; reportedModel: string | null }>;
+
+function makeCodexSidecarClient(overrides?: { model?: string | null }): ObserverClient {
+	return new ObserverClient({
+		observerProvider: "openai",
+		observerModel: overrides?.model === undefined ? "gpt-5.1-codex" : overrides.model,
+		observerRuntime: "codex_sidecar",
+		observerApiKey: null,
+		observerBaseUrl: null,
+		observerMaxChars: 12_000,
+		observerMaxTokens: 4_000,
+		observerHeaders: {},
+		observerAuthSource: "auto",
+		observerAuthFile: null,
+		observerAuthCommand: [],
+		observerAuthTimeoutMs: 1500,
+		observerAuthCacheTtlS: 300,
+	});
+}
+
+function stubCodexInvoker(client: ObserverClient, impl: CodexInvoker): void {
+	(client as unknown as { _invokeCodexSidecar: CodexInvoker })._invokeCodexSidecar = impl;
+}
+
+describe("ObserverClient.observe() — codex_sidecar", () => {
+	it("passes the selected model via -m", () => {
+		const client = makeCodexSidecarClient({ model: "gpt-5.1-codex" });
+		const command = (
+			client as unknown as {
+				_buildCodexSidecarCommand: (useModel: boolean, outputFile: string) => string[];
+			}
+		)._buildCodexSidecarCommand(true, "/tmp/out.txt");
+		expect(command).toContain("exec");
+		expect(command).toContain("-m");
+		expect(command).toContain("gpt-5.1-codex");
+		// Output capture + stdin prompt wiring.
+		expect(command).toContain("-o");
+		expect(command).toContain("/tmp/out.txt");
+		expect(command[command.length - 1]).toBe("-");
+	});
+
+	it("omits -m when useModel is false", () => {
+		const client = makeCodexSidecarClient({ model: "gpt-5.1-codex" });
+		const command = (
+			client as unknown as {
+				_buildCodexSidecarCommand: (useModel: boolean, outputFile: string) => string[];
+			}
+		)._buildCodexSidecarCommand(false, "/tmp/out.txt");
+		expect(command).not.toContain("-m");
+	});
+
+	it("skips API key init when constructed with no key", () => {
+		// Construction must not throw even though no API key is configured.
+		const client = makeCodexSidecarClient({ model: "gpt-5.1-codex" });
+		expect(client.runtime).toBe("codex_sidecar");
+		expect(client.auth.token).toBeNull();
+		expect(client.getStatus().auth.type).toBe("codex_sidecar");
+	});
+
+	it("raises ObserverAuthError when the sidecar reports an auth failure", async () => {
+		const client = makeCodexSidecarClient({ model: "gpt-5.1-codex" });
+		stubCodexInvoker(client, async () => ({
+			output: null,
+			error: "Not logged in. Please run `codex login`.",
+			reportedModel: null,
+		}));
+
+		await expect(client.observe("system", "user")).rejects.toThrow(/not logged in/i);
+		expect(client.getStatus().lastError?.code).toBe("auth_failed");
+	});
+
+	it("retries without -m and reports fallback on model-unavailable", async () => {
+		const client = makeCodexSidecarClient({ model: "gpt-5.1-codex" });
+		let calls = 0;
+		stubCodexInvoker(client, async (_system, _user, useModel) => {
+			calls++;
+			if (useModel) {
+				return { output: null, error: "unknown model: gpt-5.1-codex", reportedModel: null };
+			}
+			return { output: "codex ok", error: null, reportedModel: null };
+		});
+
+		const result = await client.observe("system", "user");
+		const status = client.getStatus();
+
+		expect(calls).toBe(2);
+		expect(result.raw).toBe("codex ok");
+		expect(status.modelFallbackApplied).toBe(true);
+		expect(status.modelFallbackReason).toBe(
+			"configured sidecar tier model unavailable; retried with default Codex model",
+		);
+		// Resolved model marker cleared since codex does not report it.
+		expect(status.actualModel).toBeNull();
+	});
+
+	describe("codex sidecar error classifiers", () => {
+		it("matches model errors from known Codex CLI phrasings", () => {
+			expect(isCodexSidecarModelError("unknown model: gpt-5.1-codex")).toBe(true);
+			expect(isCodexSidecarModelError("unsupported model foo")).toBe(true);
+			expect(isCodexSidecarModelError("invalid model name")).toBe(true);
+			expect(isCodexSidecarModelError("model not found")).toBe(true);
+			expect(isCodexSidecarModelError("that model does not exist")).toBe(true);
+		});
+
+		it("does not misclassify unrelated errors as model errors", () => {
+			expect(isCodexSidecarModelError("Not logged in")).toBe(false);
+			expect(isCodexSidecarModelError("Connection timed out")).toBe(false);
+			expect(isCodexSidecarModelError("")).toBe(false);
+		});
+
+		it("matches auth errors from known Codex CLI phrasings", () => {
+			expect(isCodexSidecarAuthError("Not logged in. Please run `codex login`.")).toBe(true);
+			expect(isCodexSidecarAuthError("Please log in to ChatGPT")).toBe(true);
+			expect(isCodexSidecarAuthError("Unauthorized")).toBe(true);
+			expect(isCodexSidecarAuthError("authentication required")).toBe(true);
+			expect(isCodexSidecarAuthError("request failed with status 401")).toBe(true);
+			expect(isCodexSidecarAuthError("request failed with status 403")).toBe(true);
+		});
+
+		it("does not misclassify unrelated errors as auth errors", () => {
+			expect(isCodexSidecarAuthError("unknown model: gpt-5.1-codex")).toBe(false);
+			expect(isCodexSidecarAuthError("Request failed with status 500")).toBe(false);
+			expect(isCodexSidecarAuthError("")).toBe(false);
+		});
+
+		it("does not false-positive on operational log noise (paths, offsets)", () => {
+			// Bare "login" substring in a path must not trip the classifier.
+			expect(isCodexSidecarAuthError("/Users/x/.codex/sessions/login.json missing")).toBe(false);
+			expect(isCodexSidecarAuthError("wrote login-state to cache")).toBe(false);
+			// Status codes must be word-anchored, not matched inside larger numbers.
+			expect(isCodexSidecarAuthError("read 40123 bytes from stream")).toBe(false);
+			expect(isCodexSidecarAuthError("offset 14031 reached")).toBe(false);
+		});
+	});
+});
+
+// ---------------------------------------------------------------------------
+// codex_sidecar real subprocess (fake `codex` via node) — locks the spawn
+// surface: env scrubbing, stdin wiring, -o capture, cleanup, redaction.
+// ---------------------------------------------------------------------------
+
+describe("ObserverClient.observe() — codex_sidecar real spawn", () => {
+	let dir: string;
+	let savedClaudeEntry: string | undefined;
+
+	beforeEach(() => {
+		dir = mkdtempSync(join(tmpdir(), "codemem-codex-fake-"));
+		savedClaudeEntry = process.env.CLAUDE_CODE_ENTRYPOINT;
+	});
+
+	afterEach(() => {
+		if (savedClaudeEntry === undefined) delete process.env.CLAUDE_CODE_ENTRYPOINT;
+		else process.env.CLAUDE_CODE_ENTRYPOINT = savedClaudeEntry;
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	function clientWithFakeCodex(scriptBody: string): ObserverClient {
+		const scriptPath = join(dir, "fake-codex.mjs");
+		writeFileSync(scriptPath, scriptBody, "utf-8");
+		return new ObserverClient({
+			observerProvider: "openai",
+			observerModel: "gpt-5.1-codex",
+			observerRuntime: "codex_sidecar",
+			observerApiKey: null,
+			observerBaseUrl: null,
+			observerMaxChars: 12_000,
+			observerMaxTokens: 4_000,
+			observerHeaders: {},
+			observerAuthSource: "auto",
+			observerAuthFile: null,
+			observerAuthCommand: [],
+			observerAuthTimeoutMs: 1500,
+			observerAuthCacheTtlS: 300,
+			codexCommand: [process.execPath, scriptPath],
+		});
+	}
+
+	function tempSidecarFileCount(): number {
+		return readdirSync(tmpdir()).filter((n) => n.startsWith("codemem-codex-sidecar-")).length;
+	}
+
+	it("scrubs CLAUDE_CODE_* env, forwards the prompt on stdin, captures -o, and cleans up", async () => {
+		process.env.CLAUDE_CODE_ENTRYPOINT = "cli";
+		const script = [
+			'import { readFileSync, writeFileSync } from "node:fs";',
+			"const argv = process.argv.slice(2);",
+			'const out = argv[argv.indexOf("-o") + 1];',
+			'let stdin = "";',
+			'process.stdin.on("data", (c) => { stdin += c; });',
+			'process.stdin.on("end", () => {',
+			"  const payload = JSON.stringify({",
+			'    claude: process.env.CLAUDE_CODE_ENTRYPOINT ?? "ABSENT",',
+			'    pluginIgnore: process.env.CODEMEM_PLUGIN_IGNORE ?? "",',
+			"    stdin,",
+			"  });",
+			"  writeFileSync(out, payload);",
+			"  process.exit(0);",
+			"});",
+		].join("\n");
+		const client = clientWithFakeCodex(script);
+		const before = tempSidecarFileCount();
+		const result = await client.observe("SYSTEM_PROMPT_MARKER", "USER_PROMPT_MARKER");
+		const parsed = JSON.parse(result.raw ?? "{}");
+		expect(parsed.claude).toBe("ABSENT");
+		expect(parsed.pluginIgnore).toBe("1");
+		expect(parsed.stdin).toContain("SYSTEM_PROMPT_MARKER");
+		expect(parsed.stdin).toContain("USER_PROMPT_MARKER");
+		// Temp output file is unlinked in finally — no leak.
+		expect(tempSidecarFileCount()).toBe(before);
+	});
+
+	it("returns null output and a redacted error on non-zero exit", async () => {
+		const warnings: string[] = [];
+		const spy = vi.spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
+			warnings.push(args.map(String).join(" "));
+		});
+		try {
+			const script = [
+				"process.stdin.resume();",
+				'process.stdin.on("end", () => {',
+				'  process.stderr.write("boom Bearer sk-abcdefghijklmnopqrstuvwxyz failed");',
+				"  process.exit(1);",
+				"});",
+			].join("\n");
+			const client = clientWithFakeCodex(script);
+			const result = await client.observe("SYS", "USR");
+			expect(result.raw).toBeNull();
+			const joined = warnings.join("\n");
+			expect(joined).toContain("[redacted]");
+			expect(joined).not.toContain("sk-abcdefghijklmnopqrstuvwxyz");
+		} finally {
+			spy.mockRestore();
+		}
+	});
+});
+
+// ---------------------------------------------------------------------------
+// codex_sidecar auto-selection gating
+// ---------------------------------------------------------------------------
+
+describe("shouldAutoSelectCodexSidecar", () => {
+	const base = {
+		observerRuntime: null,
+		hasAnyApiKey: false,
+		observerAuthSource: "auto" as string | null,
+		observerAuthFile: null as string | null,
+		observerAuthCommand: [] as string[] | null,
+		hasUsableOpenCodeCache: false,
+		codexAvailable: true,
+		codexAuthExists: true,
+	};
+
+	it("selects codex_sidecar when all preconditions hold", () => {
+		expect(shouldAutoSelectCodexSidecar({ ...base })).toBe(true);
+	});
+
+	it("does not override an explicit runtime", () => {
+		expect(shouldAutoSelectCodexSidecar({ ...base, observerRuntime: "api_http" })).toBe(false);
+	});
+
+	it("yields to any available API key", () => {
+		expect(shouldAutoSelectCodexSidecar({ ...base, hasAnyApiKey: true })).toBe(false);
+	});
+
+	it("respects a configured file auth source", () => {
+		expect(shouldAutoSelectCodexSidecar({ ...base, observerAuthSource: "file" })).toBe(false);
+	});
+
+	it("respects a configured command auth source", () => {
+		expect(shouldAutoSelectCodexSidecar({ ...base, observerAuthSource: "command" })).toBe(false);
+	});
+
+	it("respects an explicit auth file path", () => {
+		expect(shouldAutoSelectCodexSidecar({ ...base, observerAuthFile: "~/.tokens/obs" })).toBe(
+			false,
+		);
+	});
+
+	it("respects a configured auth command", () => {
+		expect(shouldAutoSelectCodexSidecar({ ...base, observerAuthCommand: ["op", "read"] })).toBe(
+			false,
+		);
+	});
+
+	it("yields to a usable OpenCode OAuth cache", () => {
+		expect(shouldAutoSelectCodexSidecar({ ...base, hasUsableOpenCodeCache: true })).toBe(false);
+	});
+
+	it("requires the codex CLI to be available", () => {
+		expect(shouldAutoSelectCodexSidecar({ ...base, codexAvailable: false })).toBe(false);
+	});
+
+	it("requires ~/.codex/auth.json to exist", () => {
+		expect(shouldAutoSelectCodexSidecar({ ...base, codexAuthExists: false })).toBe(false);
 	});
 });

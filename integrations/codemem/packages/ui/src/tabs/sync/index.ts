@@ -1,7 +1,12 @@
 /* Sync tab orchestrator — re-exports public API and coordinates sub-modules. */
 
 import * as api from "../../lib/api";
-import { isSyncRedactionEnabled, state } from "../../lib/state";
+import {
+	type CachedSyncCoordinator,
+	type DiscoveredDevice,
+	isSyncRedactionEnabled,
+	state,
+} from "../../lib/state";
 import { renderHealthOverview } from "../health";
 import { ensureSyncRenderBoundary } from "./components/render-root";
 
@@ -17,6 +22,7 @@ import { hideSkeleton, readDuplicatePersonDecisions } from "./helpers";
 import {
 	initPeopleEvents,
 	renderLegacyDeviceClaims,
+	renderProjectSharingOperations,
 	renderSyncActors,
 	renderSyncActorsUnavailable,
 	renderSyncPeers,
@@ -31,7 +37,7 @@ import {
 	renderTeamSync,
 	setLoadSyncData as setTeamSyncLoadData,
 } from "./team-sync";
-import { deriveSyncViewModel } from "./view-model";
+import { deriveSyncViewModel, type TeamSyncReconciliationState } from "./view-model";
 
 /* ── Re-exports consumed by app.ts ───────────────────────── */
 
@@ -44,11 +50,18 @@ let lastSyncHash = "";
 type SyncStatusResponseLike = {
 	status?: Record<string, unknown> | null;
 	peers?: Array<{ peer_device_id?: string }>;
-	coordinator?: Record<string, unknown> | null;
+	coordinator?: CachedSyncCoordinator | null;
 	join_requests?: unknown[];
 	sharing_review?: unknown[];
+	legacy_shared_review?: Record<string, unknown> | null;
 	attempts?: unknown[];
 	legacy_devices?: unknown[];
+	recipient_policy_reconciliation?: {
+		items?: Array<{
+			canonicalProjectIdentity?: string;
+			state?: TeamSyncReconciliationState;
+		}>;
+	} | null;
 };
 
 type SyncActorListResponseLike = {
@@ -58,6 +71,53 @@ type SyncActorListResponseLike = {
 type SyncPeerSummaryLike = {
 	peer_device_id?: string;
 };
+
+function reconcilePendingCoordinatorApprovals(
+	coordinator: CachedSyncCoordinator | null | undefined,
+): void {
+	if (!coordinator) return;
+	const coordinatorUrl = String(coordinator?.coordinator_url || "").trim();
+	const approvalDataIncomplete = Boolean(
+		coordinator.lookup_error || coordinator.reciprocal_approval_error,
+	);
+	const discoveredDevices = Array.isArray(coordinator?.discovered_devices)
+		? coordinator.discovered_devices
+		: [];
+	const devicesById = new Map<string, DiscoveredDevice[]>();
+	for (const device of discoveredDevices) {
+		const deviceId = String(device.device_id || "").trim();
+		if (!deviceId) continue;
+		devicesById.set(deviceId, [...(devicesById.get(deviceId) || []), device]);
+	}
+
+	for (const [deviceId, pendingApproval] of state.pendingCoordinatorApprovalsByDeviceId) {
+		if (pendingApproval.coordinatorUrl !== coordinatorUrl) {
+			state.pendingCoordinatorApprovalsByDeviceId.delete(deviceId);
+			continue;
+		}
+		if (approvalDataIncomplete) continue;
+		const observedDevices = devicesById.get(deviceId);
+		if (!observedDevices) continue;
+
+		const matchingRequestStillNeedsLocalApproval = observedDevices.some(
+			(device) =>
+				String(device.incoming_reciprocal_request_id || "").trim() ===
+					pendingApproval.incomingRequestId && device.needs_local_approval === true,
+		);
+		if (!matchingRequestStillNeedsLocalApproval) {
+			state.pendingCoordinatorApprovalsByDeviceId.delete(deviceId);
+		}
+	}
+}
+
+function pendingCoordinatorApprovalHashInput(): Array<readonly [string, string, string]> {
+	return [...state.pendingCoordinatorApprovalsByDeviceId]
+		.map(
+			([deviceId, pendingApproval]) =>
+				[deviceId, pendingApproval.coordinatorUrl, pendingApproval.incomingRequestId] as const,
+		)
+		.sort(([leftDeviceId], [rightDeviceId]) => leftDeviceId.localeCompare(rightDeviceId));
+}
 
 let cachedSyncStatus: { key: string; expiresAtMs: number; payload: SyncStatusResponseLike } | null =
 	null;
@@ -134,8 +194,12 @@ export async function loadSyncData() {
 
 		let actorsPayload: SyncActorListResponseLike | null = null;
 		let coordinatorAdminStatus: Record<string, unknown> | null = null;
+		let deviceIdentityInventory = state.lastDeviceIdentityInventory;
+		let shareOperations = state.lastShareOperations;
 		let actorLoadError = false;
 		let coordinatorAdminLoadError = false;
+		let deviceIdentityInventoryLoadError = state.deviceIdentityInventoryLoadError;
+		let shareOperationsLoadError = false;
 		const duplicatePersonDecisions = readDuplicatePersonDecisions();
 		try {
 			actorsPayload = await api.loadSyncActors();
@@ -147,19 +211,39 @@ export async function loadSyncData() {
 		} catch {
 			coordinatorAdminLoadError = true;
 		}
+		if (state.activeTab === "advanced") {
+			deviceIdentityInventoryLoadError = false;
+			try {
+				deviceIdentityInventory = await api.loadDeviceIdentityInventory();
+			} catch {
+				deviceIdentityInventoryLoadError = true;
+			}
+		}
+		try {
+			const sharePayload = await api.loadShareOperations();
+			shareOperations = Array.isArray(sharePayload.items) ? sharePayload.items : [];
+		} catch {
+			shareOperationsLoadError = true;
+		}
 
 		if (requestId !== latestSyncLoadRequestId) return;
 
 		if (fetchedFreshSyncStatus) {
 			writeCachedSyncStatus(project, normalizeSyncStatusForCache(payload));
 		}
+		reconcilePendingCoordinatorApprovals(payload.coordinator);
 
 		// Skip re-render if data hasn't changed since last poll
 		const hash = JSON.stringify([
 			payload,
 			actorsPayload,
 			coordinatorAdminStatus,
+			deviceIdentityInventory,
+			deviceIdentityInventoryLoadError,
+			shareOperations,
+			shareOperationsLoadError,
 			duplicatePersonDecisions,
+			pendingCoordinatorApprovalHashInput(),
 		]);
 		if (hash === lastSyncHash) return;
 		lastSyncHash = hash;
@@ -186,9 +270,19 @@ export async function loadSyncData() {
 			: [];
 		state.pendingAcceptedSyncPeers = pendingPeers;
 		state.lastSyncPeers = [...payloadPeers, ...pendingPeers];
+		if (!deviceIdentityInventoryLoadError) {
+			state.lastDeviceIdentityInventory = deviceIdentityInventory;
+		}
+		state.deviceIdentityInventoryLoadError = deviceIdentityInventoryLoadError;
+		state.lastShareOperations = shareOperations;
+		state.shareOperationsLoadError = shareOperationsLoadError;
 		state.lastSyncSharingReview = payload.sharing_review || [];
+		state.lastSyncLegacySharedReview =
+			payload.legacy_shared_review && typeof payload.legacy_shared_review === "object"
+				? payload.legacy_shared_review
+				: null;
 		state.lastSyncCoordinator = payload.coordinator || null;
-		state.lastCoordinatorAdminStatus =
+		state.lastSyncCoordinatorAdminStatus =
 			coordinatorAdminStatus && typeof coordinatorAdminStatus === "object"
 				? coordinatorAdminStatus
 				: null;
@@ -200,11 +294,16 @@ export async function loadSyncData() {
 			actors: state.lastSyncActors,
 			peers: state.lastSyncPeers,
 			coordinator: state.lastSyncCoordinator,
+			status: statusPayload,
+			shareOperations: state.lastShareOperations,
+			shareOperationsLoadError,
+			reconciliation: payload.recipient_policy_reconciliation,
 			duplicatePersonDecisions: state.lastSyncDuplicatePersonDecisions,
 		});
 		renderSyncStatus();
 		renderTeamSync();
 		renderSyncActors();
+		renderProjectSharingOperations();
 		renderSyncSharingReview();
 		renderSyncPeers();
 		renderLegacyDeviceClaims();
@@ -215,12 +314,13 @@ export async function loadSyncData() {
 			renderSyncActorsUnavailable();
 		}
 		if (coordinatorAdminLoadError) {
-			state.lastCoordinatorAdminStatus = null;
+			state.lastSyncCoordinatorAdminStatus = null;
 			renderTeamSync();
 		}
 	} catch {
 		if (requestId !== latestSyncLoadRequestId) return;
 		lastSyncHash = "";
+		state.deviceIdentityInventoryLoadError = true;
 		// Clear all skeletons so the error state is visible, not masked by loading placeholders
 		hideSkeleton("syncTeamSkeleton");
 		hideSkeleton("syncActorsSkeleton");

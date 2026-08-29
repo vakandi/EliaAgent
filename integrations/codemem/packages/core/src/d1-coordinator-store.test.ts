@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Database as DatabaseType, Statement } from "better-sqlite3";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { connectCoordinator } from "./better-sqlite-coordinator-store.js";
 import { runCoordinatorStoreContract } from "./coordinator-store-test-harness.js";
 import {
@@ -127,11 +127,61 @@ class RacingSqliteD1Database extends SqliteD1Database {
 	}
 }
 
+class FailingAuditBatchD1Database extends SqliteD1Database {
+	override async batch(statements: D1PreparedStatementLike[]): Promise<unknown[]> {
+		return this.db.transaction(() => {
+			const [mutation] = statements;
+			if (!(mutation instanceof SqliteD1Statement)) {
+				throw new Error("Unsupported D1 statement test double.");
+			}
+			mutation.executeRunSync();
+			throw new Error("audit insert failed");
+		})();
+	}
+}
+
+class FailingDeviceRemovalBatchD1Database extends SqliteD1Database {
+	override async batch(statements: D1PreparedStatementLike[]): Promise<unknown[]> {
+		return this.db.transaction(() => {
+			// Run every delete except the final enrolled_devices delete, then fail
+			// mid-batch so the rollback restores all three row types.
+			const results: unknown[] = [];
+			for (const statement of statements.slice(0, -1)) {
+				if (!(statement instanceof SqliteD1Statement)) {
+					throw new Error("Unsupported D1 statement test double.");
+				}
+				results.push(statement.executeRunSync());
+			}
+			throw new Error("device removal batch failed");
+		})();
+	}
+}
+
+class RacingRevokeBatchD1Database extends SqliteD1Database {
+	private injected = false;
+
+	override async batch(statements: D1PreparedStatementLike[]): Promise<unknown[]> {
+		if (!this.injected) {
+			this.injected = true;
+			this.db
+				.prepare(`UPDATE coordinator_scope_memberships
+					SET status = 'revoked', membership_epoch = membership_epoch + 1, updated_at = ?
+					WHERE scope_id = ? AND device_id = ?`)
+				.run("2026-05-02T00:00:00.000Z", "scope-acme", "device-a");
+		}
+		return await super.batch(statements);
+	}
+}
+
 describe("D1CoordinatorStore", () => {
 	function setupStore() {
 		const tmpDir = mkdtempSync(join(tmpdir(), "d1-coord-test-"));
 		const db = connectCoordinator(join(tmpDir, "coordinator.sqlite"));
 		db.exec(`
+			DROP TABLE IF EXISTS coordinator_scope_membership_effect_receipts;
+			DROP TABLE IF EXISTS coordinator_scope_membership_audit_log;
+			DROP TABLE IF EXISTS coordinator_scope_memberships;
+			DROP TABLE IF EXISTS coordinator_scopes;
 			DROP TABLE IF EXISTS coordinator_reciprocal_approvals;
 			DROP TABLE IF EXISTS coordinator_join_requests;
 			DROP TABLE IF EXISTS coordinator_invites;
@@ -159,8 +209,32 @@ describe("D1CoordinatorStore", () => {
 	}
 
 	runCoordinatorStoreContract("contract", () => {
-		const { store, cleanup } = setupStore();
-		return { store, cleanup };
+		const { store, db, cleanup } = setupStore();
+		return {
+			store,
+			clearInviteReviewedIntent: (inviteId: string) => {
+				db.prepare(
+					"UPDATE coordinator_invites SET reviewed_intent_json = NULL WHERE invite_id = ?",
+				).run(inviteId);
+			},
+			setInviteAssignedIdentity: (inviteId: string, identityId: string | null) => {
+				db.prepare(
+					"UPDATE coordinator_invites SET assigned_identity_id = ? WHERE invite_id = ?",
+				).run(identityId, inviteId);
+			},
+			setEnrollmentIdentity: (groupId: string, deviceId: string, identityId: string | null) => {
+				db.prepare(
+					"UPDATE enrolled_devices SET identity_id = ? WHERE group_id = ? AND device_id = ?",
+				).run(identityId, groupId, deviceId);
+			},
+			revokeInvite: (inviteId: string, revokedAt: string) => {
+				db.prepare("UPDATE coordinator_invites SET revoked_at = ? WHERE invite_id = ?").run(
+					revokedAt,
+					inviteId,
+				);
+			},
+			cleanup,
+		};
 	});
 
 	it("converges to completed when a reverse pending row appears during insert", async () => {
@@ -285,6 +359,315 @@ describe("D1CoordinatorStore", () => {
 					expiresAt: "2099-01-01T00:00:00Z",
 				}),
 			).rejects.toThrow("groupId, seedDeviceId, workerDeviceId, and expiresAt are required.");
+		} finally {
+			await cleanup();
+		}
+	});
+
+	it("rolls back D1 membership changes when the audit batch fails", async () => {
+		const { db, cleanup } = setupStore();
+		const normalStore = new D1CoordinatorStore(new SqliteD1Database(db));
+		const failingStore = new D1CoordinatorStore(new FailingAuditBatchD1Database(db));
+		try {
+			await normalStore.createGroup("group-a");
+			await normalStore.enrollDevice("group-a", {
+				deviceId: "device-a",
+				fingerprint: "fp-a",
+				publicKey: "pk-a",
+			});
+			await normalStore.createScope({
+				scopeId: "scope-acme",
+				label: "Acme Work",
+				groupId: "group-a",
+			});
+
+			await expect(
+				failingStore.grantScopeMembership({
+					effectId: "d1:failed-audit:grant",
+					scopeId: "scope-acme",
+					deviceId: "device-a",
+				}),
+			).rejects.toThrow("audit insert failed");
+			expect(await normalStore.listScopeMemberships("scope-acme", true)).toEqual([]);
+
+			await normalStore.grantScopeMembership({
+				effectId: "d1:failed-audit:baseline-grant",
+				scopeId: "scope-acme",
+				deviceId: "device-a",
+			});
+			await expect(
+				failingStore.revokeScopeMembership({
+					effectId: "d1:failed-audit:revoke",
+					scopeId: "scope-acme",
+					deviceId: "device-a",
+				}),
+			).rejects.toThrow("audit insert failed");
+			expect(await normalStore.listScopeMemberships("scope-acme", true)).toEqual([
+				expect.objectContaining({ device_id: "device-a", status: "active" }),
+			]);
+			expect(await normalStore.listScopeMembershipAuditEvents({ scopeId: "scope-acme" })).toEqual([
+				expect.objectContaining({ action: "grant", device_id: "device-a" }),
+			]);
+		} finally {
+			await failingStore.close();
+			await normalStore.close();
+			await cleanup();
+		}
+	});
+
+	it("returns false without audit when D1 revoke loses the guarded update race", async () => {
+		const { db, cleanup } = setupStore();
+		const normalStore = new D1CoordinatorStore(new SqliteD1Database(db));
+		const racingStore = new D1CoordinatorStore(new RacingRevokeBatchD1Database(db));
+		try {
+			await normalStore.createGroup("group-a");
+			await normalStore.enrollDevice("group-a", {
+				deviceId: "device-a",
+				fingerprint: "fp-a",
+				publicKey: "pk-a",
+			});
+			await normalStore.createScope({
+				scopeId: "scope-acme",
+				label: "Acme Work",
+				groupId: "group-a",
+			});
+			await normalStore.grantScopeMembership({
+				effectId: "d1:race:baseline-grant",
+				scopeId: "scope-acme",
+				deviceId: "device-a",
+			});
+			vi.useFakeTimers();
+			vi.setSystemTime(new Date("2026-05-02T00:00:00.000Z"));
+
+			await expect(
+				racingStore.revokeScopeMembership({
+					effectId: "d1:race:revoke",
+					scopeId: "scope-acme",
+					deviceId: "device-a",
+				}),
+			).resolves.toBe(false);
+			vi.useRealTimers();
+
+			expect(await normalStore.listScopeMemberships("scope-acme", true)).toEqual([
+				expect.objectContaining({
+					device_id: "device-a",
+					status: "revoked",
+					membership_epoch: 1,
+				}),
+			]);
+			expect(await normalStore.listScopeMembershipAuditEvents({ scopeId: "scope-acme" })).toEqual([
+				expect.objectContaining({ action: "grant", device_id: "device-a" }),
+			]);
+		} finally {
+			vi.useRealTimers();
+			await racingStore.close();
+			await normalStore.close();
+			await cleanup();
+		}
+	});
+
+	it("converges concurrent identical D1 effects to one receipt and one audit event", async () => {
+		const { db, cleanup } = setupStore();
+		const firstStore = new D1CoordinatorStore(new SqliteD1Database(db));
+		const secondStore = new D1CoordinatorStore(new SqliteD1Database(db));
+		try {
+			await firstStore.createScope({ scopeId: "scope-effect-race", label: "Effect race" });
+			const request = {
+				effectId: "d1:effect-race:grant",
+				scopeId: "scope-effect-race",
+				deviceId: "device-a",
+				membershipEpoch: 3,
+			};
+
+			const [first, second] = await Promise.all([
+				firstStore.grantScopeMembership(request),
+				secondStore.grantScopeMembership(request),
+			]);
+
+			expect(second).toEqual(first);
+			expect(
+				await firstStore.listScopeMembershipAuditEvents({ scopeId: "scope-effect-race" }),
+			).toEqual([expect.objectContaining({ effect_id: request.effectId, membership_epoch: 3 })]);
+			expect(
+				db
+					.prepare(
+						"SELECT COUNT(*) AS count FROM coordinator_scope_membership_effect_receipts WHERE effect_id = ?",
+					)
+					.get(request.effectId),
+			).toEqual({ count: 1 });
+		} finally {
+			await secondStore.close();
+			await firstStore.close();
+			await cleanup();
+		}
+	});
+
+	it("removes presence, reciprocal approvals, and enrollment atomically", async () => {
+		const { db, cleanup } = setupStore();
+		const store = new D1CoordinatorStore(new SqliteD1Database(db));
+		try {
+			await store.createGroup("g1");
+			await store.enrollDevice("g1", { deviceId: "d1", fingerprint: "fp1", publicKey: "pk1" });
+			await store.enrollDevice("g1", { deviceId: "d2", fingerprint: "fp2", publicKey: "pk2" });
+			await store.upsertPresence({
+				groupId: "g1",
+				deviceId: "d1",
+				addresses: ["http://localhost:9000"],
+				ttlS: 300,
+			});
+			await store.createReciprocalApproval({
+				groupId: "g1",
+				requestingDeviceId: "d1",
+				requestedDeviceId: "d2",
+			});
+
+			expect(await store.removeDevice("g1", "d1")).toBe(true);
+
+			expect(await store.getEnrollment("g1", "d1")).toBeNull();
+			expect(
+				db
+					.prepare(
+						"SELECT COUNT(*) AS n FROM presence_records WHERE group_id = ? AND device_id = ?",
+					)
+					.get("g1", "d1"),
+			).toEqual({ n: 0 });
+			expect(
+				db
+					.prepare(
+						"SELECT COUNT(*) AS n FROM coordinator_reciprocal_approvals WHERE group_id = ? AND (requesting_device_id = ? OR requested_device_id = ?)",
+					)
+					.get("g1", "d1", "d1"),
+			).toEqual({ n: 0 });
+		} finally {
+			await store.close();
+			await cleanup();
+		}
+	});
+
+	it("returns false when removing a non-existent device", async () => {
+		const { db, cleanup } = setupStore();
+		const store = new D1CoordinatorStore(new SqliteD1Database(db));
+		try {
+			await store.createGroup("g1");
+			expect(await store.removeDevice("g1", "ghost")).toBe(false);
+		} finally {
+			await store.close();
+			await cleanup();
+		}
+	});
+
+	it("leaves no partial deletion when the device removal batch fails mid-way", async () => {
+		const { db, cleanup } = setupStore();
+		const normalStore = new D1CoordinatorStore(new SqliteD1Database(db));
+		const failingStore = new D1CoordinatorStore(new FailingDeviceRemovalBatchD1Database(db));
+		try {
+			await normalStore.createGroup("g1");
+			await normalStore.enrollDevice("g1", {
+				deviceId: "d1",
+				fingerprint: "fp1",
+				publicKey: "pk1",
+			});
+			await normalStore.enrollDevice("g1", {
+				deviceId: "d2",
+				fingerprint: "fp2",
+				publicKey: "pk2",
+			});
+			await normalStore.upsertPresence({
+				groupId: "g1",
+				deviceId: "d1",
+				addresses: ["http://localhost:9000"],
+				ttlS: 300,
+			});
+			await normalStore.createReciprocalApproval({
+				groupId: "g1",
+				requestingDeviceId: "d1",
+				requestedDeviceId: "d2",
+			});
+
+			await expect(failingStore.removeDevice("g1", "d1")).rejects.toThrow(
+				"device removal batch failed",
+			);
+
+			// All-or-nothing: the enrollment, presence, and reciprocal approval rows
+			// must all survive the rolled-back batch.
+			expect(await normalStore.getEnrollment("g1", "d1")).not.toBeNull();
+			expect(
+				db
+					.prepare(
+						"SELECT COUNT(*) AS n FROM presence_records WHERE group_id = ? AND device_id = ?",
+					)
+					.get("g1", "d1"),
+			).toEqual({ n: 1 });
+			expect(
+				db
+					.prepare(
+						"SELECT COUNT(*) AS n FROM coordinator_reciprocal_approvals WHERE group_id = ? AND (requesting_device_id = ? OR requested_device_id = ?)",
+					)
+					.get("g1", "d1", "d1"),
+			).toEqual({ n: 1 });
+		} finally {
+			await failingStore.close();
+			await normalStore.close();
+			await cleanup();
+		}
+	});
+
+	it("stores a non-canonical invite expiry in canonical UTC form", async () => {
+		const { store, cleanup } = setupStore();
+		try {
+			await store.createGroup("g1", "Team Alpha");
+			const offsetInvite = await store.createInvite({
+				groupId: "g1",
+				policy: "auto_admit",
+				expiresAt: "2099-07-01T00:00:00+00:00",
+			});
+			expect(offsetInvite.expires_at).toBe("2099-07-01T00:00:00.000Z");
+
+			const dateOnlyInvite = await store.createInvite({
+				groupId: "g1",
+				policy: "auto_admit",
+				expiresAt: "2099-07-01",
+			});
+			expect(dateOnlyInvite.expires_at).toBe("2099-07-01T00:00:00.000Z");
+		} finally {
+			await cleanup();
+		}
+	});
+
+	it("rejects an unparseable invite expiry", async () => {
+		const { store, cleanup } = setupStore();
+		try {
+			await store.createGroup("g1");
+			await expect(
+				store.createInvite({ groupId: "g1", policy: "auto_admit", expiresAt: "not-a-date" }),
+			).rejects.toThrow("expiresAt must be a valid date.");
+			await expect(
+				store.createInvite({ groupId: "g1", policy: "auto_admit", expiresAt: "   " }),
+			).rejects.toThrow("expiresAt must be a valid date.");
+		} finally {
+			await cleanup();
+		}
+	});
+
+	it("excludes expired invites and includes unexpired ones by token", async () => {
+		const { store, cleanup } = setupStore();
+		try {
+			await store.createGroup("g1");
+			const liveInvite = await store.createInvite({
+				groupId: "g1",
+				policy: "auto_admit",
+				// Future, supplied with a non-canonical offset to confirm the stored
+				// canonical form compares correctly against nowISO().
+				expiresAt: "2099-01-01T00:00:00+00:00",
+			});
+			expect(await store.getInviteByToken(liveInvite.token as string)).not.toBeNull();
+
+			const expiredInvite = await store.createInvite({
+				groupId: "g1",
+				policy: "auto_admit",
+				expiresAt: "2000-01-01T00:00:00+00:00",
+			});
+			expect(await store.getInviteByToken(expiredInvite.token as string)).toBeNull();
 		} finally {
 			await cleanup();
 		}

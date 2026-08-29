@@ -1,24 +1,62 @@
+import {
+	assertMatchingMembershipEffectReceipt,
+	type CoordinatorMembershipEffectReceipt,
+	CoordinatorMembershipError,
+	grantMembershipEffectRequestJson,
+	membershipFromEffectReceipt,
+	normalizeMembershipEffectId,
+	revokeMembershipEffectRequestJson,
+} from "./coordinator-membership-effects.js";
 import type {
 	CoordinatorBootstrapGrant,
+	CoordinatorConsumeProjectInviteInput,
+	CoordinatorConsumeRecipientInviteInput,
 	CoordinatorCreateBootstrapGrantInput,
 	CoordinatorCreateInviteInput,
 	CoordinatorCreateJoinRequestInput,
 	CoordinatorCreateReciprocalApprovalInput,
+	CoordinatorCreateScopeInput,
 	CoordinatorEnrollDeviceInput,
 	CoordinatorEnrollment,
+	CoordinatorGrantScopeMembershipInput,
 	CoordinatorGroup,
+	CoordinatorInspectRecipientInviteInput,
 	CoordinatorInvite,
+	CoordinatorInviteKind,
 	CoordinatorJoinRequest,
 	CoordinatorJoinRequestReviewResult,
 	CoordinatorListReciprocalApprovalsInput,
+	CoordinatorListScopeMembershipAuditInput,
+	CoordinatorListScopesInput,
 	CoordinatorPeerRecord,
 	CoordinatorPresenceRecord,
+	CoordinatorProjectInviteAcceptance,
+	CoordinatorRecipientInviteAcceptance,
+	CoordinatorRecipientInviteInspection,
 	CoordinatorReciprocalApproval,
 	CoordinatorReviewJoinRequestBootstrapGrantInput,
 	CoordinatorReviewJoinRequestInput,
+	CoordinatorRevokeScopeMembershipInput,
+	CoordinatorScope,
+	CoordinatorScopeMembership,
+	CoordinatorScopeMembershipAuditEvent,
 	CoordinatorStore,
+	CoordinatorUpdateScopeInput,
 	CoordinatorUpsertPresenceInput,
 } from "./coordinator-store-contract.js";
+import {
+	CoordinatorReciprocalApprovalRequestChangedError,
+	isCoordinatorAssignedIdentityId,
+	normalizeInviteExpiresAt,
+	recipientInviteAuthoritativeIdentityId,
+} from "./coordinator-store-contract.js";
+import {
+	canonicalRecipientReviewedIntentJson,
+	parseStoredRecipientReviewedIntent,
+	type RecipientReviewedIntentTargetV1,
+	verifyRecipientReviewedIntent,
+} from "./recipient-reviewed-intent.js";
+import { fingerprintPublicKey } from "./sync-fingerprint.js";
 
 interface D1RunResultLike {
 	meta?: {
@@ -50,6 +88,35 @@ export interface D1DatabaseLike {
 function rowToRecord<T>(row: unknown): T {
 	if (row == null) throw new Error("expected row");
 	return row as T;
+}
+
+function rowToEnrollmentWithPresence(row: unknown): CoordinatorEnrollment {
+	const record = rowToRecord<Record<string, unknown>>(row);
+	const {
+		presence_capabilities_json: capabilitiesJson,
+		presence_expires_at: expiresAt,
+		...base
+	} = record;
+	if (typeof expiresAt !== "string" || typeof capabilitiesJson !== "string") {
+		return base as unknown as CoordinatorEnrollment;
+	}
+	try {
+		const capabilities = JSON.parse(capabilitiesJson) as unknown;
+		if (!capabilities || typeof capabilities !== "object" || Array.isArray(capabilities)) {
+			return base as unknown as CoordinatorEnrollment;
+		}
+		const capabilityRecord = capabilities as Record<string, unknown>;
+		return {
+			...(base as unknown as CoordinatorEnrollment),
+			presence_expires_at: expiresAt,
+			presence_capabilities: {
+				sync_capability: capabilityRecord.sync_capability,
+				sync_features: capabilityRecord.sync_features,
+			},
+		};
+	} catch {
+		return base as unknown as CoordinatorEnrollment;
+	}
 }
 
 function normalizeAddress(address: string): string {
@@ -127,6 +194,28 @@ function tokenUrlSafe(bytes: number): string {
 	return output.join("");
 }
 
+async function tokenDigest(token: string): Promise<string> {
+	const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
+	return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+const INVITE_COLUMNS = `invite_id, group_id, token, policy, expires_at, created_at, created_by,
+	team_name_snapshot, revoked_at, operation_id, reviewed_project_set_digest, token_digest,
+	inviter_actor_id, inviter_display_name, inviter_device_id, pending_person_id,
+	project_summaries_json, project_intent_json, consumed_at, bound_device_id, bound_public_key, bound_fingerprint,
+	recipient_actor_id, recipient_display_name, recipient_device_display_name, trust_state,
+	bootstrap_grant_id, invite_kind, policy_team_id, target_identity_id, assigned_identity_id,
+	reviewed_preview_digest, reviewed_intent_json`;
+
+const ENROLLMENT_COLUMNS =
+	"group_id, device_id, public_key, fingerprint, identity_id, display_name, enabled, created_at";
+
+const ENROLLMENT_PRESENCE_COLUMNS = `enrolled_devices.group_id, enrolled_devices.device_id,
+	enrolled_devices.public_key, enrolled_devices.fingerprint, enrolled_devices.identity_id,
+	enrolled_devices.display_name, enrolled_devices.enabled, enrolled_devices.created_at,
+	presence_records.expires_at AS presence_expires_at,
+	presence_records.capabilities_json AS presence_capabilities_json`;
+
 function requireTrimmedBootstrapGrantInput(opts: CoordinatorCreateBootstrapGrantInput): {
 	groupId: string;
 	seedDeviceId: string;
@@ -143,6 +232,415 @@ function requireTrimmedBootstrapGrantInput(opts: CoordinatorCreateBootstrapGrant
 		throw new Error("groupId, seedDeviceId, workerDeviceId, and expiresAt are required.");
 	}
 	return { groupId, seedDeviceId, workerDeviceId, expiresAt, createdBy };
+}
+
+function clean(value: string | null | undefined): string | null {
+	const trimmed = value?.trim();
+	return trimmed ? trimmed : null;
+}
+
+async function normalizeInviteMetadata(opts: CoordinatorCreateInviteInput): Promise<{
+	inviteKind: CoordinatorInviteKind;
+	policyTeamId: string | null;
+	targetIdentityId: string | null;
+	reviewedPreviewDigest: string | null;
+	reviewedIntentJson: string | null;
+}> {
+	const inviteKind =
+		opts.inviteKind ?? (clean(opts.operationId) ? "project_share" : "legacy_enrollment");
+	const policyTeamId = clean(opts.policyTeamId);
+	const targetIdentityId = clean(opts.targetIdentityId);
+	const reviewedPreviewDigest = clean(opts.reviewedPreviewDigest);
+	if (
+		!(["legacy_enrollment", "project_share", "team_member", "add_device"] as const).includes(
+			inviteKind,
+		)
+	) {
+		throw new Error("inviteKind is invalid.");
+	}
+	if (
+		[policyTeamId, targetIdentityId]
+			.filter((value): value is string => Boolean(value))
+			.some((value) => value.length > 256 || /[\p{Cc}\p{Cf}]/u.test(value))
+	) {
+		throw new Error("recipient invite identifier is invalid.");
+	}
+	if (reviewedPreviewDigest && !/^[a-f0-9]{64}$/u.test(reviewedPreviewDigest)) {
+		throw new Error("reviewedPreviewDigest must be a SHA-256 digest.");
+	}
+	if (inviteKind === "project_share") {
+		if (!clean(opts.operationId)) throw new Error("project_share invite requires operationId.");
+		if (policyTeamId || targetIdentityId || reviewedPreviewDigest) {
+			throw new Error("recipient invite metadata requires a recipient invite kind.");
+		}
+	} else if (inviteKind === "legacy_enrollment") {
+		if (clean(opts.operationId))
+			throw new Error("legacy_enrollment invite cannot reference an operation.");
+		if (policyTeamId || targetIdentityId || reviewedPreviewDigest) {
+			throw new Error("recipient invite metadata requires a recipient invite kind.");
+		}
+	} else if (inviteKind === "team_member") {
+		if (!policyTeamId || !reviewedPreviewDigest || targetIdentityId || clean(opts.operationId)) {
+			throw new Error("team_member invite metadata is invalid.");
+		}
+	} else if (inviteKind === "add_device") {
+		if (!targetIdentityId || !reviewedPreviewDigest || policyTeamId || clean(opts.operationId)) {
+			throw new Error("add_device invite metadata is invalid.");
+		}
+	}
+	const reviewedIntentProvided = opts.reviewedIntent !== undefined && opts.reviewedIntent !== null;
+	if (!reviewedIntentProvided) {
+		if (inviteKind === "team_member" || inviteKind === "add_device") {
+			throw new Error("recipient_invite_review_unavailable");
+		}
+		return {
+			inviteKind,
+			policyTeamId,
+			targetIdentityId,
+			reviewedPreviewDigest,
+			reviewedIntentJson: null,
+		};
+	}
+	let target: RecipientReviewedIntentTargetV1;
+	if (inviteKind === "team_member" && policyTeamId && reviewedPreviewDigest) {
+		target = { kind: "team_member", policyTeamId };
+	} else if (inviteKind === "add_device" && targetIdentityId && reviewedPreviewDigest) {
+		target = { kind: "add_device", targetIdentityId };
+	} else {
+		throw new Error("recipient invite metadata requires a recipient invite kind.");
+	}
+	await verifyRecipientReviewedIntent(opts.reviewedIntent, {
+		target,
+		digest: reviewedPreviewDigest,
+	});
+	return {
+		inviteKind,
+		policyTeamId,
+		targetIdentityId,
+		reviewedPreviewDigest,
+		reviewedIntentJson: canonicalRecipientReviewedIntentJson(opts.reviewedIntent, target),
+	};
+}
+
+async function recipientInspection(
+	invite: CoordinatorInvite,
+): Promise<CoordinatorRecipientInviteInspection | null> {
+	if (invite.invite_kind === "team_member") {
+		if (
+			!invite.policy_team_id ||
+			!isCoordinatorAssignedIdentityId(invite.assigned_identity_id) ||
+			!invite.reviewed_preview_digest
+		)
+			throw new Error("invite_invalid");
+		const reviewedIntent = await parseStoredRecipientReviewedIntent(invite.reviewed_intent_json, {
+			target: { kind: "team_member", policyTeamId: invite.policy_team_id },
+			digest: invite.reviewed_preview_digest,
+		});
+		return {
+			kind: "team_member",
+			invite,
+			policy_team_id: invite.policy_team_id,
+			assigned_identity_id: invite.assigned_identity_id,
+			reviewed_preview_digest: invite.reviewed_preview_digest,
+			reviewed_intent: reviewedIntent,
+			bound: Boolean(invite.consumed_at),
+		};
+	}
+	if (invite.invite_kind === "add_device") {
+		if (!invite.target_identity_id || !invite.reviewed_preview_digest)
+			throw new Error("invite_invalid");
+		const reviewedIntent = await parseStoredRecipientReviewedIntent(invite.reviewed_intent_json, {
+			target: { kind: "add_device", targetIdentityId: invite.target_identity_id },
+			digest: invite.reviewed_preview_digest,
+		});
+		return {
+			kind: "add_device",
+			invite,
+			target_identity_id: invite.target_identity_id,
+			reviewed_preview_digest: invite.reviewed_preview_digest,
+			reviewed_intent: reviewedIntent,
+			bound: Boolean(invite.consumed_at),
+		};
+	}
+	return null;
+}
+
+function normalizeEpoch(value: number | null | undefined, fallback = 0): number {
+	if (value == null) return fallback;
+	if (!Number.isFinite(value) || value < 0)
+		throw new Error("membershipEpoch must be non-negative.");
+	return Math.trunc(value);
+}
+
+function normalizeCreateScopeInput(opts: CoordinatorCreateScopeInput) {
+	const scopeId = clean(opts.scopeId);
+	const label = clean(opts.label);
+	if (!scopeId || !label) throw new Error("scopeId and label are required.");
+	return {
+		scopeId,
+		label,
+		kind: clean(opts.kind) ?? "user",
+		authorityType: clean(opts.authorityType) ?? "coordinator",
+		coordinatorId: clean(opts.coordinatorId),
+		groupId: clean(opts.groupId),
+		manifestIssuerDeviceId: clean(opts.manifestIssuerDeviceId),
+		membershipEpoch: normalizeEpoch(opts.membershipEpoch),
+		manifestHash: clean(opts.manifestHash),
+		status: clean(opts.status) ?? "active",
+	};
+}
+
+function cleanRequiredUpdate(
+	value: string | null | undefined,
+	current: string,
+	fieldName: string,
+): string {
+	if (value === undefined) return current;
+	const cleaned = clean(value);
+	if (!cleaned) throw new Error(`${fieldName} must not be empty.`);
+	return cleaned;
+}
+
+function cleanNullableUpdate(
+	value: string | null | undefined,
+	current: string | null,
+): string | null {
+	return value === undefined ? current : clean(value);
+}
+
+function normalizeUpdateScopeInput(opts: CoordinatorUpdateScopeInput, existing: CoordinatorScope) {
+	const scopeId = clean(opts.scopeId);
+	if (!scopeId) throw new Error("scopeId is required.");
+	const requestedEpoch = opts.membershipEpoch == null ? null : normalizeEpoch(opts.membershipEpoch);
+	if (requestedEpoch != null && requestedEpoch < existing.membership_epoch) {
+		throw new Error("membershipEpoch must not move backwards.");
+	}
+	return {
+		scopeId,
+		label: cleanRequiredUpdate(opts.label, existing.label, "label"),
+		kind: cleanRequiredUpdate(opts.kind, existing.kind, "kind"),
+		authorityType: cleanRequiredUpdate(
+			opts.authorityType,
+			existing.authority_type,
+			"authorityType",
+		),
+		coordinatorId: cleanNullableUpdate(opts.coordinatorId, existing.coordinator_id),
+		groupId: cleanNullableUpdate(opts.groupId, existing.group_id),
+		manifestIssuerDeviceId: cleanNullableUpdate(
+			opts.manifestIssuerDeviceId,
+			existing.manifest_issuer_device_id,
+		),
+		membershipEpoch: requestedEpoch ?? existing.membership_epoch,
+		manifestHash: cleanNullableUpdate(opts.manifestHash, existing.manifest_hash),
+		status: cleanRequiredUpdate(opts.status, existing.status, "status"),
+	};
+}
+
+function normalizeGrantInput(
+	opts: CoordinatorGrantScopeMembershipInput,
+	scope: CoordinatorScope | null,
+	existing: CoordinatorScopeMembership | null,
+) {
+	const scopeId = clean(opts.scopeId);
+	const deviceId = clean(opts.deviceId);
+	if (!scopeId || !deviceId) throw new Error("scopeId and deviceId are required.");
+	const coordinatorId = clean(opts.coordinatorId);
+	const groupId = clean(opts.groupId);
+	if (coordinatorId && coordinatorId !== scope?.coordinator_id) {
+		throw new Error("membership coordinatorId must match the scope coordinatorId.");
+	}
+	if (groupId && groupId !== scope?.group_id) {
+		throw new CoordinatorMembershipError("scope_group_mismatch");
+	}
+	const requestedEpoch = opts.membershipEpoch == null ? null : normalizeEpoch(opts.membershipEpoch);
+	const inheritedEpoch = scope?.membership_epoch ?? 0;
+	if (requestedEpoch != null && requestedEpoch < inheritedEpoch) {
+		throw new Error("membershipEpoch must not be lower than the scope membershipEpoch.");
+	}
+	if (requestedEpoch != null && existing) {
+		const minimumEpoch =
+			existing.status === "revoked" ? existing.membership_epoch + 1 : existing.membership_epoch;
+		if (requestedEpoch < minimumEpoch) {
+			throw new Error("membershipEpoch must not move backwards.");
+		}
+	}
+	const membershipEpoch =
+		requestedEpoch ??
+		(existing
+			? Math.max(
+					inheritedEpoch,
+					existing.membership_epoch + (existing.status === "revoked" ? 1 : 0),
+				)
+			: inheritedEpoch);
+	return {
+		scopeId,
+		deviceId,
+		role: clean(opts.role) ?? "member",
+		membershipEpoch,
+		coordinatorId: scope?.coordinator_id ?? null,
+		groupId: scope?.group_id ?? null,
+		manifestIssuerDeviceId:
+			clean(opts.manifestIssuerDeviceId) ?? scope?.manifest_issuer_device_id ?? null,
+		manifestHash: clean(opts.manifestHash) ?? scope?.manifest_hash ?? null,
+		signedManifestJson: clean(opts.signedManifestJson),
+		actorType: clean(opts.actorType),
+		actorId: clean(opts.actorId),
+	};
+}
+
+function normalizeAuditLimit(limit: number | null | undefined): number {
+	if (limit == null) return 100;
+	if (!Number.isFinite(limit)) return 100;
+	return Math.max(1, Math.min(1000, Math.trunc(limit)));
+}
+
+function prepareMembershipAuditFromCurrentRow(
+	db: D1DatabaseLike,
+	input: {
+		effectId: string;
+		requestJson: string;
+		action: "grant" | "revoke";
+		previous: CoordinatorScopeMembership | null;
+		scopeId: string;
+		deviceId: string;
+		status: string;
+		membershipEpoch: number;
+		updatedAt: string;
+		actorType: string | null;
+		actorId: string | null;
+		createdAt: string;
+	},
+): D1PreparedStatementLike {
+	// The immediately preceding statement inserts the immutable effect receipt.
+	// changes() therefore emits an audit row only for the request that won the
+	// receipt insert, while outcome_applied excludes persisted no-op revokes.
+	return db
+		.prepare(`INSERT INTO coordinator_scope_membership_audit_log(
+			effect_id, action, scope_id, device_id, role, status, membership_epoch,
+			previous_role, previous_status, previous_membership_epoch,
+			coordinator_id, group_id, actor_type, actor_id, manifest_hash, created_at
+		)
+		SELECT receipt.effect_id, ?, membership.scope_id, membership.device_id, membership.role, membership.status,
+			membership.membership_epoch, ?, ?, ?, membership.coordinator_id, membership.group_id,
+			?, ?, membership.manifest_hash, ?
+		FROM (SELECT 1 WHERE changes() > 0) AS required
+		JOIN coordinator_scope_membership_effect_receipts AS receipt
+			ON receipt.effect_id = ? AND receipt.action = ? AND receipt.request_json = ?
+			AND receipt.outcome_applied = 1
+		LEFT JOIN coordinator_scope_memberships AS membership
+			ON membership.scope_id = ?
+			AND membership.device_id = ?
+			AND membership.status = ?
+			AND membership.membership_epoch = ?
+			AND membership.updated_at = ?`)
+		.bind(
+			input.action,
+			input.previous?.role ?? null,
+			input.previous?.status ?? null,
+			input.previous?.membership_epoch ?? null,
+			input.actorType,
+			input.actorId,
+			input.createdAt,
+			input.effectId,
+			input.action,
+			input.requestJson,
+			input.scopeId,
+			input.deviceId,
+			input.status,
+			input.membershipEpoch,
+			input.updatedAt,
+		);
+}
+
+async function getMembershipEffectReceipt(
+	db: D1DatabaseLike,
+	effectId: string,
+): Promise<CoordinatorMembershipEffectReceipt | null> {
+	return await firstRow<CoordinatorMembershipEffectReceipt>(
+		db
+			.prepare(`SELECT effect_id, action, request_json, outcome_applied, scope_id, device_id,
+				role, status, membership_epoch, coordinator_id, group_id, manifest_issuer_device_id,
+				manifest_hash, signed_manifest_json, updated_at, created_at
+			 FROM coordinator_scope_membership_effect_receipts WHERE effect_id = ?`)
+			.bind(effectId),
+	);
+}
+
+function prepareGrantEffectReceipt(
+	db: D1DatabaseLike,
+	input: {
+		effectId: string;
+		requestJson: string;
+		scopeId: string;
+		deviceId: string;
+		createdAt: string;
+	},
+): D1PreparedStatementLike {
+	return db
+		.prepare(`INSERT INTO coordinator_scope_membership_effect_receipts(
+			effect_id, action, request_json, outcome_applied, scope_id, device_id,
+			role, status, membership_epoch, coordinator_id, group_id, manifest_issuer_device_id,
+			manifest_hash, signed_manifest_json, updated_at, created_at
+		)
+		SELECT ?, 'grant', ?, 1, membership.scope_id, membership.device_id,
+			membership.role, membership.status, membership.membership_epoch,
+			membership.coordinator_id, membership.group_id, membership.manifest_issuer_device_id,
+			membership.manifest_hash, membership.signed_manifest_json, membership.updated_at, ?
+		FROM coordinator_scope_memberships AS membership
+		WHERE changes() > 0 AND membership.scope_id = ? AND membership.device_id = ?`)
+		.bind(input.effectId, input.requestJson, input.createdAt, input.scopeId, input.deviceId);
+}
+
+function prepareRevokeEffectReceipt(
+	db: D1DatabaseLike,
+	input: {
+		effectId: string;
+		requestJson: string;
+		scopeId: string;
+		deviceId: string;
+		createdAt: string;
+	},
+): D1PreparedStatementLike {
+	return db
+		.prepare(`INSERT INTO coordinator_scope_membership_effect_receipts(
+			effect_id, action, request_json, outcome_applied, scope_id, device_id,
+			role, status, membership_epoch, coordinator_id, group_id, manifest_issuer_device_id,
+			manifest_hash, signed_manifest_json, updated_at, created_at
+		)
+		SELECT ?, 'revoke', ?, changed.applied, ?, ?, membership.role, membership.status,
+			membership.membership_epoch, membership.coordinator_id, membership.group_id,
+			membership.manifest_issuer_device_id, membership.manifest_hash,
+			membership.signed_manifest_json, membership.updated_at, ?
+		FROM (SELECT CASE WHEN changes() > 0 THEN 1 ELSE 0 END AS applied) AS changed
+		LEFT JOIN coordinator_scope_memberships AS membership
+			ON changed.applied = 1 AND membership.scope_id = ? AND membership.device_id = ?
+		WHERE NOT EXISTS (
+			SELECT 1 FROM coordinator_scope_membership_effect_receipts WHERE effect_id = ?
+		)`)
+		.bind(
+			input.effectId,
+			input.requestJson,
+			input.scopeId,
+			input.deviceId,
+			input.createdAt,
+			input.scopeId,
+			input.deviceId,
+			input.effectId,
+		);
+}
+
+async function runAuditedBatch(
+	db: D1DatabaseLike,
+	statements: D1PreparedStatementLike[],
+): Promise<unknown[]> {
+	if (!db.batch) {
+		throw new Error("D1 batch support is required for audited scope membership changes.");
+	}
+	return await db.batch(statements);
+}
+
+function batchResultChanges(result: unknown): number {
+	return Number((result as D1RunResultLike | undefined)?.meta?.changes ?? 0);
 }
 
 function normalizeBootstrapGrantRequest(
@@ -253,49 +751,64 @@ export class D1CoordinatorStore implements CoordinatorStore {
 	}
 
 	async enrollDevice(_groupId: string, _opts: CoordinatorEnrollDeviceInput): Promise<void> {
-		await this.db
-			.prepare(`INSERT INTO enrolled_devices(
-				group_id, device_id, public_key, fingerprint, display_name, enabled, created_at
-			) VALUES (?, ?, ?, ?, ?, 1, ?)
-			ON CONFLICT(group_id, device_id) DO UPDATE SET
-				public_key = excluded.public_key,
-				fingerprint = excluded.fingerprint,
-				display_name = excluded.display_name,
-				enabled = 1`)
-			.bind(
-				_groupId,
-				_opts.deviceId,
-				_opts.publicKey,
-				_opts.fingerprint,
-				_opts.displayName ?? null,
-				nowISO(),
-			)
-			.run();
+		const changes = await runChanges(
+			this.db
+				.prepare(`INSERT INTO enrolled_devices(
+					group_id, device_id, public_key, fingerprint, identity_id, display_name, enabled, created_at
+				) VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+				ON CONFLICT(group_id, device_id) DO UPDATE SET
+					public_key = excluded.public_key,
+					fingerprint = excluded.fingerprint,
+					identity_id = COALESCE(enrolled_devices.identity_id, excluded.identity_id),
+					display_name = excluded.display_name,
+					enabled = 1
+				WHERE excluded.identity_id IS NULL
+					OR enrolled_devices.identity_id IS NULL
+					OR enrolled_devices.identity_id = excluded.identity_id`)
+				.bind(
+					_groupId,
+					_opts.deviceId,
+					_opts.publicKey,
+					_opts.fingerprint,
+					_opts.identityId ?? null,
+					_opts.displayName ?? null,
+					nowISO(),
+				),
+		);
+		if (changes === 0) throw new Error("invite_identity_conflict");
 	}
 
 	async listEnrolledDevices(
 		_groupId: string,
 		_includeDisabled?: boolean,
 	): Promise<CoordinatorEnrollment[]> {
-		const where = _includeDisabled ? "" : "AND enabled = 1";
+		const where = _includeDisabled ? "" : "AND enrolled_devices.enabled = 1";
 		return (
 			await allRows<CoordinatorEnrollment>(
 				this.db
-					.prepare(`SELECT group_id, device_id, public_key, fingerprint, display_name, enabled, created_at
+					.prepare(`SELECT ${ENROLLMENT_PRESENCE_COLUMNS}
 						 FROM enrolled_devices
-						 WHERE group_id = ? ${where}
-						 ORDER BY created_at ASC, device_id ASC`)
+						 LEFT JOIN presence_records
+						   ON presence_records.group_id = enrolled_devices.group_id
+						  AND presence_records.device_id = enrolled_devices.device_id
+						 WHERE enrolled_devices.group_id = ? ${where}
+						 ORDER BY enrolled_devices.created_at ASC, enrolled_devices.device_id ASC`)
 					.bind(_groupId),
 			)
-		).map((row) => rowToRecord<CoordinatorEnrollment>(row));
+		).map(rowToEnrollmentWithPresence);
 	}
 
-	async getEnrollment(_groupId: string, _deviceId: string): Promise<CoordinatorEnrollment | null> {
+	async getEnrollment(
+		_groupId: string,
+		_deviceId: string,
+		_includeDisabled = false,
+	): Promise<CoordinatorEnrollment | null> {
+		const enabledClause = _includeDisabled ? "" : "AND enabled = 1";
 		const row = await firstRow<CoordinatorEnrollment>(
 			this.db
-				.prepare(`SELECT group_id, device_id, public_key, fingerprint, display_name, enabled, created_at
+				.prepare(`SELECT ${ENROLLMENT_COLUMNS}
 					 FROM enrolled_devices
-					 WHERE group_id = ? AND device_id = ? AND enabled = 1`)
+					 WHERE group_id = ? AND device_id = ? ${enabledClause}`)
 				.bind(_groupId, _deviceId),
 		);
 		return row ? rowToRecord<CoordinatorEnrollment>(row) : null;
@@ -324,23 +837,30 @@ export class D1CoordinatorStore implements CoordinatorStore {
 	}
 
 	async removeDevice(_groupId: string, _deviceId: string): Promise<boolean> {
-		await this.db
-			.prepare("DELETE FROM presence_records WHERE group_id = ? AND device_id = ?")
-			.bind(_groupId, _deviceId)
-			.run();
-		await this.db
-			.prepare(
-				"DELETE FROM coordinator_reciprocal_approvals WHERE group_id = ? AND (requesting_device_id = ? OR requested_device_id = ?)",
-			)
-			.bind(_groupId, _deviceId, _deviceId)
-			.run();
-		return (
-			(await runChanges(
-				this.db
-					.prepare("DELETE FROM enrolled_devices WHERE group_id = ? AND device_id = ?")
-					.bind(_groupId, _deviceId),
-			)) > 0
-		);
+		// Presence, reciprocal approvals, and the enrollment row must be removed
+		// all-or-nothing. Running them as independent statements can orphan rows
+		// (an enrolled device with no presence/approvals, or vice versa) if any
+		// one statement fails. D1 batch() is the transaction boundary here, the
+		// same convention used for audited membership changes via runAuditedBatch.
+		if (!this.db.batch) {
+			throw new Error("D1 batch support is required for atomic device removal.");
+		}
+		const results = await this.db.batch([
+			this.db
+				.prepare("DELETE FROM presence_records WHERE group_id = ? AND device_id = ?")
+				.bind(_groupId, _deviceId),
+			this.db
+				.prepare(
+					"DELETE FROM coordinator_reciprocal_approvals WHERE group_id = ? AND (requesting_device_id = ? OR requested_device_id = ?)",
+				)
+				.bind(_groupId, _deviceId, _deviceId),
+			this.db
+				.prepare("DELETE FROM enrolled_devices WHERE group_id = ? AND device_id = ?")
+				.bind(_groupId, _deviceId),
+		]);
+		// The enrolled_devices delete is the last statement; its changes() tells us
+		// whether the device existed, preserving the boolean return contract.
+		return batchResultChanges(results[2]) > 0;
 	}
 
 	async recordNonce(_deviceId: string, _nonce: string, _createdAt: string): Promise<boolean> {
@@ -363,49 +883,618 @@ export class D1CoordinatorStore implements CoordinatorStore {
 		const now = nowISO();
 		const inviteId = tokenUrlSafe(12);
 		const token = tokenUrlSafe(24);
+		const digest = await tokenDigest(token);
+		const expiresAt = normalizeInviteExpiresAt(_opts.expiresAt);
 		const group = await this.getGroup(_opts.groupId);
-		await this.db
-			.prepare(`INSERT INTO coordinator_invites(
-				invite_id, group_id, token, policy, expires_at, created_at, created_by, team_name_snapshot, revoked_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`)
-			.bind(
-				inviteId,
-				_opts.groupId,
-				token,
-				_opts.policy,
-				_opts.expiresAt,
-				now,
-				_opts.createdBy ?? null,
-				group?.display_name ?? null,
-			)
-			.run();
+		const operationId = String(_opts.operationId ?? "").trim() || null;
+		const reviewedProjectSetDigest = String(_opts.reviewedProjectSetDigest ?? "").trim() || null;
+		const metadata = await normalizeInviteMetadata(_opts);
+		const assignedIdentityId =
+			metadata.inviteKind === "team_member" ? `identity:${tokenUrlSafe(18)}` : null;
+		if (Boolean(operationId) !== Boolean(reviewedProjectSetDigest)) {
+			throw new Error("operationId and reviewedProjectSetDigest must be provided together.");
+		}
+		const readOperationInvite = async (): Promise<CoordinatorInvite | null> => {
+			if (!operationId) return null;
+			const existing = await firstRow<CoordinatorInvite>(
+				this.db
+					.prepare(`SELECT ${INVITE_COLUMNS} FROM coordinator_invites WHERE operation_id = ?`)
+					.bind(operationId),
+			);
+			if (!existing) return null;
+			// Pre-consume create retries can recover the bearer token. Successful
+			// consume clears it, so post-consume create retries fail closed.
+			if (existing.consumed_at) throw new Error("invite_already_bound");
+			if (
+				existing.group_id !== _opts.groupId ||
+				existing.policy !== _opts.policy ||
+				existing.invite_kind !== metadata.inviteKind ||
+				existing.reviewed_project_set_digest !== reviewedProjectSetDigest ||
+				existing.inviter_actor_id !== (String(_opts.inviterActorId ?? "").trim() || null) ||
+				existing.inviter_display_name !== (String(_opts.inviterDisplayName ?? "").trim() || null) ||
+				existing.inviter_device_id !== (String(_opts.inviterDeviceId ?? "").trim() || null) ||
+				existing.pending_person_id !== (String(_opts.pendingPersonId ?? "").trim() || null) ||
+				existing.project_summaries_json !==
+					(_opts.projectSummaries ? JSON.stringify(_opts.projectSummaries) : null) ||
+				existing.project_intent_json !==
+					(_opts.projectIntent ? JSON.stringify(_opts.projectIntent) : null) ||
+				existing.policy_team_id !== metadata.policyTeamId ||
+				existing.target_identity_id !== metadata.targetIdentityId ||
+				existing.reviewed_preview_digest !== metadata.reviewedPreviewDigest ||
+				existing.reviewed_intent_json !== metadata.reviewedIntentJson
+			) {
+				throw new Error("invite_operation_intent_conflict");
+			}
+			return rowToRecord<CoordinatorInvite>(existing);
+		};
+		const renewOperationInvite = async (
+			existing: CoordinatorInvite,
+		): Promise<CoordinatorInvite> => {
+			if (!existing.revoked_at && existing.expires_at > now) return existing;
+			await runChanges(
+				this.db
+					.prepare(`UPDATE coordinator_invites
+						SET token = ?, token_digest = ?, expires_at = ?, created_at = ?, created_by = ?,
+							team_name_snapshot = ?, revoked_at = NULL
+						WHERE operation_id = ? AND token = ?
+						  AND (revoked_at IS NOT NULL OR expires_at <= ?)`)
+					.bind(
+						token,
+						digest,
+						expiresAt,
+						now,
+						_opts.createdBy ?? null,
+						group?.display_name ?? null,
+						operationId,
+						existing.token,
+						now,
+					),
+			);
+			const renewed = await readOperationInvite();
+			if (!renewed) throw new Error("invite_operation_reissue_failed");
+			return renewed;
+		};
+		if (operationId) {
+			const existing = await readOperationInvite();
+			if (existing) return await renewOperationInvite(existing);
+		}
+		try {
+			await this.db
+				.prepare(`INSERT INTO coordinator_invites(
+				invite_id, group_id, token, policy, expires_at, created_at, created_by,
+				team_name_snapshot, revoked_at, operation_id, reviewed_project_set_digest,
+				token_digest, inviter_actor_id, inviter_display_name, inviter_device_id,
+				pending_person_id, project_summaries_json, project_intent_json, trust_state,
+				invite_kind, policy_team_id, target_identity_id, assigned_identity_id,
+				reviewed_preview_digest, reviewed_intent_json
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+				.bind(
+					inviteId,
+					_opts.groupId,
+					token,
+					_opts.policy,
+					expiresAt,
+					now,
+					_opts.createdBy ?? null,
+					group?.display_name ?? null,
+					operationId,
+					reviewedProjectSetDigest,
+					digest,
+					String(_opts.inviterActorId ?? "").trim() || null,
+					String(_opts.inviterDisplayName ?? "").trim() || null,
+					String(_opts.inviterDeviceId ?? "").trim() || null,
+					String(_opts.pendingPersonId ?? "").trim() || null,
+					_opts.projectSummaries ? JSON.stringify(_opts.projectSummaries) : null,
+					_opts.projectIntent ? JSON.stringify(_opts.projectIntent) : null,
+					operationId ? "pending" : null,
+					metadata.inviteKind,
+					metadata.policyTeamId,
+					metadata.targetIdentityId,
+					assignedIdentityId,
+					metadata.reviewedPreviewDigest,
+					metadata.reviewedIntentJson,
+				)
+				.run();
+		} catch (error) {
+			if (operationId) {
+				const existing = await readOperationInvite();
+				if (existing) return await renewOperationInvite(existing);
+			}
+			throw error;
+		}
 		const row = await firstRow<CoordinatorInvite>(
 			this.db
-				.prepare(`SELECT invite_id, group_id, token, policy, expires_at, created_at, created_by, team_name_snapshot, revoked_at
-					 FROM coordinator_invites WHERE invite_id = ?`)
+				.prepare(`SELECT ${INVITE_COLUMNS} FROM coordinator_invites WHERE invite_id = ?`)
 				.bind(inviteId),
 		);
 		return rowToRecord<CoordinatorInvite>(row);
 	}
 
 	async getInviteByToken(_token: string): Promise<CoordinatorInvite | null> {
+		const digest = await tokenDigest(_token);
 		const row = await firstRow<CoordinatorInvite>(
 			this.db
-				.prepare(`SELECT invite_id, group_id, token, policy, expires_at, created_at, created_by, team_name_snapshot, revoked_at
+				.prepare(`SELECT ${INVITE_COLUMNS}
 					 FROM coordinator_invites
-					 WHERE token = ?
+					 WHERE (token_digest = ? OR token = ?)
 					   AND revoked_at IS NULL
 					   AND expires_at > ?`)
-				.bind(_token, nowISO()),
+				.bind(digest, _token, nowISO()),
 		);
 		return row ? rowToRecord<CoordinatorInvite>(row) : null;
+	}
+
+	async getInviteByTokenForInspection(_token: string): Promise<CoordinatorInvite | null> {
+		const digest = await tokenDigest(_token);
+		const row = await firstRow<CoordinatorInvite>(
+			this.db
+				.prepare(
+					`SELECT ${INVITE_COLUMNS} FROM coordinator_invites WHERE token_digest = ? OR token = ?`,
+				)
+				.bind(digest, _token),
+		);
+		return row ? rowToRecord<CoordinatorInvite>(row) : null;
+	}
+
+	async inspectRecipientInvite(
+		_opts: CoordinatorInspectRecipientInviteInput,
+	): Promise<CoordinatorRecipientInviteInspection | null> {
+		const invite = await this.getInviteByTokenForInspection(_opts.token);
+		if (!invite) return null;
+		const inspection = await recipientInspection(invite);
+		if (!inspection) return null;
+		if (invite.revoked_at) throw new Error("invite_invalid");
+		if (
+			!invite.consumed_at &&
+			new Date(invite.expires_at) <= new Date(normalizeInviteExpiresAt(_opts.now))
+		) {
+			throw new Error("invite_expired");
+		}
+		const group = await this.getGroup(invite.group_id);
+		if (!group) throw new Error("group_not_found");
+		if (group.archived_at) throw new Error("group_archived");
+		return inspection;
+	}
+
+	async consumeRecipientInvite(
+		_opts: CoordinatorConsumeRecipientInviteInput,
+	): Promise<CoordinatorRecipientInviteAcceptance> {
+		const consumedAt = normalizeInviteExpiresAt(_opts.now);
+		const recipientDisplayName = _opts.recipientDisplayName ?? null;
+		const deviceDisplayName = _opts.deviceDisplayName ?? null;
+		if (
+			!_opts.identityId ||
+			!_opts.deviceId ||
+			!_opts.publicKey ||
+			!_opts.fingerprint ||
+			_opts.identityId !== _opts.identityId.trim() ||
+			_opts.deviceId !== _opts.deviceId.trim() ||
+			_opts.identityId.length > 256 ||
+			_opts.deviceId.length > 256 ||
+			/[\p{Cc}\p{Cf}]/u.test(_opts.identityId) ||
+			/[\p{Cc}\p{Cf}]/u.test(_opts.deviceId)
+		) {
+			throw new Error("invite_identity_conflict");
+		}
+		const digest = await tokenDigest(_opts.token);
+		const initial = await this.getInviteByTokenForInspection(_opts.token);
+		const inspection = initial ? await recipientInspection(initial) : null;
+		if (!initial || !inspection || inspection.kind !== _opts.inviteKind || initial.revoked_at) {
+			throw new Error("invite_invalid");
+		}
+		const group = await this.getGroup(initial.group_id);
+		if (!group) throw new Error("group_not_found");
+		if (group.archived_at) throw new Error("group_archived");
+		if (!initial.consumed_at && new Date(initial.expires_at) <= new Date(consumedAt)) {
+			throw new Error("invite_expired");
+		}
+		if (fingerprintPublicKey(_opts.publicKey) !== _opts.fingerprint) {
+			throw new Error("fingerprint_mismatch");
+		}
+		const authoritativeIdentityId = recipientInviteAuthoritativeIdentityId(inspection);
+		if (authoritativeIdentityId !== _opts.identityId) {
+			throw new Error("invite_identity_conflict");
+		}
+		const sameBinding =
+			initial.bound_device_id === _opts.deviceId &&
+			initial.bound_public_key === _opts.publicKey &&
+			initial.bound_fingerprint === _opts.fingerprint;
+		if (initial.consumed_at && !sameBinding) throw new Error("invite_already_bound");
+		if (initial.consumed_at && initial.recipient_actor_id !== authoritativeIdentityId) {
+			throw new Error("invite_identity_conflict");
+		}
+		const existingEnrollment = await firstRow<CoordinatorEnrollment>(
+			this.db
+				.prepare(`SELECT ${ENROLLMENT_COLUMNS}
+					FROM enrolled_devices WHERE group_id = ? AND device_id = ?`)
+				.bind(initial.group_id, _opts.deviceId),
+		);
+		if (
+			existingEnrollment &&
+			(existingEnrollment.public_key !== _opts.publicKey ||
+				existingEnrollment.fingerprint !== _opts.fingerprint ||
+				(existingEnrollment.identity_id !== null &&
+					existingEnrollment.identity_id !== authoritativeIdentityId))
+		) {
+			throw new Error("invite_identity_conflict");
+		}
+		let changed = 0;
+		const bootstrapGrantId = tokenUrlSafe(12);
+		if (!initial.consumed_at) {
+			if (!this.db.batch)
+				throw new Error("D1 batch support is required for atomic invite consume.");
+			const results = await this.db.batch([
+				this.db
+					.prepare(`UPDATE coordinator_invites SET token = ?, consumed_at = ?, bound_device_id = ?,
+						bound_public_key = ?, bound_fingerprint = ?, recipient_actor_id = ?,
+						recipient_display_name = ?, recipient_device_display_name = ?
+						WHERE (token_digest = ? OR token = ?) AND consumed_at IS NULL
+						AND revoked_at IS NULL AND expires_at > ? AND invite_kind = ?
+						AND reviewed_intent_json = ? AND reviewed_preview_digest = ?
+						AND ((invite_kind = 'team_member' AND assigned_identity_id = ?)
+							OR (invite_kind = 'add_device' AND target_identity_id = ?))
+						AND NOT EXISTS (
+							SELECT 1 FROM enrolled_devices e
+							WHERE e.group_id = coordinator_invites.group_id AND e.device_id = ?
+								AND (e.public_key <> ? OR e.fingerprint <> ?
+									OR (e.identity_id IS NOT NULL AND e.identity_id <> ?))
+						)
+						AND EXISTS (SELECT 1 FROM groups g WHERE g.group_id = coordinator_invites.group_id
+							AND g.archived_at IS NULL)`)
+					.bind(
+						`consumed:${initial.invite_id}`,
+						consumedAt,
+						_opts.deviceId,
+						_opts.publicKey,
+						_opts.fingerprint,
+						authoritativeIdentityId,
+						recipientDisplayName,
+						deviceDisplayName,
+						digest,
+						_opts.token,
+						consumedAt,
+						_opts.inviteKind,
+						initial.reviewed_intent_json,
+						initial.reviewed_preview_digest,
+						authoritativeIdentityId,
+						authoritativeIdentityId,
+						_opts.deviceId,
+						_opts.publicKey,
+						_opts.fingerprint,
+						authoritativeIdentityId,
+					),
+				this.db
+					.prepare(`INSERT INTO enrolled_devices(
+						group_id, device_id, public_key, fingerprint, identity_id, display_name, enabled, created_at
+					) SELECT i.group_id, i.bound_device_id, i.bound_public_key, i.bound_fingerprint,
+						i.recipient_actor_id, i.recipient_device_display_name, 1, ? FROM coordinator_invites i
+					JOIN groups g ON g.group_id = i.group_id AND g.archived_at IS NULL
+					WHERE (i.token_digest = ? OR i.token = ?) AND i.bound_device_id = ?
+						AND i.bound_public_key = ? AND i.bound_fingerprint = ?
+						AND i.recipient_actor_id = ?
+					ON CONFLICT(group_id, device_id) DO UPDATE SET
+						identity_id = COALESCE(enrolled_devices.identity_id, excluded.identity_id),
+						display_name = COALESCE(enrolled_devices.display_name, excluded.display_name),
+						enabled = 1
+					WHERE enrolled_devices.identity_id IS NULL
+						OR enrolled_devices.identity_id = excluded.identity_id`)
+					.bind(
+						consumedAt,
+						digest,
+						_opts.token,
+						_opts.deviceId,
+						_opts.publicKey,
+						_opts.fingerprint,
+						authoritativeIdentityId,
+					),
+				this.db
+					.prepare(`UPDATE coordinator_invites SET bootstrap_grant_id = ?,
+						trust_state = 'bootstrap_grant_created'
+						WHERE (token_digest = ? OR token = ?) AND invite_kind = 'add_device'
+						AND bootstrap_grant_id IS NULL AND inviter_device_id IS NOT NULL
+						AND expires_at > ?
+						AND EXISTS (SELECT 1 FROM enrolled_devices e
+							WHERE e.group_id = coordinator_invites.group_id
+							AND e.device_id = coordinator_invites.inviter_device_id AND e.enabled = 1)`)
+					.bind(bootstrapGrantId, digest, _opts.token, consumedAt),
+				this.db
+					.prepare(`INSERT OR IGNORE INTO coordinator_bootstrap_grants(
+						grant_id, group_id, seed_device_id, worker_device_id, expires_at,
+						created_at, created_by, revoked_at
+					) SELECT i.bootstrap_grant_id, i.group_id, i.inviter_device_id, i.bound_device_id,
+						i.expires_at, ?, i.recipient_actor_id, NULL FROM coordinator_invites i
+					JOIN enrolled_devices e ON e.group_id = i.group_id
+						AND e.device_id = i.inviter_device_id AND e.enabled = 1
+					WHERE (i.token_digest = ? OR i.token = ?) AND i.invite_kind = 'add_device'
+						AND i.bootstrap_grant_id IS NOT NULL AND i.bound_device_id = ?`)
+					.bind(consumedAt, digest, _opts.token, _opts.deviceId),
+			]);
+			changed = batchResultChanges(results[0]);
+		}
+		const currentGroup = await this.getGroup(initial.group_id);
+		if (!currentGroup) throw new Error("group_not_found");
+		if (currentGroup.archived_at) throw new Error("group_archived");
+		const currentEnrollment = await firstRow<CoordinatorEnrollment>(
+			this.db
+				.prepare(`SELECT ${ENROLLMENT_COLUMNS}
+					FROM enrolled_devices WHERE group_id = ? AND device_id = ?`)
+				.bind(initial.group_id, _opts.deviceId),
+		);
+		if (
+			currentEnrollment &&
+			(currentEnrollment.public_key !== _opts.publicKey ||
+				currentEnrollment.fingerprint !== _opts.fingerprint ||
+				(currentEnrollment.identity_id !== null &&
+					currentEnrollment.identity_id !== authoritativeIdentityId))
+		) {
+			throw new Error("invite_identity_conflict");
+		}
+		const saved = await this.getInviteByTokenForInspection(_opts.token);
+		if (
+			!saved ||
+			saved.revoked_at ||
+			(!saved.consumed_at && new Date(saved.expires_at) <= new Date(consumedAt))
+		) {
+			throw new Error("invite_invalid");
+		}
+		const savedInspection = await recipientInspection(saved);
+		if (!savedInspection || savedInspection.kind !== _opts.inviteKind) {
+			throw new Error("invite_invalid");
+		}
+		const savedIdentityId = recipientInviteAuthoritativeIdentityId(savedInspection);
+		if (savedIdentityId !== authoritativeIdentityId) {
+			throw new Error("invite_identity_conflict");
+		}
+		if (
+			saved.bound_device_id !== _opts.deviceId ||
+			saved.bound_public_key !== _opts.publicKey ||
+			saved.bound_fingerprint !== _opts.fingerprint
+		) {
+			throw new Error("invite_already_bound");
+		}
+		if (saved.recipient_actor_id !== authoritativeIdentityId)
+			throw new Error("invite_identity_conflict");
+		await this.db
+			.prepare(`UPDATE enrolled_devices SET identity_id = ?
+				WHERE group_id = ? AND device_id = ? AND identity_id IS NULL
+					AND public_key = ? AND fingerprint = ?`)
+			.bind(
+				authoritativeIdentityId,
+				saved.group_id,
+				_opts.deviceId,
+				_opts.publicKey,
+				_opts.fingerprint,
+			)
+			.run();
+		const enrollment = await this.getEnrollment(saved.group_id, _opts.deviceId);
+		if (!enrollment) throw new Error("invite_acceptance_incomplete");
+		if (
+			enrollment.public_key !== _opts.publicKey ||
+			enrollment.fingerprint !== _opts.fingerprint ||
+			enrollment.identity_id !== authoritativeIdentityId
+		) {
+			throw new Error("invite_identity_conflict");
+		}
+		let savedWithGrant = saved;
+		if (
+			savedInspection.kind === "add_device" &&
+			saved.inviter_device_id &&
+			!saved.bootstrap_grant_id &&
+			new Date(saved.expires_at) > new Date(consumedAt)
+		) {
+			if (!this.db.batch)
+				throw new Error("D1 batch support is required for atomic bootstrap grant recovery.");
+			const recoveryGrantId = tokenUrlSafe(12);
+			await this.db.batch([
+				this.db
+					.prepare(`UPDATE coordinator_invites SET bootstrap_grant_id = ?,
+						trust_state = 'bootstrap_grant_created'
+						WHERE invite_id = ? AND invite_kind = 'add_device'
+						AND bootstrap_grant_id IS NULL AND inviter_device_id IS NOT NULL
+						AND bound_device_id = ? AND recipient_actor_id = ? AND expires_at > ?
+						AND EXISTS (SELECT 1 FROM enrolled_devices e
+							WHERE e.group_id = coordinator_invites.group_id
+							AND e.device_id = coordinator_invites.inviter_device_id AND e.enabled = 1)`)
+					.bind(
+						recoveryGrantId,
+						saved.invite_id,
+						_opts.deviceId,
+						authoritativeIdentityId,
+						consumedAt,
+					),
+				this.db
+					.prepare(`INSERT OR IGNORE INTO coordinator_bootstrap_grants(
+						grant_id, group_id, seed_device_id, worker_device_id, expires_at,
+						created_at, created_by, revoked_at
+					) SELECT i.bootstrap_grant_id, i.group_id, i.inviter_device_id, i.bound_device_id,
+						i.expires_at, ?, i.recipient_actor_id, NULL FROM coordinator_invites i
+					JOIN enrolled_devices e ON e.group_id = i.group_id
+						AND e.device_id = i.inviter_device_id AND e.enabled = 1
+					WHERE i.invite_id = ? AND i.invite_kind = 'add_device'
+						AND i.bootstrap_grant_id IS NOT NULL AND i.bound_device_id = ?`)
+					.bind(consumedAt, saved.invite_id, _opts.deviceId),
+			]);
+			const refreshed = await this.getInviteByTokenForInspection(_opts.token);
+			if (!refreshed) throw new Error("invite_invalid");
+			savedWithGrant = refreshed;
+		}
+		const bootstrapGrant = savedWithGrant.bootstrap_grant_id
+			? await this.getBootstrapGrant(savedWithGrant.bootstrap_grant_id)
+			: null;
+		return {
+			status: changed === 1 ? "accepted" : "existing",
+			invite: savedWithGrant,
+			reviewed_intent: savedInspection.reviewed_intent,
+			bootstrap_grant: bootstrapGrant,
+		};
+	}
+
+	async consumeProjectInvite(
+		_opts: CoordinatorConsumeProjectInviteInput,
+	): Promise<CoordinatorProjectInviteAcceptance> {
+		if (!this.db.batch) throw new Error("D1 batch support is required for atomic invite consume.");
+		const consumedAt = normalizeInviteExpiresAt(_opts.now);
+		const digest = await tokenDigest(_opts.token);
+		const initial = await this.getInviteByTokenForInspection(_opts.token);
+		if (!initial?.operation_id || !initial.project_intent_json || initial.revoked_at) {
+			throw new Error("invite_invalid");
+		}
+		const group = await this.getGroup(initial.group_id);
+		if (!group) throw new Error("group_not_found");
+		if (group.archived_at) throw new Error("group_archived");
+		if (initial.operation_id !== _opts.operationId) throw new Error("invite_invalid");
+		if (fingerprintPublicKey(_opts.publicKey) !== _opts.fingerprint) {
+			throw new Error("fingerprint_mismatch");
+		}
+		if (!initial.consumed_at && new Date(initial.expires_at) <= new Date(consumedAt)) {
+			throw new Error("invite_expired");
+		}
+		const sameBinding =
+			initial.bound_device_id === _opts.deviceId &&
+			initial.bound_public_key === _opts.publicKey &&
+			initial.bound_fingerprint === _opts.fingerprint;
+		if (initial.consumed_at && !sameBinding) throw new Error("invite_already_bound");
+		if (
+			initial.consumed_at &&
+			(initial.recipient_actor_id !== _opts.recipientActorId ||
+				initial.recipient_display_name !== _opts.recipientDisplayName ||
+				initial.recipient_device_display_name !== _opts.deviceDisplayName)
+		) {
+			throw new Error("invite_identity_conflict");
+		}
+		const existingEnrollment = await firstRow<CoordinatorEnrollment>(
+			this.db
+				.prepare(`SELECT ${ENROLLMENT_COLUMNS}
+					FROM enrolled_devices WHERE group_id = ? AND device_id = ?`)
+				.bind(initial.group_id, _opts.deviceId),
+		);
+		if (
+			existingEnrollment &&
+			(existingEnrollment.public_key !== _opts.publicKey ||
+				existingEnrollment.fingerprint !== _opts.fingerprint ||
+				(existingEnrollment.identity_id != null &&
+					existingEnrollment.identity_id !== _opts.recipientActorId))
+		) {
+			throw new Error("invite_identity_conflict");
+		}
+
+		const grantId = tokenUrlSafe(12);
+		const results = await this.db.batch([
+			this.db
+				.prepare(`UPDATE coordinator_invites SET token = ?, consumed_at = ?, bound_device_id = ?,
+					bound_public_key = ?, bound_fingerprint = ?, recipient_actor_id = ?,
+					recipient_display_name = ?, recipient_device_display_name = ?,
+					trust_state = 'pending_inviter_device'
+					WHERE (token_digest = ? OR token = ?) AND consumed_at IS NULL
+					AND EXISTS (SELECT 1 FROM groups g WHERE g.group_id = coordinator_invites.group_id
+						AND g.archived_at IS NULL)`)
+				.bind(
+					`consumed:${initial.invite_id}`,
+					consumedAt,
+					_opts.deviceId,
+					_opts.publicKey,
+					_opts.fingerprint,
+					_opts.recipientActorId,
+					_opts.recipientDisplayName,
+					_opts.deviceDisplayName,
+					digest,
+					_opts.token,
+				),
+			this.db
+				.prepare(`INSERT INTO enrolled_devices(
+					group_id, device_id, public_key, fingerprint, identity_id, display_name, enabled, created_at
+				) SELECT i.group_id, i.bound_device_id, i.bound_public_key, i.bound_fingerprint,
+					i.recipient_actor_id, i.recipient_device_display_name, 1, ? FROM coordinator_invites i
+					JOIN groups g ON g.group_id = i.group_id AND g.archived_at IS NULL
+					WHERE (i.token_digest = ? OR i.token = ?) AND i.bound_device_id = ? AND ? = 1
+				ON CONFLICT(group_id, device_id) DO UPDATE SET
+					identity_id = COALESCE(enrolled_devices.identity_id, excluded.identity_id),
+					display_name = excluded.display_name, enabled = 1
+				WHERE enrolled_devices.identity_id IS NULL
+					OR enrolled_devices.identity_id = excluded.identity_id`)
+				.bind(consumedAt, digest, _opts.token, _opts.deviceId, initial.consumed_at ? 0 : 1),
+			this.db
+				.prepare(`UPDATE coordinator_invites SET bootstrap_grant_id = ?,
+					trust_state = 'bootstrap_grant_created'
+					WHERE (token_digest = ? OR token = ?) AND bootstrap_grant_id IS NULL
+					AND bound_device_id = ?
+					AND EXISTS (SELECT 1 FROM groups g WHERE g.group_id = coordinator_invites.group_id
+						AND g.archived_at IS NULL)
+					AND expires_at > ?
+					AND EXISTS (SELECT 1 FROM enrolled_devices e WHERE e.group_id = coordinator_invites.group_id
+						AND e.device_id = coordinator_invites.inviter_device_id AND e.enabled = 1)`)
+				.bind(grantId, digest, _opts.token, _opts.deviceId, consumedAt),
+			this.db
+				.prepare(`INSERT OR IGNORE INTO coordinator_bootstrap_grants(
+					grant_id, group_id, seed_device_id, worker_device_id, expires_at, created_at,
+					created_by, revoked_at
+				) SELECT i.bootstrap_grant_id, i.group_id, i.inviter_device_id, i.bound_device_id,
+					i.expires_at, ?, i.inviter_actor_id, NULL FROM coordinator_invites i
+					JOIN groups g ON g.group_id = i.group_id AND g.archived_at IS NULL
+					JOIN enrolled_devices e ON e.group_id = i.group_id AND e.device_id = i.inviter_device_id
+					WHERE (i.token_digest = ? OR i.token = ?) AND i.bootstrap_grant_id IS NOT NULL
+					AND i.bound_device_id = ? AND e.enabled = 1`)
+				.bind(consumedAt, digest, _opts.token, _opts.deviceId),
+		]);
+		const accepted = batchResultChanges(results[0]) === 1;
+		const currentGroup = await this.getGroup(initial.group_id);
+		if (!currentGroup) throw new Error("group_not_found");
+		if (currentGroup.archived_at) throw new Error("group_archived");
+		const saved = await this.getInviteByTokenForInspection(_opts.token);
+		if (!saved) throw new Error("invite_invalid");
+		if (
+			saved.bound_device_id !== _opts.deviceId ||
+			saved.bound_public_key !== _opts.publicKey ||
+			saved.bound_fingerprint !== _opts.fingerprint
+		) {
+			throw new Error("invite_already_bound");
+		}
+		if (
+			saved.recipient_actor_id !== _opts.recipientActorId ||
+			saved.recipient_display_name !== _opts.recipientDisplayName ||
+			saved.recipient_device_display_name !== _opts.deviceDisplayName
+		) {
+			throw new Error("invite_identity_conflict");
+		}
+		if (!accepted) {
+			await this.db
+				.prepare(`UPDATE enrolled_devices SET identity_id = ?
+					WHERE group_id = ? AND device_id = ? AND identity_id IS NULL AND enabled = 1
+						AND public_key = ? AND fingerprint = ?`)
+				.bind(
+					_opts.recipientActorId,
+					saved.group_id,
+					_opts.deviceId,
+					_opts.publicKey,
+					_opts.fingerprint,
+				)
+				.run();
+		}
+		const enrollment = await this.getEnrollment(saved.group_id, _opts.deviceId);
+		if (!enrollment) throw new Error("invite_acceptance_incomplete");
+		if (enrollment.identity_id !== _opts.recipientActorId) {
+			throw new Error("invite_identity_conflict");
+		}
+		const seed = saved.inviter_device_id
+			? await this.getEnrollment(saved.group_id, saved.inviter_device_id)
+			: null;
+		const grant = saved.bootstrap_grant_id
+			? await this.getBootstrapGrant(saved.bootstrap_grant_id)
+			: null;
+		return {
+			status: accepted ? "accepted" : "existing",
+			invite: saved,
+			enrollment,
+			seed_enrollment: seed,
+			bootstrap_grant: grant,
+		};
 	}
 
 	async listInvites(_groupId: string): Promise<CoordinatorInvite[]> {
 		return (
 			await allRows<CoordinatorInvite>(
 				this.db
-					.prepare(`SELECT invite_id, group_id, token, policy, expires_at, created_at, created_by, team_name_snapshot, revoked_at
+					.prepare(`SELECT ${INVITE_COLUMNS}
 					 FROM coordinator_invites WHERE group_id = ?
 					 ORDER BY created_at DESC`)
 					.bind(_groupId),
@@ -613,11 +1702,43 @@ export class D1CoordinatorStore implements CoordinatorStore {
 		const groupId = opts.groupId.trim();
 		const requestingDeviceId = opts.requestingDeviceId.trim();
 		const requestedDeviceId = opts.requestedDeviceId.trim();
+		const hasExpectedIncomingRequestId = opts.expectedIncomingRequestId !== undefined;
+		const expectedIncomingRequestId = opts.expectedIncomingRequestId?.trim() ?? "";
 		if (!groupId || !requestingDeviceId || !requestedDeviceId) {
 			throw new Error("groupId, requestingDeviceId, and requestedDeviceId are required.");
 		}
 		if (requestingDeviceId === requestedDeviceId) {
 			throw new Error("requesting and requested device ids must differ.");
+		}
+		if (hasExpectedIncomingRequestId) {
+			const resolvedAt = nowISO();
+			const changes = await runChanges(
+				this.db
+					.prepare(`UPDATE coordinator_reciprocal_approvals
+						 SET status = 'completed', resolved_at = ?
+						 WHERE request_id = ?
+						   AND group_id = ?
+						   AND requesting_device_id = ?
+						   AND requested_device_id = ?
+						   AND status = 'pending'`)
+					.bind(
+						resolvedAt,
+						expectedIncomingRequestId,
+						groupId,
+						requestedDeviceId,
+						requestingDeviceId,
+					),
+			);
+			if (changes !== 1) {
+				throw new CoordinatorReciprocalApprovalRequestChangedError();
+			}
+			const completed = await firstRow<CoordinatorReciprocalApproval>(
+				this.db
+					.prepare(`SELECT request_id, group_id, requesting_device_id, requested_device_id, status, created_at, resolved_at
+						 FROM coordinator_reciprocal_approvals WHERE request_id = ?`)
+					.bind(expectedIncomingRequestId),
+			);
+			return rowToRecord<CoordinatorReciprocalApproval>(completed);
 		}
 		const pendingPair = reciprocalPendingPair(requestingDeviceId, requestedDeviceId);
 		const existing = await firstRow<CoordinatorReciprocalApproval>(
@@ -751,6 +1872,348 @@ export class D1CoordinatorStore implements CoordinatorStore {
 				.bind(grantId),
 		);
 		return rowToRecord<CoordinatorBootstrapGrant>(row);
+	}
+
+	private async getScope(scopeId: string): Promise<CoordinatorScope | null> {
+		const row = await firstRow<CoordinatorScope>(
+			this.db
+				.prepare(`SELECT scope_id, label, kind, authority_type, coordinator_id, group_id,
+						manifest_issuer_device_id, membership_epoch, manifest_hash, status, created_at, updated_at
+					 FROM coordinator_scopes WHERE scope_id = ?`)
+				.bind(scopeId),
+		);
+		return row ? rowToRecord<CoordinatorScope>(row) : null;
+	}
+
+	private async getScopeMembership(
+		scopeId: string,
+		deviceId: string,
+	): Promise<CoordinatorScopeMembership | null> {
+		const row = await firstRow<CoordinatorScopeMembership>(
+			this.db
+				.prepare(`SELECT scope_id, device_id, role, status, membership_epoch, coordinator_id, group_id,
+						manifest_issuer_device_id, manifest_hash, signed_manifest_json, updated_at
+					 FROM coordinator_scope_memberships
+					 WHERE scope_id = ? AND device_id = ?`)
+				.bind(scopeId, deviceId),
+		);
+		return row ? rowToRecord<CoordinatorScopeMembership>(row) : null;
+	}
+
+	async createScope(opts: CoordinatorCreateScopeInput): Promise<CoordinatorScope> {
+		const normalized = normalizeCreateScopeInput(opts);
+		if (await this.getScope(normalized.scopeId)) throw new Error("scopeId already exists.");
+		const now = nowISO();
+		await this.db
+			.prepare(`INSERT INTO coordinator_scopes(
+					scope_id, label, kind, authority_type, coordinator_id, group_id,
+					manifest_issuer_device_id, membership_epoch, manifest_hash, status, created_at, updated_at
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+			.bind(
+				normalized.scopeId,
+				normalized.label,
+				normalized.kind,
+				normalized.authorityType,
+				normalized.coordinatorId,
+				normalized.groupId,
+				normalized.manifestIssuerDeviceId,
+				normalized.membershipEpoch,
+				normalized.manifestHash,
+				normalized.status,
+				now,
+				now,
+			)
+			.run();
+		const scope = await this.getScope(normalized.scopeId);
+		if (!scope) throw new Error("scope insert returned no row");
+		return scope;
+	}
+
+	async updateScope(opts: CoordinatorUpdateScopeInput): Promise<CoordinatorScope | null> {
+		const scopeId = clean(opts.scopeId);
+		const existing = scopeId ? await this.getScope(scopeId) : null;
+		if (!existing) return null;
+		const normalized = normalizeUpdateScopeInput(opts, existing);
+		await this.db
+			.prepare(`UPDATE coordinator_scopes
+				 SET label = ?,
+					 kind = ?,
+					 authority_type = ?,
+					 coordinator_id = ?,
+					 group_id = ?,
+					 manifest_issuer_device_id = ?,
+					 membership_epoch = ?,
+					 manifest_hash = ?,
+					 status = ?,
+					 updated_at = ?
+				 WHERE scope_id = ?`)
+			.bind(
+				normalized.label,
+				normalized.kind,
+				normalized.authorityType,
+				normalized.coordinatorId,
+				normalized.groupId,
+				normalized.manifestIssuerDeviceId,
+				normalized.membershipEpoch,
+				normalized.manifestHash,
+				normalized.status,
+				nowISO(),
+				normalized.scopeId,
+			)
+			.run();
+		return await this.getScope(normalized.scopeId);
+	}
+
+	async listScopes(opts: CoordinatorListScopesInput = {}): Promise<CoordinatorScope[]> {
+		const where: string[] = [];
+		const params: unknown[] = [];
+		const coordinatorId = clean(opts.coordinatorId);
+		const groupId = clean(opts.groupId);
+		const status = clean(opts.status);
+		if (coordinatorId) {
+			where.push("coordinator_id = ?");
+			params.push(coordinatorId);
+		}
+		if (groupId) {
+			where.push("group_id = ?");
+			params.push(groupId);
+		}
+		if (status) {
+			where.push("status = ?");
+			params.push(status);
+		} else if (!opts.includeInactive) {
+			where.push("status = 'active'");
+		}
+		const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+		const statement =
+			this.db.prepare(`SELECT scope_id, label, kind, authority_type, coordinator_id, group_id,
+				manifest_issuer_device_id, membership_epoch, manifest_hash, status, created_at, updated_at
+			 FROM coordinator_scopes ${whereSql}
+			 ORDER BY coordinator_id ASC, group_id ASC, scope_id ASC`);
+		return (
+			await allRows<CoordinatorScope>(params.length ? statement.bind(...params) : statement)
+		).map((row) => rowToRecord<CoordinatorScope>(row));
+	}
+
+	async grantScopeMembership(
+		opts: CoordinatorGrantScopeMembershipInput,
+	): Promise<CoordinatorScopeMembership> {
+		const effectId = normalizeMembershipEffectId(opts.effectId);
+		const requestJson = grantMembershipEffectRequestJson(opts);
+		const priorReceipt = await getMembershipEffectReceipt(this.db, effectId);
+		if (priorReceipt) {
+			assertMatchingMembershipEffectReceipt(priorReceipt, "grant", requestJson);
+			return membershipFromEffectReceipt(priorReceipt);
+		}
+		const scopeId = clean(opts.scopeId);
+		const deviceId = clean(opts.deviceId);
+		const scope = scopeId ? await this.getScope(scopeId) : null;
+		if (!scope) throw new CoordinatorMembershipError("scope_not_found");
+		if (scope.status !== "active") throw new CoordinatorMembershipError("scope_inactive");
+		const existing = scopeId && deviceId ? await this.getScopeMembership(scopeId, deviceId) : null;
+		const normalized = normalizeGrantInput(opts, scope, existing);
+		if (normalized.groupId) {
+			const enrollment = await this.getEnrollment(normalized.groupId, normalized.deviceId);
+			if (!enrollment) {
+				throw new CoordinatorMembershipError("device_not_enrolled");
+			}
+		}
+		const now = nowISO();
+		await runAuditedBatch(this.db, [
+			this.db
+				.prepare(`INSERT INTO coordinator_scope_memberships(
+					scope_id, device_id, role, status, membership_epoch, coordinator_id, group_id,
+					manifest_issuer_device_id, manifest_hash, signed_manifest_json, updated_at
+				) SELECT ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?
+				WHERE NOT EXISTS (
+					SELECT 1 FROM coordinator_scope_membership_effect_receipts WHERE effect_id = ?
+				)
+				ON CONFLICT(scope_id, device_id) DO UPDATE SET
+					role = excluded.role,
+					status = 'active',
+					membership_epoch = excluded.membership_epoch,
+					coordinator_id = excluded.coordinator_id,
+					group_id = excluded.group_id,
+					manifest_issuer_device_id = excluded.manifest_issuer_device_id,
+					manifest_hash = excluded.manifest_hash,
+					signed_manifest_json = excluded.signed_manifest_json,
+					updated_at = excluded.updated_at
+				WHERE excluded.membership_epoch > coordinator_scope_memberships.membership_epoch
+				   OR (
+					excluded.membership_epoch = coordinator_scope_memberships.membership_epoch
+					AND coordinator_scope_memberships.status != 'revoked'
+				   )`)
+				.bind(
+					normalized.scopeId,
+					normalized.deviceId,
+					normalized.role,
+					normalized.membershipEpoch,
+					normalized.coordinatorId,
+					normalized.groupId,
+					normalized.manifestIssuerDeviceId,
+					normalized.manifestHash,
+					normalized.signedManifestJson,
+					now,
+					effectId,
+				),
+			prepareGrantEffectReceipt(this.db, {
+				effectId,
+				requestJson,
+				scopeId: normalized.scopeId,
+				deviceId: normalized.deviceId,
+				createdAt: now,
+			}),
+			prepareMembershipAuditFromCurrentRow(this.db, {
+				effectId,
+				requestJson,
+				action: "grant",
+				previous: existing,
+				scopeId: normalized.scopeId,
+				deviceId: normalized.deviceId,
+				status: "active",
+				membershipEpoch: normalized.membershipEpoch,
+				updatedAt: now,
+				actorType: normalized.actorType,
+				actorId: normalized.actorId,
+				createdAt: now,
+			}),
+		]);
+		const receipt = await getMembershipEffectReceipt(this.db, effectId);
+		if (!receipt) throw new Error("scope membership grant was not applied.");
+		assertMatchingMembershipEffectReceipt(receipt, "grant", requestJson);
+		return membershipFromEffectReceipt(receipt);
+	}
+
+	async revokeScopeMembership(opts: CoordinatorRevokeScopeMembershipInput): Promise<boolean> {
+		const scopeId = clean(opts.scopeId);
+		const deviceId = clean(opts.deviceId);
+		if (!scopeId || !deviceId) throw new Error("scopeId and deviceId are required.");
+		const effectId = normalizeMembershipEffectId(opts.effectId);
+		const requestJson = revokeMembershipEffectRequestJson(opts);
+		const priorReceipt = await getMembershipEffectReceipt(this.db, effectId);
+		if (priorReceipt) {
+			assertMatchingMembershipEffectReceipt(priorReceipt, "revoke", requestJson);
+			return priorReceipt.outcome_applied === 1;
+		}
+		const membershipEpoch =
+			opts.membershipEpoch == null ? null : normalizeEpoch(opts.membershipEpoch);
+		const requestedGroupId = clean(opts.groupId);
+		const scope = requestedGroupId ? await this.getScope(scopeId) : null;
+		if (requestedGroupId && requestedGroupId !== scope?.group_id) {
+			throw new CoordinatorMembershipError("scope_group_mismatch");
+		}
+		const existing = await this.getScopeMembership(scopeId, deviceId);
+		if (membershipEpoch != null && existing && membershipEpoch <= existing.membership_epoch) {
+			throw new Error("membershipEpoch must increase on revoke.");
+		}
+		const now = nowISO();
+		const revokedEpoch = membershipEpoch ?? (existing?.membership_epoch ?? -1) + 1;
+		const updateStatement = this.db
+			.prepare(`UPDATE coordinator_scope_memberships
+						 SET status = 'revoked',
+							 membership_epoch = CASE WHEN ? IS NULL THEN membership_epoch + 1 ELSE ? END,
+							 manifest_hash = COALESCE(?, manifest_hash),
+							 signed_manifest_json = COALESCE(?, signed_manifest_json),
+							 updated_at = ?
+						 WHERE scope_id = ? AND device_id = ? AND membership_epoch = ? AND status = ?
+						   AND NOT EXISTS (
+							SELECT 1 FROM coordinator_scope_membership_effect_receipts WHERE effect_id = ?
+						   )`)
+			.bind(
+				membershipEpoch,
+				membershipEpoch,
+				clean(opts.manifestHash),
+				clean(opts.signedManifestJson),
+				now,
+				scopeId,
+				deviceId,
+				existing?.membership_epoch ?? -1,
+				existing?.status ?? "",
+				effectId,
+			);
+		const receiptStatement = prepareRevokeEffectReceipt(this.db, {
+			effectId,
+			requestJson,
+			scopeId,
+			deviceId,
+			createdAt: now,
+		});
+		const auditStatement = prepareMembershipAuditFromCurrentRow(this.db, {
+			effectId,
+			requestJson,
+			action: "revoke",
+			previous: existing,
+			scopeId,
+			deviceId,
+			status: "revoked",
+			membershipEpoch: revokedEpoch,
+			updatedAt: now,
+			actorType: clean(opts.actorType),
+			actorId: clean(opts.actorId),
+			createdAt: now,
+		});
+		try {
+			await runAuditedBatch(this.db, [updateStatement, receiptStatement, auditStatement]);
+		} catch (err) {
+			const current = await this.getScopeMembership(scopeId, deviceId);
+			if (
+				existing &&
+				(!current ||
+					current.membership_epoch !== existing.membership_epoch ||
+					current.status !== existing.status)
+			) {
+				return false;
+			}
+			throw err;
+		}
+		const receipt = await getMembershipEffectReceipt(this.db, effectId);
+		if (!receipt) throw new Error("scope membership revoke receipt was not persisted.");
+		assertMatchingMembershipEffectReceipt(receipt, "revoke", requestJson);
+		return receipt.outcome_applied === 1;
+	}
+
+	async listScopeMemberships(
+		scopeId: string,
+		includeRevoked = false,
+	): Promise<CoordinatorScopeMembership[]> {
+		const normalizedScopeId = clean(scopeId);
+		if (!normalizedScopeId) throw new Error("scopeId is required.");
+		const statusWhere = includeRevoked ? "" : "AND status = 'active'";
+		return (
+			await allRows<CoordinatorScopeMembership>(
+				this.db
+					.prepare(`SELECT scope_id, device_id, role, status, membership_epoch, coordinator_id, group_id,
+							manifest_issuer_device_id, manifest_hash, signed_manifest_json, updated_at
+						 FROM coordinator_scope_memberships
+						 WHERE scope_id = ? ${statusWhere}
+						 ORDER BY device_id ASC`)
+					.bind(normalizedScopeId),
+			)
+		).map((row) => rowToRecord<CoordinatorScopeMembership>(row));
+	}
+
+	async listScopeMembershipAuditEvents(
+		opts: CoordinatorListScopeMembershipAuditInput,
+	): Promise<CoordinatorScopeMembershipAuditEvent[]> {
+		const scopeId = clean(opts.scopeId);
+		if (!scopeId) throw new Error("scopeId is required.");
+		const deviceId = clean(opts.deviceId);
+		const limit = normalizeAuditLimit(opts.limit);
+		const where = deviceId ? "scope_id = ? AND device_id = ?" : "scope_id = ?";
+		const params = deviceId ? [scopeId, deviceId, limit] : [scopeId, limit];
+		return (
+			await allRows<CoordinatorScopeMembershipAuditEvent>(
+				this.db
+					.prepare(`SELECT event_id, effect_id, action, scope_id, device_id, role, status, membership_epoch,
+							previous_role, previous_status, previous_membership_epoch,
+							coordinator_id, group_id, actor_type, actor_id, manifest_hash, created_at
+						 FROM coordinator_scope_membership_audit_log
+						 WHERE ${where}
+						 ORDER BY event_id ASC
+						 LIMIT ?`)
+					.bind(...params),
+			)
+		).map((row) => rowToRecord<CoordinatorScopeMembershipAuditEvent>(row));
 	}
 
 	async getBootstrapGrant(grantId: string): Promise<CoordinatorBootstrapGrant | null> {

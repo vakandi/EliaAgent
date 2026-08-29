@@ -1,9 +1,14 @@
 import { connect, resolveDbPath } from "./db.js";
 import {
+	evaluateExtractionStructure,
 	evaluateSessionExtractionItems,
 	getSessionExtractionEvalScenario,
 } from "./extraction-eval.js";
-import { decideExtractionReplayTier } from "./extraction-tier-routing.js";
+import {
+	buildTieredObserverConfig,
+	decideExtractionReplayTier,
+	type ExtractionReplayTierRoutingInput,
+} from "./extraction-tier-routing.js";
 import {
 	budgetToolEvents,
 	eventToToolEvent,
@@ -12,7 +17,11 @@ import {
 	projectAdapterToolEvent,
 } from "./ingest-events.js";
 import { isLowSignalObservation } from "./ingest-filters.js";
-import { buildObserverPrompt, truncateObserverTranscript } from "./ingest-prompts.js";
+import {
+	buildObserverPrompt,
+	buildObserverRepairPrompt,
+	truncateObserverTranscript,
+} from "./ingest-prompts.js";
 import {
 	buildTranscript,
 	deriveRequest,
@@ -30,24 +39,21 @@ import type {
 	SessionContext,
 	ToolEvent,
 } from "./ingest-types.js";
-import { parseObserverResponse } from "./ingest-xml-parser.js";
+import {
+	parseObserverResponse,
+	SUPPORTED_OBSERVATION_KINDS,
+	shouldPreferRepairedObserverResponse,
+	shouldRepairObserverResponse,
+} from "./ingest-xml-parser.js";
 import {
 	type ObserverClient,
 	ObserverClient as ObserverClientImpl,
 	type ObserverConfig,
+	type ObserverStatus,
+	type ObserverTokenUsage,
 } from "./observer-client.js";
 import { resolveProject } from "./project.js";
 import { buildSessionContext } from "./raw-event-flush.js";
-
-const ALLOWED_KINDS = new Set([
-	"bugfix",
-	"feature",
-	"refactor",
-	"change",
-	"discovery",
-	"decision",
-	"exploration",
-]);
 
 function normalizePath(path: string, repoRoot: string | null): string {
 	if (!path) return "";
@@ -61,6 +67,15 @@ function normalizePath(path: string, repoRoot: string | null): string {
 
 function normalizePaths(paths: string[], repoRoot: string | null): string[] {
 	return paths.map((p) => normalizePath(p, repoRoot)).filter(Boolean);
+}
+
+function snapshotObserverStatus(observer: ObserverClient): ObserverStatus {
+	const status = observer.getStatus();
+	return {
+		...status,
+		auth: { ...status.auth },
+		...(status.lastError ? { lastError: { ...status.lastError } } : {}),
+	};
 }
 
 function summaryBody(summary: ParsedSummary): string {
@@ -105,36 +120,98 @@ async function observeStructuredOutput(
 	observer: ObserverClient,
 	system: string,
 	user: string,
-): Promise<{ raw: string | null; parsed: ParsedOutput; provider: string; model: string }> {
+): Promise<{
+	initial: {
+		raw: string | null;
+		parsed: ParsedOutput;
+		provider: string;
+		model: string;
+		elapsedMs: number | null;
+		usage: ObserverTokenUsage | null;
+		status: ObserverStatus;
+	};
+	repaired: {
+		raw: string | null;
+		parsed: ParsedOutput;
+		provider: string;
+		model: string;
+		elapsedMs: number | null;
+		usage: ObserverTokenUsage | null;
+		status: ObserverStatus;
+	} | null;
+}> {
 	const first = await observer.observe(system, user);
 	const firstParsed = first.raw
 		? parseObserverResponse(first.raw)
 		: { observations: [], summary: null, skipSummaryReason: null };
-	if (
-		!first.raw ||
-		firstParsed.observations.length > 0 ||
-		firstParsed.summary !== null ||
-		firstParsed.skipSummaryReason !== null
-	) {
-		return {
-			raw: first.raw,
-			parsed: firstParsed,
-			provider: first.provider,
-			model: first.model,
-		};
+	const initial = {
+		raw: first.raw,
+		parsed: firstParsed,
+		provider: first.provider,
+		model: first.model,
+		elapsedMs: first.elapsedMs ?? null,
+		usage: first.usage ?? null,
+		status: snapshotObserverStatus(observer),
+	};
+	if (!shouldRepairObserverResponse(first.raw, firstParsed)) {
+		return { initial, repaired: null };
 	}
 
-	const repairSystem = `${system}\n\nYour previous reply was invalid because it did not follow the required XML-only schema. Rewrite the same analysis as valid XML only. Do not include prose outside XML.`;
-	const repairUser = `${user}\n\nPrevious invalid response to rewrite as valid XML:\n${first.raw}`;
-	const repaired = await observer.observe(repairSystem, repairUser);
+	const repairPrompt = buildObserverRepairPrompt(
+		system,
+		user,
+		first.raw as string,
+		observer.maxChars,
+	);
+	let repaired: Awaited<ReturnType<ObserverClient["observe"]>>;
+	try {
+		repaired = await observer.observe(repairPrompt.system, repairPrompt.user);
+	} catch {
+		return { initial, repaired: null };
+	}
 	const repairedParsed = repaired.raw
 		? parseObserverResponse(repaired.raw)
 		: { observations: [], summary: null, skipSummaryReason: null };
 	return {
-		raw: repaired.raw,
-		parsed: repairedParsed,
-		provider: repaired.provider,
-		model: repaired.model,
+		initial,
+		repaired: {
+			raw: repaired.raw,
+			parsed: repairedParsed,
+			provider: repaired.provider,
+			model: repaired.model,
+			elapsedMs: repaired.elapsedMs ?? null,
+			usage: repaired.usage ?? null,
+			status: snapshotObserverStatus(observer),
+		},
+	};
+}
+
+function sumObserverUsage(
+	initial: ObserverTokenUsage | null,
+	repaired: ObserverTokenUsage | null,
+	repairApplied: boolean,
+): ObserverTokenUsage | null {
+	if (!initial || (repairApplied && !repaired)) return null;
+	if (!repairApplied) return { ...initial };
+	if (!repaired) return null;
+	const totalTokens =
+		initial.totalTokens != null && repaired.totalTokens != null
+			? initial.totalTokens + repaired.totalTokens
+			: undefined;
+	const cacheReadInputTokens =
+		initial.cacheReadInputTokens != null || repaired.cacheReadInputTokens != null
+			? (initial.cacheReadInputTokens ?? 0) + (repaired.cacheReadInputTokens ?? 0)
+			: undefined;
+	const cacheCreationInputTokens =
+		initial.cacheCreationInputTokens != null || repaired.cacheCreationInputTokens != null
+			? (initial.cacheCreationInputTokens ?? 0) + (repaired.cacheCreationInputTokens ?? 0)
+			: undefined;
+	return {
+		inputTokens: initial.inputTokens + repaired.inputTokens,
+		outputTokens: initial.outputTokens + repaired.outputTokens,
+		...(totalTokens != null ? { totalTokens } : {}),
+		...(cacheReadInputTokens != null ? { cacheReadInputTokens } : {}),
+		...(cacheCreationInputTokens != null ? { cacheCreationInputTokens } : {}),
 	};
 }
 
@@ -158,19 +235,40 @@ export interface ExtractionReplayResult {
 	observer: {
 		provider: string;
 		model: string;
+		transport: string;
+		requestedModel: string;
+		resolvedModel: string | null;
+		modelFallbackApplied: boolean;
+		modelFallbackReason: string | null;
 		tier: "simple" | "rich" | null;
 		tierReasons: string[];
 		openaiUseResponses: boolean;
 		reasoningEffort: string | null;
 		reasoningSummary: string | null;
-		maxOutputTokens: number;
+		maxOutputTokens: number | null;
 		temperature: number | null;
 		repairApplied: boolean;
 		initialRaw: string | null;
+		initialElapsedMs: number | null;
+		initialUsage: ObserverTokenUsage | null;
+		initialParsed: ParsedOutput;
+		initialDiagnostics: ReturnType<typeof evaluateExtractionStructure> | null;
+		repairedRaw: string | null;
+		repairedElapsedMs: number | null;
+		repairedUsage: ObserverTokenUsage | null;
+		repairedParsed: ParsedOutput | null;
+		repairedDiagnostics: ReturnType<typeof evaluateExtractionStructure> | null;
 		raw: string | null;
+		totalElapsedMs: number | null;
+		totalUsage: ObserverTokenUsage | null;
 		parsed: ParsedOutput;
+		diagnostics: ReturnType<typeof evaluateExtractionStructure> | null;
 	};
 	observerContext: ObserverContext;
+	initialClassification: ExtractionReplayResult["classification"];
+	repairedClassification: ExtractionReplayResult["classification"] | null;
+	initialEvaluation: ReturnType<typeof evaluateSessionExtractionItems>;
+	repairedEvaluation: ReturnType<typeof evaluateSessionExtractionItems> | null;
 	evaluation: ReturnType<typeof evaluateSessionExtractionItems>;
 }
 
@@ -236,20 +334,6 @@ function classifyReplayResult(input: {
 	};
 }
 
-function isRichReplayCandidate(
-	observerContext: ObserverContext,
-	sessionContext: SessionContext,
-	scenarioThreadCount: number,
-): boolean {
-	const transcriptLength = observerContext.transcript.trim().length;
-	return (
-		(sessionContext.promptCount ?? 0) >= 2 ||
-		(sessionContext.toolCount ?? 0) >= 3 ||
-		transcriptLength >= 1500 ||
-		scenarioThreadCount >= 3
-	);
-}
-
 function buildReplayItems(
 	parsed: ParsedOutput,
 	batch: {
@@ -280,7 +364,7 @@ function buildReplayItems(
 	for (const obs of parsed.observations) {
 		const kind = obs.kind.trim().toLowerCase();
 		if (!kind || (!obs.title && !obs.narrative)) continue;
-		if (!ALLOWED_KINDS.has(kind)) continue;
+		if (!SUPPORTED_OBSERVATION_KINDS.has(kind)) continue;
 		if (isLowSignalObservation(obs.title) || isLowSignalObservation(obs.narrative)) continue;
 		const bodyParts: string[] = [];
 		if (obs.narrative) bodyParts.push(obs.narrative);
@@ -301,9 +385,11 @@ function buildReplayItems(
 		});
 	}
 	if (parsed.summary && !parsed.skipSummaryReason) {
-		const summary = parsed.summary;
-		summary.filesRead = normalizePaths(summary.filesRead, batch.cwd);
-		summary.filesModified = normalizePaths(summary.filesModified, batch.cwd);
+		const summary = {
+			...parsed.summary,
+			filesRead: normalizePaths(parsed.summary.filesRead, batch.cwd),
+			filesModified: normalizePaths(parsed.summary.filesModified, batch.cwd),
+		};
 		let request = summary.request;
 		if (isTrivialRequest(request)) {
 			const derived = deriveRequest(summary);
@@ -327,50 +413,6 @@ function buildReplayItems(
 		}
 	}
 	return replayItems;
-}
-
-function needsRichSessionRepair(
-	evaluation: ReturnType<typeof evaluateSessionExtractionItems>,
-	observerContext: ObserverContext,
-	sessionContext: SessionContext,
-): boolean {
-	if (!isRichReplayCandidate(observerContext, sessionContext, evaluation.threads.length))
-		return false;
-	if (evaluation.counts.observations === 0 && evaluation.counts.summaries >= 1) return true;
-	return evaluation.counts.observations < 2;
-}
-
-async function observeRichSessionRepair(
-	observer: ObserverClient,
-	baseSystem: string,
-	baseUser: string,
-	initialRaw: string,
-	evaluation: ReturnType<typeof evaluateSessionExtractionItems>,
-): Promise<{ raw: string | null; parsed: ParsedOutput; provider: string; model: string }> {
-	const missingThreads = evaluation.threads
-		.filter((thread) => !thread.observationMatch)
-		.map((thread) => thread.title);
-	const repairSystem = `${baseSystem}
-
-RICH-SESSION REPAIR REQUIREMENT:
-- The previous output under-extracted a rich batch.
-- For a rich session, summary-only output is not acceptable when multiple durable subthreads are present.
-- Return valid XML with one broad <summary> plus at least 2 durable <observation> blocks covering DISTINCT subthreads.
-- Do not repeat the same dominant thread in multiple observations.
-- Choose observations for reusable decisions, learnings, troubleshooting outcomes, or future-facing exploration that would reduce rediscovery in later sessions.`;
-	const repairUser = `${baseUser}
-
-Previous under-extracted XML to repair:
-${initialRaw}
-
-The previous output failed because:
-- observations returned: ${evaluation.counts.observations}
-- total thread coverage: ${evaluation.coverage.totalThreadCoverage}
-- missing observation coverage for: ${missingThreads.length > 0 ? missingThreads.join(", ") : "none recorded"}
-
-Rewrite the analysis as valid XML only.
-Keep the broad summary, but add 2-4 durable observations for distinct subthreads if the transcript supports them.`;
-	return observeStructuredOutput(observer, repairSystem, repairUser);
 }
 
 async function prepareReplayBatch(
@@ -595,52 +637,90 @@ async function replayPreparedBatch(
 	tier: "simple" | "rich" | null,
 	tierReasons: string[],
 ): Promise<ExtractionReplayResult> {
-	const initialResponse = await observeStructuredOutput(observer, prepared.system, prepared.user);
-	let finalResponse = initialResponse;
-	let replayItems = buildReplayItems(finalResponse.parsed, prepared.batch, prepared.sessionContext);
-	let evaluation = evaluateSessionExtractionItems(
-		{ type: "batch", sessionId: prepared.batch.session_id, batchId: prepared.batch.id },
-		{
-			id: prepared.batch.session_id,
-			project: prepared.batch.project,
-			cwd: prepared.batch.cwd ?? process.cwd(),
-			startedAt: prepared.batch.started_at ?? "",
-			endedAt: prepared.batch.ended_at,
-			sessionClass: String(prepared.sessionPost.session_class ?? "unknown"),
-			summaryDisposition: String(prepared.sessionPost.summary_disposition ?? "unknown"),
-		},
-		replayItems,
+	const configuredModel = observer.requestedModel ?? observer.model;
+	const response = await observeStructuredOutput(observer, prepared.system, prepared.user);
+	const requestedModel = configuredModel || response.initial.model;
+	const session = {
+		id: prepared.batch.session_id,
+		project: prepared.batch.project,
+		cwd: prepared.batch.cwd ?? process.cwd(),
+		startedAt: prepared.batch.started_at ?? "",
+		endedAt: prepared.batch.ended_at,
+		sessionClass: String(prepared.sessionPost.session_class ?? "unknown"),
+		summaryDisposition: String(prepared.sessionPost.summary_disposition ?? "unknown"),
+	};
+	const target = {
+		type: "batch" as const,
+		sessionId: prepared.batch.session_id,
+		batchId: prepared.batch.id,
+	};
+	const initialEvaluation = evaluateSessionExtractionItems(
+		target,
+		session,
+		buildReplayItems(response.initial.parsed, prepared.batch, prepared.sessionContext),
 		prepared.scenario,
 	);
-	let repairApplied = false;
-	if (
-		initialResponse.raw &&
-		needsRichSessionRepair(evaluation, prepared.observerContext, prepared.sessionContext)
-	) {
-		repairApplied = true;
-		finalResponse = await observeRichSessionRepair(
-			observer,
-			prepared.system,
-			prepared.user,
-			initialResponse.raw,
-			evaluation,
-		);
-		replayItems = buildReplayItems(finalResponse.parsed, prepared.batch, prepared.sessionContext);
-		evaluation = evaluateSessionExtractionItems(
-			{ type: "batch", sessionId: prepared.batch.session_id, batchId: prepared.batch.id },
-			{
-				id: prepared.batch.session_id,
-				project: prepared.batch.project,
-				cwd: prepared.batch.cwd ?? process.cwd(),
-				startedAt: prepared.batch.started_at ?? "",
-				endedAt: prepared.batch.ended_at,
-				sessionClass: String(prepared.sessionPost.session_class ?? "unknown"),
-				summaryDisposition: String(prepared.sessionPost.summary_disposition ?? "unknown"),
-			},
-			replayItems,
-			prepared.scenario,
-		);
-	}
+	const repairedEvaluation = response.repaired
+		? evaluateSessionExtractionItems(
+				target,
+				session,
+				buildReplayItems(response.repaired.parsed, prepared.batch, prepared.sessionContext),
+				prepared.scenario,
+			)
+		: null;
+	const preferRepaired = response.repaired
+		? shouldPreferRepairedObserverResponse(
+				response.initial.parsed,
+				response.repaired.raw,
+				response.repaired.parsed,
+				response.initial.raw,
+			)
+		: false;
+	const finalResponse = preferRepaired
+		? (response.repaired as NonNullable<typeof response.repaired>)
+		: response.initial;
+	const observerStatus = finalResponse.status;
+	const modelFallbackApplied = observerStatus.modelFallbackApplied === true;
+	const resolvedModel = modelFallbackApplied
+		? (observerStatus.actualModel ?? null)
+		: (observerStatus.actualModel ?? finalResponse.model);
+	const evaluation = preferRepaired
+		? (repairedEvaluation as NonNullable<typeof repairedEvaluation>)
+		: initialEvaluation;
+	const initialClassification = classifyReplayResult({
+		raw: response.initial.raw,
+		evaluation: initialEvaluation,
+	});
+	const repairedClassification = response.repaired
+		? classifyReplayResult({
+				raw: response.repaired.raw,
+				evaluation: repairedEvaluation ?? initialEvaluation,
+			})
+		: null;
+	const initialDiagnostics = evaluateExtractionStructure(
+		response.initial.raw ?? "",
+		response.initial.parsed,
+	);
+	const repairedDiagnostics = response.repaired
+		? evaluateExtractionStructure(response.repaired.raw ?? "", response.repaired.parsed)
+		: null;
+	const repairAttempted = response.repaired !== null;
+	const totalElapsedMs =
+		response.initial.elapsedMs != null && (!repairAttempted || response.repaired?.elapsedMs != null)
+			? response.initial.elapsedMs + (response.repaired?.elapsedMs ?? 0)
+			: null;
+	const totalUsage = sumObserverUsage(
+		response.initial.usage,
+		response.repaired?.usage ?? null,
+		repairAttempted,
+	);
+	const transport =
+		observerStatus.auth.type === "codex_consumer" ||
+		observerStatus.auth.type === "anthropic_consumer"
+			? observerStatus.auth.type
+			: observerStatus.runtime;
+	const reportsRequestLimits = transport !== "codex_consumer";
+	const reportsReasoning = observer.openaiUseResponses || transport === "codex_consumer";
 
 	return {
 		scenario: {
@@ -658,19 +738,42 @@ async function replayPreparedBatch(
 		observer: {
 			provider: finalResponse.provider,
 			model: finalResponse.model,
+			transport,
+			requestedModel,
+			resolvedModel,
+			modelFallbackApplied,
+			modelFallbackReason: observerStatus.modelFallbackReason ?? null,
 			tier,
 			tierReasons,
 			openaiUseResponses: observer.openaiUseResponses,
-			reasoningEffort: observer.reasoningEffort,
-			reasoningSummary: observer.reasoningSummary,
-			maxOutputTokens: observer.maxOutputTokens,
-			temperature: observer.temperature,
-			repairApplied,
-			initialRaw: initialResponse.raw,
+			reasoningEffort: reportsReasoning ? observer.reasoningEffort : null,
+			reasoningSummary: reportsReasoning ? observer.reasoningSummary : null,
+			maxOutputTokens: reportsRequestLimits ? observer.maxOutputTokens : null,
+			temperature: reportsRequestLimits ? observer.temperature : null,
+			repairApplied: preferRepaired,
+			initialRaw: response.initial.raw,
+			initialElapsedMs: response.initial.elapsedMs,
+			initialUsage: response.initial.usage,
+			initialParsed: response.initial.parsed,
+			initialDiagnostics,
+			repairedRaw: response.repaired?.raw ?? null,
+			repairedElapsedMs: response.repaired?.elapsedMs ?? null,
+			repairedUsage: response.repaired?.usage ?? null,
+			repairedParsed: response.repaired?.parsed ?? null,
+			repairedDiagnostics,
 			raw: finalResponse.raw,
+			totalElapsedMs,
+			totalUsage,
 			parsed: finalResponse.parsed,
+			diagnostics: preferRepaired
+				? (repairedDiagnostics as NonNullable<typeof repairedDiagnostics>)
+				: initialDiagnostics,
 		},
 		observerContext: prepared.observerContext,
+		initialClassification,
+		repairedClassification,
+		initialEvaluation,
+		repairedEvaluation,
 		evaluation,
 	};
 }
@@ -693,6 +796,23 @@ export async function replayBatchExtraction(
 	return replayPreparedBatch(prepared, observer, null, []);
 }
 
+export function buildTierRoutedReplayObserverConfig(
+	baseObserver: Pick<ObserverClient, "toConfig">,
+	analysis: ExtractionReplayTierRoutingInput,
+): {
+	observer: ObserverConfig;
+	tier: "simple" | "rich";
+	reasons: string[];
+} {
+	const baseConfig = baseObserver.toConfig();
+	const decision = decideExtractionReplayTier(analysis);
+	return {
+		observer: buildTieredObserverConfig(baseConfig, decision),
+		tier: decision.tier,
+		reasons: decision.reasons,
+	};
+}
+
 export async function replayBatchExtractionWithTierRouting(
 	dbPath: string | undefined,
 	baseConfig: ObserverConfig,
@@ -709,10 +829,7 @@ export async function replayBatchExtractionWithTierRouting(
 		...opts,
 		observerMaxChars: opts.observerMaxChars ?? baseObserver.maxChars,
 	});
-	const decision = decideExtractionReplayTier(prepared.analysis);
-	const observer = new ObserverClientImpl({
-		...baseConfig,
-		...decision.observer,
-	});
-	return replayPreparedBatch(prepared, observer, decision.tier, decision.reasons);
+	const routed = buildTierRoutedReplayObserverConfig(baseObserver, prepared.analysis);
+	const observer = new ObserverClientImpl(routed.observer);
+	return replayPreparedBatch(prepared, observer, routed.tier, routed.reasons);
 }

@@ -6,7 +6,7 @@ codemem has five main pieces: **adapters** that capture shell/runtime activity, 
 
 | Component | What it does | Key files |
 |-----------|-------------|-----------|
-| Adapters | Capture OpenCode/Claude events and enqueue raw events for ingest | `packages/opencode-plugin/.opencode/plugins/codemem.js`, `plugins/claude/scripts/ingest-hook.sh`, `packages/core/src/claude-hooks.ts` |
+| Adapters | Capture and normalize agent events before enqueueing raw events | `packages/opencode-plugin/.opencode/plugins/codemem.js`, `plugins/claude/scripts/ingest-hook.mjs`, `plugins/codex/scripts/ingest-hook.mjs`, `packages/core/src/claude-hooks.ts`, `packages/core/src/codex-hooks.ts` |
 | Ingest pipeline | Extracts tool events, builds transcripts, runs the observer | `packages/core/src/ingest-pipeline.ts`, `packages/core/src/ingest-events.ts` |
 | Observer | Produces typed observations and session summaries from transcripts | `packages/core/src/ingest-prompts.ts`, `packages/core/src/ingest-xml-parser.ts` |
 | Store | SQLite persistence for sessions, memories, artifacts, embeddings | `packages/core/src/store.ts`, `packages/core/src/schema.ts` |
@@ -25,8 +25,10 @@ flowchart LR
     OC["OpenCode"] -->|tool/message events| OCA["OpenCode adapter"]
     OCA -->|POST /api/raw-events| VW["Viewer API"]
     OCA -->|fallback: enqueue-raw-event CLI| DB
-    CH["Claude hooks"] -->|POST /api/claude-hooks| VW
-    CH -->|fallback: claude-hook-ingest direct enqueue| DB
+    CH["Claude hooks"] -->|normalize once; POST /api/raw-events| VW
+    CH -->|same envelope: enqueue-raw-event| DB
+    CX["Codex hooks"] -->|normalize once; POST /api/raw-events| VW
+    CX -->|same envelope: enqueue-raw-event/spool| DB
     VW --> DB["SQLite"]
     DB -->|flush batch claimed| IN["Ingest pipeline"]
     IN --> OB["Observer"]
@@ -37,8 +39,8 @@ flowchart LR
 ```
 
 1. Adapters capture tool/conversation lifecycle events and normalize them into raw events with optional `_adapter` envelopes.
-2. OpenCode streams raw events to the viewer ingest API (`POST /api/raw-events`) with preflight checks (`GET /api/raw-events/status`) and can fall back to CLI queue enqueue when stream writes fail.
-3. Claude hook ingestion posts to `POST /api/claude-hooks` first and falls back to `codemem claude-hook-ingest` direct enqueue when the local viewer API is unavailable.
+2. OpenCode streams raw events to the viewer ingest API (`POST /api/raw-events`) with preflight checks (`GET /api/raw-events/status`) and can fall back to CLI queue enqueue when stream writes fail. Prompt-time packs and prompt-pack ledger transitions also use viewer POST APIs first, with CLI fallback only for retryable transport or version failures.
+3. Claude and Codex use checked-in, dependency-free normalizers generated from their core TypeScript implementations. Each detached event wrapper normalizes once, posts the exact envelope to `POST /api/raw-events`, and reuses that serialization for `enqueue-raw-event` or durable spool fallback. The canonical endpoint accepts additive adapter metadata. Named hook routes remain compatibility aliases used by older packaged or plugin-free CLI paths; the current packaged-wrapper audit found no named-route strings, so the aliases are not primary but cannot be removed yet.
 4. The viewer/store persists raw events and queues durable flush batches.
 5. Idle and sweeper workers claim batches and run them through ingest.
 6. Before building session context, raw events are passed through `normalizeEventsForSessionContext` (in `ingest-transcript.ts`) which projects adapter-enveloped events (`_adapter` schema v1.0) into the flat `user_prompt` / `tool.execute.after` shapes that `buildSessionContext` scans. This is critical for Claude Code hook events which always arrive wrapped in the adapter envelope.
@@ -59,7 +61,7 @@ Support tiers describe operational expectations for each adapter path:
 |---|---|---|
 | OpenCode plugin | Supported | Primary reference adapter for lifecycle events and injection behavior. |
 | Claude hooks/plugin | Supported | Hook-first queue path with CLI/runtime fallback and parity slices tracked in adapter stack PRs. |
-| Codex shell integration | Experimental | Planned as adapter-native ingestion path; no user-facing support contract yet. |
+| Codex plugin (hooks + MCP) | Experimental (early beta) | Functional capture pipeline (`plugins/codex/`, `packages/core/src/codex-hooks.ts`) dogfooded end-to-end: edge normalization → `POST /api/raw-events` → observer → memories. Prompt-time injection present and env-gated but not fully validated on strict models. Not yet promoted to a stable support tier. |
 | Windsurf integration | Experimental | Planned via shared adapter contract after OpenCode/Claude stabilization. |
 | Cursor integration | Experimental | Planned via shared adapter contract after OpenCode/Claude stabilization. |
 
@@ -161,7 +163,27 @@ flowchart TD
 
 ## Context injection
 
-The plugin injects a memory pack into the system prompt on every turn. This is the primary way codemem delivers value — it happens automatically, no manual steps required.
+The plugin injects a memory pack automatically on every turn. In OpenCode, volatile recall output is appended beside the latest user message by default so provider prompt caches can keep the stable system/history prefix.
+
+### Packaged Claude and Codex hooks
+
+The packaged `UserPromptSubmit` hooks are dependency-free direct Viewer clients. Each performs a
+payload-free profile handshake, accepts an overlapping protocol range (a missing minimum means a
+single-version legacy profile), then sends an identity-gated `POST /api/pack`. The returned pack is
+rendered as host-compatible `additionalContext`; delivery-ledger recording is best-effort and capped at
+500 ms. Prompt and event HTTP reject non-loopback Viewer hosts.
+
+Healthy retrieval starts no `codemem` or `npx` prompt child. Retryable Viewer transport, version,
+profile mismatch, or structured request errors before a compatible handshake use one local compatibility
+chain. Validated request errors after compatibility is established, plus policy, authorization, and
+compatible-profile contract defects, fail closed. Codex applies a total 4.5-second prompt-output budget
+within its 5-second host timeout. Detached event ingest is independent of prompt retrieval: it normalizes
+once and posts the same envelope to `POST /api/raw-events`, reusing it for enqueue/spool fallback.
+
+Compatibility tests simulate both supported version-skew windows: a protocol-v1 client accepts a
+protocol-v2/min-v1 Viewer, and a current client interprets a legacy v1 profile without a minimum as a
+single-version profile. These are simulated compatibility windows, not execution against historical
+artifacts.
 
 Feed and retrieval surfaces can scope the corpus without splitting storage into separate pools:
 
@@ -199,28 +221,36 @@ In plugin mode, these can be overridden via `CODEMEM_INJECT_LIMIT` and `CODEMEM_
 
 ### Injection hook
 
-The plugin uses `experimental.chat.system.transform` to append the pack text to the system prompt. It caches the pack per session and re-fetches when the query changes (i.e., when prompts or file activity shift context). A toast notification shows injection stats on first inject per session.
+The OpenCode plugin uses `experimental.chat.messages.transform` to append the current pack text to the latest user message. Earlier injected message blocks are cached by message ID and replayed byte-for-byte on later turns, preserving the stable prompt prefix for provider prompt caches while only the newest user turn receives volatile recall output. Scope revocation affects newly built packs, but historical injected blocks in the same OpenCode session are not retroactively scrubbed; start a new session after revoking access if prompt history must be clean. Set `CODEMEM_INJECT_SURFACE=system` to use the legacy `experimental.chat.system.transform` system-prompt surface. A toast notification shows injection stats on first inject per session.
+
+Before each pack build, the plugin derives stable attempt and request identities from safe request components so an exact adapter retry is idempotent. At the tool-event boundary, repository-contained absolute working-set paths are converted to repository-relative `/` paths; outside-repository, traversing, blank, and overlong paths are discarded. The same normalized set feeds pack retrieval and its ledger metadata. Before sending prompt-derived POST data, the plugin performs a payload-free, redirect-disabled handshake that verifies the Codemem viewer marker plus resolved database, identity/config, compression, and embedding targets. The viewer also verifies that its cached store identity still matches current database/config resolution before retrieval or ledger writes. Connection failures, timeouts, unavailable endpoints, unrecognized responses, server failures, unusable success responses, profile-target mismatches, and structured request errors before a compatible handshake use the compatible CLI fallback. Structured request errors become terminal only after compatibility is established. Pack assembly returns its legacy response and trace from the same retrieval pass, then the local evidence ledger stores at most 50 selected exposures and 20 diagnostics. Exposure snapshots contain bounded identity, revision, scope, score, and reason-code fields; working-set evidence is limited to normalized repository-relative paths. Attempt recording, handoff, skipped attempts, and cache reuse use the viewer ledger dispatcher on healthy paths and retain classified CLI fallback. A cache hit for the current request creates and delivers one new attempt without modifying the original, while byte-for-byte reconstruction of historical message parts creates no attempts. Ledger writes are fail-open and do not alter retrieval, rendering, or injection.
 
 ```mermaid
 sequenceDiagram
 participant OC as OpenCode
 participant PL as codemem plugin
+participant VW as viewer HTTP
 participant CLI as codemem pack
 participant ST as MemoryStore
 participant DB as SQLite
 
 OC->>PL: tool.execute.after events
 PL->>PL: update session context
-OC->>PL: experimental.chat.system.transform
+OC->>PL: experimental.chat.messages.transform
 PL->>PL: build injection query from working set
-PL->>CLI: codemem pack with query, limit, token budget
+PL->>VW: POST /api/pack with query, working set, render options, attempt
+alt retryable viewer failure
+PL->>CLI: codemem pack fallback
 CLI->>ST: build_memory_pack
+else healthy viewer
+VW->>ST: build_memory_pack
+end
 ST->>DB: FTS5 BM25 lexical search
 ST->>DB: sqlite-vec semantic search
 ST->>ST: merge, rerank, assemble sections
-ST-->>CLI: pack text and metrics
-CLI-->>PL: JSON result
-PL->>OC: append codemem context to system prompt
+ST-->>PL: pack text and metrics through selected transport
+PL->>VW: POST /api/prompt-pack-ledger delivery
+PL->>OC: append codemem context to latest user message
 ```
 
 ## Observer pipeline
@@ -233,9 +263,10 @@ The observer turns raw session transcripts into typed, structured memories. It's
 - Supported runtime values are `api_http` and `claude_sidecar`.
 - `claude_sidecar` executes observer prompts through local Claude runtime auth and bypasses provider API-key client initialization.
 - `claude_sidecar` command launch is configurable with `claude_command` / `CODEMEM_CLAUDE_COMMAND` (JSON argv; default `["claude"]`).
-- Runtime defaults: `api_http` uses `gpt-5.1-codex-mini`; `claude_sidecar` uses `claude-4.5-haiku` unless explicitly overridden.
+- Runtime defaults: `api_http` uses `gpt-5.4-mini`; `claude_sidecar` uses `claude-4.5-haiku` unless explicitly overridden.
 - For capability-safe paths, tier routing can default on without an explicit user toggle. Current safe classes are OpenAI/Anthropic over `api_http` and Claude subscription usage over `claude_sidecar`.
-- OpenAI `api_http` observer calls are Responses-first by default unless the user explicitly overrides transport behavior.
+- OpenAI `api_http` tier routing defaults to `gpt-5.6-luna` for simple batches and `gpt-5.6-terra` for rich batches. Official OpenAI and OAuth `codex_consumer` requests always use Responses and send reasoning effort `medium` unless explicitly overridden. `observer_openai_use_responses: false` is reserved for an explicitly configured custom `observer_base_url`; both tiers then use chat completions and clear effective reasoning effort/summary because those controls are not transmitted. Official OpenAI cannot opt out of Responses.
+- Simple-tier reasoning uses the global `observer_reasoning_effort` / `observer_reasoning_summary` overrides; the corresponding `observer_rich_reasoning_*` settings take precedence for rich-tier requests.
 - If a configured `observer_model` is not available in Claude CLI, codemem retries once with Claude's default model.
 - When a tier-selected path cannot honor the requested runtime/provider/model combination, codemem records the requested-versus-actual details plus a visible fallback reason rather than silently masking the downgrade.
 - Supported auth sources are `auto`, `env`, `file`, `command`, `none`.
@@ -303,10 +334,10 @@ The OpenCode adapter streams each captured event to the viewer API (`captureEven
 
 When stream delivery is unavailable, the adapter can enqueue raw events through the CLI fallback path (`enqueue-raw-event`) so events still enter durable queue processing.
 
-Claude hook ingestion is enqueue-first (`POST /api/claude-hooks`) with CLI fallback. The route nudges the raw-event
-sweeper after enqueue, but actual auto-flush still depends on `CODEMEM_RAW_EVENTS_AUTO_FLUSH=1`; otherwise processing
-waits for the normal idle/sweeper path. `CODEMEM_CLAUDE_HOOK_FLUSH_ON_STOP=1` remains a separate opt-in for `Stop`
-events.
+Claude detached hook ingest normalizes once and posts to canonical `POST /api/raw-events`; retryable
+delivery reuses the exact envelope for CLI enqueue fallback. The named `POST /api/claude-hooks` route
+remains a compatibility alias/caller for older packaged or plugin-free CLI paths. The queue/sweeper
+behavior and `CODEMEM_CLAUDE_HOOK_FLUSH_ON_STOP=1` opt-in for `Stop` remain unchanged.
 
 ### OpenCode session finalization triggers
 - `session.idle` — finalizes current local buffer
@@ -319,13 +350,14 @@ events.
 - 10+ minutes of continuous work
 
 ### OpenCode stream reliability
-- Preflight check: `GET /api/raw-events/status` with periodic re-checks (`CODEMEM_RAW_EVENTS_STATUS_CHECK_MS`)
+- Preflight check: `GET /api/raw-events/status` with periodic re-checks (`CODEMEM_RAW_EVENTS_STATUS_CHECK_MS`), bounded by a 5-second timeout
 - Backoff on failure: configurable via `CODEMEM_RAW_EVENTS_BACKOFF_MS`; on stream failure the plugin can fall back to CLI enqueue for durable persistence
 - Once events are accepted by the viewer/store queue, flush workers handle retries
 
 ### Claude hook flush boundaries
-- `CODEMEM_CLAUDE_HOOK_FLUSH=1` enables immediate `SessionEnd` boundary flush attempts
-- `CODEMEM_CLAUDE_HOOK_FLUSH_ON_STOP=1` extends immediate flush to `Stop` when boundary flush is enabled
+- `SessionEnd` immediately flushes by default; `CODEMEM_CLAUDE_HOOK_FLUSH=0` disables the attempt
+- `CODEMEM_CLAUDE_HOOK_FLUSH_ON_STOP=1` extends immediate flush to `Stop` when boundary flush is enabled; the packaged hook allows 130 seconds for the 125-second internal boundary budget
+- Direct Viewer transport waits for boundary extraction while reserving command-fallback time from the live budget after preprocessing and across both HTTP attempts; `CODEMEM_CLAUDE_HOOK_BOUNDARY_TIMEOUT_MS` can override the derived request limit
 
 ## Bootstrap grant verification flow
 

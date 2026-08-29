@@ -1,0 +1,2357 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("../lib/api", () => ({
+	deleteSharingDomainProjectMapping: vi.fn(),
+	forgetProjectInventoryMemories: vi.fn(),
+	loadProjects: vi.fn(),
+	loadCoordinatorAdminGroupsFiltered: vi.fn(),
+	loadCoordinatorAdminStatus: vi.fn(),
+	loadLegacyTeamSetupSummary: vi.fn(),
+	loadProjectScopeInventory: vi.fn(),
+	loadRecipientPolicyIntent: vi.fn(),
+	loadRecipientPolicyReview: vi.fn(),
+	loadSharingDomainSettings: vi.fn(),
+	reassignProjectInventoryProject: vi.fn(),
+	saveSharingDomainProjectMapping: vi.fn(),
+	ProjectForgetConfirmationError: class ProjectForgetConfirmationError extends Error {
+		preview: {
+			confirmation_token: string;
+			local_owned_memory_count: number;
+			peer_owned_memory_count: number;
+			workspace_identity: string;
+		};
+
+		constructor(preview: {
+			confirmation_token: string;
+			local_owned_memory_count: number;
+			peer_owned_memory_count: number;
+			workspace_identity: string;
+		}) {
+			super("Project forget confirmation required");
+			this.preview = preview;
+		}
+	},
+	RecipientPolicyReviewStaleError: class RecipientPolicyReviewStaleError extends Error {
+		result: unknown;
+
+		constructor(result: unknown) {
+			super("Recipient policy review source state changed");
+			this.result = result;
+		}
+	},
+	resolveRecipientPolicyReview: vi.fn(),
+	saveSharingDomainProjectMappings: vi.fn(),
+	SharingDomainGuardrailConfirmationError: class SharingDomainGuardrailConfirmationError extends Error {
+		requiredGuardrailTokens: string[];
+		guardrailWarnings: Array<{ code?: string; message: string }>;
+
+		constructor(input: {
+			required_guardrail_tokens?: string[];
+			guardrail_warnings?: Array<{ code?: string; message: string }>;
+		}) {
+			super("Sharing domain guardrail confirmation required");
+			this.requiredGuardrailTokens = input.required_guardrail_tokens ?? [];
+			this.guardrailWarnings = input.guardrail_warnings ?? [];
+		}
+	},
+}));
+
+vi.mock("../lib/notice", () => ({ showGlobalNotice: vi.fn() }));
+vi.mock("./project-sharing", () => ({
+	openProjectShareFlow: vi.fn(),
+	renderProjectShareFlow: vi.fn(),
+}));
+vi.mock("./recipient-policy-management", () => ({
+	mountRecipientPolicyManagement: vi.fn(),
+	openRecipientPolicyManagement: vi.fn(),
+}));
+vi.mock("./sync/sync-dialogs", () => ({ openSyncInputDialog: vi.fn() }));
+
+import * as api from "../lib/api";
+import type {
+	LegacyTeamSetupSummaryResponseV1,
+	ProjectScopeInventoryProject,
+	ProjectScopeInventoryResult,
+	RecipientPolicyIntentGraphV1,
+	RecipientPolicyReviewItemV1,
+	RecipientPolicyReviewListV1,
+} from "../lib/api/sync";
+import { state } from "../lib/state";
+import * as projectSharing from "./project-sharing";
+import { initProjectsTab, loadProjectsData } from "./projects";
+import * as recipientPolicyManagement from "./recipient-policy-management";
+import { openSyncInputDialog } from "./sync/sync-dialogs";
+
+function project(
+	overrides: Partial<ProjectScopeInventoryProject> = {},
+): ProjectScopeInventoryProject {
+	return {
+		cwd: "/workspace/work/exampleco/api",
+		display_project: "api",
+		git_branch: "main",
+		git_remote: "https://git.example.invalid/exampleco/api.git",
+		guardrail_warnings: [],
+		identity_source: "git_remote",
+		latest_session_at: "2026-05-06T00:00:00Z",
+		mapping_id: null,
+		matched_pattern: null,
+		memory_count: 1,
+		project: "api",
+		resolution_reason: "local_default",
+		resolved_scope_id: "local-default",
+		session_count: 1,
+		statuses: ["local_only"],
+		suggested_scope_id: null,
+		suggestion_reason: null,
+		suggestion_signal: null,
+		workspace_identity: "https://git.example.invalid/exampleco/api.git",
+		...overrides,
+	};
+}
+
+function reviewItem(
+	overrides: Partial<RecipientPolicyReviewItemV1> = {},
+): RecipientPolicyReviewItemV1 {
+	const preview = {
+		affectedDeviceCount: 2,
+		affectedMemoryCount: 12,
+		affectedProjectCount: 1,
+		effect: "none" as const,
+		effectiveDevices: [
+			{
+				assignment: "assigned" as const,
+				deviceId: "private-device-id",
+				displayName: "Adam’s Mac",
+				identityId: "private-identity-id",
+			},
+			{
+				assignment: "unassigned" as const,
+				deviceId: "private-build-device-id",
+				displayName: "Build host",
+				identityId: null,
+			},
+		],
+		projects: [{ canonicalIdentity: "private-project-id", displayName: "Codemem" }],
+		requiresDecisionInput: false,
+	};
+	return {
+		finding: "Older project sharing needs a decision.",
+		options: [
+			{
+				affectedDeviceCount: 2,
+				affectedMemoryCount: 12,
+				affectedProjectCount: 1,
+				decision: "keep_current_setup",
+				effect: "none",
+				label: "Keep current setup unchanged",
+				preview,
+			},
+			{
+				affectedDeviceCount: 2,
+				affectedMemoryCount: 12,
+				affectedProjectCount: 1,
+				decision: "reject_suggestion",
+				effect: "none",
+				label: "Reject suggestion",
+				preview,
+			},
+			{
+				affectedDeviceCount: 2,
+				affectedMemoryCount: 12,
+				affectedProjectCount: 1,
+				decision: "choose_recipients",
+				effect: "metadata_only",
+				label: "Choose recipients",
+				preview: { ...preview, effect: "metadata_only", requiresDecisionInput: true },
+			},
+		],
+		reason: "Review current recipient evidence for Codemem.",
+		recommendedDecision: "keep_current_setup",
+		resolution: null,
+		reviewItemId: "review-1",
+		sourceFingerprint: "fingerprint-1",
+		state: "open",
+		version: 1,
+		...overrides,
+	};
+}
+
+function recipientReview(
+	overrides: Partial<RecipientPolicyReviewListV1> = {},
+): RecipientPolicyReviewListV1 {
+	return {
+		blockedItems: [],
+		continuity: { findingCount: 1, state: "legacy_access_preserved" },
+		reviewItems: [reviewItem()],
+		version: 1,
+		...overrides,
+	};
+}
+
+function recipientIntent(
+	overrides: Partial<RecipientPolicyIntentGraphV1> = {},
+): RecipientPolicyIntentGraphV1 {
+	return {
+		version: 1,
+		identities: [
+			{
+				version: 1,
+				identityId: "identity-adam",
+				displayName: "Adam",
+				kind: "personal",
+				verification: "local",
+				status: "active",
+				mergedIntoIdentityId: null,
+			},
+		],
+		teams: [{ version: 1, teamId: "team-example", displayName: "ExampleCo", status: "active" }],
+		teamMemberships: [],
+		identityDevices: [],
+		projectRecipients: [],
+		...overrides,
+	};
+}
+
+function mountProjectsDom() {
+	document.body.innerHTML = `
+		<input id="projectsSearch" />
+		<select id="projectsStatusFilter"></select>
+		<div id="projectsInventoryMeta"></div>
+		<div id="projectsInventorySkeleton"></div>
+		<div id="projectsInventoryList"></div>
+		<div id="projectShareFlowMount"></div>
+		<div id="recipientPolicyReviewMount"></div>
+		<div id="recipientPolicyManagementMount"></div>
+		<button id="projectsShareSelected"></button>
+		<div id="projectsSelectionStatus"></div>
+		<button id="projectsPrevPage"></button>
+		<button id="projectsNextPage"></button>
+	`;
+}
+
+async function flushAsyncWork() {
+	for (let i = 0; i < 5; i += 1) {
+		await new Promise((resolve) => setTimeout(resolve, 0));
+	}
+}
+
+describe("Projects tab", () => {
+	beforeEach(() => {
+		mountProjectsDom();
+		state.lastProjectCoordinatorAdminGroups = [
+			{ archived_at: null, display_name: "ExampleCo Team", group_id: "exampleco" },
+		];
+		vi.mocked(api.loadCoordinatorAdminStatus).mockResolvedValue({
+			has_admin_secret: true,
+			readiness: "ready",
+		});
+		vi.mocked(api.loadCoordinatorAdminGroupsFiltered).mockResolvedValue({
+			items: [{ archived_at: null, display_name: "ExampleCo Team", group_id: "exampleco" }],
+		});
+		vi.mocked(api.loadSharingDomainSettings).mockResolvedValue({
+			local_default_scope_id: "local-default",
+			mappings: [],
+			projects: [],
+			scopes: [
+				{
+					authority_type: "local",
+					kind: "system",
+					label: "Local only",
+					scope_id: "local-default",
+					status: "active",
+				},
+				{
+					authority_type: "local",
+					kind: "system",
+					label: "Legacy shared review",
+					scope_id: "legacy-shared-review",
+					status: "active",
+				},
+				{
+					authority_type: "coordinator",
+					group_id: "exampleco",
+					kind: "team_default",
+					label: "ExampleCo Work",
+					scope_id: "exampleco-work",
+					status: "active",
+				},
+			],
+		});
+		vi.mocked(api.loadRecipientPolicyReview).mockResolvedValue({
+			blockedItems: [],
+			continuity: null,
+			reviewItems: [],
+			version: 1,
+		});
+		vi.mocked(api.loadRecipientPolicyIntent).mockResolvedValue(recipientIntent());
+		vi.mocked(api.loadLegacyTeamSetupSummary).mockResolvedValue({ version: 1, candidates: [] });
+		vi.mocked(api.resolveRecipientPolicyReview).mockResolvedValue({
+			errorCode: null,
+			idempotent: false,
+			reviewItemId: "review-1",
+			sourceFingerprint: "fingerprint-1",
+			status: "applied",
+		});
+		vi.mocked(api.loadProjects).mockResolvedValue(["api", "codemem"]);
+		vi.mocked(api.reassignProjectInventoryProject).mockResolvedValue({
+			moved_memory_count: 1,
+			moved_session_count: 1,
+			previous_projects: ["api"],
+			project: "codemem",
+			workspace_identity: "https://git.example.invalid/exampleco/api.git",
+		});
+		vi.mocked(api.forgetProjectInventoryMemories).mockResolvedValue({
+			confirmation_token: "token",
+			confirmed: true,
+			forgotten_memory_count: 1,
+			local_owned_memory_count: 1,
+			peer_owned_memory_count: 0,
+			workspace_identity: "https://git.example.invalid/exampleco/api.git",
+		});
+	});
+
+	afterEach(() => {
+		vi.clearAllMocks();
+		state.lastProjectCoordinatorAdminGroups = [];
+		state.lastCoordinatorAdminStatus = null;
+		state.lastCoordinatorAdminGroups = [];
+		document.body.innerHTML = "";
+	});
+
+	it("shows empty inventory without bogus pagination range", async () => {
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 25,
+			offset: 0,
+			projects: [],
+			total: 0,
+		});
+
+		initProjectsTab(() => {});
+		await loadProjectsData();
+
+		expect(document.getElementById("projectsInventoryMeta")?.textContent).toBe(
+			"0 project identities found",
+		);
+		expect(document.body.textContent).not.toContain("showing 1-0");
+		expect(api.loadProjectScopeInventory).toHaveBeenCalledWith(
+			expect.objectContaining({ limit: 250 }),
+		);
+		expect(document.getElementById("projectsInventorySkeleton")).toBeNull();
+	});
+
+	it("keeps Advanced recovery snapshots untouched when Project Team-name refresh fails", async () => {
+		state.lastCoordinatorAdminStatus = {
+			active_group: "retained-group",
+			readiness: "ready",
+		};
+		state.lastCoordinatorAdminGroups = [
+			{ archived_at: null, display_name: "Retained Team", group_id: "retained-group" },
+		];
+		vi.mocked(api.loadCoordinatorAdminStatus).mockRejectedValue(
+			new Error("project refresh failed"),
+		);
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 25,
+			offset: 0,
+			projects: [],
+			total: 0,
+		});
+
+		initProjectsTab(() => {});
+		await loadProjectsData();
+		await flushAsyncWork();
+
+		expect(state.lastCoordinatorAdminStatus?.active_group).toBe("retained-group");
+		expect(state.lastCoordinatorAdminGroups).toEqual([
+			{ archived_at: null, display_name: "Retained Team", group_id: "retained-group" },
+		]);
+		expect(state.lastProjectCoordinatorAdminGroups).toEqual([]);
+	});
+
+	it("renders mixed continuity and repair state without contradictory copy", async () => {
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [],
+			total: 0,
+		});
+		vi.mocked(api.loadRecipientPolicyReview).mockResolvedValue({
+			...recipientReview(),
+			blockedItems: [
+				{
+					blockedItemId: "blocked-1",
+					finding: "Project identity is unstable.",
+					ownerLabel: "Project owner",
+					reason: "Codemem requires source-state repair.",
+					repairAction: "Assign a stable canonical Project identity.",
+					version: 1,
+				},
+			],
+			continuity: { findingCount: 37, state: "legacy_access_preserved" },
+		});
+
+		await loadProjectsData();
+
+		const surface = document.querySelector(".recipient-policy-review");
+		expect(surface?.textContent).toContain("Sharing needs repair");
+		expect(surface?.textContent).not.toContain("Existing sharing kept as-is");
+		expect(surface?.textContent).not.toContain("No action is required for this update");
+		expect(surface?.textContent).toContain("37 older sharing findings were not changed");
+		expect(surface?.textContent).toContain("current availability cannot be confirmed");
+		expect(surface?.textContent).not.toContain("Current access remains in place");
+		expect(surface?.textContent).not.toContain("will continue using");
+		expect(surface?.textContent).toContain("Assign a stable canonical Project identity");
+		expect(surface?.querySelector("button, select")).toBeNull();
+		expect(document.querySelectorAll(".recipient-policy-review-item")).toHaveLength(0);
+	});
+
+	it("routes an unfinished server Team candidate into guided setup without resolving recipient review", async () => {
+		const onOpenTeamSetup = vi.fn();
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [],
+			total: 0,
+		});
+		vi.mocked(api.loadRecipientPolicyReview).mockResolvedValue(recipientReview());
+		vi.mocked(api.loadLegacyTeamSetupSummary).mockResolvedValue({
+			version: 1,
+			candidates: [
+				{
+					candidateRef: "opaque-candidate-ref",
+					displayName: "Example Team",
+					status: "in_progress",
+					deviceCount: 2,
+					projectCount: 1,
+					unresolvedDeviceCount: 1,
+					unresolvedProjectCount: 0,
+				},
+			],
+		});
+
+		initProjectsTab(() => {}, { onOpenTeamSetup });
+		await loadProjectsData();
+		const entry = document.querySelector<HTMLElement>(".project-team-setup-entry");
+		expect(entry?.textContent).toContain("Finish setting up this Team");
+		expect(entry?.textContent).toContain("Example Team");
+		expect(entry?.querySelector("button")?.getAttribute("aria-label")).toBe(
+			"Finish setting up Example Team",
+		);
+		entry?.querySelector<HTMLButtonElement>("button")?.click();
+
+		expect(onOpenTeamSetup).toHaveBeenCalledWith("opaque-candidate-ref");
+		expect(api.resolveRecipientPolicyReview).not.toHaveBeenCalled();
+		expect(recipientPolicyManagement.openRecipientPolicyManagement).not.toHaveBeenCalled();
+	});
+
+	it("preserves the focused Team setup action while a refresh discovery is pending", async () => {
+		const summary = {
+			version: 1 as const,
+			candidates: [
+				{
+					candidateRef: "opaque-candidate-ref",
+					displayName: "Example Team",
+					status: "in_progress" as const,
+					deviceCount: 2,
+					projectCount: 1,
+					unresolvedDeviceCount: 1,
+					unresolvedProjectCount: 0,
+				},
+			],
+		};
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [],
+			total: 0,
+		});
+		vi.mocked(api.loadRecipientPolicyReview).mockResolvedValue(recipientReview());
+		vi.mocked(api.loadLegacyTeamSetupSummary).mockResolvedValueOnce(summary);
+		initProjectsTab(() => {}, { onOpenTeamSetup: vi.fn() });
+
+		await loadProjectsData();
+		const entry = document.querySelector<HTMLElement>(".project-team-setup-entry");
+		const button = entry?.querySelector<HTMLButtonElement>("button");
+		button?.focus();
+		let resolveSummary!: (value: typeof summary) => void;
+		vi.mocked(api.loadLegacyTeamSetupSummary).mockImplementationOnce(
+			() => new Promise((resolve) => (resolveSummary = resolve)),
+		);
+
+		await loadProjectsData();
+
+		expect(document.querySelector(".project-team-setup-entry")).toBe(entry);
+		expect(button?.isConnected).toBe(true);
+		expect(document.activeElement).toBe(button);
+
+		resolveSummary(summary);
+		await vi.waitFor(() => expect(api.loadLegacyTeamSetupSummary).toHaveBeenCalledTimes(2));
+		await flushAsyncWork();
+		expect(document.querySelector(".project-team-setup-entry")).toBe(entry);
+		expect(document.activeElement).toBe(button);
+
+		vi.mocked(api.loadLegacyTeamSetupSummary).mockRejectedValueOnce(
+			new Error("temporary discovery failure"),
+		);
+		await loadProjectsData();
+		await vi.waitFor(() => expect(api.loadLegacyTeamSetupSummary).toHaveBeenCalledTimes(3));
+		await flushAsyncWork();
+		expect(document.querySelector(".project-team-setup-entry")).toBe(entry);
+		expect(entry?.querySelector('[role="status"]')?.textContent).toBe(
+			"Team setup status is temporarily unavailable. The previous Team setup status is being shown.",
+		);
+		expect(document.activeElement).toBe(button);
+
+		vi.mocked(api.loadLegacyTeamSetupSummary).mockResolvedValueOnce({
+			version: 1,
+			candidates: [],
+		});
+		await loadProjectsData();
+		await vi.waitFor(() => expect(document.querySelector(".project-team-setup-entry")).toBeNull());
+		expect(document.activeElement).toBe(document.getElementById("projectsSearch"));
+	});
+
+	it("keeps Projects usable when guided Team setup discovery is unavailable", async () => {
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [project()],
+			total: 1,
+		});
+		vi.mocked(api.loadLegacyTeamSetupSummary).mockRejectedValue(new Error("setup unavailable"));
+
+		await loadProjectsData();
+
+		expect(document.body.textContent).toContain("api");
+		expect(document.querySelector(".project-team-setup-entry")).toBeNull();
+		expect(document.getElementById("projectsInventoryMeta")?.textContent).toContain(
+			"1 project identity found",
+		);
+	});
+
+	it("renders Projects before optional Team setup discovery finishes", async () => {
+		let resolveTeamSetup!: (value: { version: 1; candidates: [] }) => void;
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [project()],
+			total: 1,
+		});
+		vi.mocked(api.loadLegacyTeamSetupSummary).mockImplementation(
+			() =>
+				new Promise((resolve) => {
+					resolveTeamSetup = resolve;
+				}),
+		);
+
+		const loading = loadProjectsData();
+		await vi.waitFor(() =>
+			expect(document.getElementById("projectsInventoryMeta")?.textContent).toContain(
+				"1 project identity found",
+			),
+		);
+		await loading;
+		expect(document.querySelector(".project-team-setup-entry")).toBeNull();
+
+		resolveTeamSetup({ version: 1, candidates: [] });
+	});
+
+	it("renders Projects but reports strict refresh failure after Team setup discovery fails", async () => {
+		let rejectTeamSetup!: (reason?: unknown) => void;
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [project()],
+			total: 1,
+		});
+		vi.mocked(api.loadLegacyTeamSetupSummary).mockImplementation(
+			() =>
+				new Promise<LegacyTeamSetupSummaryResponseV1>((_, reject) => {
+					rejectTeamSetup = reject;
+				}),
+		);
+
+		const loading = loadProjectsData({ requireTeamSetupSummary: true });
+		await vi.waitFor(() =>
+			expect(document.getElementById("projectsInventoryMeta")?.textContent).toContain(
+				"1 project identity found",
+			),
+		);
+		let settled = false;
+		void loading.then(() => {
+			settled = true;
+		});
+		await Promise.resolve();
+		expect(settled).toBe(false);
+
+		rejectTeamSetup(new Error("setup unavailable"));
+		await expect(loading).resolves.toBe(false);
+	});
+
+	it("requires a fresh Team setup summary for a strict refresh", async () => {
+		let resolveFirst!: (value: LegacyTeamSetupSummaryResponseV1) => void;
+		let resolveSecond!: (value: LegacyTeamSetupSummaryResponseV1) => void;
+		vi.mocked(api.loadLegacyTeamSetupSummary)
+			.mockImplementationOnce(() => new Promise((resolve) => (resolveFirst = resolve)))
+			.mockImplementationOnce(() => new Promise((resolve) => (resolveSecond = resolve)));
+
+		await expect(loadProjectsData()).resolves.toBe(true);
+		const strictRefresh = loadProjectsData({ requireTeamSetupSummary: true });
+		await vi.waitFor(() => expect(api.loadLegacyTeamSetupSummary).toHaveBeenCalledTimes(2));
+
+		resolveSecond({ version: 1, candidates: [] });
+		await expect(strictRefresh).resolves.toBe(true);
+		resolveFirst({ version: 1, candidates: [] });
+	});
+
+	it("fails a strict refresh while a Project domain selection is active", async () => {
+		const select = document.createElement("select");
+		select.className = "project-domain-select";
+		document.body.appendChild(select);
+		select.focus();
+
+		await expect(loadProjectsData({ requireTeamSetupSummary: true })).resolves.toBe(false);
+		expect(api.loadLegacyTeamSetupSummary).not.toHaveBeenCalled();
+	});
+
+	it("reuses slow Team setup discovery across polling generations", async () => {
+		let resolveTeamSetup!: (value: LegacyTeamSetupSummaryResponseV1) => void;
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [project()],
+			total: 1,
+		});
+		vi.mocked(api.loadLegacyTeamSetupSummary).mockImplementation(
+			() => new Promise((resolve) => (resolveTeamSetup = resolve)),
+		);
+
+		await loadProjectsData();
+		await loadProjectsData();
+		await loadProjectsData();
+		expect(api.loadLegacyTeamSetupSummary).toHaveBeenCalledTimes(1);
+
+		resolveTeamSetup({
+			version: 1,
+			candidates: [
+				{
+					candidateRef: "opaque-candidate-ref",
+					displayName: "Slow Team",
+					status: "needs_setup",
+					deviceCount: 1,
+					projectCount: 1,
+					unresolvedDeviceCount: 1,
+					unresolvedProjectCount: 0,
+				},
+			],
+		});
+		await vi.waitFor(() =>
+			expect(document.querySelector(".project-team-setup-entry")?.textContent).toContain(
+				"Slow Team",
+			),
+		);
+	});
+
+	it("preserves the continuity surface across an unchanged refresh", async () => {
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [],
+			total: 0,
+		});
+		vi.mocked(api.loadRecipientPolicyReview).mockResolvedValue(recipientReview());
+
+		await loadProjectsData();
+		const firstSurface = document.querySelector(".recipient-policy-review");
+		expect(firstSurface?.textContent).toContain("Existing sharing kept as-is");
+		expect(firstSurface?.textContent).toContain("No action is required for this update");
+
+		await loadProjectsData();
+
+		expect(document.querySelector(".recipient-policy-review")).toBe(firstSurface);
+	});
+
+	it("rerenders the continuity surface when the deferred finding count changes", async () => {
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [],
+			total: 0,
+		});
+		vi.mocked(api.loadRecipientPolicyReview)
+			.mockResolvedValueOnce(recipientReview())
+			.mockResolvedValueOnce(
+				recipientReview({
+					continuity: { findingCount: 2, state: "legacy_access_preserved" },
+				}),
+			);
+
+		await loadProjectsData();
+		const firstSurface = document.querySelector(".recipient-policy-review");
+
+		await loadProjectsData();
+
+		expect(document.querySelector(".recipient-policy-review")).not.toBe(firstSurface);
+		expect(document.body.textContent).toContain("2 older sharing findings were not changed");
+	});
+
+	it("renders blocked repair ownership without decision controls", async () => {
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [],
+			total: 0,
+		});
+		vi.mocked(api.loadRecipientPolicyReview).mockResolvedValue(
+			recipientReview({
+				blockedItems: [
+					{
+						blockedItemId: "blocked-1",
+						finding: "Project identity is unstable.",
+						ownerLabel: "Project owner",
+						reason: "Codemem requires source-state repair.",
+						repairAction: "Assign a stable canonical Project identity.",
+						version: 1,
+					},
+				],
+				continuity: null,
+				reviewItems: [],
+			}),
+		);
+
+		await loadProjectsData();
+
+		const blocked = document.querySelector(".recipient-policy-blocked-item");
+		expect(blocked?.textContent).toContain("Blocked");
+		expect(blocked?.textContent).toContain("Owner: Project owner");
+		expect(blocked?.textContent).toContain("Repair: Assign a stable canonical Project identity.");
+		expect(blocked?.querySelector("button, select")).toBeNull();
+	});
+
+	it("opens row sharing with exactly the selected canonical project", async () => {
+		const selected = project({
+			cwd: "/workspace/work/exampleco/codemem",
+			display_project: "codemem",
+			git_remote: "https://git.example.invalid/exampleco/codemem.git",
+			project: "codemem",
+			workspace_identity: "git:https://git.example.invalid/exampleco/codemem.git",
+		});
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [project(), selected],
+			total: 2,
+		});
+
+		initProjectsTab(() => {});
+		await loadProjectsData();
+		const selectedRow = [...document.querySelectorAll<HTMLElement>(".project-inventory-row")].find(
+			(row) => row.textContent?.includes("codemem"),
+		);
+		if (!selectedRow) throw new Error("selected project row missing");
+		const share = [...selectedRow.querySelectorAll<HTMLButtonElement>("button")].find(
+			(button) => button.textContent === "Share",
+		);
+		if (!share) throw new Error("Share button missing");
+		share.click();
+
+		expect(projectSharing.renderProjectShareFlow).toHaveBeenCalledWith(
+			document.getElementById("projectShareFlowMount"),
+			[project(), selected],
+			{ inventoryError: false },
+		);
+		expect(projectSharing.openProjectShareFlow).toHaveBeenCalledWith([selected.workspace_identity]);
+	});
+
+	it("loads the sharing selector independently from the filtered inventory page", async () => {
+		const filtered = project({ display_project: "filtered", workspace_identity: "git:filtered" });
+		const later = project({ display_project: "later", workspace_identity: "git:later" });
+		vi.mocked(api.loadProjectScopeInventory)
+			.mockResolvedValueOnce({
+				has_more: false,
+				limit: 250,
+				offset: 0,
+				projects: [filtered],
+				total: 1,
+			})
+			.mockResolvedValueOnce({
+				has_more: true,
+				limit: 250,
+				offset: 0,
+				projects: [project()],
+				total: 251,
+			})
+			.mockResolvedValueOnce({
+				has_more: false,
+				limit: 250,
+				offset: 250,
+				projects: [later],
+				total: 251,
+			});
+
+		initProjectsTab(() => {});
+		await loadProjectsData();
+
+		expect(projectSharing.renderProjectShareFlow).toHaveBeenCalledWith(
+			document.getElementById("projectShareFlowMount"),
+			[project(), later],
+			{ inventoryError: false },
+		);
+		expect(recipientPolicyManagement.mountRecipientPolicyManagement).toHaveBeenCalledWith(
+			document.getElementById("recipientPolicyManagementMount"),
+			[
+				{
+					canonicalProjectIdentity: project().workspace_identity,
+					displayName: "api",
+					existingMemoryCount: 1,
+				},
+				{
+					canonicalProjectIdentity: "git:later",
+					displayName: "later",
+					existingMemoryCount: 1,
+				},
+			],
+			recipientIntent(),
+			expect.objectContaining({ loadError: false }),
+		);
+		expect(api.loadProjectScopeInventory).toHaveBeenNthCalledWith(2, { limit: 250, offset: 0 });
+		expect(api.loadProjectScopeInventory).toHaveBeenNthCalledWith(3, {
+			limit: 250,
+			offset: 250,
+		});
+	});
+
+	it("does not let an older project load overwrite a newer selector snapshot", async () => {
+		let resolveOldFiltered: (value: ProjectScopeInventoryResult) => void = () => {};
+		let resolveOldSharing: (value: ProjectScopeInventoryResult) => void = () => {};
+		const oldFiltered = new Promise<ProjectScopeInventoryResult>((resolve) => {
+			resolveOldFiltered = resolve;
+		});
+		const oldSharing = new Promise<ProjectScopeInventoryResult>((resolve) => {
+			resolveOldSharing = resolve;
+		});
+		const newerFiltered = project({
+			display_project: "new filtered",
+			workspace_identity: "new-filtered",
+		});
+		const newerSharing = project({
+			display_project: "new sharing",
+			workspace_identity: "new-sharing",
+		});
+		let call = 0;
+		vi.mocked(api.loadProjectScopeInventory).mockImplementation(async () => {
+			call += 1;
+			if (call === 1) return oldFiltered;
+			if (call === 2) return oldSharing;
+			return {
+				has_more: false,
+				limit: 250,
+				offset: 0,
+				projects: [call === 3 ? newerFiltered : newerSharing],
+				total: 1,
+			};
+		});
+
+		initProjectsTab(() => {});
+		const olderLoad = loadProjectsData();
+		await loadProjectsData();
+		resolveOldFiltered({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [project({ display_project: "old filtered", workspace_identity: "old-filtered" })],
+			total: 1,
+		});
+		resolveOldSharing({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [project({ display_project: "old sharing", workspace_identity: "old-sharing" })],
+			total: 1,
+		});
+		await olderLoad;
+
+		expect(projectSharing.renderProjectShareFlow).toHaveBeenLastCalledWith(
+			document.getElementById("projectShareFlowMount"),
+			[newerSharing],
+			{ inventoryError: false },
+		);
+		expect(recipientPolicyManagement.mountRecipientPolicyManagement).toHaveBeenLastCalledWith(
+			document.getElementById("recipientPolicyManagementMount"),
+			[
+				{
+					canonicalProjectIdentity: "new-sharing",
+					displayName: "new sharing",
+					existingMemoryCount: 1,
+				},
+			],
+			recipientIntent(),
+			expect.objectContaining({ loadError: false }),
+		);
+		expect(document.body.textContent).toContain("new filtered");
+		expect(document.body.textContent).not.toContain("old filtered");
+	});
+
+	it("does not let an older coordinator refresh redraw stale project rows", async () => {
+		let resolveOldStatus: (value: { has_admin_secret: boolean; readiness: "ready" }) => void =
+			() => {};
+		const oldStatus = new Promise<{ has_admin_secret: boolean; readiness: "ready" }>((resolve) => {
+			resolveOldStatus = resolve;
+		});
+		vi.mocked(api.loadCoordinatorAdminStatus)
+			.mockImplementationOnce(async () => oldStatus)
+			.mockResolvedValueOnce({ has_admin_secret: true, readiness: "ready" });
+		const old = project({ display_project: "old filtered", workspace_identity: "old-filtered" });
+		const newer = project({ display_project: "new filtered", workspace_identity: "new-filtered" });
+		vi.mocked(api.loadProjectScopeInventory)
+			.mockResolvedValueOnce({
+				has_more: false,
+				limit: 250,
+				offset: 0,
+				projects: [old],
+				total: 1,
+			})
+			.mockResolvedValueOnce({
+				has_more: false,
+				limit: 250,
+				offset: 0,
+				projects: [old],
+				total: 1,
+			})
+			.mockResolvedValueOnce({
+				has_more: false,
+				limit: 250,
+				offset: 0,
+				projects: [newer],
+				total: 1,
+			})
+			.mockResolvedValueOnce({
+				has_more: false,
+				limit: 250,
+				offset: 0,
+				projects: [newer],
+				total: 1,
+			});
+
+		initProjectsTab(() => {});
+		await loadProjectsData();
+		await loadProjectsData();
+		await flushAsyncWork();
+		resolveOldStatus({ has_admin_secret: true, readiness: "ready" });
+		await flushAsyncWork();
+
+		expect(document.body.textContent).toContain("new filtered");
+		expect(document.body.textContent).not.toContain("old filtered");
+	});
+
+	it("disables stale sharing choices when a later primary inventory load fails", async () => {
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [project()],
+			total: 1,
+		});
+		initProjectsTab(() => {});
+		await loadProjectsData();
+		vi.mocked(api.loadProjectScopeInventory).mockRejectedValueOnce(
+			new Error("inventory unavailable"),
+		);
+
+		await loadProjectsData();
+
+		expect(projectSharing.renderProjectShareFlow).toHaveBeenLastCalledWith(
+			document.getElementById("projectShareFlowMount"),
+			[],
+			{ inventoryError: true },
+		);
+	});
+
+	it("shows exact project sharing People without leaking the summary to a sibling identity", async () => {
+		const selected = project({
+			display_project: "codemem",
+			project: "codemem",
+			workspace_identity: "git:https://git.example.invalid/exampleco/codemem.git",
+			sharing: [
+				{
+					person: { actor_id: "actor-brian", display_name: "Brian" },
+					lifecycle: {
+						state: "active",
+						label: "Up to date",
+						explanation: "Existing memories and future activity are shared.",
+					},
+				},
+				{
+					person: { actor_id: "actor-alex", display_name: "Alex" },
+					lifecycle: {
+						state: "waiting_for_device",
+						label: "Checking device compatibility",
+						explanation:
+							"Waiting for a participating device to report the required sharing capability.",
+					},
+				},
+			],
+		});
+		const sibling = project({
+			display_project: "codemem-docs",
+			project: "codemem-docs",
+			workspace_identity: "git:https://git.example.invalid/exampleco/codemem-docs.git",
+			sharing: [],
+		});
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [selected, sibling],
+			total: 2,
+		});
+
+		await loadProjectsData();
+
+		const rows = [...document.querySelectorAll<HTMLElement>(".project-inventory-row")];
+		const selectedRow = rows.find(
+			(row) => row.querySelector(".project-inventory-title")?.textContent === "codemem",
+		);
+		const siblingRow = rows.find(
+			(row) => row.querySelector(".project-inventory-title")?.textContent === "codemem-docs",
+		);
+		expect(selectedRow?.querySelector(".project-sharing-summary")?.textContent).toContain("Brian");
+		expect(selectedRow?.querySelector(".project-sharing-summary")?.textContent).toContain("Alex");
+		expect(selectedRow?.textContent).toContain("Up to date");
+		expect(selectedRow?.textContent).toContain("Checking device compatibility");
+		expect(selectedRow?.textContent.match(/Checking device compatibility/g)).toHaveLength(1);
+		expect(siblingRow?.querySelector(".project-sharing-summary")).toBeNull();
+	});
+
+	it("describes revoked and cancelled project shares as history", async () => {
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [
+				project({
+					sharing: [
+						{
+							person: { actor_id: "actor-brian", display_name: "Brian" },
+							lifecycle: {
+								state: "revoked",
+								label: "Access removed",
+								explanation: "Previously copied memories may remain.",
+							},
+						},
+						{
+							person: { actor_id: "actor-alex", display_name: "Alex" },
+							lifecycle: {
+								state: "cancelled",
+								label: "Invitation cancelled",
+								explanation: "No project access was added.",
+							},
+						},
+					],
+				}),
+			],
+			total: 1,
+		});
+
+		await loadProjectsData();
+
+		const summary = document.querySelector(".project-sharing-summary");
+		expect(summary?.textContent).toContain("Previously shared with Brian");
+		expect(summary?.textContent).toContain("Invitation to Alex cancelled");
+		expect(summary?.querySelector("strong")?.textContent).toBe("Project sharing");
+	});
+
+	it("removes the project inventory skeleton when loading fails", async () => {
+		vi.mocked(api.loadProjectScopeInventory).mockRejectedValue(new Error("inventory unavailable"));
+
+		initProjectsTab(() => {});
+		await loadProjectsData();
+
+		expect(document.getElementById("projectsInventorySkeleton")).toBeNull();
+		expect(document.getElementById("projectsInventoryMeta")?.textContent).toBe(
+			"Project inventory failed to load.",
+		);
+		expect(document.body.textContent).toContain("inventory unavailable");
+	});
+
+	it("renders peer-received project identities read-only", async () => {
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [
+				project({
+					cwd: null,
+					display_project: "codemem",
+					git_branch: null,
+					git_remote: null,
+					identity_source: "workspace_id",
+					memory_count: 18111,
+					project: "codemem",
+					read_only: true,
+					read_only_reason: "peer_received",
+					session_count: 0,
+					statuses: ["received"],
+					workspace_identity: "peer-received:peer-a:project:codemem",
+				}),
+			],
+			total: 1,
+		});
+
+		initProjectsTab(() => {});
+		await loadProjectsData();
+
+		expect(document.body.textContent).toContain("Received from peers");
+		expect(document.body.textContent).toContain("Change its project or Space on the source device");
+		expect(document.querySelector(".project-domain-select")).toBeNull();
+		expect(document.body.textContent).not.toContain("Change project…");
+	});
+
+	it("does not reload inventory while a Space select is active", async () => {
+		const refresh = vi.fn();
+		initProjectsTab(refresh);
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [project()],
+			total: 1,
+		});
+		await loadProjectsData();
+		await flushAsyncWork();
+		const select = document.querySelector(".project-domain-select") as HTMLSelectElement | null;
+		if (!select) throw new Error("project Space select missing");
+		select.focus();
+		vi.clearAllMocks();
+
+		await loadProjectsData();
+
+		expect(api.loadProjectScopeInventory).not.toHaveBeenCalled();
+		expect(api.loadSharingDomainSettings).not.toHaveBeenCalled();
+		expect(api.loadCoordinatorAdminGroupsFiltered).not.toHaveBeenCalled();
+		expect(document.activeElement).toBe(select);
+
+		select.blur();
+		expect(refresh).toHaveBeenCalledTimes(1);
+	});
+
+	it("replays skipped refresh when a focused cluster Space select blurs", async () => {
+		const refresh = vi.fn();
+		initProjectsTab(refresh);
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [
+				project({ cwd: "/workspace/a", memory_count: 2, session_count: 1 }),
+				project({
+					cwd: "/tmp/worktree-a",
+					memory_count: 3,
+					session_count: 2,
+					workspace_identity: "https://git.example.invalid/exampleco/api.git:worktree",
+				}),
+			],
+			total: 2,
+		});
+		await loadProjectsData();
+		await flushAsyncWork();
+		const select = document.querySelector(
+			".project-inventory-cluster > details > .project-advanced-administration .project-domain-select",
+		) as HTMLSelectElement | null;
+		if (!select) throw new Error("cluster Space select missing");
+		select.focus();
+		vi.clearAllMocks();
+
+		await loadProjectsData();
+		expect(document.body.textContent).not.toContain("Team: ExampleCo Team");
+		await flushAsyncWork();
+		expect(api.loadProjectScopeInventory).not.toHaveBeenCalled();
+
+		select.blur();
+		expect(refresh).toHaveBeenCalledTimes(1);
+	});
+
+	it("preserves a cluster Space draft across inventory re-renders until save succeeds", async () => {
+		const refresh = vi.fn();
+		initProjectsTab(refresh);
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [
+				project({ cwd: "/workspace/a", memory_count: 2, session_count: 1 }),
+				project({
+					cwd: "/tmp/worktree-a",
+					memory_count: 3,
+					session_count: 2,
+					workspace_identity: "https://git.example.invalid/exampleco/api.git:worktree",
+				}),
+			],
+			total: 2,
+		});
+		await loadProjectsData();
+		const select = document.querySelector(
+			".project-inventory-cluster > details > .project-advanced-administration .project-domain-select",
+		) as HTMLSelectElement | null;
+		if (!select) throw new Error("cluster Space select missing");
+		select.value = "exampleco-work";
+		select.dispatchEvent(new Event("change"));
+
+		await loadProjectsData();
+
+		const rerenderedSelect = document.querySelector(
+			".project-inventory-cluster > details > .project-advanced-administration .project-domain-select",
+		) as HTMLSelectElement | null;
+		if (!rerenderedSelect) throw new Error("cluster Space select missing after refresh");
+		expect(rerenderedSelect.value).toBe("exampleco-work");
+		const save = Array.from(document.querySelectorAll("button")).find((button) =>
+			button.textContent?.startsWith("Save Space for 2 identities"),
+		) as HTMLButtonElement | undefined;
+		expect(save).toBeDefined();
+		save?.click();
+		await flushAsyncWork();
+
+		expect(api.saveSharingDomainProjectMappings).toHaveBeenCalledWith({
+			mappings: expect.arrayContaining([
+				expect.objectContaining({
+					scope_id: "exampleco-work",
+					workspace_identity: "https://git.example.invalid/exampleco/api.git",
+				}),
+			]),
+		});
+		expect(refresh).toHaveBeenCalled();
+		await loadProjectsData();
+		const clearedSelect = document.querySelector(
+			".project-inventory-cluster > details > .project-advanced-administration .project-domain-select",
+		) as HTMLSelectElement | null;
+		expect(clearedSelect?.value).toBe("");
+	});
+
+	it("refreshes active Team names and ignores archived Teams for Space labels", async () => {
+		state.lastProjectCoordinatorAdminGroups = [
+			{ archived_at: "2026-05-01T00:00:00Z", display_name: "Old Team", group_id: "old" },
+		];
+		vi.mocked(api.loadCoordinatorAdminGroupsFiltered).mockResolvedValue({
+			items: [
+				{ archived_at: null, display_name: "ExampleCo Team", group_id: "exampleco" },
+				{ archived_at: "2026-05-01T00:00:00Z", display_name: "Old Team", group_id: "old" },
+			],
+		});
+		vi.mocked(api.loadSharingDomainSettings).mockResolvedValue({
+			local_default_scope_id: "local-default",
+			mappings: [],
+			projects: [],
+			scopes: [
+				{
+					authority_type: "coordinator",
+					group_id: "exampleco",
+					kind: "team",
+					label: "ExampleCo Work",
+					scope_id: "exampleco-work",
+					status: "active",
+				},
+				{
+					authority_type: "coordinator",
+					group_id: "old",
+					kind: "team",
+					label: "Old Work",
+					scope_id: "old-work",
+					status: "active",
+				},
+			],
+		});
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [
+				project({ resolved_scope_id: "exampleco-work" }),
+				project({
+					display_project: "old-api",
+					git_remote: "https://git.example.invalid/old/api.git",
+					project: "old-api",
+					resolved_scope_id: "old-work",
+					workspace_identity: "https://git.example.invalid/old/api.git",
+				}),
+			],
+			total: 2,
+		});
+
+		await loadProjectsData();
+		expect(document.body.textContent).not.toContain("Team: ExampleCo Team");
+		await flushAsyncWork();
+
+		expect(api.loadCoordinatorAdminGroupsFiltered).toHaveBeenCalledWith(false);
+		expect(document.body.textContent).toContain("Team: ExampleCo Team");
+		expect(document.body.textContent).not.toContain("Team: Old Team");
+		expect(document.body.textContent).toContain("Team details unavailable");
+		const enabledOptionLabels = Array.from(document.querySelectorAll("option:not(:disabled)")).map(
+			(option) => option.textContent,
+		);
+		expect(enabledOptionLabels).toContain("ExampleCo Work");
+		expect(enabledOptionLabels).not.toContain("Old Work");
+	});
+
+	it("renders inventory before coordinator Team name refresh finishes", async () => {
+		let resolveStatus: (value: unknown) => void = () => {};
+		vi.mocked(api.loadCoordinatorAdminStatus).mockReturnValue(
+			new Promise((resolve) => {
+				resolveStatus = resolve;
+			}),
+		);
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [project({ resolved_scope_id: "exampleco-work" })],
+			total: 1,
+		});
+
+		await loadProjectsData();
+
+		expect(document.getElementById("projectsInventoryMeta")?.textContent).toContain(
+			"1 project identity found",
+		);
+		expect(api.loadCoordinatorAdminGroupsFiltered).not.toHaveBeenCalled();
+
+		resolveStatus({ has_admin_secret: true, readiness: "ready" });
+		await flushAsyncWork();
+
+		expect(api.loadCoordinatorAdminGroupsFiltered).toHaveBeenCalledWith(false);
+	});
+
+	it("clusters related project identities and bulk assigns the group", async () => {
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [
+				project({ cwd: "/workspace/a", memory_count: 2, session_count: 1 }),
+				project({
+					cwd: "/tmp/worktree-a",
+					memory_count: 3,
+					session_count: 2,
+					workspace_identity: "https://git.example.invalid/exampleco/api.git:worktree",
+				}),
+			],
+			total: 2,
+		});
+
+		await loadProjectsData();
+
+		expect(document.body.textContent).toContain("2 identities · 3 sessions · 5 memories");
+		expect(document.body.textContent).toContain("Save Space for 2 identities");
+		const select = document.querySelector(
+			".project-inventory-cluster select",
+		) as HTMLSelectElement | null;
+		if (!select) throw new Error("cluster select missing");
+		expect(select.value).toBe("");
+		select.value = "exampleco-work";
+		select.dispatchEvent(new Event("change", { bubbles: true }));
+		const save = Array.from(document.querySelectorAll("button")).find(
+			(button) => button.textContent === "Save Space for 2 identities",
+		) as HTMLButtonElement | undefined;
+		expect(save?.disabled).toBe(false);
+		save?.click();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(api.saveSharingDomainProjectMappings).toHaveBeenCalledWith({
+			mappings: expect.arrayContaining([
+				expect.objectContaining({
+					scope_id: "exampleco-work",
+					workspace_identity: "https://git.example.invalid/exampleco/api.git",
+				}),
+				expect.objectContaining({
+					scope_id: "exampleco-work",
+					workspace_identity: "https://git.example.invalid/exampleco/api.git:worktree",
+				}),
+			]),
+		});
+	});
+
+	it("excludes peer-received identities from cluster bulk assignment", async () => {
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [
+				project({
+					cwd: "/workspace/a",
+					git_remote: null,
+					identity_source: "cwd",
+					memory_count: 2,
+					session_count: 1,
+					workspace_identity: "/workspace/a",
+				}),
+				project({
+					cwd: null,
+					git_branch: null,
+					git_remote: null,
+					guardrail_warnings: [
+						{
+							code: "basename_collision_review",
+							message: "Peer-received rows should not block local bulk assignment.",
+							requires_confirmation: true,
+							severity: "warning",
+						},
+					],
+					identity_source: "workspace_id",
+					memory_count: 4,
+					read_only: true,
+					read_only_reason: "peer_received",
+					session_count: 0,
+					statuses: ["received"],
+					workspace_identity: "peer-received:peer-a:project:api",
+				}),
+			],
+			total: 2,
+		});
+
+		await loadProjectsData();
+
+		expect(document.body.textContent).toContain("2 identities · 1 sessions · 6 memories");
+		expect(document.body.textContent).toContain("Save Space for 1 identity");
+		const select = document.querySelector(
+			".project-inventory-cluster select",
+		) as HTMLSelectElement | null;
+		if (!select) throw new Error("cluster select missing");
+		select.value = "exampleco-work";
+		select.dispatchEvent(new Event("change", { bubbles: true }));
+		const save = Array.from(document.querySelectorAll("button")).find(
+			(button) => button.textContent === "Save Space for 1 identity",
+		) as HTMLButtonElement | undefined;
+		expect(save?.disabled).toBe(false);
+		save?.click();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(api.saveSharingDomainProjectMappings).toHaveBeenCalledWith({
+			mappings: [
+				expect.objectContaining({
+					scope_id: "exampleco-work",
+					workspace_identity: "/workspace/a",
+				}),
+			],
+		});
+	});
+
+	it("does not show bulk Space controls for unmapped-only clusters", async () => {
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [
+				project({
+					cwd: null,
+					git_remote: null,
+					identity_source: "unmapped",
+					workspace_identity: "unmapped:one",
+				}),
+				project({
+					cwd: null,
+					git_remote: null,
+					identity_source: "unmapped",
+					workspace_identity: "unmapped:two",
+				}),
+			],
+			total: 2,
+		});
+
+		await loadProjectsData();
+
+		expect(document.body.textContent).not.toContain("Save Space for");
+		expect(document.querySelector(".project-inventory-cluster select")).toBeNull();
+	});
+
+	it("blocks cluster bulk assignment when an identity needs guardrail review", async () => {
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [
+				project(),
+				project({
+					guardrail_warnings: [
+						{
+							code: "basename_collision_review",
+							message: "Another project is also named api.",
+							requires_confirmation: true,
+							severity: "warning",
+						},
+					],
+					workspace_identity: "https://git.example.invalid/exampleco/api.git:worktree",
+				}),
+			],
+			total: 2,
+		});
+
+		await loadProjectsData();
+		const save = Array.from(document.querySelectorAll("button")).find(
+			(button) => button.textContent === "Save Space for 2 identities",
+		) as HTMLButtonElement | undefined;
+		save?.click();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(save?.disabled).toBe(true);
+		expect(api.saveSharingDomainProjectMappings).not.toHaveBeenCalled();
+		expect(document.body.textContent).toContain("need individual review");
+		expect(document.body.textContent).toContain(
+			"Blocked identity: https://git.example.invalid/exampleco/api.git:worktree",
+		);
+		expect(document.body.textContent).toContain("Another project is also named api.");
+		expect(document.body.textContent).toContain("Advanced Project administration");
+	});
+
+	it("does not block cluster bulk assignment for informational guardrail warnings", async () => {
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [
+				project(),
+				project({
+					guardrail_warnings: [
+						{
+							code: "unknown_project_local_only",
+							message: "This identity currently stays Local only.",
+							requires_confirmation: false,
+							severity: "warning",
+						},
+					],
+					workspace_identity: "https://git.example.invalid/exampleco/api.git:worktree",
+				}),
+			],
+			total: 2,
+		});
+
+		await loadProjectsData();
+		const select = document.querySelector(
+			".project-inventory-cluster select",
+		) as HTMLSelectElement | null;
+		if (!select) throw new Error("cluster select missing");
+		select.value = "exampleco-work";
+		select.dispatchEvent(new Event("change", { bubbles: true }));
+		const save = Array.from(document.querySelectorAll("button")).find(
+			(button) => button.textContent === "Save Space for 2 identities",
+		) as HTMLButtonElement | undefined;
+		expect(save?.disabled).toBe(false);
+		expect(document.body.textContent).not.toContain("Blocked identity:");
+
+		save?.click();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(api.saveSharingDomainProjectMappings).toHaveBeenCalledWith({
+			mappings: expect.arrayContaining([
+				expect.objectContaining({
+					scope_id: "exampleco-work",
+					workspace_identity: "https://git.example.invalid/exampleco/api.git:worktree",
+				}),
+			]),
+		});
+	});
+
+	it("requires explicit cluster domain choice for mixed suggestions", async () => {
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [
+				project({ suggested_scope_id: "exampleco-work" }),
+				project({
+					resolved_scope_id: "personal",
+					suggested_scope_id: "personal",
+					workspace_identity: "https://git.example.invalid/exampleco/api.git:worktree",
+				}),
+			],
+			total: 2,
+		});
+
+		await loadProjectsData();
+		const select = document.querySelector(
+			".project-inventory-cluster select",
+		) as HTMLSelectElement | null;
+		const save = Array.from(document.querySelectorAll("button")).find(
+			(button) => button.textContent === "Save Space for 2 identities",
+		) as HTMLButtonElement | undefined;
+
+		expect(select?.value).toBe("");
+		expect(save?.disabled).toBe(true);
+		expect(document.body.textContent).toContain("mixed suggestions or current Spaces");
+	});
+
+	it("does not partially update cluster identities when bulk assignment fails", async () => {
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [
+				project({ cwd: "/workspace/a" }),
+				project({
+					cwd: "/tmp/worktree-a",
+					workspace_identity: "https://git.example.invalid/exampleco/api.git:worktree",
+				}),
+			],
+			total: 2,
+		});
+		vi.mocked(api.saveSharingDomainProjectMappings).mockRejectedValueOnce(
+			new api.SharingDomainGuardrailConfirmationError({
+				guardrail_warnings: [],
+				required_guardrail_tokens: ["token-1"],
+			}),
+		);
+
+		await loadProjectsData();
+		const select = document.querySelector(
+			".project-inventory-cluster select",
+		) as HTMLSelectElement | null;
+		if (!select) throw new Error("cluster select missing");
+		select.value = "exampleco-work";
+		select.dispatchEvent(new Event("change", { bubbles: true }));
+		const save = Array.from(document.querySelectorAll("button")).find(
+			(button) => button.textContent === "Save Space for 2 identities",
+		) as HTMLButtonElement | undefined;
+		save?.click();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(api.saveSharingDomainProjectMappings).toHaveBeenCalledTimes(1);
+		expect(api.saveSharingDomainProjectMapping).not.toHaveBeenCalled();
+	});
+
+	it("does not render assignment controls for unmapped projects", async () => {
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 50,
+			offset: 0,
+			projects: [
+				project({
+					identity_source: "unmapped",
+					statuses: ["local_only", "unmapped"],
+					workspace_identity: "unmapped:abc123",
+				}),
+			],
+			total: 1,
+		});
+
+		await loadProjectsData();
+
+		expect(document.body.textContent).toContain("missing a stable path");
+		expect(document.querySelector(".project-domain-select")).toBeNull();
+	});
+
+	it("excludes legacy review from assignment options", async () => {
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 50,
+			offset: 0,
+			projects: [project()],
+			total: 1,
+		});
+
+		await loadProjectsData();
+
+		const values = Array.from(document.querySelectorAll("option")).map(
+			(option) => (option as HTMLOptionElement).value,
+		);
+		expect(values).toContain("local-default");
+		expect(values).toContain("exampleco-work");
+		expect(values).not.toContain("legacy-shared-review");
+	});
+
+	it("groups assignable Spaces by Team", async () => {
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 50,
+			offset: 0,
+			projects: [project({ resolved_scope_id: "exampleco-work" })],
+			total: 1,
+		});
+
+		await loadProjectsData();
+
+		const groups = Array.from(document.querySelectorAll("optgroup")).map((group) => ({
+			label: group.label,
+			options: Array.from(group.querySelectorAll("option")).map((option) => option.textContent),
+		}));
+		expect(groups).toEqual([
+			{ label: "Local device", options: ["Local only"] },
+			{ label: "Team: ExampleCo Team", options: ["ExampleCo Work (default)"] },
+		]);
+		expect(document.body.textContent).toContain("ExampleCo Work (default) · Team: ExampleCo Team");
+	});
+
+	it("disambiguates duplicate Space names in assignment options", async () => {
+		vi.mocked(api.loadSharingDomainSettings).mockResolvedValue({
+			local_default_scope_id: "local-default",
+			mappings: [],
+			projects: [],
+			scopes: [
+				{
+					authority_type: "local",
+					kind: "system",
+					label: "Local only",
+					scope_id: "local-default",
+					status: "active",
+				},
+				{
+					authority_type: "coordinator",
+					group_id: "exampleco",
+					kind: "team",
+					label: "Client Work",
+					scope_id: "client-work-a",
+					status: "active",
+				},
+				{
+					authority_type: "coordinator",
+					group_id: "exampleco",
+					kind: "team",
+					label: "Client Work",
+					scope_id: "client-work-b",
+					status: "active",
+				},
+			],
+		});
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 50,
+			offset: 0,
+			projects: [project()],
+			total: 1,
+		});
+
+		await loadProjectsData();
+
+		const teamGroupOptions = Array.from(
+			document
+				.querySelector('optgroup[label="Team: ExampleCo Team"]')
+				?.querySelectorAll("option") ?? [],
+		).map((option) => option.textContent);
+		expect(teamGroupOptions).toEqual([
+			"Client Work · Space ID client-work-a",
+			"Client Work · Space ID client-work-b",
+		]);
+	});
+
+	it("ignores stale suggested Spaces that are not assignable", async () => {
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 50,
+			offset: 0,
+			projects: [project({ suggested_scope_id: "legacy-shared-review" })],
+			total: 1,
+		});
+
+		await loadProjectsData();
+
+		const select = document.querySelector(".project-domain-select") as HTMLSelectElement | null;
+		const save = Array.from(document.querySelectorAll("button")).find(
+			(button) => button.textContent === "Save Space",
+		) as HTMLButtonElement | undefined;
+		expect(select?.value).toBe("local-default");
+		expect(save?.disabled).toBe(false);
+		save?.click();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(api.saveSharingDomainProjectMapping).toHaveBeenCalledWith(
+			expect.objectContaining({ scope_id: "local-default" }),
+		);
+	});
+
+	it("keeps expanded project details open after refresh", async () => {
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 50,
+			offset: 0,
+			projects: [project()],
+			total: 1,
+		});
+
+		await loadProjectsData();
+		const details = document.querySelector("details");
+		expect(details).not.toBeNull();
+		details?.setAttribute("open", "");
+		details?.dispatchEvent(new Event("toggle"));
+
+		await loadProjectsData();
+
+		expect(document.querySelector("details")?.open).toBe(true);
+	});
+
+	it("keeps draft domain selection after refresh", async () => {
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 25,
+			offset: 0,
+			projects: [project()],
+			total: 1,
+		});
+
+		await loadProjectsData();
+		const select = document.querySelector(".project-domain-select") as HTMLSelectElement | null;
+		expect(select).not.toBeNull();
+		if (!select) throw new Error("select missing");
+		select.value = "exampleco-work";
+		select.dispatchEvent(new Event("change"));
+
+		await loadProjectsData();
+
+		expect(
+			(document.querySelector(".project-domain-select") as HTMLSelectElement | null)?.value,
+		).toBe("exampleco-work");
+	});
+
+	it("explains backend guardrail confirmation as a required acknowledgement", async () => {
+		const refresh = vi.fn();
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 25,
+			offset: 0,
+			projects: [project()],
+			total: 1,
+		});
+		vi.mocked(api.saveSharingDomainProjectMapping).mockRejectedValueOnce(
+			new api.SharingDomainGuardrailConfirmationError({
+				guardrail_warnings: [
+					{
+						code: "unknown_project_local_only",
+						message:
+							"No Space assignment matches this project, so future memories stay Local only until you assign one.",
+						requires_confirmation: true,
+						severity: "warning",
+					},
+					{
+						code: "basename_collision_review",
+						message:
+							"Another workspace is also named api. Review the git remote or path before assigning a non-local Space.",
+						requires_confirmation: true,
+						severity: "warning",
+					},
+				],
+				required_guardrail_tokens: ["token-1", "token-2"],
+			}),
+		);
+
+		initProjectsTab(refresh);
+		await loadProjectsData();
+		const select = document.querySelector(".project-domain-select") as HTMLSelectElement | null;
+		if (!select) throw new Error("select missing");
+		select.value = "exampleco-work";
+		select.dispatchEvent(new Event("change"));
+		const save = Array.from(document.querySelectorAll("button")).find(
+			(button) => button.textContent === "Save Space",
+		) as HTMLButtonElement | undefined;
+		save?.click();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		await loadProjectsData();
+
+		expect(document.body.textContent).toContain("Confirmation required before saving this Space.");
+		expect(document.body.textContent).toContain(
+			"Codemem can save this change after you acknowledge the checks below.",
+		);
+		expect(document.body.textContent).toContain("Current behavior:");
+		expect(document.body.textContent).toContain("Name collision:");
+		expect(document.body.textContent).toContain("I understand, save Space");
+		expect(document.body.textContent).not.toContain("Confirm and save");
+	});
+
+	it("clears stale guardrail confirmation when the draft domain changes", async () => {
+		const refresh = vi.fn();
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 25,
+			offset: 0,
+			projects: [project()],
+			total: 1,
+		});
+		vi.mocked(api.saveSharingDomainProjectMapping).mockRejectedValueOnce(
+			new api.SharingDomainGuardrailConfirmationError({
+				guardrail_warnings: [
+					{
+						code: "basename_collision_review",
+						message:
+							"Another workspace is also named api. Review the git remote or path before assigning a non-local Space.",
+						requires_confirmation: true,
+						severity: "warning",
+					},
+				],
+				required_guardrail_tokens: ["token-1"],
+			}),
+		);
+
+		initProjectsTab(refresh);
+		await loadProjectsData();
+		const select = document.querySelector(".project-domain-select") as HTMLSelectElement | null;
+		if (!select) throw new Error("select missing");
+		select.value = "exampleco-work";
+		select.dispatchEvent(new Event("change"));
+		const save = Array.from(document.querySelectorAll("button")).find(
+			(button) => button.textContent === "Save Space",
+		) as HTMLButtonElement | undefined;
+		save?.click();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		await loadProjectsData();
+		expect(document.body.textContent).toContain("I understand, save Space");
+		const staleConfirm = Array.from(document.querySelectorAll("button")).find(
+			(button) => button.textContent === "I understand, save Space",
+		) as HTMLButtonElement | undefined;
+		expect(api.saveSharingDomainProjectMapping).toHaveBeenCalledTimes(1);
+
+		const nextSelect = document.querySelector(".project-domain-select") as HTMLSelectElement | null;
+		if (!nextSelect) throw new Error("select missing after refresh");
+		nextSelect.focus();
+		nextSelect.value = "local-default";
+		nextSelect.dispatchEvent(new Event("change"));
+		expect(document.body.textContent).not.toContain("I understand, save Space");
+		staleConfirm?.click();
+		expect(api.saveSharingDomainProjectMapping).toHaveBeenCalledTimes(1);
+		await loadProjectsData();
+
+		expect(document.body.textContent).not.toContain("I understand, save Space");
+		expect(document.body.textContent).not.toContain(
+			"Confirmation required before saving this Space.",
+		);
+		expect(refresh).toHaveBeenCalled();
+	});
+
+	it("surfaces suggestions and attention warnings on the collapsed card", async () => {
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 50,
+			offset: 0,
+			projects: [
+				project({
+					guardrail_warnings: [
+						{
+							code: "basename_collision_review",
+							message: "Another project is also named api.",
+							requires_confirmation: true,
+							severity: "warning",
+						},
+					],
+					statuses: ["suggested", "needs_attention"],
+					suggested_scope_id: "exampleco-work",
+					suggestion_reason:
+						"ExampleCo Work is suggested because the git remote contains exampleco.",
+				}),
+			],
+			total: 1,
+		});
+
+		await loadProjectsData();
+
+		expect(document.body.textContent).toContain("Suggestion: ExampleCo Work is suggested");
+		expect(document.body.textContent).toContain(
+			"Needs attention: Another project is also named api.",
+		);
+	});
+
+	it("lets project rows reassign their stored project", async () => {
+		const refresh = vi.fn();
+		vi.mocked(openSyncInputDialog).mockResolvedValue("codemem");
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 25,
+			offset: 0,
+			projects: [project({ memory_count: 11, project: "injection", session_count: 1 })],
+			total: 1,
+		});
+
+		initProjectsTab(refresh);
+		await loadProjectsData();
+		const changeProject = Array.from(document.querySelectorAll("button")).find(
+			(button) => button.textContent === "Change project…",
+		) as HTMLButtonElement | undefined;
+		expect(changeProject).not.toBeUndefined();
+
+		changeProject?.click();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(openSyncInputDialog).toHaveBeenCalledWith(
+			expect.objectContaining({
+				description: expect.stringContaining("1 session and 11 memories"),
+				initialValue: "injection",
+				title: "Change project",
+			}),
+		);
+		expect(api.reassignProjectInventoryProject).toHaveBeenCalledWith({
+			project: "codemem",
+			workspace_identity: "https://git.example.invalid/exampleco/api.git",
+		});
+		expect(refresh).toHaveBeenCalled();
+	});
+
+	it("disables project reassignment for saved mappings with no sessions", async () => {
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 25,
+			offset: 0,
+			projects: [
+				project({
+					memory_count: 0,
+					resolution_reason: "exact_mapping",
+					session_count: 0,
+				}),
+			],
+			total: 1,
+		});
+
+		await loadProjectsData();
+
+		const changeProject = Array.from(document.querySelectorAll("button")).find(
+			(button) => button.textContent === "Change project…",
+		) as HTMLButtonElement | undefined;
+		expect(changeProject?.disabled).toBe(true);
+		expect(changeProject?.title).toContain("No sessions");
+	});
+
+	it("confirms cleanup before forgetting local project memories", async () => {
+		const refresh = vi.fn();
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [project({ memory_count: 7 })],
+			total: 1,
+		});
+		vi.mocked(api.forgetProjectInventoryMemories).mockRejectedValueOnce(
+			new api.ProjectForgetConfirmationError({
+				confirmation_token: "confirm-token",
+				local_owned_memory_count: 5,
+				peer_owned_memory_count: 2,
+				workspace_identity: "https://git.example.invalid/exampleco/api.git",
+			}),
+		);
+
+		initProjectsTab(refresh);
+		await loadProjectsData();
+		const forget = Array.from(document.querySelectorAll("button")).find(
+			(button) => button.textContent === "Forget local memories…",
+		) as HTMLButtonElement | undefined;
+		forget?.click();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		await loadProjectsData();
+
+		expect(document.body.textContent).toContain("Confirm project memory cleanup");
+		expect(document.body.textContent).toContain("5 locally owned memories will be forgotten");
+		expect(document.body.textContent).toContain("2 peer-owned memories will be left unchanged");
+		const confirm = Array.from(document.querySelectorAll("button")).find(
+			(button) => button.textContent === "I understand, forget local memories",
+		) as HTMLButtonElement | undefined;
+		confirm?.click();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(api.forgetProjectInventoryMemories).toHaveBeenLastCalledWith({
+			confirmation_token: "confirm-token",
+			confirmed: true,
+			workspace_identity: "https://git.example.invalid/exampleco/api.git",
+		});
+	});
+
+	it("renders active Team and Identity recipients with only recipient management primary", async () => {
+		const selected = project({
+			display_project: "codemem",
+			workspace_identity: "project-codemem",
+			git_remote: "https://git.example.invalid/exampleco/codemem.git",
+		});
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [selected],
+			total: 1,
+		});
+		vi.mocked(api.loadRecipientPolicyIntent).mockResolvedValue(
+			recipientIntent({
+				projectRecipients: [
+					{
+						version: 1,
+						canonicalProjectIdentity: "project-codemem",
+						recipientKind: "team",
+						teamId: "team-example",
+						intentSource: "user",
+						policyRevision: "one",
+						status: "active",
+					},
+					{
+						version: 1,
+						canonicalProjectIdentity: "project-codemem",
+						recipientKind: "identity",
+						identityId: "identity-adam",
+						intentSource: "user",
+						policyRevision: "two",
+						status: "active",
+					},
+				],
+			}),
+		);
+
+		await loadProjectsData();
+
+		const row = document.querySelector<HTMLElement>(".project-inventory-row");
+		if (!row) throw new Error("project row missing");
+		expect(row.querySelector(".project-recipient-status")?.textContent).toBe(
+			"Shared with 2 recipients.",
+		);
+		expect(
+			[...row.querySelectorAll(".project-recipient-chip")].map((chip) => chip.textContent),
+		).toEqual(["Identity: Adam", "Team: ExampleCo"]);
+		const primaryButtons = [
+			...row.querySelectorAll<HTMLButtonElement>(":scope > .project-inventory-row-header button"),
+		].map((button) => button.textContent);
+		expect(primaryButtons).toEqual(["Manage recipients"]);
+		expect(row.querySelector("details")?.textContent).toContain("Share");
+		const normalCopy = row.cloneNode(true) as HTMLElement;
+		normalCopy.querySelector("details")?.remove();
+		expect(normalCopy.textContent).not.toContain(selected.workspace_identity);
+		expect(normalCopy.textContent).not.toContain("Space");
+
+		row.querySelector<HTMLButtonElement>(".project-recipient-action")?.click();
+		expect(recipientPolicyManagement.openRecipientPolicyManagement).toHaveBeenCalledWith({
+			mode: "project-manage",
+			projectId: "project-codemem",
+		});
+	});
+
+	it("bulk-selects exact canonical Projects and opens sorted recipient sharing", async () => {
+		const alpha = project({
+			display_project: "alpha",
+			git_remote: "git:alpha",
+			project: "alpha",
+			workspace_identity: "project-zeta",
+		});
+		const beta = project({
+			display_project: "beta",
+			git_remote: "git:beta",
+			project: "beta",
+			workspace_identity: "project-alpha",
+		});
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [alpha, beta],
+			total: 2,
+		});
+
+		initProjectsTab(() => {});
+		await loadProjectsData();
+		document
+			.querySelector<HTMLInputElement>('input[aria-label="Select alpha for recipient sharing"]')
+			?.click();
+		document
+			.querySelector<HTMLInputElement>('input[aria-label="Select beta for recipient sharing"]')
+			?.click();
+
+		const shareSelected = document.getElementById("projectsShareSelected") as HTMLButtonElement;
+		expect(shareSelected.textContent).toBe("Share selected (2)");
+		expect(shareSelected.disabled).toBe(false);
+		expect(document.getElementById("projectsSelectionStatus")?.textContent).toBe(
+			"2 Projects selected.",
+		);
+		shareSelected.click();
+
+		expect(recipientPolicyManagement.openRecipientPolicyManagement).toHaveBeenCalledWith({
+			mode: "project-add",
+			projectIds: ["project-alpha", "project-zeta"],
+		});
+	});
+
+	it("keeps selection across renders and prunes Projects absent from complete inventory", async () => {
+		initProjectsTab(() => {});
+		const alpha = project({
+			display_project: "alpha",
+			git_remote: "git:alpha",
+			project: "alpha",
+			workspace_identity: "project-alpha",
+		});
+		const beta = project({
+			display_project: "beta",
+			git_remote: "git:beta",
+			project: "beta",
+			workspace_identity: "project-beta",
+		});
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [alpha, beta],
+			total: 2,
+		});
+
+		await loadProjectsData();
+		document
+			.querySelector<HTMLInputElement>('input[aria-label="Select alpha for recipient sharing"]')
+			?.click();
+		document
+			.querySelector<HTMLInputElement>('input[aria-label="Select beta for recipient sharing"]')
+			?.click();
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [alpha],
+			total: 1,
+		});
+
+		await loadProjectsData();
+
+		expect(document.getElementById("projectsSelectionStatus")?.textContent).toBe(
+			"1 Project selected.",
+		);
+		expect(
+			document.querySelector<HTMLInputElement>(
+				'input[aria-label="Select alpha for recipient sharing"]',
+			)?.checked,
+		).toBe(true);
+	});
+
+	it("keeps inventory usable and disables recipient actions when intent loading fails", async () => {
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [project()],
+			total: 1,
+		});
+		vi.mocked(api.loadRecipientPolicyIntent).mockRejectedValueOnce(new Error("intent unavailable"));
+
+		initProjectsTab(() => {});
+		await loadProjectsData();
+
+		expect(document.body.textContent).toContain("Recipient access is unavailable.");
+		expect(document.querySelector<HTMLButtonElement>(".project-recipient-action")?.disabled).toBe(
+			true,
+		);
+		expect(
+			document.getElementById("projectsShareSelected")?.getAttribute("disabled"),
+		).not.toBeNull();
+		expect(recipientPolicyManagement.mountRecipientPolicyManagement).toHaveBeenCalledWith(
+			document.getElementById("recipientPolicyManagementMount"),
+			[
+				{
+					canonicalProjectIdentity: project().workspace_identity,
+					displayName: "api",
+					existingMemoryCount: 1,
+				},
+			],
+			expect.objectContaining({ projectRecipients: [] }),
+			expect.objectContaining({ loadError: true }),
+		);
+	});
+
+	it("mounts complete inventory and clears selection after a successful management commit", async () => {
+		const refresh = vi.fn();
+		const selected = project({
+			display_project: "selected",
+			workspace_identity: "project-selected",
+		});
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [selected],
+			total: 1,
+		});
+
+		initProjectsTab(refresh);
+		await loadProjectsData();
+		document.querySelector<HTMLInputElement>(".project-selection-checkbox")?.click();
+		const calls = vi.mocked(recipientPolicyManagement.mountRecipientPolicyManagement).mock.calls;
+		const options = calls[calls.length - 1]?.[3];
+		expect(calls[calls.length - 1]?.[1]).toEqual([
+			{
+				canonicalProjectIdentity: "project-selected",
+				displayName: "selected",
+				existingMemoryCount: 1,
+			},
+		]);
+		await options?.onCommitted?.({
+			version: 1,
+			status: "applied",
+			reviewedPolicyDigest: "digest",
+			errorCode: null,
+			outcomes: [],
+			writeCount: 1,
+			idempotent: false,
+		});
+
+		expect(refresh).toHaveBeenCalled();
+		expect(document.getElementById("projectsSelectionStatus")?.textContent).toBe(
+			"0 Projects selected.",
+		);
+	});
+
+	it("aggregates clustered recipients and shares all exact canonical identities", async () => {
+		const first = project({ cwd: "/workspace/a", workspace_identity: "project-zeta" });
+		const second = project({ cwd: "/workspace/b", workspace_identity: "project-alpha" });
+		vi.mocked(api.loadProjectScopeInventory).mockResolvedValue({
+			has_more: false,
+			limit: 250,
+			offset: 0,
+			projects: [first, second],
+			total: 2,
+		});
+		vi.mocked(api.loadRecipientPolicyIntent).mockResolvedValue(
+			recipientIntent({
+				projectRecipients: [
+					{
+						version: 1,
+						canonicalProjectIdentity: "project-zeta",
+						recipientKind: "team",
+						teamId: "team-example",
+						intentSource: "user",
+						policyRevision: "one",
+						status: "active",
+					},
+					{
+						version: 1,
+						canonicalProjectIdentity: "project-alpha",
+						recipientKind: "identity",
+						identityId: "identity-adam",
+						intentSource: "user",
+						policyRevision: "two",
+						status: "active",
+					},
+				],
+			}),
+		);
+
+		await loadProjectsData();
+
+		const cluster = document.querySelector<HTMLElement>(".project-inventory-cluster");
+		if (!cluster) throw new Error("project cluster missing");
+		expect(
+			[
+				...cluster.querySelectorAll(":scope > .project-recipient-summary .project-recipient-chip"),
+			].map((chip) => chip.textContent),
+		).toEqual(["Identity: Adam", "Team: ExampleCo"]);
+		const action = cluster.querySelector<HTMLButtonElement>(
+			":scope > .project-inventory-row-header .project-recipient-action",
+		);
+		expect(action?.textContent).toBe("Share selected");
+		expect(action?.getAttribute("aria-label")).toBe("Share selected identities for api");
+		const clusterSelection = cluster.querySelector<HTMLInputElement>(
+			':scope > .project-inventory-row-header input[aria-label="Select all identities for api"]',
+		);
+		clusterSelection?.click();
+		expect(document.getElementById("projectsSelectionStatus")?.textContent).toBe(
+			"2 Projects selected.",
+		);
+		action?.click();
+		expect(recipientPolicyManagement.openRecipientPolicyManagement).toHaveBeenCalledWith({
+			mode: "project-add",
+			projectIds: ["project-alpha", "project-zeta"],
+		});
+	});
+});

@@ -1,9 +1,14 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { connect } from "./db.js";
-import { buildMemoryPack, buildMemoryPackTrace, estimateTokens } from "./pack.js";
+import {
+	buildMemoryPack,
+	buildMemoryPackTrace,
+	buildMemoryPackWithTrace,
+	estimateTokens,
+} from "./pack.js";
 import { MemoryStore } from "./store.js";
 import { initTestSchema, insertTestSession } from "./test-utils.js";
 import type { MemoryResult } from "./types.js";
@@ -47,6 +52,65 @@ describe("buildMemoryPack", () => {
 		store.close();
 		rmSync(tmpDir, { recursive: true, force: true });
 	});
+
+	function insertCoordinatorScope(scopeId: string): void {
+		const now = new Date().toISOString();
+		store.db
+			.prepare(
+				`INSERT OR REPLACE INTO replication_scopes(
+					scope_id, label, kind, authority_type, coordinator_id, group_id,
+					membership_epoch, status, created_at, updated_at
+				 ) VALUES (?, ?, 'team', 'coordinator', 'coord-test', 'group-test', 0, 'active', ?, ?)`,
+			)
+			.run(scopeId, scopeId, now, now);
+	}
+
+	function grantScopeToLocalDevice(scopeId: string): void {
+		insertCoordinatorScope(scopeId);
+		store.db
+			.prepare(
+				`INSERT OR REPLACE INTO scope_memberships(
+					scope_id, device_id, role, status, membership_epoch,
+					coordinator_id, group_id, updated_at
+				 ) VALUES (?, ?, 'member', 'active', 0, 'coord-test', 'group-test', ?)`,
+			)
+			.run(scopeId, store.deviceId, new Date().toISOString());
+	}
+
+	function insertScopedMemory(scopeId: string, title: string, bodyText: string): number {
+		const now = new Date().toISOString();
+		const info = store.db
+			.prepare(
+				`INSERT INTO memory_items(session_id, kind, title, body_text, confidence,
+				 tags_text, active, created_at, updated_at, metadata_json, rev, visibility, scope_id)
+				 VALUES (?, 'discovery', ?, ?, 0.5, '', 1, ?, ?, '{}', 1, 'shared', ?)`,
+			)
+			.run(sessionId, title, bodyText, now, now, scopeId);
+		return Number(info.lastInsertRowid);
+	}
+
+	function semanticCandidate(
+		id: number,
+		title: string,
+		bodyText: string,
+		score: number,
+	): MemoryResult {
+		return {
+			id,
+			kind: "discovery",
+			title,
+			body_text: bodyText,
+			confidence: 0.9,
+			created_at: "2026-01-01T00:00:00.000Z",
+			updated_at: "2026-01-01T00:00:00.000Z",
+			tags_text: "",
+			score,
+			session_id: sessionId,
+			metadata: {},
+			narrative: null,
+			facts: null,
+		};
+	}
 
 	it("returns items and pack_text for matching context", () => {
 		store.remember(sessionId, "discovery", "Found database issue", "The DB was slow", 0.8);
@@ -156,6 +220,152 @@ describe("buildMemoryPack", () => {
 		expect(second.metrics.added_ids).toContain(id2);
 		expect(second.metrics.retained_ids).toContain(id1);
 		expect(typeof second.metrics.pack_token_delta).toBe("number");
+	});
+
+	it("does not use out-of-scope pack delta baselines", () => {
+		grantScopeToLocalDevice("authorized-team");
+		insertCoordinatorScope("unauthorized-team");
+		const hiddenId = insertScopedMemory(
+			"unauthorized-team",
+			"Hidden delta memory",
+			"delta scope body",
+		);
+		const visibleId = insertScopedMemory(
+			"authorized-team",
+			"Visible delta memory",
+			"delta scope body",
+		);
+		store.db
+			.prepare(
+				`INSERT INTO usage_events(
+					session_id, event, tokens_read, tokens_written, tokens_saved, created_at, metadata_json
+				) VALUES (NULL, 'pack', 999, 0, 0, ?, ?)`,
+			)
+			.run(
+				"2026-01-01T00:00:00.000Z",
+				JSON.stringify({ pack_item_ids: [hiddenId], pack_tokens: 999 }),
+			);
+
+		const pack = buildMemoryPack(store, "delta", 10);
+
+		expect(pack.item_ids).toContain(visibleId);
+		expect(pack.item_ids).not.toContain(hiddenId);
+		expect(pack.metrics.pack_delta_available).toBe(false);
+		expect(pack.metrics.removed_ids).not.toContain(hiddenId);
+		expect(pack.metrics.retained_ids).not.toContain(hiddenId);
+		expect(pack.metrics.added_ids).not.toContain(hiddenId);
+	});
+
+	it("does not use itemless pack delta token baselines", () => {
+		grantScopeToLocalDevice("authorized-team");
+		const visibleId = insertScopedMemory(
+			"authorized-team",
+			"Visible empty-baseline memory",
+			"empty baseline body",
+		);
+		store.db
+			.prepare(
+				`INSERT INTO usage_events(
+					session_id, event, tokens_read, tokens_written, tokens_saved, created_at, metadata_json
+				) VALUES (NULL, 'pack', 999, 0, 0, ?, ?)`,
+			)
+			.run("2026-01-01T00:00:00.000Z", JSON.stringify({ pack_item_ids: [], pack_tokens: 999 }));
+
+		const pack = buildMemoryPack(store, "empty baseline", 10);
+
+		expect(pack.item_ids).toContain(visibleId);
+		expect(pack.metrics.pack_delta_available).toBe(false);
+		expect(pack.metrics.pack_token_delta).toBe(0);
+	});
+
+	it("does not use pack delta baselines outside current scope filters", () => {
+		grantScopeToLocalDevice("scope-a");
+		grantScopeToLocalDevice("scope-b");
+		const scopeBId = insertScopedMemory("scope-b", "Scope B delta memory", "delta filter body");
+		const scopeAId = insertScopedMemory("scope-a", "Scope A delta memory", "delta filter body");
+		store.db
+			.prepare(
+				`INSERT INTO usage_events(
+					session_id, event, tokens_read, tokens_written, tokens_saved, created_at, metadata_json
+				) VALUES (NULL, 'pack', 999, 0, 0, ?, ?)`,
+			)
+			.run(
+				"2026-01-01T00:00:00.000Z",
+				JSON.stringify({ pack_item_ids: [scopeBId], pack_tokens: 999 }),
+			);
+
+		const pack = buildMemoryPack(store, "delta filter", 10, null, { scope_id: "scope-a" });
+
+		expect(pack.item_ids).toContain(scopeAId);
+		expect(pack.item_ids).not.toContain(scopeBId);
+		expect(pack.metrics.pack_delta_available).toBe(false);
+		expect(pack.metrics.removed_ids).not.toContain(scopeBId);
+		expect(pack.metrics.retained_ids).not.toContain(scopeBId);
+	});
+
+	it("finds current-scope pack delta baselines beyond out-of-scope history", () => {
+		grantScopeToLocalDevice("scope-a");
+		grantScopeToLocalDevice("scope-b");
+		const scopeAId = insertScopedMemory("scope-a", "Scope A retained memory", "retained body");
+		const scopeBId = insertScopedMemory("scope-b", "Scope B noisy memory", "retained body");
+		const insertUsage = (ids: number[], createdAt: string, packTokens: number) => {
+			store.db
+				.prepare(
+					`INSERT INTO usage_events(
+						session_id, event, tokens_read, tokens_written, tokens_saved, created_at, metadata_json
+					) VALUES (NULL, 'pack', ?, 0, 0, ?, ?)`,
+				)
+				.run(
+					packTokens,
+					createdAt,
+					JSON.stringify({ pack_item_ids: ids, pack_tokens: packTokens }),
+				);
+		};
+		insertUsage([scopeAId], "2026-01-01T00:00:00.000Z", 10);
+		for (let i = 0; i < 26; i += 1) {
+			insertUsage([scopeBId], `2026-01-02T00:${String(i).padStart(2, "0")}:00.000Z`, 999);
+		}
+
+		const pack = buildMemoryPack(store, "retained", 10, null, { scope_id: "scope-a" });
+
+		expect(pack.item_ids).toContain(scopeAId);
+		expect(pack.item_ids).not.toContain(scopeBId);
+		expect(pack.metrics.pack_delta_available).toBe(true);
+		expect(pack.metrics.retained_ids).toContain(scopeAId);
+		expect(pack.metrics.removed_ids).not.toContain(scopeBId);
+	});
+
+	it("bounds pack delta baseline scans when no current-scope baseline is recent", () => {
+		grantScopeToLocalDevice("scope-a");
+		grantScopeToLocalDevice("scope-b");
+		const scopeAId = insertScopedMemory("scope-a", "Scope A old retained memory", "retained body");
+		const scopeBId = insertScopedMemory("scope-b", "Scope B noisy old memory", "retained body");
+		const insertUsage = (ids: number[], createdAt: string, packTokens: number) => {
+			store.db
+				.prepare(
+					`INSERT INTO usage_events(
+						session_id, event, tokens_read, tokens_written, tokens_saved, created_at, metadata_json
+					) VALUES (NULL, 'pack', ?, 0, 0, ?, ?)`,
+				)
+				.run(
+					packTokens,
+					createdAt,
+					JSON.stringify({ pack_item_ids: ids, pack_tokens: packTokens }),
+				);
+		};
+		insertUsage([scopeAId], "2026-01-01T00:00:00.000Z", 10);
+		for (let i = 0; i < 260; i += 1) {
+			insertUsage(
+				[scopeBId],
+				`2026-01-02T00:${String(Math.floor(i / 60)).padStart(2, "0")}:${String(i % 60).padStart(2, "0")}.000Z`,
+				999,
+			);
+		}
+
+		const pack = buildMemoryPack(store, "retained", 10, null, { scope_id: "scope-a" });
+
+		expect(pack.item_ids).toContain(scopeAId);
+		expect(pack.metrics.pack_delta_available).toBe(false);
 	});
 
 	it("keeps project delta baseline after many packs in other projects", () => {
@@ -339,8 +549,8 @@ describe("buildMemoryPack", () => {
 			.prepare(
 				`INSERT INTO memory_items(
 					session_id, kind, title, body_text, confidence, tags_text, active,
-					created_at, updated_at, metadata_json, rev
-				) VALUES (?, 'session_summary', ?, ?, 0.8, '', 1, ?, ?, '{}', 1)`,
+					created_at, updated_at, metadata_json, rev, scope_id
+				) VALUES (?, 'session_summary', ?, ?, 0.8, '', 1, ?, ?, '{}', 1, 'local-default')`,
 			)
 			.run(sessionId, "Session recap", "Wrap-up of recent work", now, now);
 
@@ -409,8 +619,8 @@ describe("buildMemoryPack", () => {
 			.prepare(
 				`INSERT INTO memory_items(
 					session_id, kind, title, body_text, confidence, tags_text, active,
-					created_at, updated_at, metadata_json, rev, visibility, workspace_id, dedup_key
-				) VALUES (?, 'decision', ?, ?, ?, '', 1, ?, ?, '{}', 1, 'shared', 'shared:default', NULL)`,
+					created_at, updated_at, metadata_json, rev, visibility, workspace_id, dedup_key, scope_id
+				) VALUES (?, 'decision', ?, ?, ?, '', 1, ?, ?, '{}', 1, 'shared', 'shared:default', NULL, 'local-default')`,
 			)
 			.run(sessionId, "Tracing duplicate title", "Tracing duplicate body", 0.8, now, now);
 		const duplicateId = Number(info.lastInsertRowid);
@@ -453,8 +663,8 @@ describe("buildMemoryPack", () => {
 			.prepare(
 				`INSERT INTO memory_items(
 					session_id, kind, title, body_text, confidence, tags_text, active,
-					created_at, updated_at, metadata_json, rev, visibility, workspace_id, dedup_key
-				) VALUES (?, 'decision', ?, ?, ?, '', 1, ?, ?, '{}', 1, 'shared', 'shared:default', NULL)`,
+					created_at, updated_at, metadata_json, rev, visibility, workspace_id, dedup_key, scope_id
+				) VALUES (?, 'decision', ?, ?, ?, '', 1, ?, ?, '{}', 1, 'shared', 'shared:default', NULL, 'local-default')`,
 			)
 			.run(
 				sessionId,
@@ -520,6 +730,32 @@ describe("buildMemoryPack", () => {
 		expect(afterTrace.total).toBe(afterPack.total);
 	});
 
+	it("builds the legacy response and trace in one pass with one usage event", () => {
+		store.remember(sessionId, "feature", "Combined pack item", "Combined pack context", 0.8);
+		const before = store.db
+			.prepare("SELECT COUNT(*) AS total FROM usage_events WHERE event = 'pack'")
+			.get() as { total: number };
+
+		const artifacts = buildMemoryPackWithTrace(store, "combined pack item", 10);
+		const after = store.db
+			.prepare("SELECT COUNT(*) AS total FROM usage_events WHERE event = 'pack'")
+			.get() as { total: number };
+
+		expect(artifacts.trace.version).toBe(1);
+		expect(artifacts.trace.output.pack_text).toBe(artifacts.response.pack_text);
+		expect(
+			artifacts.trace.retrieval.candidates
+				.filter((candidate) => candidate.disposition === "selected")
+				.map((candidate) => candidate.id)
+				.sort((left, right) => left - right),
+		).toEqual(
+			[...new Set(Object.values(artifacts.trace.assembly.sections).flat())].sort(
+				(left, right) => left - right,
+			),
+		);
+		expect(after.total).toBe(before.total + 1);
+	});
+
 	it("uses the effective retrieval query in task-mode trace scoring", () => {
 		store.remember(
 			sessionId,
@@ -538,14 +774,122 @@ describe("buildMemoryPack", () => {
 		expect(candidate.reasons).toContain("matched query terms");
 	});
 
-	it("keeps retrieval candidates anchored to retrieval instead of fallback assembly", () => {
+	it("keeps the original query for semantic-only task trace candidates", () => {
+		store.remember(
+			sessionId,
+			"feature",
+			"Continue quasar migration task",
+			"Continue quasar migration task follow-up details",
+			0.9,
+		);
+		const semanticId = store.remember(
+			sessionId,
+			"feature",
+			"Todo zebra candidate",
+			"Todo zebra details",
+			0.8,
+		);
+		const semanticResults: MemoryResult[] = [
+			{
+				id: semanticId,
+				kind: "feature",
+				title: "Todo zebra candidate",
+				body_text: "Todo zebra details",
+				confidence: 0.8,
+				created_at: "2026-01-01T00:00:00.000Z",
+				updated_at: "2026-01-01T00:00:00.000Z",
+				tags_text: "",
+				score: 0.9,
+				session_id: sessionId,
+				metadata: {},
+				narrative: null,
+				facts: null,
+			},
+		];
+
+		const trace = buildMemoryPackTrace(
+			store,
+			"continue quasar",
+			1,
+			null,
+			undefined,
+			semanticResults,
+		);
+		const candidate = trace.retrieval.candidates.find((item) => item.id === semanticId);
+
+		expect(trace.mode.selected).toBe("task");
+		expect(candidate?.scores.text_overlap).toBe(0);
+		expect(candidate?.reasons).not.toContain("matched query terms");
+	});
+
+	it("snapshots ownership once for trace candidate scoring", () => {
 		store.remember(sessionId, "session_summary", "Latest summary", "Summary fallback text", 0.9);
+		store.remember(sessionId, "decision", "Quasar retrieval result", "Quasar evidence", 0.8);
+		const buildOwnershipPredicate = vi.spyOn(store, "buildOwnershipPredicate");
 
-		const trace = buildMemoryPackTrace(store, "zzz_nomatch_zzz", 10);
+		const trace = buildMemoryPackTrace(store, "quasar retrieval", 10);
 
-		expect(trace.retrieval.candidate_count).toBe(0);
+		expect(trace.retrieval.candidate_count).toBe(2);
+		// One ownership snapshot belongs to search reranking and one to trace scoring.
+		expect(buildOwnershipPredicate).toHaveBeenCalledTimes(2);
+	});
+
+	it("includes fallback selections in the trace so a produced result is not no-results", () => {
+		const summaryId = store.remember(
+			sessionId,
+			"session_summary",
+			"Latest summary",
+			"Summary fallback text",
+			0.9,
+		);
+		const resultId = store.remember(
+			sessionId,
+			"decision",
+			"Quasar retrieval result",
+			"Quasar retrieval evidence",
+			0.8,
+		);
+
+		const trace = buildMemoryPackTrace(store, "quasar retrieval", 10);
+		const candidateIds = trace.retrieval.candidates.map((candidate) => candidate.id);
+
+		expect(trace.retrieval.candidate_count).toBe(2);
+		expect(candidateIds).toEqual([resultId, summaryId]);
+		expect(new Set(candidateIds).size).toBe(2);
+		expect(trace.retrieval.candidates).toEqual([
+			expect.objectContaining({ id: resultId, disposition: "selected" }),
+			expect.objectContaining({ id: summaryId, disposition: "selected" }),
+		]);
 		expect(trace.output.pack_text).toContain("## Summary");
 		expect(trace.output.pack_text).toContain("Latest summary");
+	});
+
+	it("counts fallback candidates even when token budgeting selects none", () => {
+		const summaryId = store.remember(
+			sessionId,
+			"session_summary",
+			"Latest budget fallback",
+			"A summary fallback body that cannot fit into a one-token pack budget.",
+			0.9,
+		);
+		const resultId = store.remember(
+			sessionId,
+			"feature",
+			"Nebula retrieval result",
+			"A matching result body that also cannot fit into a one-token pack budget.",
+			0.8,
+		);
+
+		const trace = buildMemoryPackTrace(store, "nebula retrieval", 10, 1);
+
+		expect(trace.retrieval.candidate_count).toBe(2);
+		expect(trace.retrieval.candidates).toEqual([
+			expect.objectContaining({ id: resultId, disposition: "trimmed" }),
+			expect.objectContaining({ id: summaryId, disposition: "trimmed" }),
+		]);
+		expect(
+			trace.retrieval.candidates.filter((candidate) => candidate.disposition === "selected"),
+		).toHaveLength(0);
 	});
 
 	it("with tokenBudget=0 skips budget enforcement (treats as no budget)", () => {
@@ -573,8 +917,8 @@ describe("buildMemoryPack", () => {
 			.prepare(
 				`INSERT INTO memory_items(
 					session_id, kind, title, body_text, confidence, tags_text, active,
-					created_at, updated_at, metadata_json, rev
-				) VALUES (?, 'session_summary', ?, ?, 0.9, '', 1, ?, ?, '{}', 1)`,
+					created_at, updated_at, metadata_json, rev, scope_id
+				) VALUES (?, 'session_summary', ?, ?, 0.9, '', 1, ?, ?, '{}', 1, 'local-default')`,
 			)
 			.run(sessionId, "Budget summary", "Short summary body", now, now);
 		for (let i = 0; i < 10; i += 1) {
@@ -599,8 +943,8 @@ describe("buildMemoryPack", () => {
 			.prepare(
 				`INSERT INTO memory_items(
 					session_id, kind, title, body_text, confidence, tags_text, active,
-					created_at, updated_at, metadata_json, rev
-				) VALUES (?, 'session_summary', ?, ?, 0.8, '', 1, ?, ?, '{}', 1)`,
+					created_at, updated_at, metadata_json, rev, scope_id
+				) VALUES (?, 'session_summary', ?, ?, 0.8, '', 1, ?, ?, '{}', 1, 'local-default')`,
 			)
 			.run(
 				sessionId,
@@ -634,9 +978,27 @@ describe("buildMemoryPack", () => {
 	});
 
 	it("keeps working-set overlaps prioritized when semantic candidates are merged", () => {
+		const overlappingId = store.remember(
+			sessionId,
+			"feature",
+			"Overlapping file",
+			"Directly related to current file",
+			0.9,
+			undefined,
+			{ files_modified: ["src/important.ts"] },
+		);
+		const nonOverlappingId = store.remember(
+			sessionId,
+			"feature",
+			"Non-overlapping file",
+			"Not tied to working set",
+			0.9,
+			undefined,
+			{ files_modified: ["src/other.ts"] },
+		);
 		const semanticResults: MemoryResult[] = [
 			{
-				id: 1,
+				id: overlappingId,
 				kind: "feature",
 				title: "Overlapping file",
 				body_text: "Directly related to current file",
@@ -651,7 +1013,7 @@ describe("buildMemoryPack", () => {
 				facts: null,
 			},
 			{
-				id: 2,
+				id: nonOverlappingId,
 				kind: "feature",
 				title: "Non-overlapping file",
 				body_text: "Not tied to working set",
@@ -676,7 +1038,277 @@ describe("buildMemoryPack", () => {
 			semanticResults,
 		);
 
-		expect(pack.item_ids[0]).toBe(1);
+		expect(pack.item_ids[0]).toBe(overlappingId);
+	});
+
+	it("scopes caller-provided semantic candidates before pack merge", () => {
+		grantScopeToLocalDevice("authorized-team");
+		insertCoordinatorScope("unauthorized-team");
+		const visibleId = insertScopedMemory(
+			"authorized-team",
+			"Visible semantic pack note",
+			"visible semantic pack body",
+		);
+		const hiddenId = insertScopedMemory(
+			"unauthorized-team",
+			"Hidden semantic pack note",
+			"hidden semantic pack body",
+		);
+		const semanticResults: MemoryResult[] = [
+			{
+				id: hiddenId,
+				kind: "discovery",
+				title: "Hidden semantic pack note",
+				body_text: "hidden semantic pack body",
+				confidence: 0.9,
+				created_at: "2026-01-01T00:00:00.000Z",
+				updated_at: "2026-01-01T00:00:00.000Z",
+				tags_text: "",
+				score: 0.99,
+				session_id: sessionId,
+				metadata: {},
+				narrative: null,
+				facts: null,
+			},
+			{
+				id: visibleId,
+				kind: "discovery",
+				title: "Visible semantic pack note",
+				body_text: "visible semantic pack body",
+				confidence: 0.9,
+				created_at: "2026-01-01T00:00:00.000Z",
+				updated_at: "2026-01-01T00:00:00.000Z",
+				tags_text: "",
+				score: 0.5,
+				session_id: sessionId,
+				metadata: {},
+				narrative: null,
+				facts: null,
+			},
+		];
+
+		const pack = buildMemoryPack(store, "zzz_nomatch_zzz", 10, null, undefined, semanticResults);
+
+		expect(pack.item_ids).toContain(visibleId);
+		expect(pack.item_ids).not.toContain(hiddenId);
+		expect(pack.pack_text).toContain("Visible semantic pack note");
+		expect(pack.pack_text).not.toContain("Hidden semantic pack note");
+		expect(pack.metrics.sources.semantic).toBe(1);
+	});
+
+	it("keeps revalidating semantic candidates after hidden candidates fill the first chunk", () => {
+		grantScopeToLocalDevice("authorized-team");
+		insertCoordinatorScope("unauthorized-team");
+		const semanticResults: MemoryResult[] = [];
+		for (let i = 0; i < 205; i += 1) {
+			const hiddenId = insertScopedMemory(
+				"unauthorized-team",
+				`Hidden semantic pack note ${i}`,
+				"hidden semantic pack body",
+			);
+			semanticResults.push(
+				semanticCandidate(
+					hiddenId,
+					`Hidden semantic pack note ${i}`,
+					"hidden semantic pack body",
+					1,
+				),
+			);
+		}
+		const visibleId = insertScopedMemory(
+			"authorized-team",
+			"Visible semantic pack note after hidden chunk",
+			"visible semantic pack body",
+		);
+		semanticResults.push(
+			semanticCandidate(
+				visibleId,
+				"Visible semantic pack note after hidden chunk",
+				"visible semantic pack body",
+				0.5,
+			),
+		);
+
+		const pack = buildMemoryPack(store, "zzz_nomatch_zzz", 10, null, undefined, semanticResults);
+
+		expect(pack.item_ids).toContain(visibleId);
+		expect(pack.metrics.sources.semantic).toBe(1);
+	});
+
+	it("uses database content when revalidating semantic pack candidates", () => {
+		grantScopeToLocalDevice("authorized-team");
+		const visibleId = insertScopedMemory(
+			"authorized-team",
+			"Database semantic pack note",
+			"database semantic body",
+		);
+		const semanticResults = [
+			semanticCandidate(visibleId, "Forged semantic pack note", "forged semantic body", 0.9),
+		];
+
+		const pack = buildMemoryPack(store, "zzz_nomatch_zzz", 10, null, undefined, semanticResults);
+
+		expect(pack.pack_text).toContain("Database semantic pack note");
+		expect(pack.pack_text).not.toContain("Forged semantic pack note");
+	});
+
+	it("uses database content when revalidating semantic trace candidates", () => {
+		grantScopeToLocalDevice("authorized-team");
+		const visibleId = insertScopedMemory(
+			"authorized-team",
+			"Database semantic trace note",
+			"database semantic trace body",
+		);
+		const semanticResults = [
+			semanticCandidate(visibleId, "Forged semantic trace note", "forged semantic trace body", 0.9),
+		];
+
+		const trace = buildMemoryPackTrace(
+			store,
+			"zzz_nomatch_zzz",
+			10,
+			null,
+			undefined,
+			semanticResults,
+		);
+		const candidate = trace.retrieval.candidates.find((item) => item.id === visibleId);
+
+		expect(trace.output.pack_text).toContain("Database semantic trace note");
+		expect(trace.output.pack_text).not.toContain("Forged semantic trace note");
+		expect(candidate?.title).toBe("Database semantic trace note");
+		expect(candidate?.preview).toContain("database semantic trace body");
+		expect(candidate?.preview).not.toContain("forged semantic trace body");
+	});
+
+	it("excludes hidden semantic candidates from pack trace output", () => {
+		grantScopeToLocalDevice("authorized-team");
+		insertCoordinatorScope("unauthorized-team");
+		const visibleId = insertScopedMemory(
+			"authorized-team",
+			"Visible semantic trace note",
+			"visible semantic trace body",
+		);
+		const hiddenId = insertScopedMemory(
+			"unauthorized-team",
+			"Hidden semantic trace note",
+			"hidden semantic trace body",
+		);
+		const semanticResults = [
+			semanticCandidate(hiddenId, "Hidden semantic trace note", "hidden semantic trace body", 0.99),
+			semanticCandidate(
+				visibleId,
+				"Visible semantic trace note",
+				"visible semantic trace body",
+				0.5,
+			),
+		];
+
+		const trace = buildMemoryPackTrace(
+			store,
+			"zzz_nomatch_zzz",
+			10,
+			null,
+			undefined,
+			semanticResults,
+		);
+		const selectedIds = Object.values(trace.assembly.sections).flat();
+
+		expect(selectedIds).toContain(visibleId);
+		expect(selectedIds).not.toContain(hiddenId);
+		expect(trace.output.pack_text).toContain("Visible semantic trace note");
+		expect(trace.output.pack_text).not.toContain("Hidden semantic trace note");
+		expect(trace.retrieval.candidates.map((candidate) => candidate.id)).not.toContain(hiddenId);
+	});
+
+	it("keeps token-budget trimming behind the pack scope gate", () => {
+		grantScopeToLocalDevice("authorized-team");
+		insertCoordinatorScope("unauthorized-team");
+		const visibleId = insertScopedMemory(
+			"authorized-team",
+			"Visible budget semantic note",
+			"visible budget semantic body",
+		);
+		const hiddenId = insertScopedMemory(
+			"unauthorized-team",
+			"Hidden budget semantic note",
+			"hidden budget semantic body ".repeat(20),
+		);
+		const semanticResults = [
+			semanticCandidate(
+				hiddenId,
+				"Hidden budget semantic note",
+				"hidden budget semantic body",
+				0.99,
+			),
+			semanticCandidate(
+				visibleId,
+				"Visible budget semantic note",
+				"visible budget semantic body",
+				0.5,
+			),
+		];
+
+		const pack = buildMemoryPack(store, "zzz_nomatch_zzz", 10, 20, undefined, semanticResults);
+
+		expect(pack.item_ids).toContain(visibleId);
+		expect(pack.item_ids).not.toContain(hiddenId);
+		expect(pack.pack_text).toContain("Visible budget semantic note");
+		expect(pack.pack_text).not.toContain("Hidden budget semantic note");
+	});
+
+	it("applies scope filters to working-set file-ref candidates", () => {
+		grantScopeToLocalDevice("scope-a");
+		grantScopeToLocalDevice("scope-b");
+		const scopeAId = insertScopedMemory("scope-a", "Scope A working-set note", "working set body");
+		const scopeBId = insertScopedMemory("scope-b", "Scope B working-set note", "working set body");
+		for (const id of [scopeAId, scopeBId]) {
+			store.db
+				.prepare(
+					"INSERT OR IGNORE INTO memory_file_refs(memory_id, file_path, relation) VALUES (?, ?, 'modified')",
+				)
+				.run(id, "src/shared.ts");
+		}
+
+		const filters = { scope_id: "scope-a", working_set_paths: ["src/shared.ts"] };
+		const pack = buildMemoryPack(store, "zzz_nomatch_zzz", 10, null, filters);
+		const trace = buildMemoryPackTrace(store, "zzz_nomatch_zzz", 10, null, filters);
+		const traceIds = Object.values(trace.assembly.sections).flat();
+
+		expect(pack.item_ids).toContain(scopeAId);
+		expect(pack.item_ids).not.toContain(scopeBId);
+		expect(pack.pack_text).toContain("Scope A working-set note");
+		expect(pack.pack_text).not.toContain("Scope B working-set note");
+		expect(traceIds).toContain(scopeAId);
+		expect(traceIds).not.toContain(scopeBId);
+		expect(trace.retrieval.candidates.map((candidate) => candidate.id)).not.toContain(scopeBId);
+	});
+
+	it("scopes latest summary fallback during pack assembly", () => {
+		grantScopeToLocalDevice("authorized-team");
+		insertCoordinatorScope("unauthorized-team");
+		const insertSummary = (scopeId: string, title: string, createdAt: string): number => {
+			const info = store.db
+				.prepare(
+					`INSERT INTO memory_items(
+						session_id, kind, title, body_text, confidence, tags_text, active,
+						created_at, updated_at, metadata_json, rev, visibility, scope_id
+					) VALUES (?, 'session_summary', ?, ?, 0.8, '', 1, ?, ?, '{}', 1, 'shared', ?)`,
+				)
+				.run(sessionId, title, `${title} body`, createdAt, createdAt, scopeId);
+			return Number(info.lastInsertRowid);
+		};
+		insertSummary("authorized-team", "Authorized fallback summary", "2026-01-01T00:00:00.000Z");
+		insertSummary("unauthorized-team", "Hidden fallback summary", "2026-01-03T00:00:00.000Z");
+		insertScopedMemory(
+			"authorized-team",
+			"Newest visible non-summary",
+			"visible fallback anchor body",
+		);
+
+		const pack = buildMemoryPack(store, "zzz_nomatch_zzz", 1);
+
+		expect(pack.pack_text).toContain("Authorized fallback summary");
+		expect(pack.pack_text).not.toContain("Hidden fallback summary");
 	});
 
 	it("keeps topical terms when using task mode", () => {
@@ -708,8 +1340,8 @@ describe("buildMemoryPack", () => {
 			store.db
 				.prepare(
 					`INSERT INTO memory_items(
-						session_id, kind, title, body_text, confidence, tags_text, active, created_at, updated_at, metadata_json, rev
-					) VALUES (?, 'session_summary', ?, ?, 0.8, '', 1, ?, ?, '{}', 1)`,
+						session_id, kind, title, body_text, confidence, tags_text, active, created_at, updated_at, metadata_json, rev, scope_id
+					) VALUES (?, 'session_summary', ?, ?, 0.8, '', 1, ?, ?, '{}', 1, 'local-default')`,
 				)
 				.run(targetSessionId, title, body, now, now);
 		};
@@ -738,8 +1370,8 @@ describe("buildMemoryPack", () => {
 		store.db
 			.prepare(
 				`INSERT INTO memory_items(
-					session_id, kind, title, body_text, confidence, tags_text, active, created_at, updated_at, metadata_json, rev
-				) VALUES (?, 'session_summary', ?, ?, 0.8, '', 1, ?, ?, '{}', 1)`,
+					session_id, kind, title, body_text, confidence, tags_text, active, created_at, updated_at, metadata_json, rev, scope_id
+				) VALUES (?, 'session_summary', ?, ?, 0.8, '', 1, ?, ?, '{}', 1, 'local-default')`,
 			)
 			.run(sessionId, "Recent summary", "Catch-up recap for current work", now, now);
 		const decisionId = store.remember(
@@ -762,8 +1394,8 @@ describe("buildMemoryPack", () => {
 		store.db
 			.prepare(
 				`INSERT INTO memory_items(
-					session_id, kind, title, body_text, confidence, tags_text, active, created_at, updated_at, metadata_json, rev
-				) VALUES (?, 'change', ?, ?, 0.3, '', 1, ?, ?, ?, 1)`,
+					session_id, kind, title, body_text, confidence, tags_text, active, created_at, updated_at, metadata_json, rev, scope_id
+				) VALUES (?, 'change', ?, ?, 0.3, '', 1, ?, ?, ?, 1, 'local-default')`,
 			)
 			.run(
 				sessionId,
@@ -793,8 +1425,8 @@ describe("buildMemoryPack", () => {
 		store.db
 			.prepare(
 				`INSERT INTO memory_items(
-					session_id, kind, title, body_text, confidence, tags_text, active, created_at, updated_at, metadata_json, rev
-				) VALUES (?, 'change', ?, ?, 0.3, '', 1, ?, ?, ?, 1)`,
+					session_id, kind, title, body_text, confidence, tags_text, active, created_at, updated_at, metadata_json, rev, scope_id
+				) VALUES (?, 'change', ?, ?, 0.3, '', 1, ?, ?, ?, 1, 'local-default')`,
 			)
 			.run(
 				sessionId,
@@ -816,8 +1448,8 @@ describe("buildMemoryPack", () => {
 		store.db
 			.prepare(
 				`INSERT INTO memory_items(
-					session_id, kind, title, body_text, confidence, tags_text, active, created_at, updated_at, metadata_json, rev
-				) VALUES (?, 'session_summary', ?, ?, 0.8, '', 1, ?, ?, '{}', 1)`,
+					session_id, kind, title, body_text, confidence, tags_text, active, created_at, updated_at, metadata_json, rev, scope_id
+				) VALUES (?, 'session_summary', ?, ?, 0.8, '', 1, ?, ?, '{}', 1, 'local-default')`,
 			)
 			.run(sessionId, "Older summary", "Still the latest available summary", older, older);
 
@@ -836,8 +1468,8 @@ describe("buildMemoryPack", () => {
 		store.db
 			.prepare(
 				`INSERT INTO memory_items(
-					session_id, kind, title, body_text, confidence, tags_text, active, created_at, updated_at, metadata_json, rev
-				) VALUES (?, 'session_summary', ?, ?, 0.8, '', 1, ?, ?, '{}', 1)`,
+					session_id, kind, title, body_text, confidence, tags_text, active, created_at, updated_at, metadata_json, rev, scope_id
+				) VALUES (?, 'session_summary', ?, ?, 0.8, '', 1, ?, ?, '{}', 1, 'local-default')`,
 			)
 			.run(sessionId, "Recent summary", "Generic recap text", now, now);
 
@@ -853,6 +1485,101 @@ describe("buildMemoryPack", () => {
 
 		expect(pack.pack_text).toContain("## Summary\n[1] (session_summary) Recent summary");
 		expect(pack.item_ids[0]).toBe(decisionId);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Artifact-class trace diagnostic + relevance-first default ordering
+// (codemem-ovk2.13: salvaged from the scrapped #1302, no derived-fact boost)
+// ---------------------------------------------------------------------------
+
+describe("buildMemoryPack artifact_class trace + relevance ordering", () => {
+	let tmpDir: string;
+	let store: MemoryStore;
+	let sessionId: number;
+
+	beforeEach(() => {
+		tmpDir = mkdtempSync(join(tmpdir(), "codemem-pack-artifact-"));
+		const dbPath = join(tmpDir, "test.db");
+		const db = connect(dbPath);
+		initTestSchema(db);
+		db.close();
+		store = new MemoryStore(dbPath);
+		sessionId = insertTestSession(store.db);
+	});
+
+	afterEach(() => {
+		store.close();
+		rmSync(tmpDir, { recursive: true, force: true });
+	});
+
+	it("surfaces the in-place artifact_class marker in pack trace candidates", () => {
+		store.remember(
+			sessionId,
+			"discovery",
+			"Widget pagination cursor rule",
+			"Widget pagination must page items in stable sorted order so cursors stay valid.",
+			0.92,
+			undefined,
+			{ derivation: { artifact_class: "derived_fact" } },
+		);
+		store.remember(
+			sessionId,
+			"change",
+			"Widget pagination validation passed",
+			"pnpm run lint passed and CI is green for widget pagination work.",
+			0.5,
+			undefined,
+			{ derivation: { artifact_class: "telemetry" } },
+		);
+
+		const trace = buildMemoryPackTrace(store, "widget pagination cursor", 10);
+		const candidates = trace.retrieval.candidates;
+		expect(candidates.length).toBeGreaterThan(0);
+
+		const derived = candidates.find((c) => c.title === "Widget pagination cursor rule");
+		const telemetry = candidates.find((c) => c.title === "Widget pagination validation passed");
+		expect(derived?.artifact_class).toBe("derived_fact");
+		if (telemetry) {
+			expect(telemetry.artifact_class).toBe("telemetry");
+		}
+	});
+
+	it("labels unmarked legacy rows as unknown artifact_class", () => {
+		store.remember(
+			sessionId,
+			"decision",
+			"Plain durable decision",
+			"Chose to cap freshness diagnostics at 24h for the settings tab.",
+			0.9,
+		);
+
+		const trace = buildMemoryPackTrace(store, "freshness diagnostics settings", 10);
+		const candidate = trace.retrieval.candidates.find((c) => c.title === "Plain durable decision");
+		expect(candidate?.artifact_class).toBe("unknown");
+	});
+
+	it("does not let a less-relevant higher-priority kind displace a direct match", () => {
+		// A `decision` (top kind-rank) that barely matches the query must NOT
+		// outrank a `feature` that directly matches it. Relevance wins before kind.
+		store.remember(
+			sessionId,
+			"decision",
+			"General architecture decision",
+			"Chose a modular package layout for the workspace.",
+			0.9,
+		);
+		const featureId = store.remember(
+			sessionId,
+			"feature",
+			"Sparkline widget rendering",
+			"Implemented sparkline widget rendering with incremental canvas draws for the sparkline widget.",
+			0.85,
+		);
+
+		const pack = buildMemoryPack(store, "sparkline widget rendering", 10);
+		expect(pack.metrics.mode).toBe("default");
+		expect(pack.item_ids[0]).toBe(featureId);
 	});
 });
 
@@ -1084,7 +1811,7 @@ describe("buildMemoryPack compact mode", () => {
 		expect(pack.pack_text).toContain("## Index");
 		expect(pack.pack_text).toContain("## Detail");
 		expect(pack.pack_text).toContain("memory_get");
-		expect(pack.pack_text).toContain("memory_search");
+		expect(pack.pack_text).toContain("memory_get_observations");
 	});
 
 	it("shows index lines for all items", () => {
@@ -1268,7 +1995,26 @@ describe("buildMemoryPack compact mode", () => {
 			0.7,
 		);
 
-		const pack = buildMemoryPack(store, "thread local memory store pooling mcp server", 10, 5);
+		const unbudgeted = buildMemoryPack(
+			store,
+			"thread local memory store pooling mcp server",
+			10,
+			null,
+			undefined,
+			undefined,
+			{ compressionMode: "ids" },
+		);
+		expect(unbudgeted.items.some((item) => (item.compressed_ids?.length ?? 0) > 0)).toBe(true);
+
+		const pack = buildMemoryPack(
+			store,
+			"thread local memory store pooling mcp server",
+			10,
+			5,
+			undefined,
+			undefined,
+			{ compressionMode: "ids" },
+		);
 
 		expect(pack.items).toHaveLength(0);
 		expect(pack.item_ids).toHaveLength(0);
@@ -1299,7 +2045,17 @@ describe("buildMemoryPack compact mode", () => {
 			0.9,
 		);
 
-		const pack = buildMemoryPack(store, "remember what happened previously", 10);
+		const pack = buildMemoryPack(
+			store,
+			"remember what happened previously",
+			10,
+			null,
+			undefined,
+			undefined,
+			{
+				compressionMode: "ids",
+			},
+		);
 
 		expect(pack.item_ids).toEqual(expect.arrayContaining([summaryId, idA, idB]));
 		expect(pack.items.find((item) => item.id === idB)?.compressed_ids).toEqual([idA]);
@@ -1326,11 +2082,12 @@ describe("buildMemoryPack cluster compression", () => {
 	});
 
 	afterEach(() => {
+		vi.unstubAllEnvs();
 		store.close();
 		rmSync(tmpDir, { recursive: true, force: true });
 	});
 
-	it("compresses related items into one representative in default mode", () => {
+	it("keeps related items self-contained in default mode", () => {
 		const idA = store.remember(
 			sessionId,
 			"discovery",
@@ -1348,7 +2105,42 @@ describe("buildMemoryPack cluster compression", () => {
 
 		const pack = buildMemoryPack(store, "sync pass orchestrator typescript", 10);
 
-		expect(pack.pack_text).toContain("(+1 related)");
+		expect(pack.pack_text).not.toContain("(+1 related)");
+		expect(pack.pack_text).toContain("Sync pass orchestrator moved from Python to TypeScript");
+		expect(pack.pack_text).toContain("Sync pass orchestrator ported to TypeScript");
+		expect(pack.item_ids).toEqual(expect.arrayContaining([idA, idB]));
+		expect(pack.items.map((item) => item.id)).toEqual(expect.arrayContaining([idA, idB]));
+	});
+
+	it("compresses related items into one representative when ids mode is requested", () => {
+		const idA = store.remember(
+			sessionId,
+			"discovery",
+			"Sync pass orchestrator ported to TypeScript",
+			"Moved the sync pass orchestrator from Python to TypeScript.",
+			0.6,
+		);
+		const idB = store.remember(
+			sessionId,
+			"feature",
+			"Sync pass orchestrator moved from Python to TypeScript",
+			"The orchestrator now coordinates sync in TypeScript.",
+			0.9,
+		);
+
+		const pack = buildMemoryPack(
+			store,
+			"sync pass orchestrator typescript",
+			10,
+			null,
+			undefined,
+			undefined,
+			{
+				compressionMode: "ids",
+			},
+		);
+
+		expect(pack.pack_text).toContain(`(+1 related: [${idA}])`);
 		expect(pack.pack_text).toContain("Sync pass orchestrator moved from Python to TypeScript");
 		expect(pack.pack_text).not.toContain("Sync pass orchestrator ported to TypeScript -");
 		expect(pack.item_ids).toEqual(expect.arrayContaining([idA, idB]));
@@ -1358,6 +2150,29 @@ describe("buildMemoryPack cluster compression", () => {
 			support_count: 2,
 			compressed_ids: [idA],
 		});
+	});
+
+	it("uses CODEMEM_PACK_COMPRESSION to select ids compression mode", () => {
+		const idA = store.remember(
+			sessionId,
+			"change",
+			"Replication retention plan updated for bounded history",
+			"Updated the retention plan.",
+			0.4,
+		);
+		store.remember(
+			sessionId,
+			"decision",
+			"Replication retention plan revised for bounded history",
+			"Revised retention plan and documented bounds.",
+			0.95,
+		);
+
+		vi.stubEnv("CODEMEM_PACK_COMPRESSION", "ids");
+		const pack = buildMemoryPack(store, "replication retention bounded history", 10);
+
+		expect(pack.pack_text).toContain(`(+1 related: [${idA}])`);
+		expect(pack.items[0]?.compressed_ids).toEqual([idA]);
 	});
 
 	it("chooses highest-confidence representative on clustered items", () => {
@@ -1376,7 +2191,17 @@ describe("buildMemoryPack cluster compression", () => {
 			0.95,
 		);
 
-		const pack = buildMemoryPack(store, "replication retention bounded history", 10);
+		const pack = buildMemoryPack(
+			store,
+			"replication retention bounded history",
+			10,
+			null,
+			undefined,
+			undefined,
+			{
+				compressionMode: "ids",
+			},
+		);
 		expect(pack.items[0]?.id).toBe(idHigh);
 		expect(pack.items[0]?.compressed_ids).toEqual([idLow]);
 	});
@@ -1432,7 +2257,8 @@ describe("buildMemoryPack cluster compression", () => {
 			},
 		);
 
-		expect(pack.pack_text).toContain("(+1 related)");
+		expect(pack.pack_text).toContain(`(+1 related: [${idA}])`);
+		expect(pack.pack_text).toContain("memory_get_observations");
 		expect(pack.item_ids).toEqual(expect.arrayContaining([idA, idB]));
 		expect(pack.items).toHaveLength(1);
 	});
@@ -1497,7 +2323,15 @@ describe("buildMemoryPack cluster compression", () => {
 			0.9,
 		);
 
-		const trace = buildMemoryPackTrace(store, "peer deletion cursor leak sync worker", 10);
+		const trace = buildMemoryPackTrace(
+			store,
+			"peer deletion cursor leak sync worker",
+			10,
+			null,
+			undefined,
+			undefined,
+			{ compressionMode: "ids" },
+		);
 
 		expect(trace.assembly.compressed_clusters).toHaveLength(1);
 		expect(trace.assembly.compressed_clusters[0]).toMatchObject({

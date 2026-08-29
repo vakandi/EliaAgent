@@ -36,15 +36,18 @@ export interface FeedItem {
 	narrative?: string;
 	facts?: unknown;
 	tags?: unknown;
+	tags_text?: unknown;
 	files?: unknown;
 	project?: string;
 	actor_id?: string;
 	actor_display_name?: string;
+	resolved_actor_display_name?: string;
 	owned_by_self?: boolean;
 	visibility?: string;
 	workspace_kind?: string;
 	origin_source?: string;
 	origin_device_id?: string;
+	resolved_device_display_name?: string;
 	trust_state?: string;
 	metadata_json?: FeedItemMetadata;
 	summary?: unknown;
@@ -64,5 +67,6 @@ export interface FeedViewOps {
 	removeFeedItem: (memoryId: number) => void;
 	updateFeedView: (force?: boolean) => void;
 	loadFeedData: () => Promise<void>;
+	updateFeedQuery: (query: string) => void;
 	hasMorePages: () => boolean;
 }

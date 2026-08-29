@@ -4,7 +4,12 @@
  * Ports Python's viewer_routes/stats.py.
  */
 
-import { listMaintenanceJobs, type MemoryStore, VERSION } from "@codemem/core";
+import {
+	buildFilterClausesWithContext,
+	listMaintenanceJobs,
+	type MemoryStore,
+	VERSION,
+} from "@codemem/core";
 import { Hono } from "hono";
 
 function maintenanceJobSortKey(job: {
@@ -24,6 +29,306 @@ function sortActiveMaintenanceJobs<
 		if (aTime !== bTime) return aTime.localeCompare(bTime);
 		return aKind.localeCompare(bKind);
 	});
+}
+
+const MEMORY_ID_METADATA_KEYS = ["pack_item_ids", "added_ids", "removed_ids", "retained_ids"];
+
+type UsageRow = {
+	id: number;
+	session_id: number | null;
+	event: string;
+	tokens_read: number;
+	tokens_written: number;
+	tokens_saved: number;
+	created_at: string;
+	metadata_json: Record<string, unknown> | null;
+};
+
+type UsageVisibility = {
+	visibleMemoryIds: Set<number>;
+	visibleSessionIds: Set<number>;
+};
+
+function toUsageRow(
+	row: Record<string, unknown>,
+	metadata: Record<string, unknown> | null,
+): UsageRow {
+	return {
+		id: Number(row.id ?? 0),
+		session_id: row.session_id == null ? null : Number(row.session_id),
+		event: String(row.event ?? "pack"),
+		tokens_read: Number(row.tokens_read ?? 0),
+		tokens_written: Number(row.tokens_written ?? 0),
+		tokens_saved: Number(row.tokens_saved ?? 0),
+		created_at: String(row.created_at ?? ""),
+		metadata_json: metadata,
+	};
+}
+
+function metadataMemoryIds(value: unknown): number[] {
+	if (!Array.isArray(value)) return [];
+	return value
+		.map((item) => (typeof item === "number" ? item : Number(item)))
+		.filter((item) => Number.isInteger(item) && item > 0);
+}
+
+function chunkNumbers(values: number[], chunkSize = 500): number[][] {
+	const chunks: number[][] = [];
+	for (let start = 0; start < values.length; start += chunkSize) {
+		chunks.push(values.slice(start, start + chunkSize));
+	}
+	return chunks;
+}
+
+function visibleMemoryIdSet(store: MemoryStore, memoryIds: Set<number>): Set<number> {
+	if (memoryIds.size === 0) return new Set();
+	const filterResult = buildFilterClausesWithContext(null, {
+		actorId: store.actorId,
+		deviceId: store.deviceId,
+		enforceScopeVisibility: true,
+	});
+	const visibleIds = new Set<number>();
+	for (const chunk of chunkNumbers([...memoryIds])) {
+		const placeholders = chunk.map(() => "?").join(", ");
+		const clauses = [
+			"memory_items.active = 1",
+			`memory_items.id IN (${placeholders})`,
+			...filterResult.clauses,
+		];
+		const rows = store.db
+			.prepare(`SELECT memory_items.id FROM memory_items WHERE ${clauses.join(" AND ")}`)
+			.all(...chunk, ...filterResult.params) as Array<{ id: number }>;
+		for (const row of rows) visibleIds.add(Number(row.id));
+	}
+	return visibleIds;
+}
+
+function visibleSessionIdSet(store: MemoryStore, sessionIds: Set<number>): Set<number> {
+	if (sessionIds.size === 0) return new Set();
+	const filterResult = buildFilterClausesWithContext(null, {
+		actorId: store.actorId,
+		deviceId: store.deviceId,
+		enforceScopeVisibility: true,
+	});
+	const visibleIds = new Set<number>();
+	for (const chunk of chunkNumbers([...sessionIds])) {
+		const placeholders = chunk.map(() => "?").join(", ");
+		const clauses = [
+			"memory_items.active = 1",
+			`memory_items.session_id IN (${placeholders})`,
+			...filterResult.clauses,
+		];
+		const rows = store.db
+			.prepare(
+				`SELECT DISTINCT memory_items.session_id AS session_id
+				 FROM memory_items
+				 WHERE ${clauses.join(" AND ")}`,
+			)
+			.all(...chunk, ...filterResult.params) as Array<{ session_id: number | null }>;
+		for (const row of rows) {
+			if (typeof row.session_id === "number") visibleIds.add(row.session_id);
+		}
+	}
+	return visibleIds;
+}
+
+function buildUsageVisibility(store: MemoryStore, rows: UsageRow[]): UsageVisibility {
+	const memoryIds = new Set<number>();
+	const sessionIds = new Set<number>();
+	for (const row of rows) {
+		if (typeof row.session_id === "number") sessionIds.add(row.session_id);
+		for (const key of MEMORY_ID_METADATA_KEYS) {
+			for (const memoryId of metadataMemoryIds(row.metadata_json?.[key])) {
+				memoryIds.add(memoryId);
+			}
+		}
+	}
+	return {
+		visibleMemoryIds: visibleMemoryIdSet(store, memoryIds),
+		visibleSessionIds: visibleSessionIdSet(store, sessionIds),
+	};
+}
+
+function usageRowVisible(row: UsageRow, visibility: UsageVisibility): boolean {
+	const rowSessionVisible =
+		row.session_id == null || visibility.visibleSessionIds.has(row.session_id);
+	const packItemIds = row.metadata_json?.pack_item_ids;
+	if (Array.isArray(packItemIds)) {
+		if (packItemIds.length === 0) {
+			return row.session_id != null && visibility.visibleSessionIds.has(row.session_id);
+		}
+		return (
+			rowSessionVisible &&
+			metadataMemoryIds(packItemIds).some((memoryId) => visibility.visibleMemoryIds.has(memoryId))
+		);
+	}
+	return row.session_id != null && visibility.visibleSessionIds.has(row.session_id);
+}
+
+function sanitizePackUsageMetadata(
+	metadata: Record<string, unknown> | null,
+	visibility: UsageVisibility,
+): Record<string, unknown> | null {
+	if (!metadata) return null;
+	const sanitized = { ...metadata };
+	for (const key of MEMORY_ID_METADATA_KEYS) {
+		if (Array.isArray(sanitized[key])) {
+			sanitized[key] = metadataMemoryIds(sanitized[key]).filter((memoryId) =>
+				visibility.visibleMemoryIds.has(memoryId),
+			);
+		}
+	}
+	return sanitized;
+}
+
+type UsageAggregateRow = {
+	event: string;
+	count: number;
+	tokens_read: number;
+	tokens_written: number;
+	tokens_saved: number;
+};
+
+/**
+ * Convert the neutral core aggregate rows into the wire shape for /api/usage
+ * (ApiUsageEventSummary: total_tokens_* names), sorted by event name ASC to
+ * match the route's historical ordering.
+ */
+function mapAggregateEvents(rows: UsageAggregateRow[]): Record<string, unknown>[] {
+	return rows
+		.map((row) => ({
+			event: row.event,
+			total_tokens_read: row.tokens_read,
+			total_tokens_written: row.tokens_written,
+			total_tokens_saved: row.tokens_saved,
+			count: row.count,
+		}))
+		.sort((a, b) => a.event.localeCompare(b.event));
+}
+
+/**
+ * Sum the neutral core aggregate rows into the ApiUsageTotals wire shape.
+ */
+function totalsFromAggregate(rows: UsageAggregateRow[]): {
+	tokens_read: number;
+	tokens_written: number;
+	tokens_saved: number;
+	count: number;
+} {
+	return rows.reduce(
+		(acc, row) => ({
+			tokens_read: acc.tokens_read + row.tokens_read,
+			tokens_written: acc.tokens_written + row.tokens_written,
+			tokens_saved: acc.tokens_saved + row.tokens_saved,
+			count: acc.count + row.count,
+		}),
+		{ tokens_read: 0, tokens_written: 0, tokens_saved: 0, count: 0 },
+	);
+}
+
+type UsagePayload = Record<string, unknown>;
+
+interface UsageCacheEntry {
+	payload: UsagePayload;
+	expiresAtMs: number;
+}
+
+/**
+ * Short-lived cache for the computed /api/usage payload.
+ *
+ * The health dot polls /api/usage on every 5s refresh regardless of the
+ * active tab. The token/event totals come from indexed SQL aggregates and the
+ * recent-pack window runs scope-visibility resolution over its bounded set, so
+ * each miss is cheap — but the totals are cumulative dashboard figures where a
+ * few seconds of staleness is acceptable, so caching still collapses the
+ * repeated recompute on the polling loop. Keyed by db path + scope identity +
+ * project filter so distinct stores/projects never share an entry.
+ */
+const usagePayloadCache = new Map<string, UsageCacheEntry>();
+const USAGE_PAYLOAD_CACHE_MS = 10_000;
+
+/**
+ * Hard cap on cached usage payloads. The cache key folds in the arbitrary
+ * `?project=` filter and a scope-visibility fingerprint that becomes
+ * per-request-unique on the error/bypass path, so without a bound the map
+ * would grow without limit in a long-running viewer. The cap is far above the
+ * realistic working set (a handful of projects times one or two scope
+ * generations), so legitimate hits are never evicted under normal load.
+ */
+const USAGE_PAYLOAD_CACHE_MAX_ENTRIES = 256;
+
+/**
+ * Sweep expired entries and enforce the size cap before inserting a new one.
+ *
+ * Mirrors the lazy-sweep approach in request-rate-limit.ts: eviction is
+ * piggybacked on writes rather than run on a timer, so an idle viewer does no
+ * background work. Expired entries (those past `expiresAtMs`) are always
+ * dropped; if the map is still at capacity afterward — e.g. a burst of
+ * distinct, still-live bypass keys — the oldest-expiring entries are evicted
+ * to make room. This never changes hit/miss semantics for a live entry: the
+ * caller still re-checks `expiresAtMs` on read, and only already-expired or
+ * over-cap entries are removed here.
+ */
+function sweepUsagePayloadCache(cache: Map<string, UsageCacheEntry>, nowMs: number): void {
+	for (const [key, entry] of cache) {
+		if (entry.expiresAtMs <= nowMs) cache.delete(key);
+	}
+	if (cache.size < USAGE_PAYLOAD_CACHE_MAX_ENTRIES) return;
+	// Leave room for the entry about to be inserted by evicting down to one
+	// below the cap. Drop the soonest-to-expire entries first.
+	const byExpiry = [...cache.entries()].sort((a, b) => a[1].expiresAtMs - b[1].expiresAtMs);
+	let overflow = cache.size - USAGE_PAYLOAD_CACHE_MAX_ENTRIES + 1;
+	for (const [key] of byExpiry) {
+		if (overflow <= 0) break;
+		cache.delete(key);
+		overflow -= 1;
+	}
+}
+
+/**
+ * Cheap fingerprint of the state that drives scope visibility
+ * (`scope_memberships` / `replication_scopes`). Folding this into the usage
+ * cache key ensures a membership/scope status change — e.g. a revocation —
+ * invalidates any cached payload immediately instead of letting a device keep
+ * reading a scope it can no longer see for up to the TTL. These tables are
+ * small, so the aggregate is negligible next to the usage_events scan the
+ * cache exists to avoid. Fails safe: any error forces a unique value so the
+ * request bypasses the cache and recomputes visibility from scratch.
+ */
+function scopeVisibilityGeneration(store: MemoryStore): string {
+	try {
+		const row = store.db
+			.prepare(
+				`SELECT
+					(SELECT COUNT(*) FROM scope_memberships) AS m_count,
+					(SELECT COUNT(*) FROM scope_memberships WHERE status = 'active') AS m_active,
+					(SELECT COALESCE(MAX(updated_at), '') FROM scope_memberships) AS m_updated,
+					(SELECT COALESCE(MAX(membership_epoch), 0) FROM scope_memberships) AS m_epoch,
+					(SELECT COUNT(*) FROM replication_scopes) AS s_count,
+					(SELECT COUNT(*) FROM replication_scopes WHERE status = 'active') AS s_active,
+					(SELECT COALESCE(MAX(updated_at), '') FROM replication_scopes) AS s_updated`,
+			)
+			.get() as Record<string, unknown> | undefined;
+		if (!row) return "no-scope-state";
+		return [
+			row.m_count,
+			row.m_active,
+			row.m_updated,
+			row.m_epoch,
+			row.s_count,
+			row.s_active,
+			row.s_updated,
+		].join(":");
+	} catch {
+		// Fail safe: bypass the cache rather than risk serving a payload
+		// computed under stale visibility rules.
+		return `bypass-${Date.now()}-${Math.random()}`;
+	}
+}
+
+function usageCacheKey(store: MemoryStore, projectFilter: string | null): string {
+	const visibilityGeneration = scopeVisibilityGeneration(store);
+	return `${store.dbPath}|${store.actorId}|${store.deviceId}|${projectFilter ?? ""}|${visibilityGeneration}`;
 }
 
 /**
@@ -90,86 +395,72 @@ export function statsRoutes(getStore: () => MemoryStore) {
 		const store = getStore();
 		{
 			const projectFilter = c.req.query("project") || null;
-			const recentPacksQuery = projectFilter
-				? store.db.prepare(
-						`SELECT usage_events.id, usage_events.session_id, usage_events.event,
-						usage_events.tokens_read, usage_events.tokens_written, usage_events.tokens_saved,
-						usage_events.created_at, usage_events.metadata_json
-					 FROM usage_events
-					 JOIN sessions ON sessions.id = usage_events.session_id
-					 WHERE usage_events.event = 'pack' AND sessions.project = ?
-					 ORDER BY usage_events.created_at DESC
-					 LIMIT 10`,
-					)
-				: store.db.prepare(
-						`SELECT id, session_id, event, tokens_read, tokens_written, tokens_saved, created_at, metadata_json
-					 FROM usage_events
-					 WHERE event = 'pack'
-					 ORDER BY created_at DESC
-					 LIMIT 10`,
-					);
-			const eventsGlobal = store.db
-				.prepare(
-					`SELECT event,
-						SUM(tokens_read) AS total_tokens_read,
-						SUM(tokens_written) AS total_tokens_written,
-						SUM(tokens_saved) AS total_tokens_saved,
-						COUNT(*) AS count
-					 FROM usage_events GROUP BY event ORDER BY event`,
-				)
-				.all() as Record<string, unknown>[];
-			const totalsGlobal = store.db
-				.prepare(
-					`SELECT COALESCE(SUM(tokens_read),0) AS tokens_read,
-						COALESCE(SUM(tokens_written),0) AS tokens_written,
-						COALESCE(SUM(tokens_saved),0) AS tokens_saved,
-						COUNT(*) AS count
-					 FROM usage_events`,
-				)
-				.get() as Record<string, unknown>;
-			let eventsFiltered: Record<string, unknown>[] | null = null;
-			let totalsFiltered: Record<string, unknown> | null = null;
-			if (projectFilter) {
-				eventsFiltered = store.db
-					.prepare(
-						`SELECT event,
-							SUM(tokens_read) AS total_tokens_read,
-							SUM(tokens_written) AS total_tokens_written,
-							SUM(tokens_saved) AS total_tokens_saved,
-							COUNT(*) AS count
-						 FROM usage_events
-						 JOIN sessions ON sessions.id = usage_events.session_id
-						 WHERE sessions.project = ?
-						 GROUP BY event ORDER BY event`,
-					)
-					.all(projectFilter) as Record<string, unknown>[];
-				totalsFiltered = store.db
-					.prepare(
-						`SELECT COALESCE(SUM(tokens_read),0) AS tokens_read,
-							COALESCE(SUM(tokens_written),0) AS tokens_written,
-							COALESCE(SUM(tokens_saved),0) AS tokens_saved,
-							COUNT(*) AS count
-						 FROM usage_events
-						 JOIN sessions ON sessions.id = usage_events.session_id
-						 WHERE sessions.project = ?`,
-					)
-					.get(projectFilter) as Record<string, unknown>;
+			const cacheKey = usageCacheKey(store, projectFilter);
+			const nowMs = Date.now();
+			const cached = usagePayloadCache.get(cacheKey);
+			if (cached && nowMs < cached.expiresAtMs) {
+				return c.json(cached.payload);
 			}
-			const recentPacksRaw = (
-				projectFilter ? recentPacksQuery.all(projectFilter) : recentPacksQuery.all()
-			) as Record<string, unknown>[];
-			const recentPacks = recentPacksRaw.map((row) => ({
-				id: Number(row.id ?? 0),
-				session_id: row.session_id == null ? null : Number(row.session_id),
-				event: String(row.event ?? "pack"),
-				tokens_read: Number(row.tokens_read ?? 0),
-				tokens_written: Number(row.tokens_written ?? 0),
-				tokens_saved: Number(row.tokens_saved ?? 0),
-				created_at: String(row.created_at ?? ""),
-				metadata_json: parseMetadataJson(row.metadata_json),
-			}));
 
-			return c.json({
+			// Token/event aggregates are unfiltered SQL GROUP BYs (matching
+			// store.stats()), so they never load the full usage_events table
+			// into JS. Only the small surfaced recent_packs window below keeps
+			// per-row scope visibility + metadata sanitization.
+			const globalAggregate = store.usageAggregate();
+			const eventsGlobal = mapAggregateEvents(globalAggregate);
+			const totalsGlobal = totalsFromAggregate(globalAggregate);
+			const filteredAggregate = projectFilter ? store.usageAggregate(projectFilter) : null;
+			const eventsFiltered = filteredAggregate ? mapAggregateEvents(filteredAggregate) : null;
+			const totalsFiltered = filteredAggregate ? totalsFromAggregate(filteredAggregate) : null;
+
+			// recent_packs candidate window. Over-fetch the most-recent pack
+			// events (20x the 10 we surface) so that, in the common case where a
+			// device sees most of its own packs, 10 *visible* packs survive the
+			// scope filter below without ever scanning the whole table.
+			// Tradeoff vs. the old full-scan-then-slice: if MORE than
+			// (LIMIT - 10) of the newest packs are non-visible, fewer than 10
+			// surface, and a visible pack older than the newest 200 is not
+			// shown at all. That only bites a heavily-shared DB whose recent
+			// activity is dominated by other scopes; for an activity widget the
+			// bounded recompute on a 5s poll is the right call.
+			const RECENT_PACK_SCAN_LIMIT = 200;
+			const loadRecentPackWindow = (project?: string | null): UsageRow[] => {
+				const rows = project
+					? (store.db
+							.prepare(
+								`SELECT usage_events.id, usage_events.session_id, usage_events.event,
+									usage_events.tokens_read, usage_events.tokens_written, usage_events.tokens_saved,
+									usage_events.created_at, usage_events.metadata_json
+								 FROM usage_events
+								 JOIN sessions ON sessions.id = usage_events.session_id
+								 WHERE sessions.project = ? AND usage_events.event = 'pack'
+								 ORDER BY usage_events.created_at DESC
+								 LIMIT ?`,
+							)
+							.all(project, RECENT_PACK_SCAN_LIMIT) as Record<string, unknown>[])
+					: (store.db
+							.prepare(
+								`SELECT id, session_id, event, tokens_read, tokens_written, tokens_saved,
+									created_at, metadata_json
+								 FROM usage_events
+								 WHERE event = 'pack'
+								 ORDER BY created_at DESC
+								 LIMIT ?`,
+							)
+							.all(RECENT_PACK_SCAN_LIMIT) as Record<string, unknown>[]);
+				return rows.map((row) => toUsageRow(row, parseMetadataJson(row.metadata_json)));
+			};
+			const recentWindow = loadRecentPackWindow(projectFilter);
+			const recentVisibility = buildUsageVisibility(store, recentWindow);
+			const recentPacks = recentWindow
+				.filter((row) => usageRowVisible(row, recentVisibility))
+				.slice(0, 10)
+				.map((row) => ({
+					...row,
+					metadata_json: sanitizePackUsageMetadata(row.metadata_json, recentVisibility),
+				}));
+
+			const payload: UsagePayload = {
 				project: projectFilter,
 				events: projectFilter ? eventsFiltered : eventsGlobal,
 				totals: projectFilter ? totalsFiltered : totalsGlobal,
@@ -178,9 +469,27 @@ export function statsRoutes(getStore: () => MemoryStore) {
 				events_filtered: eventsFiltered,
 				totals_filtered: totalsFiltered,
 				recent_packs: recentPacks,
+			};
+			const setAtMs = Date.now();
+			sweepUsagePayloadCache(usagePayloadCache, setAtMs);
+			usagePayloadCache.set(cacheKey, {
+				payload,
+				expiresAtMs: setAtMs + USAGE_PAYLOAD_CACHE_MS,
 			});
+			return c.json(payload);
 		}
 	});
 
 	return app;
 }
+
+/**
+ * Internals exposed for unit tests of the usage-cache eviction. Not part of the
+ * route's public surface; consumers should go through the HTTP handlers.
+ */
+export const __usageCacheTestHooks = {
+	cache: usagePayloadCache,
+	sweep: sweepUsagePayloadCache,
+	maxEntries: USAGE_PAYLOAD_CACHE_MAX_ENTRIES,
+	ttlMs: USAGE_PAYLOAD_CACHE_MS,
+};

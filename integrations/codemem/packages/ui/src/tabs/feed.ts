@@ -31,19 +31,25 @@ let observationOffset = 0;
 let summaryOffset = 0;
 let observationHasMore = true;
 let summaryHasMore = true;
-let loadMoreInFlight = false;
+let loadMoreInFlightGeneration: number | null = null;
+let primaryLoadRequestSequence = 0;
+let primaryLoadInFlight: { generation: number; requestId: number } | null = null;
 let feedScrollHandlerBound = false;
 let feedProjectGeneration = 0;
 let lastFeedScope = "all";
-/** Tracks the agent filter aligned with pagination; seeded in `initFeedTab`. */
-let lastFeedAgent: string | null = null;
+let lastFeedQuery = "";
+let feedQueryTimer: ReturnType<typeof setTimeout> | null = null;
+let feedLoadError = "";
+
+export const FEED_QUERY_DEBOUNCE_MS = 250;
 
 import { ensureFeedRenderBoundary, renderIntoFeedMount } from "./feed/data/mount";
 
 function resetPagination(project: string) {
 	lastFeedProject = project;
 	lastFeedScope = state.feedScopeFilter;
-	lastFeedAgent = state.agentFilter;
+	lastFeedQuery = state.feedQuery.trim();
+	feedLoadError = "";
 	feedProjectGeneration += 1;
 	observationOffset = 0;
 	summaryOffset = 0;
@@ -103,17 +109,17 @@ import type { FeedViewOps } from "./feed/types";
 
 /* ── Filtering ───────────────────────────────────────────── */
 
-import {
-	computeSignature, filterByQuery, filterByType, filterByAgent } from "./feed/data/filter";
+import { computeSignature, filterByType } from "./feed/data/filter";
 
 async function loadMoreFeedPage() {
-	if (loadMoreInFlight || !hasMorePages()) return;
-	const requestProject = state.currentProject || "";
-	const requestAgent = state.agentFilter !== "all" ? state.agentFilter : undefined;
+	if (!hasMorePages()) return;
 	const requestGeneration = feedProjectGeneration;
+	if (loadMoreInFlightGeneration === requestGeneration) return;
+	const requestProject = state.currentProject || "";
+	const requestQuery = state.feedQuery.trim();
 	const startObservationOffset = observationOffset;
 	const startSummaryOffset = summaryOffset;
-	loadMoreInFlight = true;
+	loadMoreInFlightGeneration = requestGeneration;
 	try {
 		const [observations, summaries] = await Promise.all([
 			observationHasMore
@@ -121,7 +127,7 @@ async function loadMoreFeedPage() {
 						limit: OBSERVATION_PAGE_SIZE,
 						offset: startObservationOffset,
 						scope: state.feedScopeFilter,
-						agent: requestAgent,
+						q: requestQuery || undefined,
 					})
 				: Promise.resolve({
 						items: [],
@@ -132,7 +138,7 @@ async function loadMoreFeedPage() {
 						limit: SUMMARY_PAGE_SIZE,
 						offset: startSummaryOffset,
 						scope: state.feedScopeFilter,
-						agent: requestAgent,
+						q: requestQuery || undefined,
 					})
 				: Promise.resolve({
 						items: [],
@@ -143,14 +149,16 @@ async function loadMoreFeedPage() {
 		if (
 			requestGeneration !== feedProjectGeneration ||
 			requestProject !== (state.currentProject || "") ||
-			requestAgent !== (state.agentFilter !== "all" ? state.agentFilter : undefined)
+			requestQuery !== state.feedQuery.trim()
 		) {
 			return;
 		}
 
 		const summaryItems = (summaries.items || []) as FeedItem[];
 		const observationItems = (observations.items || []) as FeedItem[];
-		const filtered = observationItems.filter((i) => !isLowSignalObservation(i));
+		const filtered = requestQuery
+			? observationItems
+			: observationItems.filter((i) => !isLowSignalObservation(i));
 		state.lastFeedFilteredCount += observationItems.length - filtered.length;
 
 		summaryHasMore = pageHasMore(summaries, summaryItems.length, SUMMARY_PAGE_SIZE);
@@ -168,17 +176,31 @@ async function loadMoreFeedPage() {
 
 		state.lastFeedItems = feedItems;
 		updateFeedView();
-	} catch (err) {
-		state.feedLoadError =
-			err instanceof Error ? err.message : `Load more failed: ${String(err)}`;
-		updateFeedView(true);
 	} finally {
-		loadMoreInFlight = false;
+		if (loadMoreInFlightGeneration === requestGeneration) {
+			loadMoreInFlightGeneration = null;
+		}
 	}
 }
 
+export const __feedSearchTestHooks = {
+	loadMoreFeedPage,
+	maybeLoadMoreFeedPage,
+	pagination: () => ({
+		observationOffset,
+		summaryOffset,
+		observationHasMore,
+		summaryHasMore,
+		loadMoreInFlightGeneration,
+		primaryLoadInFlightGeneration: primaryLoadInFlight?.generation ?? null,
+		generation: feedProjectGeneration,
+	}),
+};
+
 function maybeLoadMoreFeedPage() {
 	if (state.activeTab !== "feed") return;
+	if (feedQueryTimer) return;
+	if (primaryLoadInFlight) return;
 	if (!hasMorePages()) return;
 	if (!isNearFeedBottom()) return;
 	void loadMoreFeedPage();
@@ -189,15 +211,21 @@ const feedOps: FeedViewOps = {
 	removeFeedItem,
 	updateFeedView: (force?: boolean) => updateFeedView(force),
 	loadFeedData: () => loadFeedData(),
+	updateFeedQuery: (query: string) => updateFeedQuery(query),
 	hasMorePages,
 };
 
-function renderFeedTab(items: FeedItem[], options?: { loadingText?: string }) {
+function renderFeedTab(items: FeedItem[], options?: { errorText?: string; loadingText?: string }) {
 	const feedTab = document.getElementById("tab-feed");
 	if (!feedTab) return false;
 	renderIntoFeedMount(
 		feedTab,
-		h(FeedTabView, { items, loadingText: options?.loadingText, ops: feedOps }),
+		h(FeedTabView, {
+			errorText: options?.errorText,
+			items,
+			loadingText: options?.loadingText,
+			ops: feedOps,
+		}),
 	);
 	const globalLucide = (globalThis as { lucide?: { createIcons: () => void } }).lucide;
 	if (globalLucide && !options?.loadingText) {
@@ -206,15 +234,13 @@ function renderFeedTab(items: FeedItem[], options?: { loadingText?: string }) {
 	return true;
 }
 
-function renderProjectSwitchLoadingState() {
-	renderFeedTab([], { loadingText: "Loading selected project..." });
+function renderFeedLoadingState(message = "Loading selected project...") {
+	renderFeedTab([], { loadingText: message });
 }
 
 /* ── Public API ──────────────────────────────────────────── */
 
 export function initFeedTab() {
-	lastFeedScope = state.feedScopeFilter;
-	lastFeedAgent = state.agentFilter;
 	ensureFeedRenderBoundary();
 	renderFeedTab(
 		state.lastFeedItems,
@@ -243,21 +269,33 @@ export function updateFeedScopeToggle() {
 	updateFeedView(true);
 }
 
+export function updateFeedQuery(query: string) {
+	if (query === state.feedQuery) return;
+	const previousQuery = state.feedQuery.trim();
+	state.feedQuery = query;
+	if (query.trim() === previousQuery) return;
+	resetPagination(state.currentProject || "");
+	renderFeedLoadingState("Searching memories…");
+	if (feedQueryTimer) clearTimeout(feedQueryTimer);
+	feedQueryTimer = setTimeout(() => {
+		feedQueryTimer = null;
+		void loadFeedData().catch(() => undefined);
+	}, FEED_QUERY_DEBOUNCE_MS);
+}
+
 export function updateFeedView(force = false) {
 	const feedTab = document.getElementById("tab-feed");
 	if (!feedTab) return;
 
 	const scrollY = window.scrollY;
-	const byType = filterByType(state.lastFeedItems as FeedItem[]);
-	const byAgent = filterByAgent(byType);
-	const visible = filterByQuery(byAgent);
+	const visible = filterByType(state.lastFeedItems as FeedItem[]);
 
 	const sig = computeSignature(visible);
 	const changed = force || sig !== state.lastFeedSignature;
 	state.lastFeedSignature = sig;
 
 	if (changed) {
-		renderFeedTab(visible);
+		renderFeedTab(visible, { errorText: feedLoadError || undefined });
 	}
 
 	window.scrollTo({ top: scrollY });
@@ -266,48 +304,60 @@ export function updateFeedView(force = false) {
 
 export async function loadFeedData() {
 	const project = state.currentProject || "";
-	const agent = state.agentFilter !== "all" ? state.agentFilter : undefined;
 	const scopeChanged = state.feedScopeFilter !== lastFeedScope;
-	const agentChanged = lastFeedAgent === null || state.agentFilter !== lastFeedAgent;
-	state.feedLoadError = null;
-
-	if (project !== lastFeedProject || scopeChanged || agentChanged) {
+	const query = state.feedQuery.trim();
+	const queryChanged = query !== lastFeedQuery;
+	if (project !== lastFeedProject || scopeChanged || queryChanged) {
 		resetPagination(project);
-		renderProjectSwitchLoadingState();
-		updateFeedView(true);
+		renderFeedLoadingState(queryChanged ? "Searching memories…" : undefined);
 	}
 	const requestGeneration = feedProjectGeneration;
-
-	const observationsLimit = OBSERVATION_PAGE_SIZE;
-	const summariesLimit = SUMMARY_PAGE_SIZE;
+	const requestId = ++primaryLoadRequestSequence;
+	primaryLoadInFlight = { generation: requestGeneration, requestId };
+	const recoveringFromLoadError = Boolean(feedLoadError);
+	if (recoveringFromLoadError) {
+		feedLoadError = "";
+		if (state.lastFeedItems.length > 0) {
+			updateFeedView(true);
+		} else {
+			renderFeedLoadingState(query ? "Searching memories…" : undefined);
+		}
+	}
 
 	try {
+		const observationsLimit = OBSERVATION_PAGE_SIZE;
+		const summariesLimit = SUMMARY_PAGE_SIZE;
+
 		const [observations, summaries] = await Promise.all([
 			api.loadMemoriesPage(project, {
 				limit: observationsLimit,
 				offset: 0,
 				scope: state.feedScopeFilter,
-				agent,
+				q: query || undefined,
 			}),
 			api.loadSummariesPage(project, {
 				limit: summariesLimit,
 				offset: 0,
 				scope: state.feedScopeFilter,
-				agent,
+				q: query || undefined,
 			}),
 		]);
 
 		if (
+			primaryLoadInFlight?.generation !== requestGeneration ||
+			primaryLoadInFlight.requestId !== requestId ||
 			requestGeneration !== feedProjectGeneration ||
 			project !== (state.currentProject || "") ||
-			agent !== (state.agentFilter !== "all" ? state.agentFilter : undefined)
+			query !== state.feedQuery.trim()
 		) {
 			return;
 		}
 
 		const summaryItems = (summaries.items || []) as FeedItem[];
 		const observationItems = (observations.items || []) as FeedItem[];
-		const filtered = observationItems.filter((i) => !isLowSignalObservation(i));
+		const filtered = query
+			? observationItems
+			: observationItems.filter((i) => !isLowSignalObservation(i));
 		const filteredCount = observationItems.length - filtered.length;
 		const firstPageFeedItems = [...summaryItems, ...filtered].sort((a, b) => {
 			return new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime();
@@ -328,6 +378,7 @@ export async function loadFeedData() {
 
 		state.pendingFeedItems = null;
 		state.lastFeedItems = feedItems;
+		feedLoadError = "";
 		state.lastFeedFilteredCount = Math.max(state.lastFeedFilteredCount, filteredCount);
 		summaryHasMore = pageHasMore(summaries, summaryItems.length, summariesLimit);
 		observationHasMore = pageHasMore(observations, observationItems.length, observationsLimit);
@@ -337,15 +388,33 @@ export async function loadFeedData() {
 			pageNextOffset(observations, observationItems.length),
 		);
 		lastFeedScope = state.feedScopeFilter;
-		lastFeedAgent = state.agentFilter;
-		updateFeedView();
-	} catch (err) {
-		state.feedLoadError =
-			err instanceof Error ? err.message : `Failed to load feed: ${String(err)}`;
-		state.lastFeedItems = [];
-		state.pendingFeedItems = null;
-		state.lastFeedSignature = "";
-		lastFeedAgent = null;
-		updateFeedView(true);
+		if (
+			primaryLoadInFlight?.generation === requestGeneration &&
+			primaryLoadInFlight.requestId === requestId
+		) {
+			primaryLoadInFlight = null;
+		}
+		updateFeedView(recoveringFromLoadError);
+	} catch (error) {
+		if (
+			primaryLoadInFlight?.generation === requestGeneration &&
+			primaryLoadInFlight.requestId === requestId &&
+			requestGeneration === feedProjectGeneration &&
+			project === (state.currentProject || "") &&
+			query === state.feedQuery.trim()
+		) {
+			observationHasMore = false;
+			summaryHasMore = false;
+			feedLoadError = "Feed unavailable. Refresh and try again.";
+			updateFeedView(true);
+		}
+		throw error;
+	} finally {
+		if (
+			primaryLoadInFlight?.generation === requestGeneration &&
+			primaryLoadInFlight.requestId === requestId
+		) {
+			primaryLoadInFlight = null;
+		}
 	}
 }

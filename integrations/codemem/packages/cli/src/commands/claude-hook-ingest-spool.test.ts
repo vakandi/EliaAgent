@@ -247,7 +247,8 @@ describe("claude-hook-ingest-spool", () => {
 			writeFileSync(join(queueDir, "hook-array.json"), "[1,2,3]", "utf8");
 			writeFileSync(join(queueDir, "hook-string.json"), '"oops"', "utf8");
 
-			await drainSpool(async () => true);
+			const result = await drainSpool(async () => true);
+			expect(result).toEqual({ processed: 0, failed: 2 });
 
 			const remaining = readdirSync(queueDir);
 			// Both files quarantined under .bad-wrong-shape-, none left active.

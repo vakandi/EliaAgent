@@ -1,11 +1,12 @@
-import { mkdtempSync } from "node:fs";
+import { chmodSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import {
 	aiBackfillStructuredContent,
 	applyRawEventRelinkPlan,
+	applyRawEventRelinkPlanWithDb,
 	backfillMemoryDedupKeys,
 	backfillNarrativeFromBody,
 	backfillTagsText,
@@ -14,6 +15,7 @@ import {
 	deactivateLowSignalObservations,
 	dedupNearDuplicateMemories,
 	extractNarrativeFromBody,
+	getMemoryArtifactReport,
 	getMemoryRoleReport,
 	getRawEventRelinkPlan,
 	getRawEventRelinkReport,
@@ -21,6 +23,7 @@ import {
 	getReliabilityMetrics,
 	initDatabase,
 	retryRawEventFailures,
+	scanSecretsRetroactive,
 	vacuumDatabase,
 } from "./maintenance.js";
 import { getMaintenanceJob } from "./maintenance-jobs.js";
@@ -57,6 +60,30 @@ function seedMaintenanceDb(dbPath: string): void {
 				'opencode', 'sess-1', 'sess-1', 2, 4,
 				'raw_events_v1', 'failed', 'boom', '2026-03-01T10:10:00Z', '2026-03-01T10:05:00Z'
 			);
+		`);
+	} finally {
+		db.close();
+	}
+}
+
+function seedMemoryArtifactReportDb(dbPath: string): void {
+	const db = new Database(dbPath);
+	try {
+		initTestSchema(db);
+		db.exec(`
+			INSERT INTO sessions(id, started_at, ended_at, cwd, project, user, tool_version) VALUES
+			  (1, '2026-03-01T10:00:00Z', '2026-03-01T10:10:00Z', '/tmp/repo', 'codemem', 'adam', 'test'),
+			  (2, '2026-03-01T11:00:00Z', '2026-03-01T11:10:00Z', '/tmp/other', 'other', 'adam', 'test');
+			INSERT INTO memory_items(
+				id, session_id, kind, title, body_text, active, created_at, updated_at, metadata_json, facts, import_key
+			) VALUES
+			  (1, 1, 'session_summary', 'Session recap', 'Implemented the report and validation passed.', 1, '2026-03-01T10:10:00Z', '2026-03-01T10:10:00Z', '{}', NULL, 'k1'),
+			  (2, 1, 'change', 'Dedup contract', 'packages/core/src/store.ts must preserve dedup_key propagation.', 1, '2026-03-01T10:10:01Z', '2026-03-01T10:10:01Z', '{}', NULL, 'k2'),
+			  (3, 1, 'change', 'Validation passed', 'pnpm run tsc passed.', 1, '2026-03-01T10:10:02Z', '2026-03-01T10:10:02Z', '{}', NULL, 'k3'),
+			  (4, 1, 'change', 'Minor cleanup', 'Updated wording in the sidebar.', 1, '2026-03-01T10:10:03Z', '2026-03-01T10:10:03Z', '{}', NULL, 'k4'),
+			  (5, 1, 'change', 'Validation contract', 'pnpm run tsc passed and packages/core/src/store.ts must preserve dedup_key propagation.', 1, '2026-03-01T10:10:04Z', '2026-03-01T10:10:04Z', '{}', NULL, 'k5'),
+			  (6, 1, 'change', 'Inactive validation', 'pnpm run tsc passed.', 0, '2026-03-01T10:10:05Z', '2026-03-01T10:10:05Z', '{"inactive":true}', NULL, 'k6'),
+			  (7, 2, 'decision', 'Other project decision', 'Decided the other project keeps this decision because imports rely on it.', 1, '2026-03-01T11:10:00Z', '2026-03-01T11:10:00Z', '{}', NULL, 'k7');
 		`);
 	} finally {
 		db.close();
@@ -178,6 +205,22 @@ describe("maintenance", { timeout: 15_000 }, () => {
 
 		const metrics = getReliabilityMetrics(dbPath);
 		expect(metrics.counts.retry_depth_max).toBe(3);
+	});
+
+	it("counts gave-up raw-event batches as terminal reliability failures", () => {
+		const dbPath = createDbPath("gave-up-reliability");
+		seedMaintenanceDb(dbPath);
+		const db = new Database(dbPath);
+		try {
+			db.prepare("UPDATE raw_event_flush_batches SET status = 'gave_up'").run();
+		} finally {
+			db.close();
+		}
+
+		const metrics = getReliabilityMetrics(dbPath);
+		expect(metrics.counts.errored_batches).toBe(1);
+		expect(metrics.counts.terminal_batches).toBe(1);
+		expect(metrics.rates.flush_success_rate).toBe(0);
 	});
 
 	it("backfills tags_text for memories with empty tags", () => {
@@ -378,16 +421,16 @@ describe("maintenance", { timeout: 15_000 }, () => {
 		try {
 			initTestSchema(db);
 			db.exec(`
-				INSERT INTO sessions(id, started_at, ended_at, cwd, project, user, tool_version) VALUES
-				  (1, '2026-03-01T10:00:00Z', '2026-03-01T10:10:00Z', '/tmp/repo', 'codemem', 'adam', 'test');
-				INSERT INTO opencode_sessions(source, stream_id, opencode_session_id, session_id, created_at) VALUES
-				  ('opencode', 'ses-1', 'ses-1', 1, '2026-03-01T10:00:00Z');
-				INSERT INTO memory_items(
-					id, session_id, kind, title, body_text, active, created_at, updated_at, metadata_json, import_key
-				) VALUES
-				  (1, 1, 'session_summary', 'Session recap', 'Summary body', 1, '2026-03-01T10:10:00Z', '2026-03-01T10:10:00Z', '{}', 'k1'),
-				  (2, 1, 'decision', 'OAuth callback fix', 'Patched callback validation', 1, '2026-03-01T10:10:01Z', '2026-03-01T10:10:01Z', '{}', 'k2');
-			`);
+					INSERT INTO sessions(id, started_at, ended_at, cwd, project, user, tool_version) VALUES
+					  (1, '2026-03-01T10:00:00Z', '2026-03-01T10:10:00Z', '/tmp/repo', 'codemem', 'adam', 'test');
+					INSERT INTO opencode_sessions(source, stream_id, opencode_session_id, session_id, created_at) VALUES
+					  ('opencode', 'ses-1', 'ses-1', 1, '2026-03-01T10:00:00Z');
+					INSERT INTO memory_items(
+						id, session_id, kind, title, body_text, active, created_at, updated_at, metadata_json, import_key, scope_id
+					) VALUES
+					  (1, 1, 'session_summary', 'Session recap', 'Summary body', 1, '2026-03-01T10:10:00Z', '2026-03-01T10:10:00Z', '{}', 'k1', 'local-default'),
+					  (2, 1, 'decision', 'OAuth callback fix', 'Patched callback validation', 1, '2026-03-01T10:10:01Z', '2026-03-01T10:10:01Z', '{}', 'k2', 'local-default');
+				`);
 		} finally {
 			db.close();
 		}
@@ -453,6 +496,234 @@ describe("maintenance", { timeout: 15_000 }, () => {
 		expect(report.summary_disposition_buckets).toEqual({ unknown: 1 });
 	});
 
+	it("reports heuristic dual-artifact shares for probe top results", () => {
+		const dbPath = createDbPath("memory-role-report-artifacts");
+		const db = new Database(dbPath);
+		try {
+			initTestSchema(db);
+			db.exec(`
+				INSERT INTO sessions(id, started_at, ended_at, cwd, project, user, tool_version) VALUES
+				  (1, '2026-03-01T10:00:00Z', '2026-03-01T10:10:00Z', '/tmp/repo', 'codemem', 'adam', 'test');
+				INSERT INTO memory_items(
+					id, session_id, kind, title, body_text, active, created_at, updated_at, metadata_json, facts, import_key, scope_id
+				) VALUES
+				  (1, 1, 'decision', 'Future memory extraction preserve contract', 'Future memory extraction must preserve implementation contract language.', 1, '2026-03-01T10:10:01Z', '2026-03-01T10:10:01Z', '{}', '["Future memory extraction must preserve implementation contract language."]', 'k1', 'local-default'),
+				  (2, 1, 'session_summary', 'Memory extraction recap', 'Summary of future memory extraction preserve work.', 1, '2026-03-01T10:10:02Z', '2026-03-01T10:10:02Z', '{}', NULL, 'k2', 'local-default'),
+				  (3, 1, 'change', 'Future memory extraction tsc passed', 'pnpm run tsc passed for future memory extraction preserve work.', 1, '2026-03-01T10:10:03Z', '2026-03-01T10:10:03Z', '{}', NULL, 'k3', 'local-default'),
+				  (4, 1, 'discovery', 'Future memory extraction overview', 'Overview of the future memory extraction preserve work area and its components.', 1, '2026-03-01T10:10:04Z', '2026-03-01T10:10:04Z', '{}', NULL, 'k4', 'local-default');
+			`);
+		} finally {
+			db.close();
+		}
+
+		const report = getMemoryRoleReport(dbPath, {
+			project: "codemem",
+			probes: ["what must future memory extraction preserve"],
+		});
+
+		const probe = report.probe_results[0];
+		expect(probe?.top_artifact_counts).toEqual({
+			session_summary: 1,
+			telemetry: 1,
+			derived_fact_like: 1,
+			durable_memory: 1,
+			ephemeral: 0,
+		});
+		expect(probe?.top_artifact_share).toEqual({
+			session_summary_share: 0.25,
+			telemetry_share: 0.25,
+			derived_fact_like_share: 0.25,
+			durable_memory_share: 0.25,
+			ephemeral_share: 0,
+		});
+		expect(probe?.scenario_score?.primary_match_count).toBeGreaterThan(0);
+	});
+
+	it("reports legacy memory artifact classes without mutating rows", () => {
+		const dbPath = createDbPath("memory-artifact-report");
+		seedMemoryArtifactReportDb(dbPath);
+		const db = new Database(dbPath, { readonly: true });
+		let before: Array<{ id: number; active: number; metadata_json: string | null }>;
+		try {
+			before = db
+				.prepare("SELECT id, active, metadata_json FROM memory_items ORDER BY id")
+				.all() as Array<{ id: number; active: number; metadata_json: string | null }>;
+		} finally {
+			db.close();
+		}
+
+		const report = getMemoryArtifactReport(dbPath, { project: "codemem" });
+
+		expect(report.totals).toEqual({ memories: 5, active: 5, sessions: 1 });
+		expect(report.counts_by_artifact).toEqual({
+			session_summary: 1,
+			derived_fact: 2,
+			telemetry: 1,
+			unknown: 1,
+		});
+		expect(report.counts_by_action).toEqual({ store: 3, store_demoted: 1, suppress: 1 });
+		expect(report.counts_by_reason.session_summary_recap).toBe(1);
+		expect(report.counts_by_reason.implementation_contract).toBe(2);
+		expect(report.counts_by_reason.validation_telemetry_only).toBe(1);
+		expect(report.counts_by_reason.role_inferred_ephemeral).toBe(1);
+		expect(report.counts_by_kind).toEqual({
+			session_summary: { session_summary: 1 },
+			change: { derived_fact: 2, telemetry: 1, unknown: 1 },
+		});
+		expect(report.counts_by_project.codemem).toEqual({
+			session_summary: 1,
+			derived_fact: 2,
+			telemetry: 1,
+			unknown: 1,
+		});
+		expect(report.high_confidence_telemetry).toEqual({
+			total: 1,
+			by_reason: { validation_telemetry_only: 1 },
+			examples: [
+				{
+					id: 3,
+					kind: "change",
+					project: "codemem",
+					title: "Validation passed",
+					reasons: ["validation_telemetry_only"],
+				},
+			],
+		});
+
+		const dbAfter = new Database(dbPath, { readonly: true });
+		try {
+			const after = dbAfter
+				.prepare("SELECT id, active, metadata_json FROM memory_items ORDER BY id")
+				.all() as Array<{ id: number; active: number; metadata_json: string | null }>;
+			expect(after).toEqual(before);
+		} finally {
+			dbAfter.close();
+		}
+	});
+
+	it("supports artifact report project and inactive filters", () => {
+		const dbPath = createDbPath("memory-artifact-report-filters");
+		seedMemoryArtifactReportDb(dbPath);
+
+		const allProjects = getMemoryArtifactReport(dbPath, { allProjects: true });
+		expect(allProjects.totals).toEqual({ memories: 6, active: 6, sessions: 2 });
+		expect(allProjects.counts_by_artifact).toEqual({
+			session_summary: 1,
+			derived_fact: 3,
+			telemetry: 1,
+			unknown: 1,
+		});
+		expect(allProjects.counts_by_project.other).toEqual({ derived_fact: 1 });
+
+		const includeInactive = getMemoryArtifactReport(dbPath, {
+			project: "codemem",
+			includeInactive: true,
+		});
+		expect(includeInactive.totals).toEqual({ memories: 6, active: 5, sessions: 1 });
+		expect(includeInactive.counts_by_artifact.telemetry).toBe(2);
+		expect(includeInactive.high_confidence_telemetry.total).toBe(2);
+	});
+
+	it("tolerates malformed metadata JSON in artifact reports", () => {
+		const dbPath = createDbPath("memory-artifact-report-malformed-metadata");
+		const db = new Database(dbPath);
+		try {
+			initTestSchema(db);
+			db.exec(`
+				INSERT INTO sessions(id, started_at, ended_at, cwd, project, user, tool_version) VALUES
+				  (1, '2026-03-01T10:00:00Z', '2026-03-01T10:10:00Z', '/tmp/repo', 'codemem', 'adam', 'test');
+				INSERT INTO memory_items(
+					id, session_id, kind, title, body_text, active, created_at, updated_at, metadata_json, import_key
+				) VALUES
+				  (1, 1, 'change', 'Broken metadata row', 'Updated parsing notes.', 1, '2026-03-01T10:10:00Z', '2026-03-01T10:10:00Z', '{not-json', 'k1');
+			`);
+		} finally {
+			db.close();
+		}
+
+		const report = getMemoryArtifactReport(dbPath, { project: "codemem" });
+
+		expect(report.totals.memories).toBe(1);
+		expect(report.counts_by_artifact.unknown).toBe(1);
+	});
+
+	it("inspects a read-only database snapshot without write access", () => {
+		const dbPath = createDbPath("memory-artifact-report-readonly");
+		seedMemoryArtifactReportDb(dbPath);
+		// Make the DB file AND its directory read-only so any write-oriented open
+		// path (mkdir, WAL, bootstrap) would fail. The read-only audit must not.
+		chmodSync(dbPath, 0o444);
+		chmodSync(dirname(dbPath), 0o555);
+		try {
+			const report = getMemoryArtifactReport(dbPath, { project: "codemem" });
+			expect(report.totals.memories).toBe(5);
+			expect(report.counts_by_artifact.derived_fact).toBe(2);
+		} finally {
+			// Restore perms so the temp dir can be cleaned up by the OS later.
+			chmodSync(dirname(dbPath), 0o755);
+			chmodSync(dbPath, 0o644);
+		}
+	});
+
+	it("matches a path-style project filter by basename", () => {
+		const dbPath = createDbPath("memory-artifact-report-path-project");
+		seedMemoryArtifactReportDb(dbPath);
+
+		// sessions.project is stored as "codemem"; a path-style filter must still
+		// match by basename instead of returning an empty report.
+		const report = getMemoryArtifactReport(dbPath, { project: "/Users/me/work/codemem" });
+
+		expect(report.totals.memories).toBe(5);
+		expect(report.counts_by_artifact.derived_fact).toBe(2);
+		expect(report.counts_by_project.codemem).toBeDefined();
+	});
+
+	it("classifies durable content stored only in narrative", () => {
+		const dbPath = createDbPath("memory-artifact-report-narrative");
+		const db = new Database(dbPath);
+		try {
+			initTestSchema(db);
+			db.exec(`
+				INSERT INTO sessions(id, started_at, ended_at, cwd, project, user, tool_version) VALUES
+				  (1, '2026-03-01T10:00:00Z', '2026-03-01T10:10:00Z', '/tmp/repo', 'codemem', 'adam', 'test');
+				INSERT INTO memory_items(
+					id, session_id, kind, title, body_text, narrative, active, created_at, updated_at, metadata_json, import_key
+				) VALUES
+				  (1, 1, 'change', 'Structured row', '', 'packages/core/src/store.ts must preserve dedup_key propagation across replication.', 1, '2026-03-01T10:10:00Z', '2026-03-01T10:10:00Z', '{}', 'n1');
+			`);
+		} finally {
+			db.close();
+		}
+
+		// Body is empty; the durable contract lives only in `narrative`. It must be
+		// classified as a derived_fact, not dropped as unknown.
+		const report = getMemoryArtifactReport(dbPath, { project: "codemem" });
+		expect(report.counts_by_artifact.derived_fact).toBe(1);
+		expect(report.counts_by_reason.implementation_contract).toBe(1);
+	});
+
+	it("exposes stable artifact report JSON shape", () => {
+		const dbPath = createDbPath("memory-artifact-report-shape");
+		seedMemoryArtifactReportDb(dbPath);
+
+		const report = getMemoryArtifactReport(dbPath, { project: "codemem" });
+
+		expect(Object.keys(report)).toEqual([
+			"totals",
+			"counts_by_artifact",
+			"counts_by_action",
+			"counts_by_reason",
+			"counts_by_kind",
+			"counts_by_project",
+			"high_confidence_telemetry",
+		]);
+		expect(Object.keys(report.high_confidence_telemetry)).toEqual([
+			"total",
+			"by_reason",
+			"examples",
+		]);
+	});
+
 	it("reports persisted session policy buckets from session metadata", () => {
 		const dbPath = createDbPath("memory-role-session-policy-buckets");
 		const db = new Database(dbPath);
@@ -492,18 +763,18 @@ describe("maintenance", { timeout: 15_000 }, () => {
 		const baselineDb = new Database(baselinePath);
 		try {
 			baselineDb.exec(`
-				INSERT INTO sessions(id, started_at, ended_at, cwd, project, user, tool_version) VALUES
-				  (1, '2026-03-01T10:00:00Z', '2026-03-01T10:10:00Z', '/tmp/repo', 'codemem', 'adam', 'test'),
-				  (2, '2026-03-01T10:20:00Z', '2026-03-01T10:20:20Z', '/tmp/repo', 'codemem', 'adam', 'test');
-				INSERT INTO opencode_sessions(source, stream_id, opencode_session_id, session_id, created_at) VALUES
-				  ('opencode', 'ses-1', 'ses-1', 1, '2026-03-01T10:00:00Z');
-				INSERT INTO memory_items(
-					id, session_id, kind, title, body_text, active, created_at, updated_at, metadata_json, import_key
-				) VALUES
-				  (1, 1, 'session_summary', 'Session recap', 'Summary body', 1, '2026-03-01T10:10:00Z', '2026-03-01T10:10:00Z', '{}', 'k1'),
-				  (2, 2, 'change', 'Legacy recap', '## Request\nfoo\n\n## Completed\nbar', 1, '2026-03-01T10:20:20Z', '2026-03-01T10:20:20Z', '{"is_summary":true}', 'k2'),
-				  (3, 2, 'decision', 'OAuth callback fix', 'Patched callback validation', 1, '2026-03-01T10:20:21Z', '2026-03-01T10:20:21Z', '{}', 'k3');
-			`);
+					INSERT INTO sessions(id, started_at, ended_at, cwd, project, user, tool_version) VALUES
+					  (1, '2026-03-01T10:00:00Z', '2026-03-01T10:10:00Z', '/tmp/repo', 'codemem', 'adam', 'test'),
+					  (2, '2026-03-01T10:20:00Z', '2026-03-01T10:20:20Z', '/tmp/repo', 'codemem', 'adam', 'test');
+					INSERT INTO opencode_sessions(source, stream_id, opencode_session_id, session_id, created_at) VALUES
+					  ('opencode', 'ses-1', 'ses-1', 1, '2026-03-01T10:00:00Z');
+					INSERT INTO memory_items(
+						id, session_id, kind, title, body_text, active, created_at, updated_at, metadata_json, import_key, scope_id
+					) VALUES
+					  (1, 1, 'session_summary', 'Session recap', 'Summary body', 1, '2026-03-01T10:10:00Z', '2026-03-01T10:10:00Z', '{}', 'k1', 'local-default'),
+					  (2, 2, 'change', 'Legacy recap', '## Request\nfoo\n\n## Completed\nbar', 1, '2026-03-01T10:20:20Z', '2026-03-01T10:20:20Z', '{"is_summary":true}', 'k2', 'local-default'),
+					  (3, 2, 'decision', 'OAuth callback fix', 'Patched callback validation', 1, '2026-03-01T10:20:21Z', '2026-03-01T10:20:21Z', '{}', 'k3', 'local-default');
+				`);
 		} finally {
 			baselineDb.close();
 		}
@@ -511,16 +782,16 @@ describe("maintenance", { timeout: 15_000 }, () => {
 		const candidateDb = new Database(candidatePath);
 		try {
 			candidateDb.exec(`
-				INSERT INTO sessions(id, started_at, ended_at, cwd, project, user, tool_version) VALUES
-				  (1, '2026-03-01T10:00:00Z', '2026-03-01T10:10:00Z', '/tmp/repo', 'codemem', 'adam', 'test');
-				INSERT INTO opencode_sessions(source, stream_id, opencode_session_id, session_id, created_at) VALUES
-				  ('opencode', 'ses-1', 'ses-1', 1, '2026-03-01T10:00:00Z');
-				INSERT INTO memory_items(
-					id, session_id, kind, title, body_text, active, created_at, updated_at, metadata_json, import_key
-				) VALUES
-				  (20, 1, 'decision', 'OAuth callback fix', 'Patched callback validation', 1, '2026-03-01T10:20:21Z', '2026-03-01T10:20:21Z', '{}', 'k3'),
-				  (21, 1, 'session_summary', 'Session recap', 'Summary body', 1, '2026-03-01T10:10:00Z', '2026-03-01T10:10:00Z', '{}', 'k1');
-			`);
+					INSERT INTO sessions(id, started_at, ended_at, cwd, project, user, tool_version) VALUES
+					  (1, '2026-03-01T10:00:00Z', '2026-03-01T10:10:00Z', '/tmp/repo', 'codemem', 'adam', 'test');
+					INSERT INTO opencode_sessions(source, stream_id, opencode_session_id, session_id, created_at) VALUES
+					  ('opencode', 'ses-1', 'ses-1', 1, '2026-03-01T10:00:00Z');
+					INSERT INTO memory_items(
+						id, session_id, kind, title, body_text, active, created_at, updated_at, metadata_json, import_key, scope_id
+					) VALUES
+					  (20, 1, 'decision', 'OAuth callback fix', 'Patched callback validation', 1, '2026-03-01T10:20:21Z', '2026-03-01T10:20:21Z', '{}', 'k3', 'local-default'),
+					  (21, 1, 'session_summary', 'Session recap', 'Summary body', 1, '2026-03-01T10:10:00Z', '2026-03-01T10:10:00Z', '{}', 'k1', 'local-default');
+				`);
 		} finally {
 			candidateDb.close();
 		}
@@ -729,6 +1000,22 @@ describe("maintenance", { timeout: 15_000 }, () => {
 					id, session_id, project, prompt_text, created_at, created_at_epoch, metadata_json, import_key
 				) VALUES
 				  (1, 2, 'codemem', 'repair me', '2026-03-01T10:12:30Z', 1740823950, '{}', 'prompt-1');
+				INSERT INTO retrieval_attempts(
+					attempt_id, contract_version, surface, trigger, started_at, retrieval_status,
+					delivery_status, candidate_count, selected_count, persisted_candidate_count,
+					recorder_version, session_id, retention_until, retention_pinned
+				) VALUES
+				  ('attempt-canonical', 1, 'mcp_search', 'automatic', '2026-03-01T10:05:00.000Z', 'succeeded', 'handed_off', 1, 1, 1, 'test', 1, '2026-03-31T10:05:00.000Z', 0),
+				  ('attempt-duplicate', 1, 'mcp_search', 'automatic', '2026-03-01T10:12:30.000Z', 'succeeded', 'handed_off', 1, 1, 1, 'test', 2, '2026-03-31T10:12:30.000Z', 0);
+				INSERT INTO retrieval_exposures(
+					attempt_id, rank, disposition, handoff_status
+				) VALUES ('attempt-duplicate', 1, 'selected', 'handed_off');
+				INSERT INTO outcome_evidence(
+					evidence_id, contract_version, dimension, evidence_type, source_class, observed_at,
+					producer, producer_version, status, session_id, references_json, retention_until, retention_pinned
+				) VALUES
+				  ('018f2db4-f9d3-7a22-8d18-000000000001', 1, 'quality', 'quality.test_result', 'observed', '2026-03-01T10:05:00.000Z', 'test', 'v1', 'pass', 1, '{"check_id":"canonical-check"}', '2026-03-31T10:05:00.000Z', 0),
+				  ('018f2db4-f9d3-7a22-8d18-000000000002', 1, 'quality', 'quality.test_result', 'observed', '2026-03-01T10:12:30.000Z', 'test', 'v1', 'fail', 2, '{"check_id":"duplicate-check"}', '2026-03-31T10:12:30.000Z', 0);
 			`);
 		} finally {
 			db.close();
@@ -776,6 +1063,199 @@ describe("maintenance", { timeout: 15_000 }, () => {
 				.prepare("SELECT session_id FROM user_prompts WHERE id = 1")
 				.get() as { session_id: number };
 			expect(userPrompt.session_id).toBe(1);
+
+			const attempts = verify
+				.prepare("SELECT attempt_id, session_id FROM retrieval_attempts ORDER BY attempt_id")
+				.all();
+			expect(attempts).toEqual([
+				{ attempt_id: "attempt-canonical", session_id: 1 },
+				{ attempt_id: "attempt-duplicate", session_id: 1 },
+			]);
+			expect(verify.prepare("SELECT count(*) FROM retrieval_exposures").pluck().get()).toBe(1);
+
+			const evidence = verify
+				.prepare(
+					"SELECT evidence_id, status, session_id FROM outcome_evidence ORDER BY evidence_id",
+				)
+				.all();
+			expect(evidence).toEqual([
+				{
+					evidence_id: "018f2db4-f9d3-7a22-8d18-000000000001",
+					status: "pass",
+					session_id: 1,
+				},
+				{
+					evidence_id: "018f2db4-f9d3-7a22-8d18-000000000002",
+					status: "fail",
+					session_id: 1,
+				},
+			]);
+		} finally {
+			verify.close();
+		}
+	}, 15_000);
+
+	it("compacts duplicate sessions when optional ledger tables are absent or partial", () => {
+		for (const scenario of ["both-absent", "retrieval-only", "outcome-only"] as const) {
+			const db = new Database(":memory:");
+			try {
+				initTestSchema(db);
+				// Upstack attribution schemas reference outcome evidence. Remove optional dependents
+				// first so this fixture can still model partial ledger installations.
+				db.exec(`
+					DROP TABLE IF EXISTS attribution_assessment_evidence;
+					DROP TABLE IF EXISTS attribution_assessments;
+				`);
+				db.exec(`
+					INSERT INTO sessions(id, started_at, project, tool_version, metadata_json) VALUES
+					  (1, '2026-03-01T10:00:00Z', 'codemem', 'test', '{"session_context":{"source":"opencode","flusher":"raw_events","streamId":"ses-${scenario}"}}'),
+					  (2, '2026-03-01T10:12:00Z', 'codemem', 'test', '{"session_context":{"source":"opencode","flusher":"raw_events","streamId":"ses-${scenario}"}}');
+					INSERT INTO memory_items(
+						id, session_id, kind, title, body_text, active, created_at, updated_at, metadata_json, import_key
+					) VALUES (1, 2, 'decision', 'Optional ledger', 'body', 1, '2026-03-01T10:13:00Z', '2026-03-01T10:13:00Z', '{}', 'memory-${scenario}');
+					INSERT INTO user_prompts(
+						id, session_id, project, prompt_text, created_at, created_at_epoch, metadata_json, import_key
+					) VALUES (1, 2, 'codemem', 'compact me', '2026-03-01T10:12:30Z', 1740823950, '{}', 'prompt-${scenario}');
+				`);
+
+				if (scenario === "retrieval-only") {
+					db.exec(`
+						INSERT INTO retrieval_attempts(
+							attempt_id, contract_version, surface, trigger, started_at, retrieval_status,
+							delivery_status, candidate_count, selected_count, persisted_candidate_count,
+							recorder_version, session_id, retention_until, retention_pinned
+						) VALUES ('attempt-partial', 1, 'mcp_search', 'automatic', '2026-03-01T10:12:30.000Z', 'no_results', 'not_attempted', 0, 0, 0, 'test', 2, '2026-03-31T10:12:30.000Z', 0);
+						DROP TABLE outcome_evidence;
+					`);
+				} else if (scenario === "outcome-only") {
+					db.exec(`
+						INSERT INTO outcome_evidence(
+							evidence_id, contract_version, dimension, evidence_type, source_class, observed_at,
+							producer, producer_version, status, session_id, references_json, retention_until, retention_pinned
+						) VALUES ('018f2db4-f9d3-7a22-8d18-000000000004', 1, 'quality', 'quality.test_result', 'observed', '2026-03-01T10:12:30.000Z', 'test', 'v1', 'pass', 2, '{"check_id":"partial-check"}', '2026-03-31T10:12:30.000Z', 0);
+						DROP TABLE retrieval_exposures;
+						DROP TABLE retrieval_attempts;
+					`);
+				} else {
+					db.exec(`
+						DROP TABLE outcome_evidence;
+						DROP TABLE retrieval_exposures;
+						DROP TABLE retrieval_attempts;
+					`);
+				}
+
+				const result = applyRawEventRelinkPlanWithDb(db, { limit: 10 });
+				expect(result.totals.session_compactions).toBe(1);
+				expect(db.prepare("SELECT id FROM sessions ORDER BY id").all()).toEqual([{ id: 1 }]);
+				expect(db.prepare("SELECT session_id FROM memory_items WHERE id = 1").pluck().get()).toBe(
+					1,
+				);
+				expect(db.prepare("SELECT session_id FROM user_prompts WHERE id = 1").pluck().get()).toBe(
+					1,
+				);
+				expect(
+					db
+						.prepare("SELECT session_id FROM opencode_sessions WHERE stream_id = ?")
+						.pluck()
+						.get(`ses-${scenario}`),
+				).toBe(1);
+
+				const tables = db
+					.prepare(
+						"SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('retrieval_attempts', 'outcome_evidence') ORDER BY name",
+					)
+					.pluck()
+					.all();
+				expect(tables).toEqual(
+					scenario === "retrieval-only"
+						? ["retrieval_attempts"]
+						: scenario === "outcome-only"
+							? ["outcome_evidence"]
+							: [],
+				);
+				if (scenario === "retrieval-only") {
+					expect(
+						db
+							.prepare("SELECT session_id FROM retrieval_attempts WHERE attempt_id = ?")
+							.pluck()
+							.get("attempt-partial"),
+					).toBe(1);
+				}
+				if (scenario === "outcome-only") {
+					expect(
+						db
+							.prepare("SELECT session_id FROM outcome_evidence WHERE evidence_id = ?")
+							.pluck()
+							.get("018f2db4-f9d3-7a22-8d18-000000000004"),
+					).toBe(1);
+				}
+			} finally {
+				db.close();
+			}
+		}
+	}, 15_000);
+
+	it("rolls back evidence relinks and neighboring changes when compaction fails", () => {
+		const dbPath = createDbPath("raw-event-relink-evidence-rollback");
+		const db = new Database(dbPath);
+		try {
+			initTestSchema(db);
+			db.exec(`
+				INSERT INTO sessions(id, started_at, project, tool_version, metadata_json) VALUES
+				  (1, '2026-03-01T10:00:00Z', 'codemem', 'test', '{"session_context":{"source":"opencode","flusher":"raw_events","streamId":"ses-rollback"}}'),
+				  (2, '2026-03-01T10:12:00Z', 'codemem', 'test', '{"session_context":{"source":"opencode","flusher":"raw_events","streamId":"ses-rollback"}}');
+				INSERT INTO memory_items(
+					id, session_id, kind, title, body_text, active, created_at, updated_at, metadata_json, import_key
+				) VALUES (1, 2, 'decision', 'Rollback', 'body', 1, '2026-03-01T10:13:00Z', '2026-03-01T10:13:00Z', '{}', 'rollback-memory');
+				INSERT INTO user_prompts(
+					id, session_id, project, prompt_text, created_at, created_at_epoch, metadata_json, import_key
+				) VALUES (1, 2, 'codemem', 'rollback me', '2026-03-01T10:12:30Z', 1740823950, '{}', 'rollback-prompt');
+				INSERT INTO retrieval_attempts(
+					attempt_id, contract_version, surface, trigger, started_at, retrieval_status,
+					delivery_status, candidate_count, selected_count, persisted_candidate_count,
+					recorder_version, session_id, retention_until, retention_pinned
+				) VALUES ('attempt-rollback', 1, 'mcp_search', 'automatic', '2026-03-01T10:12:30.000Z', 'no_results', 'not_attempted', 0, 0, 0, 'test', 2, '2026-03-31T10:12:30.000Z', 0);
+				INSERT INTO outcome_evidence(
+					evidence_id, contract_version, dimension, evidence_type, source_class, observed_at,
+					producer, producer_version, status, session_id, references_json, retention_until, retention_pinned
+				) VALUES ('018f2db4-f9d3-7a22-8d18-000000000003', 1, 'quality', 'quality.test_result', 'observed', '2026-03-01T10:12:30.000Z', 'test', 'v1', 'pass', 2, '{"check_id":"rollback-check"}', '2026-03-31T10:12:30.000Z', 0);
+				CREATE TRIGGER fail_duplicate_session_delete
+				BEFORE DELETE ON sessions WHEN OLD.id = 2
+				BEGIN SELECT RAISE(ABORT, 'injected compaction failure'); END;
+			`);
+		} finally {
+			db.close();
+		}
+
+		expect(() => applyRawEventRelinkPlan(dbPath, { limit: 10 })).toThrow(
+			/injected compaction failure/,
+		);
+
+		const verify = new Database(dbPath, { readonly: true });
+		try {
+			expect(verify.prepare("SELECT id FROM sessions ORDER BY id").all()).toEqual([
+				{ id: 1 },
+				{ id: 2 },
+			]);
+			expect(verify.prepare("SELECT session_id FROM memory_items WHERE id = 1").pluck().get()).toBe(
+				2,
+			);
+			expect(verify.prepare("SELECT session_id FROM user_prompts WHERE id = 1").pluck().get()).toBe(
+				2,
+			);
+			expect(
+				verify
+					.prepare("SELECT session_id FROM retrieval_attempts WHERE attempt_id = ?")
+					.pluck()
+					.get("attempt-rollback"),
+			).toBe(2);
+			expect(
+				verify
+					.prepare("SELECT session_id FROM outcome_evidence WHERE evidence_id = ?")
+					.pluck()
+					.get("018f2db4-f9d3-7a22-8d18-000000000003"),
+			).toBe(2);
+			expect(verify.prepare("SELECT count(*) FROM opencode_sessions").pluck().get()).toBe(0);
 		} finally {
 			verify.close();
 		}
@@ -1437,6 +1917,48 @@ describe("aiBackfillStructuredContent", () => {
 		}
 	});
 
+	it("redacts secrets in AI-generated narrative, facts, and concepts before persisting", async () => {
+		const db = new Database(":memory:");
+		try {
+			initTestSchema(db);
+			const sessionId = Number(
+				db
+					.prepare("INSERT INTO sessions(started_at, project) VALUES (?, ?)")
+					.run("2026-01-01T00:00:00Z", "test").lastInsertRowid,
+			);
+			const id = seedMemory(
+				db,
+				sessionId,
+				"change",
+				"Memory with secret-shaped AI output",
+				"Original body.",
+			);
+
+			const pat = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+			const observer = makeObserver(
+				JSON.stringify({
+					narrative: `AI summary mentions ${pat} verbatim.`,
+					facts: [`fact A references ${pat}`, "harmless fact"],
+					concepts: ["what-changed"],
+				}),
+			);
+
+			const result = await aiBackfillStructuredContent(db, { observer });
+			expect(result).toMatchObject({ updated: 1 });
+
+			const row = db.prepare("SELECT narrative, facts FROM memory_items WHERE id = ?").get(id) as {
+				narrative: string | null;
+				facts: string | null;
+			};
+			expect(row.narrative ?? "").not.toContain(pat);
+			expect(row.narrative ?? "").toContain("[REDACTED:github_pat_classic]");
+			expect(row.facts ?? "").not.toContain(pat);
+			expect(row.facts ?? "").toContain("[REDACTED:github_pat_classic]");
+		} finally {
+			db.close();
+		}
+	});
+
 	it("preserves existing structured fields by default", async () => {
 		const db = new Database(":memory:");
 		try {
@@ -1672,6 +2194,409 @@ describe("aiBackfillStructuredContent", () => {
 			expect(row.narrative).toBeNull();
 			expect(row.facts).toBeNull();
 			expect(row.concepts).toBeNull();
+		} finally {
+			db.close();
+		}
+	});
+});
+
+describe("scanSecretsRetroactive", () => {
+	function seedLegacyRow(
+		db: Database,
+		sessionId: number,
+		title: string,
+		body: string,
+		extras: Partial<{
+			subtitle: string;
+			narrative: string;
+			tags_text: string;
+			facts: string;
+			concepts: string;
+			metadata_json: string;
+		}> = {},
+	): number {
+		const now = new Date().toISOString();
+		const info = db
+			.prepare(
+				`INSERT INTO memory_items(session_id, kind, title, subtitle, body_text, confidence,
+				 tags_text, active, created_at, updated_at, metadata_json, rev, visibility,
+				 narrative, facts, concepts)
+				 VALUES (?, ?, ?, ?, ?, 0.5, ?, 1, ?, ?, ?, 1, 'shared', ?, ?, ?)`,
+			)
+			.run(
+				sessionId,
+				"discovery",
+				title,
+				extras.subtitle ?? null,
+				body,
+				extras.tags_text ?? "",
+				now,
+				now,
+				extras.metadata_json ?? "{}",
+				extras.narrative ?? null,
+				extras.facts ?? null,
+				extras.concepts ?? null,
+			);
+		return Number(info.lastInsertRowid);
+	}
+
+	it("redacts legacy unredacted memories in place", () => {
+		const db = new Database(":memory:");
+		try {
+			initTestSchema(db);
+			const sessionId = Number(
+				db
+					.prepare("INSERT INTO sessions(started_at, project) VALUES (?, ?)")
+					.run("2026-01-01T00:00:00Z", "test").lastInsertRowid,
+			);
+			const pat = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+			const awsId = "AKIAIOSFODNN7EXAMPLE";
+			const id = seedLegacyRow(db, sessionId, `legacy ${pat}`, `body has ${awsId}`, {
+				narrative: `narrative has ${pat}`,
+				tags_text: `safe ${pat}`,
+				facts: JSON.stringify([`fact has ${pat}`, "clean"]),
+				metadata_json: JSON.stringify({ password: "supersecretvalue123", note: "fine" }),
+			});
+
+			const result = scanSecretsRetroactive(db);
+			expect(result.checked).toBe(1);
+			expect(result.updated).toBe(1);
+			expect(result.detections.length).toBeGreaterThan(0);
+
+			const row = db
+				.prepare(
+					"SELECT title, body_text, narrative, tags_text, facts, metadata_json FROM memory_items WHERE id = ?",
+				)
+				.get(id) as {
+				title: string;
+				body_text: string;
+				narrative: string | null;
+				tags_text: string | null;
+				facts: string | null;
+				metadata_json: string | null;
+			};
+			expect(row.title).not.toContain(pat);
+			expect(row.title).toContain("[REDACTED:github_pat_classic]");
+			expect(row.body_text).not.toContain(awsId);
+			expect(row.narrative).not.toContain(pat);
+			expect(row.tags_text ?? "").not.toContain(pat);
+			expect(row.facts ?? "").not.toContain(pat);
+			const meta = JSON.parse(row.metadata_json ?? "{}");
+			expect(meta.password).toBe("[REDACTED:context_secret]");
+			expect(meta.note).toBe("fine");
+		} finally {
+			db.close();
+		}
+	});
+
+	it("is idempotent — second run reports zero updates", () => {
+		const db = new Database(":memory:");
+		try {
+			initTestSchema(db);
+			const sessionId = Number(
+				db
+					.prepare("INSERT INTO sessions(started_at, project) VALUES (?, ?)")
+					.run("2026-01-01T00:00:00Z", "test").lastInsertRowid,
+			);
+			seedLegacyRow(db, sessionId, "legacy ghp_abcdefghijklmnopqrstuvwxyz0123456789", "clean body");
+			const first = scanSecretsRetroactive(db);
+			expect(first.updated).toBe(1);
+			const second = scanSecretsRetroactive(db);
+			expect(second.checked).toBeGreaterThan(0);
+			expect(second.updated).toBe(0);
+		} finally {
+			db.close();
+		}
+	});
+
+	it("dry-run reports detections without writing", () => {
+		const db = new Database(":memory:");
+		try {
+			initTestSchema(db);
+			const sessionId = Number(
+				db
+					.prepare("INSERT INTO sessions(started_at, project) VALUES (?, ?)")
+					.run("2026-01-01T00:00:00Z", "test").lastInsertRowid,
+			);
+			const pat = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+			const id = seedLegacyRow(db, sessionId, `legacy ${pat}`, "clean body");
+			const result = scanSecretsRetroactive(db, { dryRun: true });
+			expect(result.updated).toBe(1);
+			expect(result.detections.find((d) => d.kind === "github_pat_classic")?.count).toBe(1);
+			const row = db.prepare("SELECT title FROM memory_items WHERE id = ?").get(id) as {
+				title: string;
+			};
+			expect(row.title).toContain(pat);
+		} finally {
+			db.close();
+		}
+	});
+
+	it("skips rows over the size cap and reports them", () => {
+		const db = new Database(":memory:");
+		try {
+			initTestSchema(db);
+			const sessionId = Number(
+				db
+					.prepare("INSERT INTO sessions(started_at, project) VALUES (?, ?)")
+					.run("2026-01-01T00:00:00Z", "test").lastInsertRowid,
+			);
+			const pat = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+			seedLegacyRow(db, sessionId, "huge", `${"x".repeat(200)}${pat}`);
+			const result = scanSecretsRetroactive(db, { maxRowBytes: 100 });
+			expect(result.skippedOversized).toBe(1);
+			expect(result.updated).toBe(0);
+		} finally {
+			db.close();
+		}
+	});
+
+	it("idempotent on dual-rule redactions (secret-context plus pattern match)", () => {
+		const db = new Database(":memory:");
+		try {
+			initTestSchema(db);
+			const sessionId = Number(
+				db
+					.prepare("INSERT INTO sessions(started_at, project) VALUES (?, ?)")
+					.run("2026-01-01T00:00:00Z", "test").lastInsertRowid,
+			);
+			// "secret: ghp_..." triggers BOTH generic_assigned_secret and github_pat_classic.
+			const id = seedLegacyRow(
+				db,
+				sessionId,
+				"title",
+				"secret: ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+			);
+			const first = scanSecretsRetroactive(db);
+			expect(first.updated).toBe(1);
+			const firstBody = db.prepare("SELECT body_text FROM memory_items WHERE id = ?").get(id) as {
+				body_text: string;
+			};
+			expect(firstBody.body_text).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz0123456789");
+			const second = scanSecretsRetroactive(db);
+			expect(second.updated).toBe(0);
+			const secondBody = db.prepare("SELECT body_text FROM memory_items WHERE id = ?").get(id) as {
+				body_text: string;
+			};
+			expect(secondBody.body_text).toBe(firstBody.body_text);
+		} finally {
+			db.close();
+		}
+	});
+
+	it("redacts actor_display_name and origin_source", () => {
+		const db = new Database(":memory:");
+		try {
+			initTestSchema(db);
+			const sessionId = Number(
+				db
+					.prepare("INSERT INTO sessions(started_at, project) VALUES (?, ?)")
+					.run("2026-01-01T00:00:00Z", "test").lastInsertRowid,
+			);
+			const pat = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+			const now = new Date().toISOString();
+			const id = Number(
+				db
+					.prepare(
+						`INSERT INTO memory_items(session_id, kind, title, body_text, confidence,
+						 tags_text, active, created_at, updated_at, metadata_json, rev, visibility,
+						 actor_display_name, origin_source)
+						 VALUES (?, 'discovery', 'Title', 'Body', 0.5, '', 1, ?, ?, '{}', 1, 'shared', ?, ?)`,
+					)
+					.run(sessionId, now, now, `peer ${pat}`, `tool ${pat}`).lastInsertRowid,
+			);
+			const result = scanSecretsRetroactive(db);
+			expect(result.updated).toBe(1);
+			const row = db
+				.prepare("SELECT actor_display_name, origin_source FROM memory_items WHERE id = ?")
+				.get(id) as { actor_display_name: string | null; origin_source: string | null };
+			expect(row.actor_display_name ?? "").not.toContain(pat);
+			expect(row.actor_display_name ?? "").toContain("[REDACTED:github_pat_classic]");
+			expect(row.origin_source ?? "").not.toContain(pat);
+		} finally {
+			db.close();
+		}
+	});
+
+	it("refreshes memory_concept_refs after redacting concepts", () => {
+		const db = new Database(":memory:");
+		try {
+			initTestSchema(db);
+			const sessionId = Number(
+				db
+					.prepare("INSERT INTO sessions(started_at, project) VALUES (?, ?)")
+					.run("2026-01-01T00:00:00Z", "test").lastInsertRowid,
+			);
+			const pat = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+			const conceptsRaw = JSON.stringify([`leaks ${pat}`, "clean"]);
+			const id = seedLegacyRow(db, sessionId, "Title", "Body", { concepts: conceptsRaw });
+			// Seed the junction table with the unredacted concept (mimic what
+			// would have happened if remember() had been called pre-scanner).
+			db.prepare("INSERT INTO memory_concept_refs (memory_id, concept) VALUES (?, ?), (?, ?)").run(
+				id,
+				`leaks ${pat}`.toLowerCase(),
+				id,
+				"clean",
+			);
+			const result = scanSecretsRetroactive(db);
+			expect(result.updated).toBe(1);
+			const refs = db
+				.prepare("SELECT concept FROM memory_concept_refs WHERE memory_id = ? ORDER BY concept")
+				.all(id) as Array<{ concept: string }>;
+			const all = refs.map((r) => r.concept).join("|");
+			expect(all).not.toContain(pat);
+		} finally {
+			db.close();
+		}
+	});
+
+	it("redacts legacy file_read/file_modified arrays and refreshes memory_file_refs", () => {
+		const db = new Database(":memory:");
+		try {
+			initTestSchema(db);
+			const sessionId = Number(
+				db
+					.prepare("INSERT INTO sessions(started_at, project) VALUES (?, ?)")
+					.run("2026-01-01T00:00:00Z", "test").lastInsertRowid,
+			);
+			const pat = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+			const filesRead = JSON.stringify([`/tmp/${pat}.log`, "/clean/path"]);
+			const filesModified = JSON.stringify([`/var/${pat}.tmp`]);
+			// Seed legacy memory and pre-scanner junction-table refs that contain
+			// the unredacted paths (mimics what populateMemoryRefs would have done
+			// pre-scanner deployment).
+			const now = new Date().toISOString();
+			const id = Number(
+				db
+					.prepare(
+						`INSERT INTO memory_items(session_id, kind, title, body_text, confidence,
+						 tags_text, active, created_at, updated_at, metadata_json, rev, visibility,
+						 files_read, files_modified)
+						 VALUES (?, 'discovery', 'T', 'B', 0.5, '', 1, ?, ?, '{}', 1, 'shared', ?, ?)`,
+					)
+					.run(sessionId, now, now, filesRead, filesModified).lastInsertRowid,
+			);
+			db.prepare(
+				"INSERT INTO memory_file_refs (memory_id, file_path, relation) VALUES (?, ?, 'read'), (?, ?, 'read'), (?, ?, 'modified')",
+			).run(id, `/tmp/${pat}.log`, id, "/clean/path", id, `/var/${pat}.tmp`);
+
+			const result = scanSecretsRetroactive(db);
+			expect(result.updated).toBe(1);
+
+			const row = db
+				.prepare("SELECT files_read, files_modified FROM memory_items WHERE id = ?")
+				.get(id) as { files_read: string; files_modified: string };
+			expect(row.files_read).not.toContain(pat);
+			expect(row.files_read).toContain("[REDACTED:github_pat_classic]");
+			expect(row.files_modified).not.toContain(pat);
+
+			const refs = db
+				.prepare("SELECT file_path FROM memory_file_refs WHERE memory_id = ?")
+				.all(id) as Array<{ file_path: string }>;
+			for (const r of refs) {
+				expect(r.file_path).not.toContain(pat);
+			}
+			expect(refs.some((r) => r.file_path === "/clean/path")).toBe(true);
+		} finally {
+			db.close();
+		}
+	});
+
+	it("does not flag rows as changed when metadata only differs by JSON canonicalization", () => {
+		const db = new Database(":memory:");
+		try {
+			initTestSchema(db);
+			const sessionId = Number(
+				db
+					.prepare("INSERT INTO sessions(started_at, project) VALUES (?, ?)")
+					.run("2026-01-01T00:00:00Z", "test").lastInsertRowid,
+			);
+			// Stored JSON has whitespace and key order V8's JSON.stringify will
+			// not reproduce. The row contains no secrets, so the sweep must
+			// report changed=false rather than re-stringifying and treating the
+			// canonicalization diff as a redaction.
+			const noisyMeta = '{"b": 2,  "a":1,\n"nested": {"x": "ok"}}';
+			seedLegacyRow(db, sessionId, "Title", "Body no secrets", { metadata_json: noisyMeta });
+			const result = scanSecretsRetroactive(db);
+			expect(result.checked).toBe(1);
+			expect(result.updated).toBe(0);
+			expect(result.detections).toEqual([]);
+		} finally {
+			db.close();
+		}
+	});
+
+	it("completes without stack overflow on a large no-op sweep", () => {
+		const db = new Database(":memory:");
+		try {
+			initTestSchema(db);
+			const sessionId = Number(
+				db
+					.prepare("INSERT INTO sessions(started_at, project) VALUES (?, ?)")
+					.run("2026-01-01T00:00:00Z", "test").lastInsertRowid,
+			);
+			// Seed enough rows that the previous mergeDetections(...detectionLists)
+			// spread would have tripped V8's argument-stack limit (~10k entries).
+			// Pre-redacted titles ensure changed=false so the only thing we're
+			// stressing is the accumulator path.
+			const insert = db.prepare(
+				`INSERT INTO memory_items(session_id, kind, title, body_text, confidence,
+				 tags_text, active, created_at, updated_at, metadata_json, rev, visibility)
+				 VALUES (?, 'discovery', ?, '', 0.5, '', 1, ?, ?, '{}', 1, 'shared')`,
+			);
+			const now = new Date().toISOString();
+			db.transaction(() => {
+				for (let i = 0; i < 12_000; i++) {
+					insert.run(sessionId, `clean title ${i}`, now, now);
+				}
+			})();
+			expect(() => scanSecretsRetroactive(db)).not.toThrow();
+			const result = scanSecretsRetroactive(db);
+			expect(result.checked).toBe(12_000);
+			expect(result.updated).toBe(0);
+		} finally {
+			db.close();
+		}
+	});
+
+	it("rejects updates with a stale rev when a concurrent writer bumps rev mid-scan", async () => {
+		const { SecretScanner } = await import("./secret-scanner.js");
+		const db = new Database(":memory:");
+		try {
+			initTestSchema(db);
+			const sessionId = Number(
+				db
+					.prepare("INSERT INTO sessions(started_at, project) VALUES (?, ?)")
+					.run("2026-01-01T00:00:00Z", "test").lastInsertRowid,
+			);
+			const pat = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+			const id = seedLegacyRow(db, sessionId, `legacy ${pat}`, "Body");
+			// Inject a concurrent rev bump between the sweep's SELECT (which
+			// loaded rev=1) and its UPDATE. The first scan call happens on
+			// the title; we hijack it to bump rev in the DB so the UPDATE's
+			// WHERE rev=1 guard fails.
+			const racy = new SecretScanner();
+			const orig = racy.scan.bind(racy);
+			let bumped = false;
+			racy.scan = (text: string) => {
+				if (!bumped && text.includes(pat)) {
+					bumped = true;
+					db.prepare("UPDATE memory_items SET rev = rev + 1 WHERE id = ?").run(id);
+				}
+				return orig(text);
+			};
+			const result = scanSecretsRetroactive(db, { scanner: racy });
+			expect(result.updated).toBe(0);
+			expect(result.staleWrites).toBe(1);
+			// Stale-write rows must NOT appear in samples or detections — those
+			// only describe persisted redactions.
+			expect(result.samples).toEqual([]);
+			expect(result.detections).toEqual([]);
+			const row = db.prepare("SELECT title FROM memory_items WHERE id = ?").get(id) as {
+				title: string;
+			};
+			// Original content survives because the rev guard rejected the write.
+			expect(row.title).toContain(pat);
 		} finally {
 			db.close();
 		}

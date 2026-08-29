@@ -6,8 +6,11 @@
 
 import * as api from "../../../../lib/api";
 import { clearFieldError, friendlyError, markFieldError } from "../../../../lib/form";
+import { humanPresentationLabel } from "../../../../lib/identity-presentation";
+import { handlePrimaryActionKeyboard } from "../../../../lib/keyboard";
 import { showGlobalNotice } from "../../../../lib/notice";
 import { state } from "../../../../lib/state";
+import { openProjectShareFlow } from "../../../project-sharing";
 import type { SyncActionFeedback } from "../../components/sync-inline-feedback";
 import { summarizeSyncRunResult } from "../../view-model";
 import { teamSyncState } from "../data/state";
@@ -23,6 +26,9 @@ export function initTeamSyncEvents(refreshCallback: () => void, loadSyncData: ()
 	renderInvitePolicySelect();
 
 	const syncNowButton = document.getElementById("syncNowButton") as HTMLButtonElement | null;
+	const syncShareProjectsButton = document.getElementById(
+		"syncShareProjectsButton",
+	) as HTMLButtonElement | null;
 	const syncCreateInviteButton = document.getElementById(
 		"syncCreateInviteButton",
 	) as HTMLButtonElement | null;
@@ -33,6 +39,69 @@ export function initTeamSyncEvents(refreshCallback: () => void, loadSyncData: ()
 	) as HTMLTextAreaElement | null;
 	const syncJoinButton = document.getElementById("syncJoinButton") as HTMLButtonElement | null;
 	const syncJoinInvite = document.getElementById("syncJoinInvite") as HTMLTextAreaElement | null;
+	const projectInviteReview = document.getElementById(
+		"syncProjectInviteReview",
+	) as HTMLDivElement | null;
+	const projectInviteContext = document.getElementById(
+		"syncProjectInviteContext",
+	) as HTMLDivElement | null;
+	const projectInviteReviewHeading = document.getElementById(
+		"syncProjectInviteReviewHeading",
+	) as HTMLHeadingElement | null;
+	const recipientName = document.getElementById("syncRecipientName") as HTMLInputElement | null;
+	const recipientDeviceName = document.getElementById(
+		"syncRecipientDeviceName",
+	) as HTMLInputElement | null;
+	let inspectedInviteValue = "";
+	let inspectedInviteKind: api.InspectInviteResult["kind"] | undefined;
+	let inviteInputRevision = 0;
+
+	syncShareProjectsButton?.addEventListener("click", () => {
+		if (!openProjectShareFlow()) {
+			showGlobalNotice(
+				"Project sharing is unavailable. Refresh Projects and try again.",
+				"warning",
+			);
+		}
+	});
+
+	const reviewProjectInvite = async (
+		inviteValue: string,
+		inputRevision: number,
+	): Promise<"project" | "other" | "stale"> => {
+		if (!projectInviteReview || !recipientName || !recipientDeviceName) return "other";
+		const inspected = await api.inspectCoordinatorInvite(inviteValue);
+		if (inputRevision !== inviteInputRevision || syncJoinInvite?.value.trim() !== inviteValue) {
+			return "stale";
+		}
+		inspectedInviteKind = inspected.kind;
+		if (inspected.kind !== "project_share_invite") return "other";
+		const projectNames = (inspected.projects ?? [])
+			.map(
+				(project) =>
+					`${project.display_name} (${project.existing_memory_count} existing ${project.existing_memory_count === 1 ? "memory" : "memories"})`,
+			)
+			.join(", ");
+		if (projectInviteContext) {
+			projectInviteContext.textContent = `${inspected.inviter_name || "A teammate"} invited you${inspected.team_name ? ` through ${inspected.team_name}` : ""} to share ${projectNames || "selected projects"}.`;
+		}
+		recipientName.value = humanPresentationLabel(inspected.recipient_name);
+		recipientDeviceName.value = humanPresentationLabel(inspected.device_name);
+		projectInviteReview.hidden = false;
+		inspectedInviteValue = inviteValue;
+		if (syncJoinButton) syncJoinButton.textContent = "Accept and start syncing";
+		projectInviteReviewHeading?.focus();
+		return "project";
+	};
+
+	syncJoinInvite?.addEventListener("input", () => {
+		inviteInputRevision += 1;
+		if (syncJoinInvite.value.trim() === inspectedInviteValue) return;
+		inspectedInviteValue = "";
+		inspectedInviteKind = undefined;
+		if (projectInviteReview) projectInviteReview.hidden = true;
+		if (syncJoinButton) syncJoinButton.textContent = "Review invite";
+	});
 
 	syncCreateInviteButton?.addEventListener("click", async () => {
 		if (!syncCreateInviteButton || !syncInviteGroup || !syncInviteTtl || !syncInviteOutput) return;
@@ -91,6 +160,16 @@ export function initTeamSyncEvents(refreshCallback: () => void, loadSyncData: ()
 		}
 	});
 
+	// Cmd/Ctrl+Enter inside the invite textarea triggers Accept. Bare Enter
+	// is intentionally left alone so users can keep the textarea's native
+	// newline behavior while pasting multi-line payloads.
+	syncJoinInvite?.addEventListener("keydown", (event) => {
+		handlePrimaryActionKeyboard(event, {
+			onSubmit: () => syncJoinButton?.click(),
+			disabled: !syncJoinButton || syncJoinButton.disabled,
+		});
+	});
+
 	syncJoinButton?.addEventListener("click", async () => {
 		if (!syncJoinButton || !syncJoinInvite) return;
 		const inviteValue = syncJoinInvite.value.trim();
@@ -99,15 +178,59 @@ export function initTeamSyncEvents(refreshCallback: () => void, loadSyncData: ()
 			return;
 		}
 		clearFieldError(syncJoinInvite);
+		if (inspectedInviteValue !== inviteValue) {
+			const inputRevision = inviteInputRevision;
+			try {
+				const reviewOutcome = await reviewProjectInvite(inviteValue, inputRevision);
+				if (reviewOutcome === "project" || reviewOutcome === "stale") return;
+			} catch {
+				// Pairing payloads and legacy envelopes continue through the existing importer.
+			}
+			if (inputRevision !== inviteInputRevision || syncJoinInvite.value.trim() !== inviteValue) {
+				return;
+			}
+			inspectedInviteValue = inviteValue;
+			syncJoinButton.textContent = "Accept invite";
+			return;
+		}
+		const identity =
+			projectInviteReview && !projectInviteReview.hidden
+				? {
+						recipient_name: recipientName?.value.trim() ?? "",
+						device_name: recipientDeviceName?.value.trim() ?? "",
+					}
+				: undefined;
+		if (identity) {
+			const invalid = (value: string) => humanPresentationLabel(value) === "";
+			if (invalid(identity.recipient_name)) {
+				if (recipientName)
+					markFieldError(
+						recipientName,
+						"Enter a human-readable name using 120 characters or fewer.",
+					);
+				return;
+			}
+			if (invalid(identity.device_name)) {
+				if (recipientDeviceName)
+					markFieldError(
+						recipientDeviceName,
+						"Enter a human-readable device name using 120 characters or fewer.",
+					);
+				return;
+			}
+		}
 		syncJoinButton.disabled = true;
 		syncJoinButton.textContent = "Accepting\u2026";
 		try {
-			const result = await api.importCoordinatorInvite(inviteValue);
+			const result = await api.importCoordinatorInvite(inviteValue, identity, inspectedInviteKind);
 			state.lastTeamJoin = result;
-			const resultType =
-				typeof (result as { type?: unknown }).type === "string"
-					? ((result as { type: string }).type as "pair" | "team_join")
-					: "team_join";
+			const resultFields = result as {
+				detail?: unknown;
+				restart_required?: unknown;
+				setup_state?: unknown;
+				type?: unknown;
+			};
+			const resultType = typeof resultFields.type === "string" ? resultFields.type : "team_join";
 			let feedback: SyncActionFeedback;
 			if (resultType === "pair") {
 				const peerId = String((result as { peer_device_id?: unknown }).peer_device_id ?? "").trim();
@@ -117,6 +240,24 @@ export function initTeamSyncEvents(refreshCallback: () => void, loadSyncData: ()
 						: "Paired the device. It will appear in People & devices.",
 					tone: "success",
 				};
+			} else if (resultType === "project_share") {
+				const pendingSetup =
+					resultFields.restart_required === true ||
+					resultFields.setup_state === "pending_inviter" ||
+					result.status === "pending_setup";
+				const detail = typeof resultFields.detail === "string" ? resultFields.detail.trim() : "";
+				feedback = pendingSetup
+					? {
+							message:
+								detail ||
+								(resultFields.restart_required === true
+									? "Project invitation accepted. Restart codemem to finish setup."
+									: resultFields.setup_state === "pending_inviter"
+										? "Project invitation accepted. Waiting for the inviter to finish setup."
+										: "Project invitation accepted. Setup is still pending."),
+							tone: "warning",
+						}
+					: { message: "Project invitation accepted.", tone: "success" };
 			} else {
 				feedback = {
 					message:
@@ -129,6 +270,8 @@ export function initTeamSyncEvents(refreshCallback: () => void, loadSyncData: ()
 			state.syncJoinFlowFeedback = feedback;
 			setJoinFeedbackVisibility();
 			syncJoinInvite.value = "";
+			inspectedInviteValue = "";
+			if (projectInviteReview) projectInviteReview.hidden = true;
 			try {
 				await loadSyncData();
 			} catch (error) {
@@ -157,7 +300,7 @@ export function initTeamSyncEvents(refreshCallback: () => void, loadSyncData: ()
 		} finally {
 			if (syncJoinButton.disabled) {
 				syncJoinButton.disabled = false;
-				syncJoinButton.textContent = "Accept";
+				syncJoinButton.textContent = "Review invite";
 			}
 		}
 	});

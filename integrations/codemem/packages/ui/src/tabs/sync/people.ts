@@ -2,14 +2,16 @@
 
 import * as api from "../../lib/api";
 import { clearFieldError, friendlyError, markFieldError } from "../../lib/form";
+import { handlePrimaryActionKeyboard } from "../../lib/keyboard";
 import { showGlobalNotice } from "../../lib/notice";
 import { state } from "../../lib/state";
+import { renderProjectShareOperations } from "./components/project-share-operations";
 import { renderSyncActorsList } from "./components/sync-actors";
 import { renderSyncEmptyState } from "./components/sync-diagnostics";
 import type { SyncActionFeedback } from "./components/sync-inline-feedback";
 import { renderLegacyClaimsSlice } from "./components/sync-legacy-claims";
-import { renderSyncPeersList } from "./components/sync-peers";
-import { clearPeerScopeReview, hideSkeleton, isPeerScopeReviewPending } from "./helpers";
+import { canManageLegacyCoordinatorSpaces, renderSyncPeersList } from "./components/sync-peers";
+import { hideSkeleton, isPeerScopeReviewPending, shouldClearStalePeersFeedback } from "./helpers";
 import { openSyncConfirmDialog } from "./sync-dialogs";
 import {
 	deriveVisiblePeopleActors,
@@ -50,8 +52,8 @@ export function renderSyncActors() {
 	const actors = actorVisibility.visibleActors;
 	if (actorMeta) {
 		actorMeta.textContent = actors.length
-			? "Manage people here, then assign devices below."
-			: "No named people yet. Create a person here, then assign devices below so sync ownership is easier to review.";
+			? "Manage Identity names here. Confirm authoritative device ownership in Devices."
+			: "No named people yet. Create an Identity here, then confirm device ownership in Devices.";
 		if (actorVisibility.hiddenLocalDuplicateCount > 0) {
 			actorMeta.textContent += ` ${actorVisibility.hiddenLocalDuplicateCount} unresolved duplicate ${actorVisibility.hiddenLocalDuplicateCount === 1 ? "entry is" : "entries are"} hidden here until reviewed in Needs attention.`;
 		}
@@ -104,6 +106,25 @@ export function renderSyncActorsUnavailable() {
 	}
 }
 
+export function renderProjectSharingOperations() {
+	const mount = document.getElementById("syncProjectShareOperations");
+	if (!mount) return;
+	renderProjectShareOperations(mount, {
+		operations: state.lastShareOperations,
+		onAdvance: (operationId) => api.advanceShareOperation(operationId),
+		onLoadOperation: (operationId) => api.loadShareOperation(operationId),
+		onReload: _loadSyncData,
+	});
+	const meta = document.getElementById("syncProjectShareOperationsMeta");
+	if (meta) {
+		meta.textContent = state.shareOperationsLoadError
+			? "Project sharing status could not be refreshed. Existing device diagnostics remain available below."
+			: state.lastShareOperations.length > 0
+				? "Project access is grouped by Person. Devices appear after invitation acceptance."
+				: "Share a project from Projects to invite a teammate.";
+	}
+}
+
 /* ── Devices renderer ────────────────────────────────────── */
 
 export function renderSyncPeers() {
@@ -111,8 +132,16 @@ export function renderSyncPeers() {
 	if (!syncPeers) return;
 	hideSkeleton("syncPeersSkeleton");
 	const peers = state.lastSyncPeers;
+	const peersArray = Array.isArray(peers) ? peers : [];
+	// "Removed peer X" feedback survives in module state until the page
+	// reloads. Clear it once the same peer reappears in the loaded list
+	// (e.g. because the user re-paired the device they just removed) so
+	// the banner does not contradict the live device row beneath it.
+	if (shouldClearStalePeersFeedback(state.syncPeersSectionFeedback, peersArray)) {
+		state.syncPeersSectionFeedback = null;
+	}
 	renderSyncPeersList(syncPeers, {
-		peers: Array.isArray(peers) ? peers : [],
+		peers: peersArray,
 		onRename: async (peerId, nextName) => {
 			try {
 				await api.renamePeer(peerId, nextName);
@@ -127,16 +156,19 @@ export function renderSyncPeers() {
 		},
 		onSync: async (peer, address) => {
 			try {
-				const result = await api.triggerSync(address);
-				const summary = summarizeSyncRunResult(result);
 				const peerId = String(peer?.peer_device_id || "");
+				const result = await api.triggerSync({ address, peerDeviceId: peerId || undefined });
+				const summary = summarizeSyncRunResult(result);
 				let feedback: SyncActionFeedback | null;
 				if (!summary.ok) {
 					feedback = { message: summary.message, tone: "warning" };
 				} else if (peerId && isPeerScopeReviewPending(peerId)) {
 					const displayName = peer?.name || (peerId ? peerId.slice(0, 8) : "unknown");
+					const reviewGuidance = canManageLegacyCoordinatorSpaces()
+						? "Review Space access and advanced rules in coordinator administration (legacy) if this device needs tighter sharing."
+						: "A coordinator operator can review Space access and advanced rules in coordinator administration (legacy) if this device needs tighter sharing.";
 					feedback = {
-						message: `Triggered sync for ${displayName}. Review scope in this card if you want tighter sharing rules.`,
+						message: `Triggered sync for ${displayName}. ${reviewGuidance}`,
 						tone: "warning",
 					};
 				} else {
@@ -164,10 +196,13 @@ export function renderSyncPeers() {
 				await api.deletePeer(peerId);
 				const feedback = {
 					message: `Removed peer ${label}.`,
-					tone: "success",
+					tone: "success" as const,
 				} satisfies SyncActionFeedback;
 				state.syncPeerFeedbackById.delete(peerId);
-				state.syncPeersSectionFeedback = feedback;
+				// Tag the section feedback with the removed peer id so a
+				// subsequent re-pair of the same device can detect and clear
+				// the stale "Removed peer X" banner on the next render.
+				state.syncPeersSectionFeedback = { ...feedback, relatedPeerDeviceId: peerId };
 				await _loadSyncData();
 				return feedback;
 			} catch (error) {
@@ -175,62 +210,6 @@ export function renderSyncPeers() {
 					message: friendlyError(
 						error,
 						"Failed to remove peer. The local peer entry is still here.",
-					),
-					tone: "warning",
-				} satisfies SyncActionFeedback;
-			}
-		},
-		onAssignActor: async (peerId, actorId) => {
-			try {
-				await api.assignPeerActor(peerId, actorId);
-				await _loadSyncData();
-				return {
-					message: actorId ? "Device assignment updated." : "Device assignment cleared.",
-					tone: "success",
-				} satisfies SyncActionFeedback;
-			} catch (error) {
-				return {
-					message: friendlyError(
-						error,
-						"Failed to update device assignment. The current assignment is unchanged.",
-					),
-					tone: "warning",
-				} satisfies SyncActionFeedback;
-			}
-		},
-		onSaveScope: async (peerId, include, exclude) => {
-			try {
-				await api.updatePeerScope(peerId, include, exclude);
-				clearPeerScopeReview(peerId);
-				await _loadSyncData();
-				return {
-					message: "Device sync scope saved.",
-					tone: "success",
-				} satisfies SyncActionFeedback;
-			} catch (error) {
-				return {
-					message: friendlyError(
-						error,
-						"Failed to save device scope. The current sharing rules are still active.",
-					),
-					tone: "warning",
-				} satisfies SyncActionFeedback;
-			}
-		},
-		onResetScope: async (peerId) => {
-			try {
-				await api.updatePeerScope(peerId, null, null, true);
-				clearPeerScopeReview(peerId);
-				await _loadSyncData();
-				return {
-					message: "Device sync scope reset to global defaults.",
-					tone: "success",
-				} satisfies SyncActionFeedback;
-			} catch (error) {
-				return {
-					message: friendlyError(
-						error,
-						"Failed to reset device scope. The current sharing rules are still active.",
 					),
 					tone: "warning",
 				} satisfies SyncActionFeedback;
@@ -259,7 +238,7 @@ export function renderSyncPeopleUnavailable() {
 		renderSyncEmptyState(syncPeers, {
 			title: "Devices unavailable right now.",
 			detail:
-				"Refresh this page to retry. When sync is reachable again, paired devices will reload here so you can rename, assign, or re-pair them.",
+				"Refresh this page to retry. When sync is reachable again, paired devices will reload here so you can rename, inspect, or re-pair them.",
 		});
 	}
 }
@@ -299,6 +278,15 @@ export function initPeopleEvents(loadSyncData: () => Promise<void>) {
 	const syncLegacyClaimButton = document.getElementById(
 		"syncLegacyClaimButton",
 	) as HTMLButtonElement | null;
+
+	// Enter inside the create-person input triggers Create person so the
+	// user does not need to chase the button after typing the name.
+	syncActorCreateInput?.addEventListener("keydown", (event) => {
+		handlePrimaryActionKeyboard(event, {
+			onSubmit: () => syncActorCreateButton?.click(),
+			disabled: !syncActorCreateButton || syncActorCreateButton.disabled,
+		});
+	});
 
 	syncActorCreateButton?.addEventListener("click", async () => {
 		if (!syncActorCreateButton || !syncActorCreateInput) return;

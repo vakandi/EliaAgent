@@ -6,11 +6,34 @@
  */
 
 import { projectClause } from "./project.js";
+import {
+	LEGACY_SHARED_REVIEW_SCOPE_ID,
+	LOCAL_DEFAULT_SCOPE_ID,
+	MAX_SCOPE_IN_PARAMS,
+} from "./scope-resolution.js";
 import type { MemoryFilters } from "./types.js";
 
 export interface OwnershipFilterContext {
 	actorId: string;
 	deviceId: string;
+	claimedDeviceIds?: string[];
+	legacyActorIds?: string[];
+	/**
+	 * Apply the local read boundary for replication scopes. This is opt-in so
+	 * low-level filter unit tests and non-memory callers can keep using the pure
+	 * filter builder, while store/search paths can make scope visibility a hard
+	 * invariant.
+	 */
+	enforceScopeVisibility?: boolean;
+	/**
+	 * Pre-resolved set of scope_ids this device may read (see
+	 * `resolveVisibleScopeIds` in scope-resolution.ts). When present, scope visibility is
+	 * enforced with an index-eligible `scope_id IN (...)` predicate instead of
+	 * the per-row EXISTS subqueries. Callers that cannot resolve the set up front
+	 * (e.g. a context built without db access) omit it and fall back to the
+	 * EXISTS predicate, which is semantically identical.
+	 */
+	visibleScopeIds?: readonly string[];
 }
 
 export interface FilterResult {
@@ -84,6 +107,127 @@ function addMultiValueFilter(
 	}
 }
 
+function cleanUniqueStrings(value: string[] | undefined): string[] {
+	return [...new Set((value ?? []).map((item) => item.trim()).filter(Boolean))];
+}
+
+// Mirror MemoryStore.buildOwnershipPredicate(): prefer the top-level column,
+// then fall back to the metadata_json copy, and finally normalize a missing
+// owner to '' (never NULL) so the `theirs` (NOT ...) comparison stays null-safe.
+function ownershipColumnSql(column: string, jsonPath: string): string {
+	return `COALESCE(
+	NULLIF(TRIM(memory_items.${column}), ''),
+	NULLIF(TRIM(CASE
+		WHEN json_valid(COALESCE(memory_items.metadata_json, ''))
+		THEN COALESCE(json_extract(memory_items.metadata_json, '${jsonPath}'), '')
+		ELSE ''
+	END), ''),
+	''
+)`;
+}
+
+const OWNERSHIP_ACTOR_SQL = ownershipColumnSql("actor_id", "$.actor_id");
+const OWNERSHIP_ORIGIN_DEVICE_SQL = ownershipColumnSql("origin_device_id", "$.origin_device_id");
+
+function ownershipPredicateSql(context: OwnershipFilterContext): {
+	clause: string;
+	params: string[];
+} {
+	const alternatives: string[] = [];
+	const params: string[] = [];
+	// Guard blank identity: an empty actorId/deviceId must NOT match every
+	// ownerless row (mirrors the falsy checks in
+	// MemoryStore.buildOwnershipPredicate()). Skip the equality alternative
+	// when the value is empty rather than emitting `<expr> = ''`.
+	const actorId = context.actorId.trim();
+	if (actorId) {
+		alternatives.push(`${OWNERSHIP_ACTOR_SQL} = ?`);
+		params.push(actorId);
+	}
+	const deviceId = context.deviceId.trim();
+	if (deviceId) {
+		alternatives.push(`${OWNERSHIP_ORIGIN_DEVICE_SQL} = ?`);
+		params.push(deviceId);
+	}
+	const claimedDeviceIds = cleanUniqueStrings(context.claimedDeviceIds);
+	if (claimedDeviceIds.length > 0) {
+		alternatives.push(
+			`${OWNERSHIP_ORIGIN_DEVICE_SQL} IN (${claimedDeviceIds.map(() => "?").join(", ")})`,
+		);
+		params.push(...claimedDeviceIds);
+	}
+	const legacyActorIds = cleanUniqueStrings(context.legacyActorIds);
+	if (legacyActorIds.length > 0) {
+		alternatives.push(`${OWNERSHIP_ACTOR_SQL} IN (${legacyActorIds.map(() => "?").join(", ")})`);
+		params.push(...legacyActorIds);
+	}
+	// No usable owner identity → nothing is "mine" (and `theirs` = everything).
+	if (alternatives.length === 0) return { clause: "(0 = 1)", params };
+	return { clause: `(${alternatives.join(" OR ")})`, params };
+}
+
+function addScopeVisibilityFilter(
+	clauses: string[],
+	params: unknown[],
+	context: OwnershipFilterContext | undefined,
+): void {
+	if (!context?.enforceScopeVisibility) return;
+	const deviceId = context.deviceId.trim();
+	if (!deviceId) {
+		clauses.push("0 = 1");
+		return;
+	}
+	// Blank/NULL scope_id is treated as local-default for read visibility.
+	// Migration backfill promotes legacy rows to explicit scopes asynchronously,
+	// but until that completes those rows must remain visible to their owning
+	// device exactly the way local-default rows are.
+	const visibleScopeIds = context.visibleScopeIds;
+	if (visibleScopeIds !== undefined && visibleScopeIds.length <= MAX_SCOPE_IN_PARAMS) {
+		// Fast path: the visible scope-id set was resolved once per request (see
+		// resolveVisibleScopeIds in scope-resolution.ts). A plain `scope_id IN (...)`
+		// is index-eligible on idx_memory_items_scope_visibility_created, unlike the
+		// EXISTS-based fallback below.
+		//
+		// Guarded by MAX_SCOPE_IN_PARAMS: each id is one bound parameter, so an
+		// unrealistically large visible set would otherwise blow SQLite's variable
+		// limit and throw at prepare time. Beyond the cap we fail safe to the
+		// fixed-param EXISTS fallback, which is semantically identical.
+		//
+		// We deliberately do NOT TRIM memory_items.scope_id here. TRIM defeats the
+		// index, and it is unnecessary: stored scope_ids are always trimmed on
+		// write (op scope_id is .trim()ed), so no whitespace-padded values exist.
+		// NULL scope_id (legacy rows pending backfill) is handled by the explicit
+		// IS NULL branch; the empty string "" is included in the resolved set.
+		const placeholders = visibleScopeIds.map(() => "?").join(", ");
+		clauses.push(`(memory_items.scope_id IS NULL OR memory_items.scope_id IN (${placeholders}))`);
+		params.push(...visibleScopeIds);
+		return;
+	}
+	// Fallback path: no pre-resolved set (e.g. a context built without db access).
+	// Semantically identical to the IN predicate above, but evaluated per row.
+	clauses.push(`(
+		COALESCE(TRIM(memory_items.scope_id), '') IN (?, ?, ?)
+		OR EXISTS (
+			SELECT 1
+			FROM replication_scopes rs
+			WHERE rs.scope_id = memory_items.scope_id
+			  AND rs.status = 'active'
+			  AND rs.authority_type = 'local'
+		)
+		OR EXISTS (
+			SELECT 1
+			FROM scope_memberships sm
+			JOIN replication_scopes rs ON rs.scope_id = sm.scope_id
+			WHERE sm.scope_id = memory_items.scope_id
+			  AND sm.device_id = ?
+			  AND sm.status = 'active'
+			  AND rs.status = 'active'
+			  AND sm.membership_epoch >= rs.membership_epoch
+		)
+	)`);
+	params.push("", LOCAL_DEFAULT_SCOPE_ID, LEGACY_SHARED_REVIEW_SCOPE_ID, deviceId);
+}
+
 /**
  * Build WHERE clause fragments from a MemoryFilters object.
  *
@@ -100,12 +244,14 @@ export function buildFilterClausesWithContext(
 	ownership?: OwnershipFilterContext,
 ): FilterResult {
 	const result: FilterResult = { clauses: [], params: [], joinSessions: false };
+	const { clauses, params } = result;
+	addScopeVisibilityFilter(clauses, params, ownership);
 	if (!filters) return result;
 
-	const { clauses, params } = result;
-
-	// Single kind filter
-	if (filters.kind) {
+	// Single kind filter — guard against non-string kinds from untyped
+	// JSON request bodies (a number/bool would otherwise become a broken
+	// bound parameter).
+	if (typeof filters.kind === "string" && filters.kind) {
 		clauses.push("memory_items.kind = ?");
 		params.push(filters.kind);
 	}
@@ -122,16 +268,13 @@ export function buildFilterClausesWithContext(
 		.trim()
 		.toLowerCase();
 	if (ownership && (ownershipScope === "mine" || ownershipScope === "theirs")) {
-		const ownedClause =
-			"(COALESCE(memory_items.actor_id, '') = ? OR COALESCE(memory_items.origin_device_id, '') = ?)";
+		const ownedPredicate = ownershipPredicateSql(ownership);
 		if (ownershipScope === "mine") {
-			clauses.push(ownedClause);
+			clauses.push(ownedPredicate.clause);
 		} else {
-			clauses.push(
-				"(COALESCE(memory_items.actor_id, '') != ? AND COALESCE(memory_items.origin_device_id, '') != ?)",
-			);
+			clauses.push(`NOT ${ownedPredicate.clause}`);
 		}
-		params.push(ownership.actorId, ownership.deviceId);
+		params.push(...ownedPredicate.params);
 	}
 
 	// Project scoping — requires sessions JOIN
@@ -151,6 +294,17 @@ export function buildFilterClausesWithContext(
 		"memory_items.visibility",
 		normalizeVisibilityValues(filters.include_visibility ?? filters.visibility),
 		normalizeVisibilityValues(filters.exclude_visibility),
+	);
+
+	// Replication scope filters. These are an explicit narrowing layer and are
+	// always intersected with the central scope-visibility gate above when the
+	// caller enables it.
+	addMultiValueFilter(
+		clauses,
+		params,
+		"memory_items.scope_id",
+		normalizeFilterStrings(filters.include_scope_ids ?? filters.scope_id),
+		normalizeFilterStrings(filters.exclude_scope_ids),
 	);
 
 	// Workspace IDs

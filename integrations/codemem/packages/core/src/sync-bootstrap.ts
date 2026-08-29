@@ -6,20 +6,35 @@
  * The bootstrap protocol:
  * 1. Fetch paginated snapshot pages from GET /v1/snapshot
  * 2. Collect all canonical shared memory items (including tombstones)
- * 3. In a single transaction: wipe local shared memories, apply snapshot,
- *    update replication cursor to baseline_cursor, bump generation
+ * 3. In a single transaction: wipe local synced memories for the requested
+ *    scope, apply snapshot, update replication cursor to baseline_cursor,
+ *    bump generation
  */
 
-import { and, eq, isNotNull, ne, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/better-sqlite3";
+import type { ApiSyncMemorySnapshotPageResponse } from "./api-types.js";
 import type { Database } from "./db.js";
 import { toJson } from "./db.js";
 import * as schema from "./schema.js";
-import { buildAuthHeaders } from "./sync-auth.js";
+import { redactMemoryFields, SecretScanner } from "./secret-scanner.js";
+import { buildAuthHeaders, buildDirectPeerAuthHeaders } from "./sync-auth.js";
+import { SYNC_BOOTSTRAP_CWD_PREFIX } from "./sync-bootstrap-constants.js";
+import { LOCAL_SYNC_CAPABILITY, SYNC_CAPABILITY_HEADER } from "./sync-capability.js";
 import { requestJson } from "./sync-http-client.js";
-import { setReplicationCursor, setSyncResetState } from "./sync-replication.js";
+import {
+	clearReplicationCursorLastApplied,
+	clockDeviceIdFromMetadataJson,
+	DEFAULT_SYNC_SCOPE_ID,
+	isNewerClock,
+	SCOPED_NULL_BASELINE_BOOTSTRAP_CURSOR_MARKER,
+	setReplicationCursor,
+	setSyncResetState,
+} from "./sync-replication.js";
 import type { SyncMemorySnapshotItem, SyncResetRequired } from "./types.js";
 import { queueVectorBackfillForSyncBootstrap } from "./vector-migration.js";
+
+export { SYNC_BOOTSTRAP_CWD_PREFIX } from "./sync-bootstrap-constants.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -32,9 +47,19 @@ export interface BootstrapResult {
 	error?: string;
 }
 
+interface ExistingSnapshotRow {
+	id: number;
+	rev: number | null;
+	updated_at: string;
+	metadata_json: string | null;
+}
+
 export interface BootstrapOptions {
 	keysDir?: string;
+	dbPath?: string;
 	bootstrapGrantId?: string;
+	/** Direct peer identity used to add recipient-bound v3 auth headers. */
+	recipientId?: string;
 	/** Max items per page request. Defaults to 200. */
 	pageSize?: number;
 	/** Timeout per HTTP request in seconds. Defaults to 10. */
@@ -47,15 +72,7 @@ export interface BootstrapOptions {
 // Snapshot page fetcher
 // ---------------------------------------------------------------------------
 
-interface SnapshotPageResponse {
-	generation: number;
-	snapshot_id: string;
-	baseline_cursor: string | null;
-	retained_floor_cursor: string | null;
-	items: SyncMemorySnapshotItem[];
-	next_page_token: string | null;
-	has_more: boolean;
-}
+type SnapshotPageResponse = ApiSyncMemorySnapshotPageResponse;
 
 /**
  * Fetch all snapshot pages from a peer's /v1/snapshot endpoint.
@@ -75,7 +92,9 @@ export async function fetchAllSnapshotPages(
 	const pageSize = options?.pageSize ?? 200;
 	const timeoutS = options?.timeoutS ?? 10;
 	const keysDir = options?.keysDir;
+	const dbPath = options?.dbPath;
 	const bootstrapGrantId = options?.bootstrapGrantId?.trim() || undefined;
+	const recipientId = options?.recipientId?.trim() || undefined;
 	const maxItems = options?.maxItems ?? 100_000;
 
 	const allItems: SyncMemorySnapshotItem[] = [];
@@ -92,23 +111,37 @@ export async function fetchAllSnapshotPages(
 		if (resetInfo.baseline_cursor) {
 			params.set("baseline_cursor", resetInfo.baseline_cursor);
 		}
+		if (resetInfo.scope_id) {
+			params.set("scope_id", resetInfo.scope_id);
+		}
 		if (pageToken) {
 			params.set("page_token", pageToken);
 		}
 
 		const url = `${baseUrl}/v1/snapshot?${params.toString()}`;
-		const headers = buildAuthHeaders({
+		const authOptions = {
 			deviceId,
 			method: "GET",
 			url,
 			bodyBytes: Buffer.alloc(0),
 			bootstrapGrantId,
 			keysDir,
-		});
+			dbPath,
+		};
+		const headers = {
+			// Public callers that omit a recipient retain the legacy v2 wire contract. All
+			// in-repo direct-peer callers provide recipientId and therefore emit v3.
+			...(recipientId === undefined
+				? buildAuthHeaders(authOptions)
+				: buildDirectPeerAuthHeaders({ ...authOptions, recipientId })),
+			[SYNC_CAPABILITY_HEADER]: LOCAL_SYNC_CAPABILITY,
+		};
 
 		const [status, payload] = await requestJson("GET", url, { headers, timeoutS });
 		if (status !== 200 || !payload) {
-			const detail = payload?.error ? String(payload.error) : `status ${status}`;
+			const error = payload?.error ? String(payload.error) : "";
+			const reason = payload?.reason ? String(payload.reason) : "";
+			const detail = error ? (reason ? `${error}:${reason}` : error) : `status ${status}`;
 			throw new Error(`snapshot fetch failed: ${detail}`);
 		}
 
@@ -168,6 +201,36 @@ function isEmbeddableSnapshotPayload(payload: Record<string, unknown>): boolean 
 	return `${title}\n${bodyText}`.trim().length > 0;
 }
 
+function normalizeBootstrapScopeId(scopeId: unknown): string | null {
+	if (typeof scopeId !== "string") return null;
+	const trimmed = scopeId.trim();
+	return trimmed.length > 0 ? trimmed : null;
+}
+
+function snapshotPayloadScopeId(
+	payload: Record<string, unknown>,
+	bootstrapScopeId: string | null,
+): string | null {
+	if (bootstrapScopeId) return bootstrapScopeId;
+	return normalizeBootstrapScopeId(payload.scope_id);
+}
+
+function validateSnapshotScopes(
+	items: SyncMemorySnapshotItem[],
+	bootstrapScopeId: string | null,
+): void {
+	if (bootstrapScopeId === DEFAULT_SYNC_SCOPE_ID) throw new Error("scope_mismatch");
+	for (const item of items) {
+		const payload = parseSnapshotPayload(item);
+		if (!payload) continue;
+		const payloadScopeId = normalizeBootstrapScopeId(payload.scope_id);
+		if (!bootstrapScopeId) throw new Error("scope_mismatch");
+		if (payloadScopeId && payloadScopeId !== bootstrapScopeId) {
+			throw new Error("scope_mismatch");
+		}
+	}
+}
+
 const bootstrapSessionCache = new Map<string, number>();
 
 function ensureSessionForBootstrap(
@@ -179,7 +242,7 @@ function ensureSessionForBootstrap(
 	const cached = bootstrapSessionCache.get(projectKey);
 	if (cached != null) return cached;
 
-	const cwd = project ? `__sync_bootstrap__:${project}` : "__sync_bootstrap__";
+	const cwd = project ? `${SYNC_BOOTSTRAP_CWD_PREFIX}:${project}` : SYNC_BOOTSTRAP_CWD_PREFIX;
 	const existing = d
 		.select({ id: schema.sessions.id })
 		.from(schema.sessions)
@@ -207,12 +270,125 @@ function ensureSessionForBootstrap(
 	return id;
 }
 
+function shouldReplaceExistingSnapshotRows(
+	existingRows: ExistingSnapshotRow[],
+	item: SyncMemorySnapshotItem,
+): boolean {
+	if (existingRows.length === 0) return true;
+	// Mirror the canonical last-writer-wins clock used by incremental
+	// replication: rev → updated_at → clock_device_id. Without the device-id
+	// tie-break, an exact rev+timestamp tie that the snapshot should win would
+	// be skipped here while the scoped cursor/baseline still advances, leaving
+	// the stale local row with no later pull to correct it.
+	const candidate: [number, string, string] = [
+		item.clock_rev,
+		item.clock_updated_at,
+		item.clock_device_id,
+	];
+	return existingRows.every((row) =>
+		isNewerClock(candidate, [
+			typeof row.rev === "number" ? row.rev : 0,
+			row.updated_at,
+			clockDeviceIdFromMetadataJson(row.metadata_json),
+		]),
+	);
+}
+
+function insertSnapshotItem(
+	d: ReturnType<typeof drizzle>,
+	item: SyncMemorySnapshotItem,
+	bootstrapScopeId: string | null,
+	activeScanner: SecretScanner,
+): { applied: boolean; embeddable: boolean } {
+	const payload = parseSnapshotPayload(item);
+	if (!payload) return { applied: false, embeddable: false };
+	redactMemoryFields(payload, activeScanner);
+	const scopeId = snapshotPayloadScopeId(payload, bootstrapScopeId);
+	const project =
+		typeof payload.project === "string" && payload.project.trim() ? payload.project.trim() : null;
+	const sessionId = ensureSessionForBootstrap(d, new Date().toISOString(), project);
+
+	const metaRaw = payload.metadata_json;
+	const meta =
+		metaRaw && typeof metaRaw === "object" && !Array.isArray(metaRaw)
+			? (metaRaw as Record<string, unknown>)
+			: {};
+	meta.clock_device_id = item.clock_device_id;
+
+	const isDeleted = item.op_type === "delete";
+
+	d.insert(schema.memoryItems)
+		.values({
+			session_id: sessionId,
+			kind: typeof payload.kind === "string" ? payload.kind : "discovery",
+			title: typeof payload.title === "string" ? payload.title : "",
+			subtitle: typeof payload.subtitle === "string" ? payload.subtitle : null,
+			body_text: typeof payload.body_text === "string" ? payload.body_text : "",
+			confidence: typeof payload.confidence === "number" ? payload.confidence : 0.5,
+			tags_text: typeof payload.tags_text === "string" ? payload.tags_text : "",
+			active: isDeleted ? 0 : 1,
+			created_at:
+				typeof payload.created_at === "string" ? payload.created_at : item.clock_updated_at,
+			updated_at: item.clock_updated_at,
+			metadata_json: toJson(meta),
+			import_key: item.entity_id,
+			deleted_at: isDeleted ? item.clock_updated_at : null,
+			rev: item.clock_rev,
+			actor_id: typeof payload.actor_id === "string" ? payload.actor_id : null,
+			actor_display_name:
+				typeof payload.actor_display_name === "string" ? payload.actor_display_name : null,
+			visibility: typeof payload.visibility === "string" ? payload.visibility : "shared",
+			workspace_id:
+				typeof payload.workspace_id === "string" ? payload.workspace_id : "shared:default",
+			workspace_kind:
+				typeof payload.workspace_kind === "string" ? payload.workspace_kind : "shared",
+			origin_device_id:
+				typeof payload.origin_device_id === "string"
+					? payload.origin_device_id
+					: item.clock_device_id,
+			origin_source: typeof payload.origin_source === "string" ? payload.origin_source : null,
+			trust_state: typeof payload.trust_state === "string" ? payload.trust_state : "trusted",
+			narrative: typeof payload.narrative === "string" ? payload.narrative : null,
+			facts: Array.isArray(payload.facts) ? JSON.stringify(payload.facts) : null,
+			concepts: Array.isArray(payload.concepts) ? JSON.stringify(payload.concepts) : null,
+			files_read: Array.isArray(payload.files_read) ? JSON.stringify(payload.files_read) : null,
+			files_modified: Array.isArray(payload.files_modified)
+				? JSON.stringify(payload.files_modified)
+				: null,
+			user_prompt_id: typeof payload.user_prompt_id === "number" ? payload.user_prompt_id : null,
+			prompt_number: typeof payload.prompt_number === "number" ? payload.prompt_number : null,
+			scope_id: scopeId,
+			// Persist the originating project name from the snapshot so the
+			// Projects read model can surface this memory under its real
+			// project identity on this receiver.
+			project,
+		})
+		.run();
+
+	return { applied: true, embeddable: !isDeleted && isEmbeddableSnapshotPayload(payload) };
+}
+
+function clearScopedAckedCursor(db: Database, peerDeviceId: string, scopeId: string): void {
+	drizzle(db, { schema })
+		.update(schema.replicationCursorsV2)
+		.set({ last_acked_cursor: null, updated_at: new Date().toISOString() })
+		.where(
+			and(
+				eq(schema.replicationCursorsV2.peer_device_id, peerDeviceId),
+				eq(schema.replicationCursorsV2.scope_id, scopeId),
+			),
+		)
+		.run();
+}
+
 /**
  * Apply a bootstrap snapshot to the local database, atomically replacing
- * all shared memories with the snapshot contents.
+ * synced memories in the requested scope with the snapshot contents.
  *
  * This runs in a single IMMEDIATE transaction:
- * 1. Delete all local shared-visibility memory_items (preserving private)
+ * 1. For an explicit scope, delete local shared-visibility memory_items in
+ *    that scope (preserving private and other-scope rows). Unscoped bootstrap
+ *    is non-destructive because its serving lane contains no regular rows.
  * 2. Insert all snapshot items (upsert handles tombstones via active/deleted_at)
  * 3. Update the replication cursor to baseline_cursor
  * 4. Bump the local generation + snapshot_id to match the peer
@@ -222,117 +398,195 @@ export function applyBootstrapSnapshot(
 	peerDeviceId: string,
 	items: SyncMemorySnapshotItem[],
 	resetInfo: SyncResetRequired,
+	scanner?: SecretScanner,
 ): BootstrapResult {
 	const result: BootstrapResult = { ok: false, applied: 0, deleted: 0 };
+	// Bootstrap items are peer-authored content. Run them through the same
+	// scanner as locally-authored writes; without this, a single bootstrap
+	// from a misbehaving peer could re-populate the local store with secrets
+	// the peer emitted before they ran scanner-aware versions.
+	const activeScanner = scanner ?? new SecretScanner();
+	const bootstrapScopeId = normalizeBootstrapScopeId(resetInfo.scope_id);
+	validateSnapshotScopes(items, bootstrapScopeId);
 
 	db.transaction(() => {
 		const d = drizzle(db, { schema });
 		let embeddableApplied = 0;
 
-		// 1. Delete all local sync-eligible memories that have been synced.
+		// 1. Delete local sync-eligible memories only for an explicit bootstrap scope.
 		// - Only memories with import_key (i.e. previously synced) are deleted.
+		// - Bootstrap for one Sharing domain must not wipe rows from another.
 		// - Only explicitly private memories are preserved; NULL visibility is
 		//   treated as sync-eligible (matching syncVisibilityAllowed semantics)
 		//   to avoid leaving stale rows that could create duplicate import_keys.
 		// - The dirty-local gate in sync-pass ensures we only reach here when
 		//   no unsynced shared changes exist.
-		const deleteResult = d
-			.delete(schema.memoryItems)
-			.where(
-				and(
-					isNotNull(schema.memoryItems.import_key),
-					ne(sql`COALESCE(${schema.memoryItems.visibility}, '')`, "private"),
-				),
-			)
-			.run();
-		result.deleted = deleteResult.changes;
+		if (bootstrapScopeId) {
+			const deleteResult = d
+				.delete(schema.memoryItems)
+				.where(
+					and(
+						isNotNull(schema.memoryItems.import_key),
+						eq(schema.memoryItems.scope_id, bootstrapScopeId),
+						ne(sql`COALESCE(${schema.memoryItems.visibility}, '')`, "private"),
+					),
+				)
+				.run();
+			result.deleted = deleteResult.changes;
+		}
 
 		// 2. Insert snapshot items, grouping by project.
 		bootstrapSessionCache.clear();
 
 		for (const item of items) {
-			const payload = parseSnapshotPayload(item);
-			if (!payload) continue;
-			const project =
-				typeof payload.project === "string" && payload.project.trim()
-					? payload.project.trim()
-					: null;
-			const sessionId = ensureSessionForBootstrap(d, new Date().toISOString(), project);
-
-			const metaRaw = payload.metadata_json;
-			const meta =
-				metaRaw && typeof metaRaw === "object" && !Array.isArray(metaRaw)
-					? (metaRaw as Record<string, unknown>)
-					: {};
-			meta.clock_device_id = item.clock_device_id;
-
-			const isDeleted = item.op_type === "delete";
-			if (!isDeleted && isEmbeddableSnapshotPayload(payload)) {
-				embeddableApplied++;
-			}
-
-			d.insert(schema.memoryItems)
-				.values({
-					session_id: sessionId,
-					kind: typeof payload.kind === "string" ? payload.kind : "discovery",
-					title: typeof payload.title === "string" ? payload.title : "",
-					subtitle: typeof payload.subtitle === "string" ? payload.subtitle : null,
-					body_text: typeof payload.body_text === "string" ? payload.body_text : "",
-					confidence: typeof payload.confidence === "number" ? payload.confidence : 0.5,
-					tags_text: typeof payload.tags_text === "string" ? payload.tags_text : "",
-					active: isDeleted ? 0 : 1,
-					created_at:
-						typeof payload.created_at === "string" ? payload.created_at : item.clock_updated_at,
-					updated_at: item.clock_updated_at,
-					metadata_json: toJson(meta),
-					import_key: item.entity_id,
-					deleted_at: isDeleted ? item.clock_updated_at : null,
-					rev: item.clock_rev,
-					actor_id: typeof payload.actor_id === "string" ? payload.actor_id : null,
-					actor_display_name:
-						typeof payload.actor_display_name === "string" ? payload.actor_display_name : null,
-					visibility: typeof payload.visibility === "string" ? payload.visibility : "shared",
-					workspace_id:
-						typeof payload.workspace_id === "string" ? payload.workspace_id : "shared:default",
-					workspace_kind:
-						typeof payload.workspace_kind === "string" ? payload.workspace_kind : "shared",
-					origin_device_id:
-						typeof payload.origin_device_id === "string"
-							? payload.origin_device_id
-							: item.clock_device_id,
-					origin_source: typeof payload.origin_source === "string" ? payload.origin_source : null,
-					trust_state: typeof payload.trust_state === "string" ? payload.trust_state : "trusted",
-					narrative: typeof payload.narrative === "string" ? payload.narrative : null,
-					facts: Array.isArray(payload.facts) ? JSON.stringify(payload.facts) : null,
-					concepts: Array.isArray(payload.concepts) ? JSON.stringify(payload.concepts) : null,
-					files_read: Array.isArray(payload.files_read) ? JSON.stringify(payload.files_read) : null,
-					files_modified: Array.isArray(payload.files_modified)
-						? JSON.stringify(payload.files_modified)
-						: null,
-					user_prompt_id:
-						typeof payload.user_prompt_id === "number" ? payload.user_prompt_id : null,
-					prompt_number: typeof payload.prompt_number === "number" ? payload.prompt_number : null,
-				})
-				.run();
+			const inserted = insertSnapshotItem(d, item, bootstrapScopeId, activeScanner);
+			if (!inserted.applied) continue;
+			if (inserted.embeddable) embeddableApplied++;
 			result.applied++;
 		}
 
-		// 3. Update replication cursor to baseline_cursor.
-		if (resetInfo.baseline_cursor) {
-			setReplicationCursor(db, peerDeviceId, {
-				lastApplied: resetInfo.baseline_cursor,
-			});
+		// 3. Update replication cursor to baseline_cursor. For scoped null-baseline
+		// snapshots, baseline_cursor can be null; store a hidden marker in the
+		// scoped cursor row so status can distinguish "this peer/scope bootstrap
+		// completed without a cursor boundary" from "this scope was never attempted".
+		if (resetInfo.baseline_cursor || resetInfo.scope_id) {
+			if (resetInfo.scope_id && !resetInfo.baseline_cursor) {
+				clearReplicationCursorLastApplied(db, peerDeviceId, resetInfo.scope_id);
+			}
+			if (resetInfo.scope_id && resetInfo.baseline_cursor) {
+				clearScopedAckedCursor(db, peerDeviceId, resetInfo.scope_id);
+			}
+			setReplicationCursor(
+				db,
+				peerDeviceId,
+				{
+					lastApplied: resetInfo.baseline_cursor,
+					lastAcked: resetInfo.baseline_cursor
+						? undefined
+						: SCOPED_NULL_BASELINE_BOOTSTRAP_CURSOR_MARKER,
+				},
+				resetInfo.scope_id,
+			);
 		}
 
 		// 4. Bump local generation + snapshot_id to match the peer.
-		setSyncResetState(db, {
-			generation: resetInfo.generation,
-			snapshot_id: resetInfo.snapshot_id,
-			baseline_cursor: resetInfo.baseline_cursor,
-		});
+		setSyncResetState(
+			db,
+			{
+				generation: resetInfo.generation,
+				snapshot_id: resetInfo.snapshot_id,
+				baseline_cursor: resetInfo.baseline_cursor,
+			},
+			resetInfo.scope_id,
+		);
 
 		queueVectorBackfillForSyncBootstrap(db, { embeddableTotal: embeddableApplied });
 
+		result.ok = true;
+	}).immediate();
+
+	return result;
+}
+
+/**
+ * Additively merge a peer snapshot into an already-populated scope.
+ *
+ * Unlike `applyBootstrapSnapshot`, this does not delete local imported rows that
+ * are absent from the peer snapshot. It only inserts missing snapshot entities
+ * or replaces stale copies of the same snapshot entity. Use this when a scoped
+ * peer has no cursor yet but the receiver already has rows in that scope from
+ * another source, making destructive bootstrap unsafe.
+ */
+export function mergeBootstrapSnapshot(
+	db: Database,
+	peerDeviceId: string,
+	items: SyncMemorySnapshotItem[],
+	resetInfo: SyncResetRequired,
+	scanner?: SecretScanner,
+): BootstrapResult {
+	const result: BootstrapResult = { ok: false, applied: 0, deleted: 0 };
+	const activeScanner = scanner ?? new SecretScanner();
+	const bootstrapScopeId = normalizeBootstrapScopeId(resetInfo.scope_id);
+	validateSnapshotScopes(items, bootstrapScopeId);
+	const mergeScopePredicate = bootstrapScopeId
+		? eq(schema.memoryItems.scope_id, bootstrapScopeId)
+		: or(
+				isNull(schema.memoryItems.scope_id),
+				eq(schema.memoryItems.scope_id, DEFAULT_SYNC_SCOPE_ID),
+			);
+
+	db.transaction(() => {
+		const d = drizzle(db, { schema });
+		let embeddableApplied = 0;
+		bootstrapSessionCache.clear();
+
+		for (const item of items) {
+			if (!parseSnapshotPayload(item)) continue;
+			const existingRows = d
+				.select({
+					id: schema.memoryItems.id,
+					rev: schema.memoryItems.rev,
+					updated_at: schema.memoryItems.updated_at,
+					metadata_json: schema.memoryItems.metadata_json,
+				})
+				.from(schema.memoryItems)
+				.where(
+					and(
+						eq(schema.memoryItems.import_key, item.entity_id),
+						mergeScopePredicate,
+						ne(sql`COALESCE(${schema.memoryItems.visibility}, '')`, "private"),
+					),
+				)
+				.all();
+
+			if (!shouldReplaceExistingSnapshotRows(existingRows, item)) continue;
+
+			const existingIds = existingRows.map((row) => row.id);
+			if (existingIds.length > 0) {
+				const deleteResult = d
+					.delete(schema.memoryItems)
+					.where(inArray(schema.memoryItems.id, existingIds))
+					.run();
+				result.deleted += deleteResult.changes;
+			}
+
+			const inserted = insertSnapshotItem(d, item, bootstrapScopeId, activeScanner);
+			if (!inserted.applied) continue;
+			if (inserted.embeddable) embeddableApplied++;
+			result.applied++;
+		}
+
+		if (resetInfo.baseline_cursor || resetInfo.scope_id) {
+			if (resetInfo.scope_id && !resetInfo.baseline_cursor) {
+				clearReplicationCursorLastApplied(db, peerDeviceId, resetInfo.scope_id);
+			}
+			if (resetInfo.scope_id && resetInfo.baseline_cursor) {
+				clearScopedAckedCursor(db, peerDeviceId, resetInfo.scope_id);
+			}
+			setReplicationCursor(
+				db,
+				peerDeviceId,
+				{
+					lastApplied: resetInfo.baseline_cursor,
+					lastAcked: resetInfo.baseline_cursor
+						? undefined
+						: SCOPED_NULL_BASELINE_BOOTSTRAP_CURSOR_MARKER,
+				},
+				resetInfo.scope_id,
+			);
+		}
+
+		setSyncResetState(
+			db,
+			{
+				generation: resetInfo.generation,
+				snapshot_id: resetInfo.snapshot_id,
+				baseline_cursor: resetInfo.baseline_cursor,
+			},
+			resetInfo.scope_id,
+		);
+
+		queueVectorBackfillForSyncBootstrap(db, { embeddableTotal: embeddableApplied });
 		result.ok = true;
 	}).immediate();
 

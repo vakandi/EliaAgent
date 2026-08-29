@@ -1,0 +1,609 @@
+import { readFileSync } from "node:fs";
+import Database from "better-sqlite3";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { toJson } from "./db.js";
+import { getMaintenanceJob } from "./maintenance-jobs.js";
+import {
+	backfillScopeIds,
+	classifyLegacyMemoryScope,
+	ensureScopeBackfillScopes,
+	hasPendingScopeBackfill,
+	LEGACY_SHARED_REVIEW_SCOPE_ID,
+	runScopeBackfillPass,
+} from "./scope-backfill.js";
+import { LOCAL_DEFAULT_SCOPE_ID } from "./scope-resolution.js";
+import { initTestSchema } from "./test-utils.js";
+
+function insertSession(
+	db: InstanceType<typeof Database>,
+	overrides: { project?: string | null; cwd?: string | null; gitRemote?: string | null } = {},
+): number {
+	const now = "2026-05-01T00:00:00Z";
+	const cwd = Object.hasOwn(overrides, "cwd") ? overrides.cwd : "/tmp/codemem-test";
+	const project = Object.hasOwn(overrides, "project") ? overrides.project : "codemem-test";
+	const gitRemote = Object.hasOwn(overrides, "gitRemote") ? overrides.gitRemote : null;
+	const result = db
+		.prepare(
+			`INSERT INTO sessions(started_at, cwd, project, git_remote, user, tool_version)
+			 VALUES (?, ?, ?, ?, ?, ?)`,
+		)
+		.run(now, cwd, project, gitRemote, "test-user", "test");
+	return Number(result.lastInsertRowid);
+}
+
+function insertMemory(
+	db: InstanceType<typeof Database>,
+	input: {
+		sessionId: number;
+		title: string;
+		visibility?: string | null;
+		workspaceKind?: string | null;
+		workspaceId?: string | null;
+		active?: number;
+		deletedAt?: string | null;
+		importKey?: string | null;
+		scopeId?: string | null;
+	},
+): number {
+	const now = "2026-05-01T00:00:00Z";
+	const result = db
+		.prepare(
+			`INSERT INTO memory_items(
+				session_id, kind, title, body_text, created_at, updated_at,
+				visibility, workspace_id, workspace_kind, active, deleted_at,
+				import_key, scope_id, metadata_json
+			 ) VALUES (?, 'discovery', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		)
+		.run(
+			input.sessionId,
+			input.title,
+			`${input.title} body`,
+			now,
+			now,
+			input.visibility ?? null,
+			input.workspaceId ?? null,
+			input.workspaceKind ?? null,
+			input.active ?? 1,
+			input.deletedAt ?? null,
+			input.importKey ?? null,
+			input.scopeId ?? null,
+			toJson({}),
+		);
+	return Number(result.lastInsertRowid);
+}
+
+function insertReplicationOp(
+	db: InstanceType<typeof Database>,
+	opId: string,
+	entityId: string,
+): void {
+	db.prepare(
+		`INSERT INTO replication_ops(
+			op_id, entity_type, entity_id, op_type, payload_json,
+			clock_rev, clock_updated_at, clock_device_id, device_id, created_at
+		 ) VALUES (?, 'memory_item', ?, 'upsert', NULL, 1, ?, 'dev-a', 'dev-a', ?)`,
+	).run(opId, entityId, "2026-05-01T00:00:00Z", "2026-05-01T00:00:00Z");
+}
+
+describe("scope backfill", () => {
+	let db: InstanceType<typeof Database>;
+
+	beforeEach(() => {
+		db = new Database(":memory:");
+		initTestSchema(db);
+	});
+
+	afterEach(() => {
+		db.close();
+	});
+
+	it("classifies private and ambiguous legacy memories conservatively", () => {
+		expect(classifyLegacyMemoryScope({ visibility: "private" })).toEqual({
+			scopeId: LOCAL_DEFAULT_SCOPE_ID,
+			reason: "private_or_personal",
+			needsReview: false,
+		});
+		expect(
+			classifyLegacyMemoryScope({
+				visibility: "shared",
+				project: "codemem",
+				workspaceId: "shared:default",
+			}),
+		).toEqual({
+			scopeId: LEGACY_SHARED_REVIEW_SCOPE_ID,
+			reason: "shared_ambiguous_review",
+			needsReview: true,
+		});
+		expect(
+			classifyLegacyMemoryScope({
+				visibility: "shared",
+				cwd: "/work/acme/service",
+				gitRemote: "https://example.com/acme/service.git",
+				workspaceId: "shared:team",
+			}),
+		).toEqual({
+			scopeId: LEGACY_SHARED_REVIEW_SCOPE_ID,
+			reason: "shared_with_canonical_workspace_review",
+			needsReview: true,
+		});
+	});
+
+	it("seeds required migration scopes idempotently", () => {
+		expect(ensureScopeBackfillScopes(db, "2026-05-01T00:00:00Z")).toBe(2);
+		expect(ensureScopeBackfillScopes(db, "2026-05-01T00:00:00Z")).toBe(0);
+
+		const rows = db
+			.prepare("SELECT scope_id, label, authority_type FROM replication_scopes ORDER BY scope_id")
+			.all() as Array<{ scope_id: string; label: string; authority_type: string }>;
+		expect(rows).toEqual([
+			{
+				scope_id: LEGACY_SHARED_REVIEW_SCOPE_ID,
+				label: "Legacy shared review",
+				authority_type: "local",
+			},
+			{ scope_id: LOCAL_DEFAULT_SCOPE_ID, label: "Local only", authority_type: "local" },
+		]);
+	});
+
+	it("backfills memories and existing replication ops without overwriting scopes", () => {
+		const privateSession = insertSession(db, { project: "personal", cwd: "/home/me/personal" });
+		const sharedSession = insertSession(db, {
+			project: "service",
+			cwd: "/work/acme/service",
+			gitRemote: "https://example.com/acme/service.git",
+		});
+		const ambiguousSession = insertSession(db, { project: "codemem", cwd: null });
+
+		const privateId = insertMemory(db, {
+			sessionId: privateSession,
+			title: "Private",
+			visibility: "private",
+			workspaceKind: "personal",
+			workspaceId: "personal:actor-1",
+			importKey: "key:private",
+		});
+		insertMemory(db, {
+			sessionId: sharedSession,
+			title: "Shared clear",
+			visibility: "shared",
+			workspaceKind: "shared",
+			workspaceId: "shared:team",
+			importKey: "key:shared",
+		});
+		insertMemory(db, {
+			sessionId: ambiguousSession,
+			title: "Shared ambiguous",
+			visibility: "shared",
+			workspaceKind: "shared",
+			workspaceId: "shared:default",
+			importKey: "key:ambiguous",
+		});
+		insertMemory(db, {
+			sessionId: sharedSession,
+			title: "Deleted shared",
+			visibility: "shared",
+			workspaceKind: "shared",
+			workspaceId: "shared:team",
+			active: 0,
+			deletedAt: "2026-05-01T00:00:00Z",
+			importKey: "key:deleted",
+		});
+		insertMemory(db, {
+			sessionId: sharedSession,
+			title: "Already scoped",
+			visibility: "shared",
+			workspaceKind: "shared",
+			workspaceId: "shared:team",
+			importKey: "key:custom",
+			scopeId: "custom-scope",
+		});
+
+		insertReplicationOp(db, "op-private", "key:private");
+		insertReplicationOp(db, "op-deleted", "key:deleted");
+		insertReplicationOp(db, "op-numeric", String(privateId));
+		insertReplicationOp(db, "op-missing", "key:missing");
+
+		expect(hasPendingScopeBackfill(db)).toBe(true);
+		const result = backfillScopeIds(db, { now: "2026-05-01T00:00:00Z" });
+
+		expect(result.seededScopes).toBe(2);
+		expect(result.checkedMemoryItems).toBe(4);
+		expect(result.updatedMemoryItems).toBe(4);
+		expect(result.checkedReplicationOps).toBe(3);
+		expect(result.updatedReplicationOps).toBe(3);
+		expect(result.skippedReplicationOps).toBe(0);
+
+		const memories = db
+			.prepare("SELECT import_key, scope_id FROM memory_items ORDER BY import_key")
+			.all() as Array<{ import_key: string; scope_id: string }>;
+		expect(memories).toEqual([
+			{ import_key: "key:ambiguous", scope_id: LEGACY_SHARED_REVIEW_SCOPE_ID },
+			{ import_key: "key:custom", scope_id: "custom-scope" },
+			{ import_key: "key:deleted", scope_id: LEGACY_SHARED_REVIEW_SCOPE_ID },
+			{ import_key: "key:private", scope_id: LOCAL_DEFAULT_SCOPE_ID },
+			{ import_key: "key:shared", scope_id: LEGACY_SHARED_REVIEW_SCOPE_ID },
+		]);
+
+		const ops = db
+			.prepare("SELECT op_id, scope_id FROM replication_ops ORDER BY op_id")
+			.all() as Array<{ op_id: string; scope_id: string | null }>;
+		expect(ops).toEqual([
+			{ op_id: "op-deleted", scope_id: LEGACY_SHARED_REVIEW_SCOPE_ID },
+			{ op_id: "op-missing", scope_id: null },
+			{ op_id: "op-numeric", scope_id: LOCAL_DEFAULT_SCOPE_ID },
+			{ op_id: "op-private", scope_id: LOCAL_DEFAULT_SCOPE_ID },
+		]);
+
+		const second = backfillScopeIds(db, { now: "2026-05-01T00:00:00Z" });
+		expect(second.seededScopes).toBe(0);
+		expect(second.updatedMemoryItems).toBe(0);
+		expect(second.updatedReplicationOps).toBe(0);
+	});
+
+	it("skips unmatchable ops when selecting limited replication-op batches", () => {
+		const sessionId = insertSession(db, { project: "codemem", cwd: null });
+		insertMemory(db, {
+			sessionId,
+			title: "Scoped memory",
+			visibility: "private",
+			workspaceKind: "personal",
+			workspaceId: "personal:actor-1",
+			importKey: "key:matchable",
+			scopeId: LOCAL_DEFAULT_SCOPE_ID,
+		});
+		insertReplicationOp(db, "op-aaa-unmatched", "key:missing");
+		insertReplicationOp(db, "op-zzz-matchable", "key:matchable");
+
+		const result = backfillScopeIds(db, { memoryLimit: 10, replicationOpLimit: 1 });
+
+		expect(result.checkedReplicationOps).toBe(1);
+		expect(result.updatedReplicationOps).toBe(1);
+		expect(result.skippedReplicationOps).toBe(0);
+		expect(
+			(
+				db
+					.prepare("SELECT scope_id FROM replication_ops WHERE op_id = 'op-zzz-matchable'")
+					.get() as {
+					scope_id: string | null;
+				}
+			).scope_id,
+		).toBe(LOCAL_DEFAULT_SCOPE_ID);
+	});
+
+	it("prefers import_key over numeric id when replication entity IDs are ambiguous", () => {
+		const sessionId = insertSession(db, { project: "codemem", cwd: "/tmp/codemem" });
+		insertMemory(db, {
+			sessionId,
+			title: "Import key match",
+			visibility: "shared",
+			workspaceKind: "shared",
+			workspaceId: "shared:team",
+			importKey: "2",
+			scopeId: LEGACY_SHARED_REVIEW_SCOPE_ID,
+		});
+		const numericId = insertMemory(db, {
+			sessionId,
+			title: "Numeric id match",
+			visibility: "private",
+			workspaceKind: "personal",
+			workspaceId: "personal:actor-1",
+			importKey: "key:numeric",
+			scopeId: LOCAL_DEFAULT_SCOPE_ID,
+		});
+		insertReplicationOp(db, "op-ambiguous", String(numericId));
+
+		const result = backfillScopeIds(db, { memoryLimit: 10, replicationOpLimit: 10 });
+
+		expect(numericId).toBe(2);
+		expect(result.checkedReplicationOps).toBe(1);
+		expect(result.updatedReplicationOps).toBe(1);
+		const op = db
+			.prepare("SELECT scope_id FROM replication_ops WHERE op_id = ?")
+			.get("op-ambiguous") as { scope_id: string | null };
+		expect(op.scope_id).toBe(LEGACY_SHARED_REVIEW_SCOPE_ID);
+	});
+
+	it("defers replication-op scanning while memory batches are still full", () => {
+		const sessionId = insertSession(db, { project: "personal", cwd: "/home/me/personal" });
+		insertMemory(db, {
+			sessionId,
+			title: "Pending one",
+			visibility: "private",
+			workspaceKind: "personal",
+			workspaceId: "personal:actor-1",
+			importKey: "key:pending-one",
+		});
+		insertMemory(db, {
+			sessionId,
+			title: "Pending two",
+			visibility: "private",
+			workspaceKind: "personal",
+			workspaceId: "personal:actor-1",
+			importKey: "key:pending-two",
+		});
+		insertMemory(db, {
+			sessionId,
+			title: "Stamped",
+			workspaceKind: "personal",
+			workspaceId: "personal:actor-1",
+			importKey: "key:stamped",
+			scopeId: LOCAL_DEFAULT_SCOPE_ID,
+		});
+		insertReplicationOp(db, "op-stamped", "key:stamped");
+
+		const result = backfillScopeIds(db, { memoryLimit: 1, replicationOpLimit: 10 });
+
+		expect(result.checkedMemoryItems).toBe(1);
+		expect(result.updatedMemoryItems).toBe(1);
+		expect(result.checkedReplicationOps).toBe(0);
+		const op = db
+			.prepare("SELECT scope_id FROM replication_ops WHERE op_id = ?")
+			.get("op-stamped") as { scope_id: string | null };
+		expect(op.scope_id).toBeNull();
+	});
+
+	it("keeps scope predicates index-friendly in the hot path", () => {
+		const source = readFileSync(new URL("./scope-backfill.ts", import.meta.url), "utf8");
+
+		expect(source).not.toContain("TRIM(scope_id)");
+		expect(source).not.toContain("TRIM(mi.scope_id)");
+		expect(source).not.toContain("TRIM(ro.scope_id)");
+	});
+
+	it("runs as a maintenance pass and completes when no matching op work remains", async () => {
+		const sessionId = insertSession(db, { project: "personal", cwd: "/home/me/personal" });
+		insertMemory(db, {
+			sessionId,
+			title: "Private",
+			visibility: "private",
+			workspaceKind: "personal",
+			workspaceId: "personal:actor-1",
+			importKey: "key:private",
+		});
+		for (let index = 0; index < 10; index += 1) {
+			insertReplicationOp(db, `op-missing-${index}`, `key:missing-${index}`);
+		}
+
+		// Two-tick confirmation: the first pass stamps the memory and
+		// observes zero stampable ops, but flags the run as a candidate
+		// for completion rather than committing immediately. A second
+		// pass with the same observation completes the job — the gap
+		// between ticks is what protects against the concurrent-writer
+		// race surfaced in the #1025 review.
+		await expect(runScopeBackfillPass(db, { batchSize: 10 })).resolves.toBe(true);
+		let job = getMaintenanceJob(db, "scope_id_backfill");
+		expect(job?.title).toBe("Backfilling Sharing domains");
+		expect(job?.message).toContain("memories and replication ops");
+		expect(job?.progress.current).toBeLessThan(job?.progress.total ?? 0);
+		expect(job?.progress.current).toBe(3);
+		expect(job?.progress.total).toBe(13);
+
+		await expect(runScopeBackfillPass(db, { batchSize: 10 })).resolves.toBe(false);
+		job = getMaintenanceJob(db, "scope_id_backfill");
+		expect(job?.message).toContain("future startup should be quieter");
+
+		const memory = db.prepare("SELECT scope_id FROM memory_items").get() as { scope_id: string };
+		expect(memory.scope_id).toBe(LOCAL_DEFAULT_SCOPE_ID);
+		expect(hasPendingScopeBackfill(db)).toBe(false);
+	});
+
+	it("keeps running progress below 100% while completion confirmation is pending", async () => {
+		const sessionId = insertSession(db, { project: "personal", cwd: "/home/me/personal" });
+		insertMemory(db, {
+			sessionId,
+			title: "Already scoped",
+			workspaceId: "personal:actor-1",
+			workspaceKind: "personal",
+			importKey: "key:stamped",
+			scopeId: LOCAL_DEFAULT_SCOPE_ID,
+		});
+		insertReplicationOp(db, "op-stamped", "key:stamped");
+
+		await expect(runScopeBackfillPass(db, { batchSize: 10 })).resolves.toBe(true);
+		let job = getMaintenanceJob(db, "scope_id_backfill");
+		expect(job?.status).toBe("running");
+		expect(job?.progress.current).toBeLessThan(job?.progress.total ?? 0);
+		expect(hasPendingScopeBackfill(db)).toBe(true);
+		expect(job?.metadata).toMatchObject({
+			processed_replication_ops: 1,
+			remaining_memories: 0,
+			remaining_replication_ops: 0,
+			exhausted_in_previous_pass: false,
+		});
+
+		await expect(runScopeBackfillPass(db, { batchSize: 10 })).resolves.toBe(true);
+		job = getMaintenanceJob(db, "scope_id_backfill");
+		expect(job?.status).toBe("running");
+		expect(job?.progress.current).toBeLessThan(job?.progress.total ?? 0);
+		expect(hasPendingScopeBackfill(db)).toBe(true);
+		expect(job?.metadata).toMatchObject({ exhausted_in_previous_pass: true });
+
+		await expect(runScopeBackfillPass(db, { batchSize: 10 })).resolves.toBe(false);
+		job = getMaintenanceJob(db, "scope_id_backfill");
+		expect(job?.status).toBe("completed");
+		expect(job?.progress.current).toBe(job?.progress.total);
+		expect(hasPendingScopeBackfill(db)).toBe(false);
+	});
+
+	it("hasPendingScopeBackfill returns quickly without joining replication_ops to memory_items", () => {
+		// Reproduces the slow-startup case: a database where the legacy
+		// pendingWorkCount path's correlated EXISTS join (replication_ops
+		// vs memory_items with TRIM and OR-on-keys) blocked the main
+		// thread on Pi 4 and even on M4 Max desktops. The fast existence
+		// probes must answer "yes, there is pending work" without doing
+		// that join. A vitest spy on the bound prepare statement caches
+		// the SQL string, but the cleanest assertion is that the query
+		// finishes well under a soft deadline even when there are many
+		// replication_ops with no matching memory_items.
+
+		// Seed a few memory_items already stamped + many replication_ops
+		// pointing at non-existent entity_ids. Under the old correlated
+		// EXISTS path each replication_op would scan memory_items twice
+		// (once per OR branch); under the cheap probe path the first
+		// missing scope_id alone short-circuits.
+		const sessionId = insertSession(db, { project: "p", cwd: "/x" });
+		insertMemory(db, {
+			sessionId,
+			title: "stamped",
+			workspaceId: "personal:actor-1",
+			workspaceKind: "personal",
+			importKey: "key:stamped",
+			scopeId: LOCAL_DEFAULT_SCOPE_ID,
+		});
+		const insertOp = db.prepare(
+			`INSERT INTO replication_ops(op_id, entity_type, entity_id, op_type, payload_json,
+				clock_rev, clock_updated_at, clock_device_id, device_id, created_at, scope_id)
+			 VALUES (?, 'memory_item', ?, 'upsert', NULL, 1, ?, 'dev', 'dev', ?, NULL)`,
+		);
+		const ts = "2026-05-04T00:00:00Z";
+		for (let index = 0; index < 500; index += 1) {
+			insertOp.run(`op-orphan-${index}`, `key:does-not-exist-${index}`, ts, ts);
+		}
+
+		const start = Date.now();
+		const pending = hasPendingScopeBackfill(db);
+		const elapsedMs = Date.now() - start;
+
+		expect(pending).toBe(true);
+		// Soft cap. The intent is "must not depend on the orphan-op
+		// volume above" — under the old COUNT(*) join, this assertion
+		// would fail on slow disks even at this size.
+		expect(elapsedMs).toBeLessThan(50);
+	});
+
+	it("hasPendingScopeBackfill rewakes when an orphan op becomes stampable later", async () => {
+		// Reviewer-flagged regression: after a complete pass leaves orphan
+		// ops behind (no matching memory_items row), a later insert of the
+		// matching memory turns those orphans into actual work. The
+		// unstamped op count is unchanged, so a count-only probe would
+		// say "no work" forever. The probe must also catch the case where
+		// new stamped memory_items appear past the recorded watermark.
+		const sessionId = insertSession(db, { project: "p", cwd: "/x" });
+		insertMemory(db, {
+			sessionId,
+			title: "already stamped",
+			workspaceId: "personal:actor-1",
+			workspaceKind: "personal",
+			importKey: "key:already-stamped",
+			scopeId: LOCAL_DEFAULT_SCOPE_ID,
+		});
+		// One orphan op pointing at a memory that doesn't exist yet.
+		insertReplicationOp(db, "op-pending", "key:future-memory");
+
+		// Run two passes — the first observes "no stampable ops" and
+		// flags the run as a candidate for completion; the second
+		// confirms (no concurrent writers in the gap) and commits the
+		// completion watermark.
+		await expect(runScopeBackfillPass(db, { batchSize: 10 })).resolves.toBe(true);
+		await expect(runScopeBackfillPass(db, { batchSize: 10 })).resolves.toBe(false);
+		expect(hasPendingScopeBackfill(db)).toBe(false);
+
+		// The matching memory arrives later (e.g., from a peer sync
+		// applying after backfill ran). Its scope_id is already stamped
+		// at insert time, so the orphan is now stampable, even though
+		// the unstamped op count didn't grow.
+		insertMemory(db, {
+			sessionId,
+			title: "future memory arrives",
+			workspaceId: "personal:actor-1",
+			workspaceKind: "personal",
+			importKey: "key:future-memory",
+			scopeId: LOCAL_DEFAULT_SCOPE_ID,
+		});
+
+		expect(hasPendingScopeBackfill(db)).toBe(true);
+	});
+
+	it("two-tick confirmation: a writer inserting between passes prevents premature completion", async () => {
+		// Reviewer-flagged race: if a concurrent writer inserts a stampable
+		// replication_ops row after the runner's batch query returns empty
+		// but before the watermark is captured, a single-pass completion
+		// would persist a watermark that already accounts for the new row,
+		// causing the cheap startup probe to skip it forever. The runner
+		// must require TWO consecutive empty passes — any new op in the
+		// gap resets the candidate-complete flag.
+		const sessionId = insertSession(db, { project: "p", cwd: "/x" });
+		insertMemory(db, {
+			sessionId,
+			title: "stamped",
+			workspaceId: "personal:actor-1",
+			workspaceKind: "personal",
+			importKey: "key:stamped",
+			scopeId: LOCAL_DEFAULT_SCOPE_ID,
+		});
+
+		// First pass: nothing to do, runner flags candidate-complete.
+		await expect(runScopeBackfillPass(db, { batchSize: 10 })).resolves.toBe(true);
+
+		// Concurrent writer arrives in the gap, inserting a memory whose
+		// scope is already stamped plus a matching replication op. The
+		// op IS stampable but a single-pass completion would have just
+		// captured the watermark and skipped it.
+		const sneakyId = insertMemory(db, {
+			sessionId,
+			title: "sneaky",
+			workspaceId: "personal:actor-1",
+			workspaceKind: "personal",
+			importKey: "key:sneaky",
+			scopeId: LOCAL_DEFAULT_SCOPE_ID,
+		});
+		insertReplicationOp(db, "op-sneaky", `${sneakyId}`);
+
+		// Second pass: the new op is selected and stamped; passLooksDone
+		// becomes false, candidate flag is cleared, runner reports more
+		// work to do.
+		await expect(runScopeBackfillPass(db, { batchSize: 10 })).resolves.toBe(true);
+		const sneakyOp = db
+			.prepare("SELECT scope_id FROM replication_ops WHERE op_id = ?")
+			.get("op-sneaky") as { scope_id: string | null };
+		expect(sneakyOp.scope_id).toBe(LOCAL_DEFAULT_SCOPE_ID);
+
+		// Third pass: candidate-complete again, fourth confirms — the
+		// runner's two-tick guard works on the new op too.
+		await expect(runScopeBackfillPass(db, { batchSize: 10 })).resolves.toBe(true);
+		await expect(runScopeBackfillPass(db, { batchSize: 10 })).resolves.toBe(false);
+		expect(hasPendingScopeBackfill(db)).toBe(false);
+	});
+
+	it("selectReplicationOpScopeCandidates rejects malformed entity_id integer false-positives", async () => {
+		// Reviewer-flagged regression for #1026: SQLite's CAST AS INTEGER
+		// is lenient — "123abc" casts to 123. Without a strict text-equality
+		// guard the index-friendly id-branch JOIN would treat such a row
+		// as a match for memory_items.id = 123, occupying batch slots that
+		// genuinely stampable ops need. Codemem doesn't write malformed
+		// entity_ids in normal operation, but a buggy peer could send one.
+		const sessionId = insertSession(db, { project: "p", cwd: "/x" });
+		const stampedId = insertMemory(db, {
+			sessionId,
+			title: "stamped",
+			workspaceId: "personal:actor-1",
+			workspaceKind: "personal",
+			importKey: "key:stamped",
+			scopeId: LOCAL_DEFAULT_SCOPE_ID,
+		});
+
+		// Simulate a malformed entity_id whose lenient INTEGER cast
+		// happens to match a real memory's id: "<id>garbage" → <id>.
+		insertReplicationOp(db, "op-malformed", `${stampedId}garbage`);
+		// Real stampable op for the same memory via id form.
+		insertReplicationOp(db, "op-real", String(stampedId));
+
+		const result = backfillScopeIds(db, { memoryLimit: 10, replicationOpLimit: 10 });
+
+		// Only the real op should be selected and stamped; the malformed
+		// one stays unstamped (its scope_id remains NULL) so it never
+		// claims a batch slot in steady-state runs either.
+		expect(result.checkedReplicationOps).toBe(1);
+		expect(result.updatedReplicationOps).toBe(1);
+
+		const realOp = db
+			.prepare("SELECT scope_id FROM replication_ops WHERE op_id = ?")
+			.get("op-real") as { scope_id: string | null };
+		expect(realOp.scope_id).toBe(LOCAL_DEFAULT_SCOPE_ID);
+
+		const malformedOp = db
+			.prepare("SELECT scope_id FROM replication_ops WHERE op_id = ?")
+			.get("op-malformed") as { scope_id: string | null };
+		expect(malformedOp.scope_id).toBeNull();
+	});
+});

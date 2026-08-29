@@ -4,9 +4,6 @@ import { state } from "../../../lib/state";
 import { feedScopeLabel } from "./helpers";
 
 export function feedMetaText(visibleCount: number, hasMorePages: boolean): string {
-	if (state.feedLoadError) {
-		return `Failed to load feed: ${state.feedLoadError}`;
-	}
 	const filterLabel =
 		state.feedTypeFilter === "observations"
 			? " · observations"

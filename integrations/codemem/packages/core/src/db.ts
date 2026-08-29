@@ -26,13 +26,19 @@ import type { Database as DatabaseType } from "better-sqlite3";
 import Database from "better-sqlite3";
 import * as sqliteVec from "sqlite-vec";
 import { expandUserPath } from "./observer-config.js";
-import { canAutoBootstrapSchema, ensureSchemaBootstrapped } from "./schema-bootstrap.js";
+import {
+	canAutoBootstrapSchema,
+	ensureLegacyTeamSetupDraftSchema,
+	ensureRetrievalLedgerSchema,
+	ensureSchemaBootstrapped,
+	ensureSyncPeerSignatureStateSchema,
+} from "./schema-bootstrap.js";
 
 // Re-export the Database type for consumers
 export type { DatabaseType as Database };
 
 /** Current schema version this TS runtime was built against. */
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 20;
 
 /**
  * Minimum schema version the TS runtime can operate with.
@@ -52,7 +58,16 @@ const REQUIRED_TABLES = [
 	"usage_events",
 ] as const;
 
-export const REQUIRED_BOOTSTRAPPED_TABLES = [...REQUIRED_TABLES, "memory_fts"] as const;
+export const REQUIRED_BOOTSTRAPPED_TABLES = [
+	...REQUIRED_TABLES,
+	"memory_fts",
+	"coordinator_enrollment_reconciliation_issues",
+	// The legacy_team_setup_* tables are deliberately NOT listed: they are
+	// created additively by `ensureLegacyTeamSetupDraftSchema` on every
+	// connection path. Listing them would make a valid older bootstrapped
+	// schema look partial and skip WAL/pragma connection setup for the first
+	// post-upgrade connection.
+] as const;
 
 /** Marker file written after the first successful TS access to a DB. */
 const TS_MARKER = ".codemem-ts-accessed";
@@ -218,10 +233,87 @@ export function connect(dbPath: string = DEFAULT_DB_PATH): DatabaseType {
 
 		db.pragma("synchronous = NORMAL");
 
+		// Read tuning for large (multi-GB) databases. The SQLite defaults — a
+		// ~2 MiB page cache and no mmap — force repeated disk/page-cache reads of
+		// B-tree interior pages on every non-trivial query. A 64 MiB cache, 1 GiB
+		// memory-mapped I/O, and in-memory temp B-trees cut that cost. These are
+		// per-connection and must be set here (they do not persist in the file).
+		db.pragma("cache_size = -65536");
+		db.pragma("mmap_size = 1073741824");
+		db.pragma("temp_store = MEMORY");
+
 		return db;
 	} catch (error) {
 		db.close();
 		throw error;
+	}
+}
+
+/**
+ * Open an EXISTING database read-only.
+ *
+ * Unlike {@link connect}, this never creates the parent directory, never opens
+ * for writing, and never enables WAL or runs schema bootstrap — so it works on
+ * read-only snapshots and read-only directories (e.g. a copied audit snapshot).
+ * Read-tuning pragmas are still applied because they are per-connection and do
+ * not write to the file. Schema readiness is validated read-only.
+ */
+export interface ReadOnlyConnectionOptions {
+	warn?: (message: string) => void;
+}
+
+export function connectReadOnly(
+	dbPath: string = DEFAULT_DB_PATH,
+	options: ReadOnlyConnectionOptions = {},
+): DatabaseType {
+	const db = new Database(dbPath, { readonly: true, fileMustExist: true });
+	try {
+		db.pragma("foreign_keys = ON");
+		db.pragma("busy_timeout = 5000");
+		// Read tuning only — safe on a read-only connection (per-connection state).
+		db.pragma("cache_size = -65536");
+		db.pragma("mmap_size = 1073741824");
+		db.pragma("temp_store = MEMORY");
+		assertSchemaReadyReadOnly(db, options.warn);
+		return db;
+	} catch (error) {
+		db.close();
+		throw error;
+	}
+}
+
+/**
+ * Validate schema readiness without any writes (no bootstrap, no migration).
+ * Mirrors {@link assertSchemaReady} but is safe on read-only connections.
+ */
+export function assertSchemaReadyReadOnly(
+	db: DatabaseType,
+	warn: (message: string) => void = console.warn,
+): void {
+	const version = getSchemaVersion(db);
+	if (version === 0) {
+		throw new Error(
+			"Database schema is not initialized (read-only open). " +
+				"Point at an initialized codemem database.",
+		);
+	}
+	if (version < MIN_COMPATIBLE_SCHEMA) {
+		throw new Error(
+			`Database schema version ${version} is older than minimum compatible (${MIN_COMPATIBLE_SCHEMA}).`,
+		);
+	}
+	if (version > SCHEMA_VERSION) {
+		warn(
+			`Database schema version ${version} is newer than this TS runtime (${SCHEMA_VERSION}). ` +
+				"Running in read-only compatibility mode.",
+		);
+	}
+	const missing = REQUIRED_TABLES.filter((t) => !tableExists(db, t));
+	if (missing.length > 0) {
+		throw new Error(
+			`Required tables missing: ${missing.join(", ")}. ` +
+				"The database may be corrupt or from an incompatible version.",
+		);
 	}
 }
 
@@ -485,16 +577,691 @@ export function columnExists(db: DatabaseType, table: string, column: string): b
 	return row !== undefined;
 }
 
+function addColumnIfMissing(
+	db: DatabaseType,
+	table: string,
+	name: string,
+	definition: string,
+): void {
+	if (columnExists(db, table, name)) return;
+	try {
+		db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
+	} catch (err) {
+		const message = err instanceof Error ? err.message.toLowerCase() : "";
+		if (message.includes("duplicate column name") && columnExists(db, table, name)) {
+			return;
+		}
+		throw err;
+	}
+}
+
+const RECIPIENT_POLICY_DEVICE_ELIGIBILITY_COMPATIBILITY_ERROR =
+	"recipient_policy_device_eligibility_schema_incompatible";
+
+export const IDENTITY_DEVICE_ASSIGNMENT_TRIGGERS_DDL = `
+	DROP TRIGGER IF EXISTS trg_identity_devices_assignment_version;
+	CREATE TRIGGER trg_identity_devices_assignment_version
+	AFTER UPDATE OF identity_id ON identity_devices
+	WHEN NEW.identity_id <> OLD.identity_id
+	BEGIN
+		UPDATE identity_devices
+		SET assignment_version = OLD.assignment_version + 1
+		WHERE device_id = NEW.device_id;
+	END;
+	DROP TRIGGER IF EXISTS trg_identity_devices_purge_decisions;
+	CREATE TRIGGER trg_identity_devices_purge_decisions
+	AFTER DELETE ON identity_devices
+	BEGIN
+		DELETE FROM policy_team_device_decisions WHERE device_id = OLD.device_id;
+	END;
+`;
+
+function ensureIdentityDeviceAssignmentVersionTriggers(db: DatabaseType): void {
+	if (
+		!tableExists(db, "identity_devices") ||
+		!columnExists(db, "identity_devices", "identity_id") ||
+		!columnExists(db, "identity_devices", "assignment_version") ||
+		!tableExists(db, "policy_team_device_decisions") ||
+		!columnExists(db, "policy_team_device_decisions", "device_id")
+	) {
+		return;
+	}
+	db.transaction(() => db.exec(IDENTITY_DEVICE_ASSIGNMENT_TRIGGERS_DDL)).immediate();
+}
+
+function ensureDeviceIdentityBindingAuditSchema(db: DatabaseType): void {
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS device_identity_binding_commits (
+			commit_digest TEXT PRIMARY KEY NOT NULL,
+			reviewed_inventory_digest TEXT NOT NULL,
+			request_json TEXT NOT NULL,
+			outcomes_json TEXT NOT NULL,
+			write_count INTEGER NOT NULL,
+			decided_by_identity_id TEXT NOT NULL,
+			decided_by_device_id TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS device_identity_binding_audit (
+			event_id TEXT PRIMARY KEY NOT NULL,
+			commit_digest TEXT NOT NULL REFERENCES device_identity_binding_commits(commit_digest),
+			device_id TEXT NOT NULL,
+			previous_identity_id TEXT,
+			target_identity_id TEXT NOT NULL,
+			action TEXT NOT NULL,
+			previous_assignment_version INTEGER,
+			resulting_assignment_version INTEGER NOT NULL,
+			decided_by_identity_id TEXT NOT NULL,
+			decided_by_device_id TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		);
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_device_identity_binding_audit_commit_device
+			ON device_identity_binding_audit(commit_digest, device_id);
+		CREATE INDEX IF NOT EXISTS idx_device_identity_binding_audit_device_created
+			ON device_identity_binding_audit(device_id, created_at, event_id);
+	`);
+}
+
+function assertRecipientPolicyDeviceEligibilityCompatibility(db: DatabaseType): void {
+	const recipientPolicySchemaPresent = [
+		"policy_teams",
+		"policy_team_memberships",
+		"identity_devices",
+		"project_recipients",
+		"policy_team_device_decisions",
+	].some((table) => tableExists(db, table));
+	if (!recipientPolicySchemaPresent) return;
+
+	const missing: string[] = [];
+	for (const [table, column] of [
+		["policy_teams", "device_eligibility_mode"],
+		["identity_devices", "assignment_version"],
+	] as const) {
+		try {
+			if (!columnExists(db, table, column)) missing.push(`${table}.${column}`);
+		} catch {
+			missing.push(`${table}.${column}`);
+		}
+	}
+	for (const column of ["team_id", "device_id", "decision", "assignment_version"]) {
+		try {
+			if (!columnExists(db, "policy_team_device_decisions", column)) {
+				missing.push(`policy_team_device_decisions.${column}`);
+			}
+		} catch {
+			missing.push(`policy_team_device_decisions.${column}`);
+		}
+	}
+	if (missing.length > 0) {
+		throw new Error(
+			`${RECIPIENT_POLICY_DEVICE_ELIGIBILITY_COMPATIBILITY_ERROR}:${missing.join(",")}`,
+		);
+	}
+}
+
+/**
+ * Repair display-only peer version metadata independently of the compatibility
+ * marker because these additive columns intentionally do not bump the schema.
+ */
+function ensureSyncPeerRuntimeVersionColumns(db: DatabaseType): void {
+	if (!tableExists(db, "sync_peers")) return;
+	addColumnIfMissing(db, "sync_peers", "runtime_version", "TEXT");
+	addColumnIfMissing(db, "sync_peers", "runtime_version_observed_at", "TEXT");
+}
+
+/** Persist a direct-peer signature version only when it advances the peer's observed maximum. */
+export function recordHighestObservedDirectSignatureVersion(
+	db: DatabaseType,
+	peerDeviceId: string,
+	version: number,
+): boolean {
+	if (!Number.isSafeInteger(version) || version < 1) {
+		throw new RangeError("Direct signature version must be a positive safe integer");
+	}
+	return db.transaction(() => {
+		const result = db
+			.prepare(
+				`INSERT INTO sync_peer_signature_state(
+					peer_device_id, highest_observed_direct_signature_version
+				 )
+				 SELECT ?, ?
+				 WHERE EXISTS (
+					SELECT 1 FROM sync_peers WHERE peer_device_id = ?
+				 )
+				 ON CONFLICT(peer_device_id) DO UPDATE SET
+					highest_observed_direct_signature_version = excluded.highest_observed_direct_signature_version
+				 WHERE sync_peer_signature_state.highest_observed_direct_signature_version
+					< excluded.highest_observed_direct_signature_version`,
+			)
+			.run(peerDeviceId, version, peerDeviceId);
+		// Retain the additive column as a compatibility mirror for older runtimes.
+		db.prepare(
+			`UPDATE sync_peers
+			 SET highest_observed_direct_signature_version = ?
+			 WHERE peer_device_id = ?
+			   AND (
+				 highest_observed_direct_signature_version IS NULL
+				 OR highest_observed_direct_signature_version < ?
+			   )`,
+		).run(version, peerDeviceId, version);
+		return result.changes > 0;
+	})();
+}
+
+/**
+ * Has the additive compatibility shim already run for the current SCHEMA_VERSION?
+ *
+ * Fail-safe: returns false on any error (including a missing
+ * `schema_compat_state` table) so the shim re-runs rather than skipping needed
+ * additive DDL on uncertainty. Keyed on SCHEMA_VERSION so a future runtime with
+ * a higher SCHEMA_VERSION (and new additive DDL) sees the older marker and
+ * re-applies.
+ */
+function schemaCompatAlreadyApplied(db: DatabaseType): boolean {
+	try {
+		const row = db
+			.prepare("SELECT applied_schema_version AS v FROM schema_compat_state WHERE id = 1 LIMIT 1")
+			.get() as { v: number } | undefined;
+		return typeof row?.v === "number" && row.v >= SCHEMA_VERSION;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Record that the additive compatibility shim has been applied for the current
+ * SCHEMA_VERSION. Fail-open: a failed mark just means the shim re-runs on the
+ * next open, which is harmless because the DDL is idempotent.
+ */
+function markSchemaCompatApplied(db: DatabaseType): void {
+	try {
+		db.prepare(
+			`INSERT INTO schema_compat_state(id, applied_schema_version, applied_at)
+			 VALUES (1, ?, ?)
+			 ON CONFLICT(id) DO UPDATE SET
+				 applied_schema_version = excluded.applied_schema_version,
+				 applied_at = excluded.applied_at`,
+		).run(SCHEMA_VERSION, new Date().toISOString());
+	} catch {
+		// Fail-open: a missed mark only costs one extra idempotent re-run.
+	}
+}
+
+/**
+ * Backfill the denormalized memory_items.project column from sessions.project.
+ *
+ * Runs on EVERY store open (not gated behind the schema-compat marker) because
+ * moveMemoryProject edits sessions.project and relies on this backfill plus a
+ * reader-fallback to propagate the new project to legacy rows whose project is
+ * still NULL. Idempotent — only touches rows where project IS NULL.
+ */
+function backfillMemoryItemProject(db: DatabaseType): void {
+	try {
+		db.exec(`UPDATE memory_items
+			 SET project = (
+				 SELECT s.project FROM sessions s
+				 WHERE s.id = memory_items.session_id
+			 )
+			 WHERE project IS NULL`);
+	} catch {
+		// Best-effort backfill — readers fall back to sessions.project
+		// when memory_items.project is null.
+	}
+}
+
 /**
  * Apply additive compatibility fixes for legacy TS-era schemas.
  *
  * These are safe, one-way `ALTER TABLE ... ADD COLUMN` updates used to
  * prevent runtime failures when older local databases are missing columns
  * introduced in later releases.
+ *
+ * The ~39 idempotent DDL statements are gated behind a `schema_compat_state`
+ * marker so steady-state opens skip them: each database runs the shim once
+ * (idempotent — a fresh DB's statements are all no-ops), records the marker,
+ * and skips thereafter. We deliberately do NOT short-circuit on
+ * `user_version >= SCHEMA_VERSION`: additive columns (e.g. memory_items.project)
+ * have been added over time WITHOUT bumping SCHEMA_VERSION, so a database can
+ * report user_version=SCHEMA_VERSION yet still lack a column the shim adds —
+ * the version is not proof the shim ran. Only the marker is. The project
+ * backfill still runs on every open regardless of the gate.
  */
+function indexColumns(db: DatabaseType, indexName: string): string[] {
+	const quoted = indexName.replaceAll('"', '""');
+	return (db.prepare(`PRAGMA index_info("${quoted}")`).all() as Array<{ name?: string }>)
+		.map((row) => String(row.name ?? ""))
+		.filter(Boolean);
+}
+
+function repairShareOperationEffectIdIndex(db: DatabaseType): void {
+	if (
+		!tableExists(db, "share_operation_steps") ||
+		!columnExists(db, "share_operation_steps", "effect_id")
+	) {
+		return;
+	}
+	const indexes = db.prepare("PRAGMA index_list('share_operation_steps')").all() as Array<{
+		name: string;
+		unique: number;
+	}>;
+	const hasInlineUniqueEffectId = indexes.some(
+		(index) =>
+			index.unique === 1 &&
+			index.name !== "idx_share_operation_steps_effect_id_nonempty" &&
+			indexColumns(db, index.name).join(",") === "effect_id",
+	);
+	if (hasInlineUniqueEffectId) {
+		db.transaction(() => {
+			db.exec(`
+				DROP INDEX IF EXISTS idx_share_operation_steps_effect_id_nonempty;
+				ALTER TABLE share_operation_steps RENAME TO share_operation_steps_unique_legacy;
+				CREATE TABLE share_operation_steps (
+					operation_id TEXT NOT NULL,
+					step_key TEXT NOT NULL,
+					effect_id TEXT NOT NULL,
+					status TEXT NOT NULL,
+					attempt_count INTEGER NOT NULL DEFAULT 0,
+					started_at TEXT,
+					completed_at TEXT,
+					last_attempt_at TEXT,
+					safe_error_code TEXT,
+					updated_at TEXT NOT NULL,
+					PRIMARY KEY (operation_id, step_key)
+				);
+				INSERT INTO share_operation_steps(
+					operation_id, step_key, effect_id, status, attempt_count, started_at,
+					completed_at, last_attempt_at, safe_error_code, updated_at
+				) SELECT operation_id, step_key, effect_id, status, attempt_count, started_at,
+					completed_at, last_attempt_at, safe_error_code, updated_at
+				FROM share_operation_steps_unique_legacy;
+				DROP TABLE share_operation_steps_unique_legacy;
+			`);
+		})();
+	}
+	db.exec(`
+		DROP INDEX IF EXISTS idx_share_operation_steps_effect_id_nonempty;
+		CREATE INDEX IF NOT EXISTS idx_share_operation_steps_effect_id_nonempty
+			ON share_operation_steps(effect_id)
+			WHERE effect_id <> '';
+	`);
+}
+
+let retrievalLedgerSchemaWarningEmitted = false;
+
 export function ensureAdditiveSchemaCompatibility(db: DatabaseType): void {
+	// This remains outside the compatibility marker gate so a partial legacy
+	// database can gain its base tables before a later open creates the ledger.
 	try {
-		db.exec(`
+		ensureRetrievalLedgerSchema(db);
+	} catch {
+		// The ledger is optional local derived state. A malformed/locked optional
+		// ledger must not prevent the existing store from opening.
+		if (!retrievalLedgerSchemaWarningEmitted) {
+			retrievalLedgerSchemaWarningEmitted = true;
+			console.warn(
+				"[codemem] Retrieval evidence storage is unavailable; continuing without attribution data.",
+			);
+		}
+	}
+	// Always run: current-marker databases may predate these no-version-bump
+	// columns, so the schema_compat_state gate cannot prove they exist.
+	ensureSyncPeerRuntimeVersionColumns(db);
+	ensureSyncPeerSignatureStateSchema(db);
+	ensureDeviceIdentityBindingAuditSchema(db);
+	ensureLegacyTeamSetupDraftSchema(db);
+	const compatAlreadyApplied = schemaCompatAlreadyApplied(db);
+	if (!compatAlreadyApplied) {
+		// IMPORTANT: any NEW DDL added to this gated block REQUIRES bumping
+		// SCHEMA_VERSION. The "already applied" marker keys on SCHEMA_VERSION, so
+		// without a bump, legacy DBs already marked at the current version would
+		// skip the new DDL forever.
+		// Marker table must exist before we can mark; create it first.
+		try {
+			db.exec(`
+				CREATE TABLE IF NOT EXISTS schema_compat_state (
+					id INTEGER PRIMARY KEY CHECK (id = 1),
+					applied_schema_version INTEGER NOT NULL,
+					applied_at TEXT NOT NULL
+				)
+			`);
+		} catch {
+			// Keep compatibility shim fail-open for the marker table.
+		}
+		try {
+			db.exec(`
+			CREATE TABLE IF NOT EXISTS coordinator_enrollment_reconciliation_issues (
+				coordinator_id TEXT NOT NULL,
+				group_id TEXT NOT NULL,
+				kind TEXT NOT NULL,
+				reference_id TEXT NOT NULL,
+				code TEXT NOT NULL,
+				status TEXT NOT NULL DEFAULT 'open',
+				first_seen_at TEXT NOT NULL,
+				last_seen_at TEXT NOT NULL,
+				resolved_at TEXT,
+				occurrence_count INTEGER NOT NULL DEFAULT 1,
+				updated_at TEXT NOT NULL,
+				PRIMARY KEY (coordinator_id, group_id, kind, reference_id, code)
+			);
+			CREATE INDEX IF NOT EXISTS idx_coordinator_enrollment_issues_boundary_status
+				ON coordinator_enrollment_reconciliation_issues(coordinator_id, group_id, status);
+			CREATE INDEX IF NOT EXISTS idx_coordinator_enrollment_issues_status_recent
+				ON coordinator_enrollment_reconciliation_issues(status, last_seen_at, resolved_at);
+			CREATE TABLE IF NOT EXISTS recipient_policy_review_resolutions (
+				review_item_id TEXT NOT NULL,
+				source_fingerprint TEXT NOT NULL,
+				decision TEXT NOT NULL,
+				decision_input_json TEXT NOT NULL,
+				preview_json TEXT NOT NULL,
+				decided_by_identity_id TEXT NOT NULL,
+				decided_by_device_id TEXT NOT NULL,
+				resolved_at TEXT NOT NULL,
+				PRIMARY KEY (review_item_id, source_fingerprint)
+			);
+			CREATE TABLE IF NOT EXISTS policy_teams (
+				team_id TEXT PRIMARY KEY NOT NULL,
+				display_name TEXT NOT NULL,
+				status TEXT NOT NULL,
+				device_eligibility_mode TEXT NOT NULL DEFAULT 'person_all_devices',
+				provenance TEXT NOT NULL,
+				revision TEXT NOT NULL,
+				migration_state TEXT NOT NULL,
+				source_fingerprint TEXT,
+				idempotency_key TEXT NOT NULL UNIQUE,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS policy_team_memberships (
+				team_id TEXT NOT NULL,
+				identity_id TEXT NOT NULL,
+				role TEXT NOT NULL,
+				status TEXT NOT NULL,
+				provenance TEXT NOT NULL,
+				revision TEXT NOT NULL,
+				migration_state TEXT NOT NULL,
+				source_fingerprint TEXT,
+				idempotency_key TEXT NOT NULL UNIQUE,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				PRIMARY KEY (team_id, identity_id)
+			);
+			CREATE TABLE IF NOT EXISTS identity_devices (
+				device_id TEXT PRIMARY KEY NOT NULL,
+				identity_id TEXT NOT NULL,
+				display_name TEXT NOT NULL,
+				status TEXT NOT NULL,
+				provenance TEXT NOT NULL,
+				revision TEXT NOT NULL,
+				migration_state TEXT NOT NULL,
+				assignment_version INTEGER NOT NULL DEFAULT 0,
+				source_fingerprint TEXT,
+				idempotency_key TEXT NOT NULL UNIQUE,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS policy_team_device_decisions (
+				team_id TEXT NOT NULL REFERENCES policy_teams(team_id) ON DELETE CASCADE,
+				device_id TEXT NOT NULL,
+				decision TEXT NOT NULL,
+				assignment_version INTEGER NOT NULL DEFAULT 0,
+				provenance TEXT NOT NULL,
+				revision TEXT NOT NULL,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				PRIMARY KEY (team_id, device_id)
+			);
+			CREATE INDEX IF NOT EXISTS idx_policy_team_device_decisions_device
+				ON policy_team_device_decisions(device_id);
+			CREATE TABLE IF NOT EXISTS project_recipients (
+				canonical_project_identity TEXT NOT NULL,
+				recipient_kind TEXT NOT NULL,
+				recipient_id TEXT NOT NULL,
+				status TEXT NOT NULL,
+				provenance TEXT NOT NULL,
+				policy_revision TEXT NOT NULL,
+				migration_state TEXT NOT NULL,
+				source_fingerprint TEXT,
+				idempotency_key TEXT NOT NULL UNIQUE,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				PRIMARY KEY (canonical_project_identity, recipient_kind, recipient_id)
+			);
+			CREATE TABLE IF NOT EXISTS recipient_policy_authority_states (
+				canonical_project_identity TEXT PRIMARY KEY NOT NULL,
+				authority_state TEXT NOT NULL DEFAULT 'legacy',
+				generation INTEGER NOT NULL DEFAULT 0,
+				desired_devices_digest TEXT,
+				current_devices_digest TEXT,
+				stable_parity_evidence_digest TEXT,
+				stable_parity_passed_at TEXT,
+				fresh_snapshot_fingerprint TEXT,
+				fresh_snapshot_observed_at TEXT,
+				safe_error_code TEXT,
+				state_changed_at TEXT NOT NULL,
+				last_error_at TEXT,
+				attempt_count INTEGER NOT NULL DEFAULT 0,
+				last_attempt_at TEXT,
+				last_completed_at TEXT,
+				lease_owner TEXT,
+				lease_acquired_at TEXT,
+				lease_expires_at TEXT,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS recipient_policy_reconciliation_steps (
+				canonical_project_identity TEXT NOT NULL,
+				generation INTEGER NOT NULL,
+				step_key TEXT NOT NULL,
+				effect_id TEXT NOT NULL,
+				payload_digest TEXT NOT NULL,
+				status TEXT NOT NULL DEFAULT 'pending',
+				attempt_count INTEGER NOT NULL DEFAULT 0,
+				started_at TEXT,
+				completed_at TEXT,
+				last_attempt_at TEXT,
+				safe_error_code TEXT,
+				error_at TEXT,
+				lease_owner TEXT,
+				lease_acquired_at TEXT,
+				lease_expires_at TEXT,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				PRIMARY KEY (canonical_project_identity, generation, step_key)
+			);
+			CREATE UNIQUE INDEX IF NOT EXISTS idx_recipient_policy_reconciliation_steps_effect
+				ON recipient_policy_reconciliation_steps(effect_id);
+			CREATE INDEX IF NOT EXISTS idx_recipient_policy_reconciliation_steps_status
+				ON recipient_policy_reconciliation_steps(canonical_project_identity, status);
+			CREATE INDEX IF NOT EXISTS idx_recipient_policy_reconciliation_steps_pending_refresh
+				ON recipient_policy_reconciliation_steps(canonical_project_identity, generation, step_key)
+				WHERE status IN ('pending', 'running', 'failed')
+				AND step_key GLOB 'refresh-after-revocations-v2:*';
+			CREATE TABLE IF NOT EXISTS recipient_policy_deny_overlays (
+				canonical_project_identity TEXT NOT NULL,
+				scope_id TEXT NOT NULL,
+				device_id TEXT NOT NULL,
+				generation INTEGER NOT NULL,
+				reason_code TEXT NOT NULL,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				PRIMARY KEY (canonical_project_identity, scope_id, device_id)
+			);
+			CREATE INDEX IF NOT EXISTS idx_recipient_policy_deny_overlays_scope_device
+				ON recipient_policy_deny_overlays(scope_id, device_id);
+			CREATE INDEX IF NOT EXISTS idx_policy_team_memberships_identity_status
+				ON policy_team_memberships(identity_id, status);
+			CREATE INDEX IF NOT EXISTS idx_identity_devices_identity_status
+				ON identity_devices(identity_id, status);
+			CREATE INDEX IF NOT EXISTS idx_project_recipients_project_status
+				ON project_recipients(canonical_project_identity, status);
+			CREATE INDEX IF NOT EXISTS idx_project_recipients_recipient_status
+				ON project_recipients(recipient_kind, recipient_id, status);
+			CREATE TABLE IF NOT EXISTS recipient_managed_project_projections (
+				canonical_project_identity TEXT NOT NULL,
+				display_name TEXT NOT NULL,
+				managed_scope_id TEXT NOT NULL,
+				coordinator_id TEXT NOT NULL,
+				group_id TEXT NOT NULL,
+				recipient_identity_id TEXT NOT NULL,
+				accepting_device_id TEXT NOT NULL,
+				source_operation_id TEXT NOT NULL,
+				reviewed_project_set_digest TEXT NOT NULL,
+				status TEXT NOT NULL DEFAULT 'active',
+				accepted_at TEXT NOT NULL,
+				revoked_at TEXT,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				PRIMARY KEY (source_operation_id, canonical_project_identity)
+			);
+			CREATE INDEX IF NOT EXISTS idx_recipient_managed_projects_identity_status
+				ON recipient_managed_project_projections(recipient_identity_id, status);
+			CREATE INDEX IF NOT EXISTS idx_recipient_managed_projects_scope_authority
+				ON recipient_managed_project_projections(
+					managed_scope_id, coordinator_id, group_id, status
+				);
+			CREATE TABLE IF NOT EXISTS share_operations (
+				operation_id TEXT PRIMARY KEY NOT NULL,
+				state TEXT NOT NULL,
+				inviter_actor_id TEXT NOT NULL,
+				inviter_device_ids_json TEXT NOT NULL,
+				person_id TEXT NOT NULL,
+				person_kind TEXT NOT NULL,
+				pending_person_operation_id TEXT,
+				teammate_name TEXT NOT NULL,
+				history_policy TEXT NOT NULL,
+				reviewed_project_set_digest TEXT NOT NULL,
+				coordinator_group_id TEXT NOT NULL,
+				coordinator_invite_id TEXT,
+				invite_token_digest TEXT NOT NULL,
+				invite_expires_at TEXT NOT NULL,
+				recipient_actor_id TEXT,
+				recipient_display_name TEXT,
+				recipient_device_id TEXT,
+				recipient_device_display_name TEXT,
+				recipient_public_key TEXT,
+				recipient_fingerprint TEXT,
+				acceptance_consumed_at TEXT,
+				trust_state TEXT,
+				bootstrap_grant_id TEXT,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL
+			);
+			CREATE TABLE IF NOT EXISTS share_operation_projects (
+				operation_id TEXT NOT NULL,
+				canonical_project_identity TEXT NOT NULL,
+				display_name TEXT NOT NULL,
+				identity_source TEXT NOT NULL,
+				existing_memory_count INTEGER NOT NULL,
+				ordinal INTEGER NOT NULL,
+				PRIMARY KEY (operation_id, canonical_project_identity)
+			);
+			CREATE TABLE IF NOT EXISTS share_operation_steps (
+				operation_id TEXT NOT NULL,
+				step_key TEXT NOT NULL,
+				effect_id TEXT NOT NULL,
+				status TEXT NOT NULL,
+				attempt_count INTEGER NOT NULL DEFAULT 0,
+				started_at TEXT,
+				completed_at TEXT,
+				last_attempt_at TEXT,
+				safe_error_code TEXT,
+				updated_at TEXT NOT NULL,
+				PRIMARY KEY (operation_id, step_key)
+			);
+		`);
+		} catch {
+			// Keep compatibility shim fail-open for additive share-operation state.
+		}
+		for (const [table, name, definition] of [
+			["policy_teams", "device_eligibility_mode", "TEXT NOT NULL DEFAULT 'person_all_devices'"],
+			["identity_devices", "assignment_version", "INTEGER NOT NULL DEFAULT 0"],
+			["policy_team_device_decisions", "assignment_version", "INTEGER NOT NULL DEFAULT 0"],
+		] as const) {
+			try {
+				addColumnIfMissing(db, table, name, definition);
+			} catch {
+				// Continue repairing independent recipient-policy columns.
+			}
+		}
+		const shareOperationColumns = [
+			["state", "TEXT NOT NULL DEFAULT 'waiting_for_acceptance'"],
+			["inviter_actor_id", "TEXT NOT NULL DEFAULT ''"],
+			["inviter_device_ids_json", "TEXT NOT NULL DEFAULT '[]'"],
+			["person_id", "TEXT NOT NULL DEFAULT ''"],
+			["person_kind", "TEXT NOT NULL DEFAULT 'pending'"],
+			["pending_person_operation_id", "TEXT"],
+			["teammate_name", "TEXT NOT NULL DEFAULT ''"],
+			["history_policy", "TEXT NOT NULL DEFAULT 'existing_and_future'"],
+			["reviewed_project_set_digest", "TEXT NOT NULL DEFAULT ''"],
+			["coordinator_group_id", "TEXT NOT NULL DEFAULT ''"],
+			["coordinator_invite_id", "TEXT"],
+			["invite_token_digest", "TEXT NOT NULL DEFAULT ''"],
+			["invite_expires_at", "TEXT NOT NULL DEFAULT ''"],
+			["recipient_actor_id", "TEXT"],
+			["recipient_display_name", "TEXT"],
+			["recipient_device_id", "TEXT"],
+			["recipient_device_display_name", "TEXT"],
+			["recipient_public_key", "TEXT"],
+			["recipient_fingerprint", "TEXT"],
+			["acceptance_consumed_at", "TEXT"],
+			["trust_state", "TEXT"],
+			["bootstrap_grant_id", "TEXT"],
+			["created_at", "TEXT NOT NULL DEFAULT ''"],
+			["updated_at", "TEXT NOT NULL DEFAULT ''"],
+		] as const;
+		for (const [name, definition] of shareOperationColumns) {
+			try {
+				addColumnIfMissing(db, "share_operations", name, definition);
+			} catch {
+				// Continue repairing independent additive columns.
+			}
+		}
+		for (const [table, columns] of [
+			[
+				"share_operation_projects",
+				[
+					["display_name", "TEXT NOT NULL DEFAULT ''"],
+					["identity_source", "TEXT NOT NULL DEFAULT ''"],
+					["existing_memory_count", "INTEGER NOT NULL DEFAULT 0"],
+					["ordinal", "INTEGER NOT NULL DEFAULT 0"],
+				],
+			],
+			[
+				"share_operation_steps",
+				[
+					["effect_id", "TEXT NOT NULL DEFAULT ''"],
+					["status", "TEXT NOT NULL DEFAULT 'pending'"],
+					["attempt_count", "INTEGER NOT NULL DEFAULT 0"],
+					["started_at", "TEXT"],
+					["completed_at", "TEXT"],
+					["last_attempt_at", "TEXT"],
+					["safe_error_code", "TEXT"],
+					["updated_at", "TEXT NOT NULL DEFAULT ''"],
+				],
+			],
+		] as const) {
+			for (const [name, definition] of columns) {
+				try {
+					addColumnIfMissing(db, table, name, definition);
+				} catch {
+					// Continue repairing independent additive columns.
+				}
+			}
+		}
+		try {
+			db.exec(`
+				CREATE INDEX IF NOT EXISTS idx_share_operations_state_updated
+					ON share_operations(state, updated_at);
+				CREATE UNIQUE INDEX IF NOT EXISTS idx_share_operations_invite_digest
+					ON share_operations(invite_token_digest);
+				CREATE UNIQUE INDEX IF NOT EXISTS idx_share_operations_pending_person_operation
+					ON share_operations(pending_person_operation_id)
+					WHERE pending_person_operation_id IS NOT NULL;
+			`);
+		} catch {
+			// Keep compatibility shim fail-open for additive share-operation indexes.
+		}
+		try {
+			db.exec(`
 			CREATE TABLE IF NOT EXISTS sync_reset_state (
 				id INTEGER PRIMARY KEY,
 				generation INTEGER NOT NULL,
@@ -504,53 +1271,308 @@ export function ensureAdditiveSchemaCompatibility(db: DatabaseType): void {
 				updated_at TEXT NOT NULL
 			)
 		`);
-	} catch {
-		// Keep compatibility shim fail-open for optional additive tables.
-	}
-
-	// Add phase column to sync_daemon_state for rebootstrap safety gate.
-	if (tableExists(db, "sync_daemon_state") && !columnExists(db, "sync_daemon_state", "phase")) {
-		try {
-			db.exec("ALTER TABLE sync_daemon_state ADD COLUMN phase TEXT");
 		} catch {
-			// Race-safe: another process may have added it first.
+			// Keep compatibility shim fail-open for optional additive tables.
 		}
-	}
 
-	if (tableExists(db, "memory_items")) {
-		if (!columnExists(db, "memory_items", "dedup_key")) {
+		try {
+			db.exec(`
+			CREATE TABLE IF NOT EXISTS sync_scope_rejections (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				peer_device_id TEXT,
+				op_id TEXT NOT NULL,
+				entity_type TEXT NOT NULL,
+				entity_id TEXT NOT NULL,
+				scope_id TEXT,
+				reason TEXT NOT NULL,
+				created_at TEXT NOT NULL
+			);
+			CREATE INDEX IF NOT EXISTS idx_sync_scope_rejections_peer_created
+				ON sync_scope_rejections(peer_device_id, created_at);
+			CREATE INDEX IF NOT EXISTS idx_sync_scope_rejections_scope_created
+				ON sync_scope_rejections(scope_id, created_at);
+		`);
+		} catch {
+			// Keep compatibility shim fail-open for optional additive diagnostics.
+		}
+
+		try {
+			db.exec(`
+			CREATE TABLE IF NOT EXISTS sync_reset_state_v2 (
+				scope_id TEXT PRIMARY KEY NOT NULL,
+				generation INTEGER NOT NULL,
+				snapshot_id TEXT NOT NULL,
+				baseline_cursor TEXT,
+				retained_floor_cursor TEXT,
+				updated_at TEXT NOT NULL
+			);
+
+			CREATE TABLE IF NOT EXISTS sync_retention_state_v2 (
+				scope_id TEXT PRIMARY KEY NOT NULL,
+				last_run_at TEXT,
+				last_duration_ms INTEGER,
+				last_deleted_ops INTEGER NOT NULL DEFAULT 0,
+				last_estimated_bytes_before INTEGER,
+				last_estimated_bytes_after INTEGER,
+				retained_floor_cursor TEXT,
+				last_error TEXT,
+				last_error_at TEXT
+			);
+
+			CREATE TABLE IF NOT EXISTS replication_cursors_v2 (
+				peer_device_id TEXT NOT NULL,
+				scope_id TEXT NOT NULL,
+				last_applied_cursor TEXT,
+				last_acked_cursor TEXT,
+				updated_at TEXT NOT NULL,
+				PRIMARY KEY (peer_device_id, scope_id)
+			);
+			CREATE INDEX IF NOT EXISTS idx_replication_cursors_v2_scope
+				ON replication_cursors_v2(scope_id);
+		`);
+		} catch {
+			// Keep compatibility shim fail-open for optional additive tables.
+		}
+
+		if (tableExists(db, "sync_reset_state") && tableExists(db, "sync_reset_state_v2")) {
 			try {
-				db.exec("ALTER TABLE memory_items ADD COLUMN dedup_key TEXT");
-			} catch (err) {
-				const message = err instanceof Error ? err.message.toLowerCase() : "";
-				const duplicateColumn = message.includes("duplicate column name");
-				if (!(duplicateColumn && columnExists(db, "memory_items", "dedup_key"))) {
-					throw err;
+				db.exec(`
+				INSERT OR IGNORE INTO sync_reset_state_v2
+					(scope_id, generation, snapshot_id, baseline_cursor, retained_floor_cursor, updated_at)
+				SELECT 'local-default', generation, snapshot_id, baseline_cursor, retained_floor_cursor, updated_at
+				FROM sync_reset_state
+				WHERE id = 1
+			`);
+			} catch {
+				// Best-effort bridge from legacy singleton state.
+			}
+		}
+
+		if (tableExists(db, "sync_retention_state") && tableExists(db, "sync_retention_state_v2")) {
+			try {
+				db.exec(`
+				INSERT OR IGNORE INTO sync_retention_state_v2
+					(
+						scope_id,
+						last_run_at,
+						last_duration_ms,
+						last_deleted_ops,
+						last_estimated_bytes_before,
+						last_estimated_bytes_after,
+						retained_floor_cursor,
+						last_error,
+						last_error_at
+					)
+				SELECT
+					'local-default',
+					last_run_at,
+					last_duration_ms,
+					last_deleted_ops,
+					last_estimated_bytes_before,
+					last_estimated_bytes_after,
+					retained_floor_cursor,
+					last_error,
+					last_error_at
+				FROM sync_retention_state
+				WHERE id = 1
+			`);
+			} catch {
+				// Best-effort bridge from legacy singleton state.
+			}
+		}
+
+		if (tableExists(db, "replication_cursors") && tableExists(db, "replication_cursors_v2")) {
+			try {
+				db.exec(`
+				INSERT OR IGNORE INTO replication_cursors_v2
+					(peer_device_id, scope_id, last_applied_cursor, last_acked_cursor, updated_at)
+				SELECT peer_device_id, 'local-default', last_applied_cursor, last_acked_cursor, updated_at
+				FROM replication_cursors
+			`);
+			} catch {
+				// Best-effort bridge from legacy peer-level cursors.
+			}
+		}
+
+		// Add phase column to sync_daemon_state for rebootstrap safety gate.
+		if (tableExists(db, "sync_daemon_state") && !columnExists(db, "sync_daemon_state", "phase")) {
+			try {
+				db.exec("ALTER TABLE sync_daemon_state ADD COLUMN phase TEXT");
+			} catch {
+				// Race-safe: another process may have added it first.
+			}
+		}
+
+		if (tableExists(db, "memory_items")) {
+			try {
+				db.exec(
+					"CREATE INDEX IF NOT EXISTS idx_memory_items_origin_device_active ON memory_items(origin_device_id, active)",
+				);
+			} catch {
+				// Keep additive compatibility best-effort for index creation.
+			}
+
+			if (!columnExists(db, "memory_items", "dedup_key")) {
+				try {
+					db.exec("ALTER TABLE memory_items ADD COLUMN dedup_key TEXT");
+				} catch (err) {
+					const message = err instanceof Error ? err.message.toLowerCase() : "";
+					const duplicateColumn = message.includes("duplicate column name");
+					if (!(duplicateColumn && columnExists(db, "memory_items", "dedup_key"))) {
+						throw err;
+					}
 				}
+			}
+
+			try {
+				db.exec(
+					"CREATE INDEX IF NOT EXISTS idx_memory_items_dedup_key_active_created ON memory_items(dedup_key, active, created_at)",
+				);
+			} catch {
+				// Keep additive compatibility best-effort for index creation.
+			}
+
+			try {
+				db.exec(
+					"CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_items_same_session_dedup_unique ON memory_items(session_id, kind, visibility, workspace_id, dedup_key) WHERE active = 1 AND dedup_key IS NOT NULL",
+				);
+			} catch {
+				// Keep additive compatibility best-effort for index creation.
+			}
+
+			addColumnIfMissing(db, "memory_items", "scope_id", "TEXT");
+			try {
+				db.exec(
+					"CREATE INDEX IF NOT EXISTS idx_memory_items_scope_visibility_created ON memory_items(scope_id, visibility, created_at)",
+				);
+			} catch {
+				// Keep additive compatibility best-effort for index creation.
+			}
+			try {
+				db.exec(
+					"CREATE INDEX IF NOT EXISTS idx_memory_items_scope_backfill_pending ON memory_items(id) WHERE scope_id IS NULL OR scope_id = ''",
+				);
+			} catch {
+				// Keep additive compatibility best-effort for index creation.
+			}
+
+			// Denormalized project column: created here so the Projects read model can
+			// read directly from memory_items without joining through sessions (which
+			// carry device-local cwd and don't replicate). The actual NULL backfill
+			// runs unconditionally via backfillMemoryItemProject() on every open below.
+			addColumnIfMissing(db, "memory_items", "project", "TEXT");
+			try {
+				db.exec("CREATE INDEX IF NOT EXISTS idx_memory_items_project ON memory_items(project)");
+			} catch {
+				// Keep additive compatibility best-effort for index creation.
+			}
+
+			// Drop legacy memory_items indexes that no longer back any query, only
+			// adding write amplification on databases created by older schemas. The
+			// current schema never creates these. `visibility`/`workspace_kind` are
+			// low-cardinality and only ever appear as secondary predicates already
+			// covered by composite indexes (e.g. idx_memory_items_scope_visibility_created,
+			// idx_memory_items_same_session_dedup_unique); `user_prompt_id` is unused
+			// as a filter (and is all-NULL in practice).
+			try {
+				db.exec(
+					`DROP INDEX IF EXISTS idx_memory_items_visibility;
+				 DROP INDEX IF EXISTS idx_memory_items_workspace_kind;
+				 DROP INDEX IF EXISTS idx_memory_items_user_prompt_id;`,
+				);
+			} catch {
+				// Best-effort cleanup of legacy indexes.
+			}
+		}
+
+		if (tableExists(db, "replication_ops")) {
+			addColumnIfMissing(db, "replication_ops", "scope_id", "TEXT");
+			try {
+				db.exec(
+					"CREATE INDEX IF NOT EXISTS idx_replication_ops_scope_created ON replication_ops(scope_id, created_at, op_id)",
+				);
+			} catch {
+				// Keep additive compatibility best-effort for index creation.
 			}
 		}
 
 		try {
-			db.exec(
-				"CREATE INDEX IF NOT EXISTS idx_memory_items_dedup_key_active_created ON memory_items(dedup_key, active, created_at)",
+			db.exec(`
+			CREATE TABLE IF NOT EXISTS replication_scopes (
+				scope_id TEXT PRIMARY KEY NOT NULL,
+				label TEXT NOT NULL,
+				kind TEXT NOT NULL DEFAULT 'user',
+				authority_type TEXT NOT NULL DEFAULT 'local',
+				coordinator_id TEXT,
+				group_id TEXT,
+				manifest_issuer_device_id TEXT,
+				membership_epoch INTEGER NOT NULL DEFAULT 0,
+				manifest_hash TEXT,
+				status TEXT NOT NULL DEFAULT 'active',
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL
 			);
+			CREATE INDEX IF NOT EXISTS idx_replication_scopes_status
+				ON replication_scopes(status);
+			CREATE INDEX IF NOT EXISTS idx_replication_scopes_authority_group
+				ON replication_scopes(coordinator_id, group_id);
+
+			CREATE TABLE IF NOT EXISTS project_scope_mappings (
+				id INTEGER PRIMARY KEY,
+				workspace_identity TEXT,
+				project_pattern TEXT NOT NULL,
+				scope_id TEXT NOT NULL,
+				priority INTEGER NOT NULL DEFAULT 0,
+				source TEXT NOT NULL DEFAULT 'user',
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL
+			);
+			CREATE INDEX IF NOT EXISTS idx_project_scope_mappings_workspace_priority
+				ON project_scope_mappings(workspace_identity, priority);
+			CREATE INDEX IF NOT EXISTS idx_project_scope_mappings_pattern_priority
+				ON project_scope_mappings(project_pattern, priority);
+			CREATE INDEX IF NOT EXISTS idx_project_scope_mappings_scope
+				ON project_scope_mappings(scope_id);
+
+			CREATE TABLE IF NOT EXISTS scope_memberships (
+				scope_id TEXT NOT NULL,
+				device_id TEXT NOT NULL,
+				role TEXT NOT NULL DEFAULT 'member',
+				status TEXT NOT NULL DEFAULT 'active',
+				membership_epoch INTEGER NOT NULL DEFAULT 0,
+				coordinator_id TEXT,
+				group_id TEXT,
+				manifest_issuer_device_id TEXT,
+				manifest_hash TEXT,
+				signed_manifest_json TEXT,
+				updated_at TEXT NOT NULL,
+				PRIMARY KEY (scope_id, device_id)
+			);
+			CREATE INDEX IF NOT EXISTS idx_scope_memberships_device_status
+				ON scope_memberships(device_id, status);
+			CREATE INDEX IF NOT EXISTS idx_scope_memberships_scope_status
+				ON scope_memberships(scope_id, status);
+			CREATE INDEX IF NOT EXISTS idx_scope_memberships_authority_group
+				ON scope_memberships(coordinator_id, group_id);
+
+			CREATE TABLE IF NOT EXISTS scope_membership_cache_state (
+				coordinator_id TEXT NOT NULL,
+				group_id TEXT NOT NULL,
+				last_refresh_at TEXT NOT NULL,
+				last_success_at TEXT,
+				last_error TEXT,
+				updated_at TEXT NOT NULL,
+				PRIMARY KEY (coordinator_id, group_id)
+			);
+		`);
 		} catch {
-			// Keep additive compatibility best-effort for index creation.
+			// Keep compatibility shim fail-open for optional additive scope metadata.
 		}
 
+		// Junction tables for structured file/concept references on memories.
+		// Added in schema v7; existing v6 databases need these created additively.
 		try {
-			db.exec(
-				"CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_items_same_session_dedup_unique ON memory_items(session_id, kind, visibility, workspace_id, dedup_key) WHERE active = 1 AND dedup_key IS NOT NULL",
-			);
-		} catch {
-			// Keep additive compatibility best-effort for index creation.
-		}
-	}
-
-	// Junction tables for structured file/concept references on memories.
-	// Added in schema v7; existing v6 databases need these created additively.
-	try {
-		db.exec(`
+			db.exec(`
 			CREATE TABLE IF NOT EXISTS memory_file_refs (
 				memory_id INTEGER NOT NULL,
 				file_path TEXT NOT NULL,
@@ -568,72 +1590,147 @@ export function ensureAdditiveSchemaCompatibility(db: DatabaseType): void {
 			);
 			CREATE INDEX IF NOT EXISTS idx_memory_concept_refs_concept ON memory_concept_refs(concept);
 		`);
-	} catch {
-		// Keep compatibility shim fail-open for optional additive tables.
-	}
+		} catch {
+			// Keep compatibility shim fail-open for optional additive tables.
+		}
 
-	// Multi-team coordinator groups (v1) — additive columns + preferences table.
-	// Existing databases acquire these so peer enrollment can record the group
-	// it came from, and so per-group scope templates can be stored locally.
-	if (tableExists(db, "sync_peers")) {
-		for (const name of ["discovered_via_coordinator_id", "discovered_via_group_id"]) {
-			if (columnExists(db, "sync_peers", name)) continue;
-			try {
-				db.exec(`ALTER TABLE sync_peers ADD COLUMN ${name} TEXT`);
-			} catch (err) {
-				const message = err instanceof Error ? err.message.toLowerCase() : "";
-				if (message.includes("duplicate column name") && columnExists(db, "sync_peers", name)) {
-					continue;
+		// Multi-team coordinator groups (v1) — additive columns + preferences table.
+		// Existing databases acquire these so peer enrollment can record the group
+		// it came from, and so per-group scope templates can be stored locally.
+		if (tableExists(db, "sync_peers")) {
+			for (const name of [
+				"discovered_via_coordinator_id",
+				"discovered_via_group_id",
+				"trust_provenance",
+				"pending_bootstrap_grant_id",
+			]) {
+				if (columnExists(db, "sync_peers", name)) continue;
+				try {
+					db.exec(`ALTER TABLE sync_peers ADD COLUMN ${name} TEXT`);
+				} catch (err) {
+					const message = err instanceof Error ? err.message.toLowerCase() : "";
+					if (message.includes("duplicate column name") && columnExists(db, "sync_peers", name)) {
+						continue;
+					}
+					throw err;
 				}
-				throw err;
 			}
 		}
-	}
-	try {
-		db.exec(`
+		if (tableExists(db, "sync_attempts")) {
+			for (const name of [
+				"local_sync_capability",
+				"peer_sync_capability",
+				"negotiated_sync_capability",
+			]) {
+				if (columnExists(db, "sync_attempts", name)) continue;
+				try {
+					db.exec(`ALTER TABLE sync_attempts ADD COLUMN ${name} TEXT`);
+				} catch (err) {
+					const message = err instanceof Error ? err.message.toLowerCase() : "";
+					if (
+						message.includes("duplicate column name") &&
+						columnExists(db, "sync_attempts", name)
+					) {
+						continue;
+					}
+					throw err;
+				}
+			}
+		}
+		try {
+			db.exec(`
 			CREATE TABLE IF NOT EXISTS coordinator_group_preferences (
 				coordinator_id TEXT NOT NULL,
 				group_id TEXT NOT NULL,
 				projects_include_json TEXT,
 				projects_exclude_json TEXT,
 				auto_seed_scope INTEGER NOT NULL DEFAULT 1,
+				default_space_scope_id TEXT,
+				auto_grant_default_space_on_join INTEGER NOT NULL DEFAULT 0,
 				updated_at TEXT NOT NULL,
 				PRIMARY KEY (coordinator_id, group_id)
 			)
 		`);
-	} catch {
-		// Keep compatibility shim fail-open for optional additive tables.
-	}
-
-	if (!tableExists(db, "raw_event_flush_batches")) return;
-
-	const additiveColumns: Array<{ name: string; ddl: string }> = [
-		{ name: "error_message", ddl: "TEXT" },
-		{ name: "error_type", ddl: "TEXT" },
-		{ name: "observer_provider", ddl: "TEXT" },
-		{ name: "observer_model", ddl: "TEXT" },
-		{ name: "observer_runtime", ddl: "TEXT" },
-		{ name: "observer_auth_source", ddl: "TEXT" },
-		{ name: "observer_auth_type", ddl: "TEXT" },
-		{ name: "observer_error_code", ddl: "TEXT" },
-		{ name: "observer_error_message", ddl: "TEXT" },
-		{ name: "attempt_count", ddl: "INTEGER NOT NULL DEFAULT 0" },
-	];
-
-	for (const { name, ddl } of additiveColumns) {
-		if (columnExists(db, "raw_event_flush_batches", name)) continue;
-		try {
-			db.exec(`ALTER TABLE raw_event_flush_batches ADD COLUMN ${name} ${ddl}`);
-		} catch (err) {
-			const message = err instanceof Error ? err.message.toLowerCase() : "";
-			const duplicateColumn = message.includes("duplicate column name");
-			if (duplicateColumn && columnExists(db, "raw_event_flush_batches", name)) {
-				// Another process may have raced and added the column first.
-				continue;
+		} catch {
+			// Keep compatibility shim fail-open for optional additive tables.
+		}
+		for (const { name, ddl } of [
+			{ name: "default_space_scope_id", ddl: "TEXT" },
+			{ name: "auto_grant_default_space_on_join", ddl: "INTEGER NOT NULL DEFAULT 0" },
+		]) {
+			if (columnExists(db, "coordinator_group_preferences", name)) continue;
+			try {
+				db.exec(`ALTER TABLE coordinator_group_preferences ADD COLUMN ${name} ${ddl}`);
+			} catch (err) {
+				const message = err instanceof Error ? err.message.toLowerCase() : "";
+				if (message.includes("duplicate column name")) continue;
+				throw err;
 			}
-			throw err;
+		}
+
+		if (tableExists(db, "raw_event_flush_batches")) {
+			const additiveColumns: Array<{ name: string; ddl: string }> = [
+				{ name: "error_message", ddl: "TEXT" },
+				{ name: "error_type", ddl: "TEXT" },
+				{ name: "observer_provider", ddl: "TEXT" },
+				{ name: "observer_model", ddl: "TEXT" },
+				{ name: "observer_runtime", ddl: "TEXT" },
+				{ name: "observer_auth_source", ddl: "TEXT" },
+				{ name: "observer_auth_type", ddl: "TEXT" },
+				{ name: "observer_error_code", ddl: "TEXT" },
+				{ name: "observer_error_message", ddl: "TEXT" },
+				{ name: "attempt_count", ddl: "INTEGER NOT NULL DEFAULT 0" },
+			];
+
+			for (const { name, ddl } of additiveColumns) {
+				if (columnExists(db, "raw_event_flush_batches", name)) continue;
+				try {
+					db.exec(`ALTER TABLE raw_event_flush_batches ADD COLUMN ${name} ${ddl}`);
+				} catch (err) {
+					const message = err instanceof Error ? err.message.toLowerCase() : "";
+					const duplicateColumn = message.includes("duplicate column name");
+					if (duplicateColumn && columnExists(db, "raw_event_flush_batches", name)) {
+						// Another process may have raced and added the column first.
+						continue;
+					}
+					throw err;
+				}
+			}
+		}
+
+		const recipientPolicyTablesReady = [
+			"coordinator_enrollment_reconciliation_issues",
+			"policy_teams",
+			"policy_team_memberships",
+			"policy_team_device_decisions",
+			"identity_devices",
+			"project_recipients",
+			"recipient_managed_project_projections",
+			"recipient_policy_authority_states",
+			"recipient_policy_reconciliation_steps",
+			"recipient_policy_deny_overlays",
+		].every((table) => tableExists(db, table));
+		const currentVersion = getSchemaVersion(db);
+		if (recipientPolicyTablesReady && currentVersion > 0 && currentVersion < SCHEMA_VERSION) {
+			db.pragma(`user_version = ${SCHEMA_VERSION}`);
 		}
 	}
+	// Intentionally fail the whole connect path: no runtime surface may open a
+	// partially upgraded authorization schema and discover the drift via raw SELECTs.
+	assertRecipientPolicyDeviceEligibilityCompatibility(db);
+	// Reinstall outside the compatibility marker so a missing or stale security
+	// trigger self-heals before any authorization reader can use the connection.
+	ensureIdentityDeviceAssignmentVersionTriggers(db);
+	if (!compatAlreadyApplied) markSchemaCompatApplied(db);
+	try {
+		repairShareOperationEffectIdIndex(db);
+	} catch {
+		// Keep compatibility shim fail-open for interrupted or partial legacy schemas.
+	}
+
+	// Always runs (not gated): moveMemoryProject relies on this backfill +
+	// reader-fallback to propagate sessions.project edits to legacy NULL rows.
+	backfillMemoryItemProject(db);
 }
 
 /** Safely parse a JSON string, returning {} on failure. */

@@ -10,7 +10,12 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { ObserverClient } from "@codemem/core";
+import type {
+	DeviceIdentityCoordinatorEvidence,
+	GetUpdateStatusOptions,
+	ObserverClient,
+	UpdateStatus,
+} from "@codemem/core";
 import { MemoryStore, type RawEventSweeper, resolveDbPath, VERSION } from "@codemem/core";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { Hono } from "hono";
@@ -20,12 +25,49 @@ import {
 	type InMemoryRequestRateLimiter,
 } from "./request-rate-limit.js";
 import { configRoutes } from "./routes/config.js";
+import { healthRoutes } from "./routes/health.js";
 import { memoryRoutes } from "./routes/memory.js";
 import { observerStatusRoutes } from "./routes/observer-status.js";
-import { pluginObserverRoutes } from "./routes/plugin-observer.js";
+import { packTransportRoutes } from "./routes/pack.js";
 import { rawEventsRoutes } from "./routes/raw-events.js";
 import { statsRoutes } from "./routes/stats.js";
-import { syncProtocolRoutes, syncRoutes } from "./routes/sync.js";
+import { type SyncRoutesOptions, syncProtocolRoutes, syncRoutes } from "./routes/sync.js";
+import {
+	type LegacyTeamConfiguredGroupSnapshotLoader,
+	TEAM_SETUP_ROUTE_PREFIX,
+	teamSetupRoutes,
+} from "./routes/team-setup.js";
+import { updateStatusRoutes } from "./routes/update-status.js";
+
+export type {
+	AdvancePendingProjectSharesResult,
+	AdvanceProjectShareOperationResult,
+	RecipientPolicyReconciliationReadModel,
+	RecipientPolicyReconciliationReadState,
+	ReconcileConfiguredCoordinatorEnrollmentResult,
+	ReconcileRecipientPolicyProjectsResult,
+} from "./routes/sync.js";
+export {
+	advancePendingProjectShares,
+	advanceProjectShareOperation,
+	createRecipientPolicyReconcilerEffects,
+	listRecipientPolicyReconciliationStatus,
+	recipientPolicyCapabilityFromStatus,
+	reconcileConfiguredCoordinatorEnrollment,
+	reconcileRecipientPolicyProjects,
+} from "./routes/sync.js";
+export type {
+	LegacyTeamSetupCandidateSummaryV1,
+	LegacyTeamSetupDetailResponseV1,
+	LegacyTeamSetupDeviceV1,
+	LegacyTeamSetupErrorResponseV1,
+	LegacyTeamSetupFinishResponseV1,
+	LegacyTeamSetupIdentityChoiceV1,
+	LegacyTeamSetupMutationResponseV1,
+	LegacyTeamSetupProjectV1,
+	LegacyTeamSetupSummaryResponseV1,
+	LegacyTeamSetupViewerAccessDeltaV1,
+} from "./routes/team-setup.js";
 
 export { VERSION };
 
@@ -54,6 +96,11 @@ export interface AppOptions {
 	storeFactory?: () => MemoryStore;
 	sweeper?: RawEventSweeper | null;
 	observer?: ObserverClient | null;
+	getUpdateStatus?: (options: GetUpdateStatusOptions) => Promise<UpdateStatus>;
+	loadDeviceIdentityCoordinatorEvidence?: () => Promise<DeviceIdentityCoordinatorEvidence>;
+	loadLegacyTeamConfiguredGroupSnapshots?: LegacyTeamConfiguredGroupSnapshotLoader;
+	readCoordinatorConfig?: SyncRoutesOptions["readCoordinatorConfig"];
+	renameCoordinatorGroup?: SyncRoutesOptions["renameCoordinatorGroup"];
 	syncRequestRateLimit?: {
 		limiter?: InMemoryRequestRateLimiter;
 		readLimit?: number;
@@ -80,15 +127,18 @@ export function createApp(opts?: AppOptions) {
 	const sweeper = opts?.sweeper ?? null;
 	const observer = opts?.observer ?? null;
 	const getSyncRuntimeStatus = opts?.getSyncRuntimeStatus ?? (() => null);
+	let invalidateTeamSetupSummary = () => {};
 	const app = new Hono();
 
 	// CORS / origin guard
 	app.use("*", preflightHandler());
-	app.use("*", originGuard());
+	app.use("*", originGuard({ unsafeGetPathPrefixes: [TEAM_SETUP_ROUTE_PREFIX] }));
 
 	// API routes
+	app.route("/", healthRoutes(storeFactory));
 	app.route("/", statsRoutes(storeFactory));
 	app.route("/", memoryRoutes(storeFactory));
+	app.route("/", packTransportRoutes(storeFactory));
 	app.route(
 		"/",
 		observerStatusRoutes({
@@ -99,19 +149,43 @@ export function createApp(opts?: AppOptions) {
 	);
 	app.route("/", configRoutes({ getSweeper: () => sweeper }));
 	app.route("/", rawEventsRoutes(storeFactory, sweeper));
-	app.route("/", pluginObserverRoutes(storeFactory, sweeper));
-	app.route("/", syncRoutes(storeFactory, getSyncRuntimeStatus));
+	app.route(
+		"/",
+		syncRoutes(storeFactory, getSyncRuntimeStatus, {
+			loadDeviceIdentityCoordinatorEvidence: opts?.loadDeviceIdentityCoordinatorEvidence,
+			onRecipientPolicyTeamRenamed: () => invalidateTeamSetupSummary(),
+			readCoordinatorConfig: opts?.readCoordinatorConfig,
+			renameCoordinatorGroup: opts?.renameCoordinatorGroup,
+		}),
+	);
+	app.route(
+		"/",
+		teamSetupRoutes({
+			getStore: storeFactory,
+			loadLegacyTeamConfiguredGroupSnapshots: opts?.loadLegacyTeamConfiguredGroupSnapshots,
+			registerSummaryInvalidator: (invalidate) => {
+				invalidateTeamSetupSummary = invalidate;
+			},
+		}),
+	);
+	app.route("/", updateStatusRoutes({ getUpdateStatus: opts?.getUpdateStatus }));
 
 	// Static assets — serve under /assets/*
 	// Resolves to packages/viewer-server/static/ both in dev and when installed from npm.
 	const staticRoot =
 		process.env.CODEMEM_VIEWER_STATIC_DIR ?? join(import.meta.dirname ?? ".", "../static");
 
+	app.use("/assets/*", async (c, next) => {
+		c.header("Cache-Control", "no-cache");
+		await next();
+	});
+
 	app.use(
 		"/assets/*",
 		serveStatic({
 			root: staticRoot,
 			rewriteRequestPath: (path) => path.replace(/^\/assets/, ""),
+			precompressed: true,
 		}),
 	);
 
@@ -127,6 +201,7 @@ export function createApp(opts?: AppOptions) {
 		if (c.req.path.startsWith("/api/")) {
 			return c.json({ error: "not found" }, 404);
 		}
+		c.header("Cache-Control", "no-store");
 		return c.html(indexHtml);
 	});
 

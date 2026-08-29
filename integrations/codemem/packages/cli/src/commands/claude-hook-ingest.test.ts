@@ -78,21 +78,63 @@ describe("claude-hook-ingest command", () => {
 	});
 
 	it("returns HTTP result when viewer ingest succeeds", async () => {
+		let httpPayload: Record<string, unknown> | undefined;
 		const result = await ingestClaudeHookPayload(
 			{ hook_event_name: "SessionStart", session_id: "sess-http", cwd: "/tmp/demo" },
 			{ host: "127.0.0.1", port: 38888 },
 			{
-				httpIngest: async () => ({ ok: true, inserted: 2, skipped: 1 }),
+				httpIngest: async (request) => {
+					httpPayload = request;
+					return { ok: true, inserted: 2, skipped: 1 };
+				},
 				directIngest: () => {
 					throw new Error("direct ingest should not be called");
 				},
-				resolveDb: () => {
-					throw new Error("resolveDb should not be called");
-				},
+				resolveDb: () => "/tmp/resolved.sqlite",
 			},
 		);
 
 		expect(result).toEqual({ inserted: 2, skipped: 1, via: "http" });
+		expect(httpPayload).toMatchObject({
+			db_path: "/tmp/resolved.sqlite",
+			identity_target: expect.any(Object),
+		});
+	});
+
+	it("does not re-probe a mismatched Viewer while draining backlog", async () => {
+		mkdirSync(queueDir, { recursive: true });
+		writeFileSync(
+			join(queueDir, "hook-0000000001-pid-1.json"),
+			JSON.stringify({ hook_event_name: "Stop", session_id: "queued", tag: "queued" }),
+			"utf8",
+		);
+		let httpCalls = 0;
+		const directCalls: Array<Record<string, unknown>> = [];
+		const result = await ingestClaudeHookPayload(
+			{
+				hook_event_name: "SessionStart",
+				session_id: "sess-mismatch",
+				cwd: "/tmp/demo",
+				tag: "fresh",
+			},
+			{ host: "127.0.0.1", port: 38888, db: "/tmp/custom.sqlite" },
+			{
+				httpIngest: async () => {
+					httpCalls += 1;
+					return { ok: false, inserted: 0, skipped: 0, targetMismatch: true };
+				},
+				directIngest: (payload) => {
+					directCalls.push(payload);
+					return { inserted: 1, skipped: 0 };
+				},
+				resolveDb: () => "/tmp/resolved.sqlite",
+			},
+		);
+
+		expect(result).toEqual({ inserted: 1, skipped: 0, via: "direct" });
+		expect(httpCalls).toBe(1);
+		expect(directCalls.map((payload) => payload.tag)).toEqual(["queued", "fresh"]);
+		expect(readdirSync(queueDir)).toHaveLength(0);
 	});
 
 	it("falls back to direct ingest when HTTP path fails", async () => {
@@ -123,7 +165,7 @@ describe("claude-hook-ingest command", () => {
 			const second = directEnqueue(payload, dbPath);
 
 			expect(first).toEqual({ inserted: 1, skipped: 0 });
-			expect(second).toEqual({ inserted: 0, skipped: 0 });
+			expect(second).toEqual({ inserted: 0, skipped: 1 });
 
 			const db = connect(dbPath);
 			try {
@@ -133,6 +175,10 @@ describe("claude-hook-ingest command", () => {
 				};
 				expect(rawCount.c).toBe(1);
 				expect(sessionCount.c).toBe(1);
+				const row = db.prepare("SELECT event_seq FROM raw_events").get() as {
+					event_seq: number;
+				};
+				expect(row.event_seq).toBe(0);
 			} finally {
 				db.close();
 			}
@@ -391,6 +437,46 @@ describe("claude-hook-ingest command", () => {
 			expect(directCalls[0]?.hook_event_name).toBe("SessionEnd");
 			expect(boundaryFlushCalls).toHaveLength(1);
 			expect(boundaryFlushCalls[0]?.hook_event_name).toBe("SessionEnd");
+		});
+
+		it("drains the backlog BEFORE the boundary flush on the HTTP-success path", async () => {
+			// A previously-spooled payload must be drained before the
+			// SessionEnd flush pass runs, so the flush sees the queued
+			// payloads of the session too.
+			mkdirSync(queueDir, { recursive: true });
+			writeFileSync(
+				join(queueDir, "hook-0000000001-pid-1.json"),
+				JSON.stringify({
+					hook_event_name: "Stop",
+					session_id: "queued-before-flush",
+					tag: "queued",
+				}),
+				"utf8",
+			);
+
+			const events: string[] = [];
+			const result = await ingestClaudeHookPayload(
+				{ hook_event_name: "SessionEnd", session_id: "sess-end", tag: "fresh" },
+				{ host: "127.0.0.1", port: 38888 },
+				{
+					httpIngest: async (payload) => {
+						events.push(`http:${String(payload.tag ?? "")}`);
+						return { ok: true, inserted: 0, skipped: 0 };
+					},
+					directIngest: (payload) => {
+						events.push(`direct:${String(payload.tag ?? "")}`);
+						return { inserted: 1, skipped: 0 };
+					},
+					boundaryFlush: (payload) => {
+						events.push(`flush:${String(payload.tag ?? "")}`);
+					},
+					resolveDb: () => "/tmp/test.sqlite",
+				},
+			);
+			expect(result.via).toBe("http");
+			// fresh HTTP → queued drain → boundary write-through → flush.
+			expect(events).toEqual(["http:fresh", "http:queued", "direct:fresh", "flush:fresh"]);
+			expect(readdirSync(queueDir)).toHaveLength(0);
 		});
 
 		it("Stop flush truth table: only fires when BOTH flush envs are truthy", async () => {
