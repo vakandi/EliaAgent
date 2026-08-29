@@ -6,7 +6,8 @@ LABEL description="EliaAI Subworker Management Server"
 # Prevent Python from writing .pyc files and enable unbuffered output
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    DEBIAN_FRONTEND=noninteractive
+    DEBIAN_FRONTEND=noninteractive \
+    TZ=Africa/Casablanca
 
 WORKDIR /app
 
