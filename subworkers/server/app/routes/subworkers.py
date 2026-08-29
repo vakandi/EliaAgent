@@ -4,6 +4,7 @@ Provides status, trigger, enable/disable, config editing, and log viewing.
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -58,6 +59,7 @@ class TriggerResponse(BaseModel):
     status: str
     name: str
     message: str | None = None
+    session_id: str | None = None
 
 
 class EnableResponse(BaseModel):
@@ -213,10 +215,18 @@ async def trigger_subworker(name: str, body: TriggerRequest | None = None) -> Tr
             message=result.get("message", "Unknown error"),
         )
 
+    session_id: str | None = None
+    for _ in range(20):
+        session_id = scheduler.get_running_session_id(name) or scheduler.get_last_session_id(name)
+        if session_id:
+            break
+        await asyncio.sleep(0.4)
+
     return TriggerResponse(
         status="triggered",
         name=name,
         message=f"Subworker '{name}' triggered successfully",
+        session_id=session_id,
     )
 
 
@@ -287,12 +297,23 @@ async def update_subworker(name: str, body: UpdateSubworkerRequest) -> Subworker
     if body.max_retries is not None:
         updates["max_retries"] = body.max_retries
     if body.schedule is not None:
-        from app.config.models import CronSchedule, IntervalSchedule
+        from app.config.models import CronSchedule, EverySchedule, IntervalSchedule
         schedule_data = body.schedule
         schedule_type = schedule_data.get("type", "interval")
         if schedule_type == "cron":
             updates["schedule"] = CronSchedule(
                 expression=schedule_data["expression"],
+            )
+        elif schedule_type == "every":
+            every_val = int(schedule_data.get("every", 0))
+            if every_val < 1 or every_val > 1440:
+                raise HTTPException(status_code=422, detail="every must be 1..1440 minutes")
+            hours = schedule_data.get("hours")
+            days = schedule_data.get("days")
+            updates["schedule"] = EverySchedule(
+                every=every_val,
+                hours=[int(h) for h in hours] if hours else None,
+                days=[int(d) for d in days] if days else None,
             )
         elif schedule_type == "interval":
             days = schedule_data.get("days")
@@ -458,6 +479,7 @@ async def get_subworker_sessions(
         raise HTTPException(status_code=404, detail=f"Subworker '{name}' not found")
 
     import os
+    from app.utils.exceptions import OpenCodeError
     from app.utils.opencode_client import OpenCodeClient
 
     server_url = os.environ.get("OPENCODE_SERVER_URL", "http://127.0.0.1:5655")
@@ -473,6 +495,7 @@ async def get_subworker_sessions(
                 s for s in all_sessions
                 if s.get("agent") == sw.agent_id
                 or s.get("directory", "").startswith(ws_dir)
+                or s.get("directory", "").startswith("/data/subworkers/" + sw.name)
                 or _title_matches_subworker(s, sw)
             ]
             if matching:
@@ -483,12 +506,26 @@ async def get_subworker_sessions(
                 session_id = matching[0].get("id")
 
         if not session_id:
-            session_id = scheduler.get_last_session_id(name)
+            session_id = scheduler.get_running_session_id(name) or scheduler.get_last_session_id(name)
 
         if not session_id:
             return SessionResponse(name=name, session_id=None, messages=[], total_messages=0)
 
-        raw_messages = await client.list_messages(session_id, limit=limit)
+        try:
+            raw_messages = await client.list_messages(session_id, limit=limit)
+        except OpenCodeError as exc:
+            if getattr(exc, "status_code", None) == 404:
+                try:
+                    running = scheduler.get_running_session_id(name)
+                    if running and running != session_id:
+                        raw_messages = await client.list_messages(running, limit=limit)
+                        session_id = running
+                    else:
+                        return SessionResponse(name=name, session_id=session_id, messages=[], total_messages=0)
+                except Exception:
+                    return SessionResponse(name=name, session_id=session_id, messages=[], total_messages=0)
+            else:
+                raise
 
     messages: list[SessionMessage] = []
     for msg in raw_messages:
@@ -513,16 +550,18 @@ async def get_subworker_sessions(
 
         parts: list[SessionMessagePart] = []
         for p in parts_raw:
-            # OpenCode nests tool payload under state: {status, input, output, ...}
+            # OpenCode nests tool payload under state: {status, input, output, tool, ...}
             state = p.get("state") if isinstance(p.get("state"), dict) else {}
             tool_input = state.get("input", p.get("input"))
             tool_output = state.get("output", p.get("output"))
             if isinstance(tool_output, str) and len(tool_output) > 8000:
                 tool_output = tool_output[:8000] + "\n… (truncated)"
+            # Tool name may live in state.tool / state.name depending on OpenCode version
+            raw_tool = p.get("tool") or state.get("tool") or state.get("name") or p.get("name")
             parts.append(SessionMessagePart(
                 type=p.get("type", "unknown"),
                 text=p.get("text"),
-                tool=p.get("tool"),
+                tool=raw_tool if isinstance(raw_tool, str) else None,
                 input=tool_input if isinstance(tool_input, dict) else None,
                 output=tool_output if isinstance(tool_output, str) else None,
             ))
@@ -558,7 +597,7 @@ def _effective_workspace(sw) -> str:
     container paths; opencode sessions carry host paths)."""
     import os as _os
 
-    root = _os.environ.get("OPENCODE_WORKSPACE", str(Path.home() / "EliaAI"))
+    root = _os.environ.get("OPENCODE_WORKSPACE", "/Users/vakandi/EliaAI")
     workspace = sw.workspace
     if not workspace:
         try:
@@ -602,7 +641,7 @@ async def list_subworker_sessions(name: str) -> SessionListResponse:
     all_sessions: list[dict] = []
     try:
         async with OpenCodeClient(server_url, default_timeout=5.0) as client:
-            all_sessions = await client.list_sessions(limit=100)
+            all_sessions = await client.list_sessions(limit=200)
     except Exception:
         all_sessions = []
 
@@ -611,6 +650,7 @@ async def list_subworker_sessions(name: str) -> SessionListResponse:
         s for s in all_sessions
         if s.get("agent") == sw.agent_id
         or s.get("directory", "").startswith(ws_dir)
+        or s.get("directory", "").startswith("/data/subworkers/" + sw.name)
         or _title_matches_subworker(s, sw)
     ]
     items = []
@@ -632,6 +672,67 @@ async def list_subworker_sessions(name: str) -> SessionListResponse:
         items.append(SessionListItem(session_id=scheduler_sid, title=None, agent=sw.agent_id, time_created=None))
 
     return SessionListResponse(name=name, sessions=items)
+
+
+# ── User Reinjection (manual continue) ───────────────────────────────────
+
+
+class ContinueRequest(BaseModel):
+    message: str | None = Field(default=None, description="Message to send to the session (default: 'continue the tasks')")
+
+
+class ContinueResponse(BaseModel):
+    status: str
+    name: str
+    session_id: str
+    message: str
+
+
+@router.post("/sessions/{name}/{session_id}/continue", response_model=ContinueResponse)
+async def continue_session(
+    name: str,
+    session_id: str,
+    body: ContinueRequest | None = None,
+) -> ContinueResponse:
+    """Send a user message to an existing OpenCode session to continue it.
+
+    Unlike POST /trigger/{name} which creates a NEW session, this re-injects
+    into an OLD session (from the session list). Used by EliaTopBar's
+    'Continue' badge for manual reinjection.
+    """
+    config = _get_config()
+    sw = config.get_subworker(name)
+    if not sw:
+        raise HTTPException(status_code=404, detail=f"Subworker '{name}' not found")
+
+    import os
+    from app.utils.exceptions import OpenCodeError
+    from app.utils.opencode_client import OpenCodeClient
+
+    server_url = os.environ.get("OPENCODE_SERVER_URL", "http://127.0.0.1:5655")
+    content = (body.message if body and body.message else "continue the tasks").strip()
+    if not content:
+        content = "continue the tasks"
+
+    try:
+        async with OpenCodeClient(server_url, default_timeout=60.0) as client:
+            await client.send_message(session_id, content=content, agent=sw.agent_id, timeout=60.0)
+    except OpenCodeError as exc:
+        if getattr(exc, "status_code", None) == 404:
+            raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found on OpenCode server") from exc
+        status = getattr(exc, "status_code", None)
+        if status in (408, 504) or "timed out" in str(exc).lower():
+            logger.warning("session.continue_timeout name=%s session_id=%s", name, session_id)
+        else:
+            raise HTTPException(status_code=502, detail=f"OpenCode error: {exc}") from exc
+
+    logger.info("session.continued name=%s session_id=%s message_len=%d", name, session_id, len(content))
+    return ContinueResponse(
+        status="continued",
+        name=name,
+        session_id=session_id,
+        message=f"Message sent to session {session_id}",
+    )
 
 
 # ── Main Agent Management ────────────────────────────────────────────────
