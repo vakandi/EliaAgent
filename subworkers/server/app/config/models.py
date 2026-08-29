@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 class ScheduleType(str, Enum):
     INTERVAL = "interval"
+    EVERY = "every"
     CRON = "cron"
 
 
@@ -27,13 +28,30 @@ class IntervalSchedule(BaseModel):
     days: list[int] | None = Field(None, description="Weekdays 0=Sun..6=Sat; None/empty = every day")
 
 
+class EverySchedule(BaseModel):
+    """Run every N minutes (5,10,15,20,30,45…), optionally restricted to hours/days.
+
+    Generates a CronTrigger under the hood (minute = */N or explicit minute list)
+    so the job stays clock-aligned (00, 10, 20 …), matching user expectation for
+    “every 10 min”. For intervals that do not divide 60 evenly (e.g. 45) we use
+    the cron minute list [0,45] — two runs per hour, still predictable.
+
+    hours: if provided, only fire in those hours; None/empty = every hour.
+    days: weekday filter 0=Sun..6=Sat; None/empty = every day.
+    """
+    type: ScheduleType = ScheduleType.EVERY
+    every: int = Field(..., ge=1, le=1440, description="Interval in minutes (e.g. 10, 20, 30, 45)")
+    hours: list[int] | None = Field(None, description="Restrict to these hours 0-23; None = every hour")
+    days: list[int] | None = Field(None, description="Weekdays 0=Sun..6=Sat; None/empty = every day")
+
+
 class CronSchedule(BaseModel):
     """Run on a cron expression: e.g. '0 9-23 * * *'."""
     type: ScheduleType = ScheduleType.CRON
     expression: str = Field(..., description="Standard 5-field cron expression")
 
 
-Schedule = IntervalSchedule | CronSchedule
+Schedule = IntervalSchedule | EverySchedule | CronSchedule
 
 
 # ── Server Config ───────────────────────────────────────────────────────────
