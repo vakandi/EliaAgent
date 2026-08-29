@@ -16,7 +16,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 import structlog
 
-from app.config.models import CronSchedule, IntervalSchedule, SubworkerConfig
+from app.config.models import CronSchedule, EverySchedule, IntervalSchedule, SubworkerConfig
 
 log = structlog.get_logger(__name__)
 
@@ -343,6 +343,28 @@ class SubworkerScheduler:
             hours_str = ",".join(str(h) for h in sorted(schedule.hours))
             day_of_week = ",".join(str(d) for d in sorted(schedule.days)) if schedule.days else None
             return CronTrigger(minute=schedule.minute, hour=hours_str, day_of_week=day_of_week)
+        elif isinstance(schedule, EverySchedule):
+            every = schedule.every
+            use_hours_interval = every >= 60 and every % 60 == 0
+            if use_hours_interval:
+                minute_expr = "0"
+            elif 60 % every == 0:
+                minute_expr = f"*/{every}"
+            else:
+                mins = []
+                m = 0
+                while m < 60:
+                    mins.append(str(m))
+                    m += every
+                minute_expr = ",".join(mins)
+            if schedule.hours is not None and len(schedule.hours) > 0:
+                hours_str = ",".join(str(h) for h in sorted(schedule.hours))
+            elif use_hours_interval:
+                hours_str = f"*/{every // 60}"
+            else:
+                hours_str = "*"
+            day_of_week = ",".join(str(d) for d in sorted(schedule.days)) if schedule.days else None
+            return CronTrigger(minute=minute_expr, hour=hours_str, day_of_week=day_of_week)
         else:
             raise ValueError(f"Unknown schedule type: {type(schedule)}")
 

@@ -1,17 +1,35 @@
 {
   "subworkers": [
     {
-      "name": "your-main-agent",
+      "name": "elia",
       "enabled": false,
       "schedule": {
         "type": "interval",
-        "hours": [9, 12, 15, 18],
-        "minute": 0
+        "hours": [
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "minute": 0,
+        "days": null
       },
       "prompt_file": "PROMPT.md",
       "workspace": "/data",
-      "agent_id": "your-main-agent",
-      "model": null,
+      "agent_id": "elia",
+      "model": "opencode/muse-spark-1.2-contributor-free",
+      "variant": "low",
       "max_retries": 3,
       "timeout_minutes": 60,
       "proxy_enabled": false,
@@ -19,17 +37,40 @@
       "notify_discord": false
     },
     {
-      "name": "your-seo-agent",
-      "enabled": false,
+      "name": "refund-hunter",
+      "enabled": true,
       "schedule": {
-        "type": "interval",
-        "hours": [10, 14, 18],
-        "minute": 0
+        "type": "every",
+        "every": 30,
+        "hours": [
+          0,
+          1,
+          2,
+          3,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "days": null
       },
       "prompt_file": "PROMPT.md",
-      "workspace": "/data/subworkers/your-seo-agent/workspace",
-      "agent_id": "your-seo-agent",
-      "model": null,
+      "workspace": "/data/subworkers/refund-hunter/workspace",
+      "agent_id": "refund-hunter",
+      "model": "opencode/muse-spark-1.2-contributor-free",
+      "variant": "high",
       "max_retries": 3,
       "timeout_minutes": 30,
       "proxy_enabled": false,
@@ -37,17 +78,36 @@
       "notify_discord": false
     },
     {
-      "name": "your-community-agent",
+      "name": "mirorpay-community-organic",
       "enabled": false,
       "schedule": {
         "type": "interval",
-        "hours": [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23],
-        "minute": 0
+        "hours": [
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "minute": 0,
+        "days": null
       },
       "prompt_file": "PROMPT.md",
-      "workspace": "/data/subworkers/your-community-agent/workspace",
-      "agent_id": "your-community-agent",
-      "model": null,
+      "workspace": "/data/subworkers/mirorpay-community-organic/workspace",
+      "agent_id": "mirorpay-community-organic",
+      "model": "opencode/muse-spark-1.2-contributor-free",
+      "variant": "xhigh",
       "max_retries": 3,
       "timeout_minutes": 30,
       "proxy_enabled": false,
@@ -55,19 +115,380 @@
       "notify_discord": false
     },
     {
-      "name": "your-promoter-agent",
+      "name": "mirrorpay-telegram",
       "enabled": false,
       "schedule": {
         "type": "interval",
-        "hours": [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
-        "minute": 30
+        "hours": [
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "minute": 0,
+        "days": null
       },
       "prompt_file": "PROMPT.md",
-      "workspace": "/data/subworkers/your-promoter-agent/workspace",
-      "agent_id": "your-promoter-agent",
+      "workspace": "/data/subworkers/mirrorpay-telegram/workspace",
+      "agent_id": "mirrorpay-telegram",
       "model": null,
+      "variant": null,
       "max_retries": 3,
       "timeout_minutes": 30,
+      "proxy_enabled": false,
+      "mcp_servers": [],
+      "notify_discord": false
+    },
+    {
+      "name": "bene2luxe-promoter",
+      "enabled": false,
+      "schedule": {
+        "type": "interval",
+        "hours": [
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20
+        ],
+        "minute": 30,
+        "days": null
+      },
+      "prompt_file": "PROMPT.md",
+      "workspace": "/data/subworkers/bene2luxe-promoter/workspace",
+      "agent_id": "bene2luxe-promoter",
+      "model": null,
+      "variant": null,
+      "max_retries": 3,
+      "timeout_minutes": 30,
+      "proxy_enabled": false,
+      "mcp_servers": [],
+      "notify_discord": false
+    },
+    {
+      "name": "bene2luxe-suppliers",
+      "enabled": false,
+      "schedule": {
+        "type": "interval",
+        "hours": [
+          9,
+          12,
+          15,
+          18
+        ],
+        "minute": 0,
+        "days": null
+      },
+      "prompt_file": "PROMPT.md",
+      "workspace": "/data/subworkers/bene2luxe-suppliers/workspace",
+      "agent_id": "bene2luxe-suppliers",
+      "model": null,
+      "variant": null,
+      "max_retries": 3,
+      "timeout_minutes": 30,
+      "proxy_enabled": false,
+      "mcp_servers": [],
+      "notify_discord": false
+    },
+    {
+      "name": "cobou-promoter",
+      "enabled": false,
+      "schedule": {
+        "type": "interval",
+        "hours": [
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20
+        ],
+        "minute": 15,
+        "days": null
+      },
+      "prompt_file": "PROMPT.md",
+      "workspace": "/data/subworkers/cobou-promoter/workspace",
+      "agent_id": "cobou-promoter",
+      "model": null,
+      "variant": null,
+      "max_retries": 3,
+      "timeout_minutes": 30,
+      "proxy_enabled": false,
+      "mcp_servers": [],
+      "notify_discord": false
+    },
+    {
+      "name": "mirorpay-seo",
+      "enabled": false,
+      "schedule": {
+        "type": "interval",
+        "hours": [
+          10,
+          14,
+          18
+        ],
+        "minute": 0,
+        "days": null
+      },
+      "prompt_file": "PROMPT.md",
+      "workspace": "/data/subworkers/mirorpay-seo/workspace",
+      "agent_id": "mirorpay-seo",
+      "model": "opencode/muse-spark-1.2-contributor-free",
+      "variant": "xhigh",
+      "max_retries": 3,
+      "timeout_minutes": 30,
+      "proxy_enabled": false,
+      "mcp_servers": [],
+      "notify_discord": false
+    },
+    {
+      "name": "reddit-saas-scraper",
+      "enabled": false,
+      "schedule": {
+        "type": "interval",
+        "hours": [
+          9,
+          12,
+          15,
+          18,
+          21
+        ],
+        "minute": 0,
+        "days": null
+      },
+      "prompt_file": "PROMPT.md",
+      "workspace": "/data/subworkers/reddit-saas-scraper/workspace",
+      "agent_id": "reddit-saas-scraper",
+      "model": null,
+      "variant": null,
+      "max_retries": 2,
+      "timeout_minutes": 30,
+      "proxy_enabled": false,
+      "mcp_servers": [],
+      "notify_discord": false
+    },
+    {
+      "name": "teleorbit-community-organic",
+      "enabled": false,
+      "schedule": {
+        "type": "interval",
+        "hours": [
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "minute": 0,
+        "days": null
+      },
+      "prompt_file": "PROMPT.md",
+      "workspace": "/data/subworkers/teleorbit-community-organic/workspace",
+      "agent_id": "teleorbit-community-organic",
+      "model": null,
+      "variant": null,
+      "max_retries": 3,
+      "timeout_minutes": 30,
+      "proxy_enabled": false,
+      "mcp_servers": [],
+      "notify_discord": false
+    },
+    {
+      "name": "teleorbit-seo",
+      "enabled": false,
+      "schedule": {
+        "type": "interval",
+        "hours": [
+          10,
+          14,
+          18
+        ],
+        "minute": 0,
+        "days": null
+      },
+      "prompt_file": "PROMPT.md",
+      "workspace": "/data/subworkers/teleorbit-seo/workspace",
+      "agent_id": "teleorbit-seo",
+      "model": null,
+      "variant": null,
+      "max_retries": 3,
+      "timeout_minutes": 30,
+      "proxy_enabled": false,
+      "mcp_servers": [],
+      "notify_discord": false
+    },
+    {
+      "name": "tempack-dev",
+      "enabled": false,
+      "schedule": {
+        "type": "interval",
+        "hours": [
+          10,
+          14,
+          18
+        ],
+        "minute": 0,
+        "days": null
+      },
+      "prompt_file": "PROMPT.md",
+      "workspace": "/data/subworkers/tempack-dev/workspace",
+      "agent_id": "tempack-dev",
+      "model": null,
+      "variant": null,
+      "max_retries": 3,
+      "timeout_minutes": 30,
+      "proxy_enabled": false,
+      "mcp_servers": [],
+      "notify_discord": false
+    },
+    {
+      "name": "tiktok-content",
+      "enabled": false,
+      "schedule": {
+        "type": "interval",
+        "hours": [
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20
+        ],
+        "minute": 0,
+        "days": null
+      },
+      "prompt_file": "PROMPT.md",
+      "workspace": "/data/subworkers/tiktok-content/workspace",
+      "agent_id": "tiktok-content",
+      "model": null,
+      "variant": null,
+      "max_retries": 3,
+      "timeout_minutes": 30,
+      "proxy_enabled": false,
+      "mcp_servers": [],
+      "notify_discord": false
+    },
+    {
+      "name": "vcam-community-organic",
+      "enabled": false,
+      "schedule": {
+        "type": "interval",
+        "hours": [
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "minute": 0,
+        "days": null
+      },
+      "prompt_file": "PROMPT.md",
+      "workspace": "/data/subworkers/vcam-community-organic/workspace",
+      "agent_id": "vcam-community-organic",
+      "model": null,
+      "variant": null,
+      "max_retries": 3,
+      "timeout_minutes": 30,
+      "proxy_enabled": false,
+      "mcp_servers": [],
+      "notify_discord": false
+    },
+    {
+      "name": "vcam-seo",
+      "enabled": false,
+      "schedule": {
+        "type": "interval",
+        "hours": [
+          10,
+          14,
+          18
+        ],
+        "minute": 0,
+        "days": null
+      },
+      "prompt_file": "PROMPT.md",
+      "workspace": "/data/subworkers/vcam-seo/workspace",
+      "agent_id": "vcam-seo",
+      "model": null,
+      "variant": null,
+      "max_retries": 3,
+      "timeout_minutes": 30,
+      "proxy_enabled": false,
+      "mcp_servers": [],
+      "notify_discord": false
+    },
+    {
+      "name": "deploymates-watch",
+      "enabled": true,
+      "schedule": {
+        "type": "interval",
+        "hours": [
+          12
+        ],
+        "minute": 0,
+        "days": null
+      },
+      "prompt_file": "PROMPT.md",
+      "workspace": "/data/subworkers/deploymates-watch/workspace",
+      "agent_id": "deploymates-watch",
+      "model": "opencode/muse-spark-1.2-contributor-free",
+      "variant": "low",
+      "max_retries": 3,
+      "timeout_minutes": 15,
       "proxy_enabled": false,
       "mcp_servers": [],
       "notify_discord": false
