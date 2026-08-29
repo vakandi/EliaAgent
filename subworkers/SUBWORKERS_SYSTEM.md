@@ -1,11 +1,11 @@
 # Subworkers System
 
-**Date:** August 2026  
-**Version:** 4.0
+**Date:** 29 August 2026  
+**Version:** 4.1 — TZ + persistence + manual Continue
 
 > Technical documentation for the autonomous subworker agent system.
 >
-> **Current runtime**: Fully dockerized — Python FastAPI (5656) + OpenCode serve (5655) **in the same container** `elia-subworker-srv`. No host `opencode` process.
+> **Current runtime**: Fully dockerized — Python FastAPI (5656) + OpenCode serve (5655) **in the same container** `elia-subworker-srv`. No host `opencode` process. Timezone synced via `TZ=Africa/Casablanca` (host `+01` = container `+01`; `docker exec date` matches `date` on macOS).
 > **Purpose**: **Save CPU/RAM** (one Colima VM instead of 14 host agents), **security isolation** (agents blocked to `workspace/` via container filesystem + `opencode.json` permissions), **full control** (one `docker compose` owns the whole stack).
 > **Previous version**: `SUBWORKERS_SYSTEM_OLD.md` (v3.0 — Node.js trigger + launchd plists, host `opencode` on 4096).
 
@@ -75,15 +75,16 @@ EliaAI/subworkers/
 ├── SUBWORKERS_SYSTEM.md          # This file
 ├── SUBWORKERS_SYSTEM_OLD.md      # Previous version (v3.0 — launchd/Node.js era)
 ├── server/                       # ★ PRIMARY RUNTIME (Docker FastAPI server)
-│   ├── Dockerfile                # python:3.12-slim + Node 20
-│   ├── docker-compose.yml        # container elia-subworker-srv, host network, port 5656
+│   ├── Dockerfile                # python:3.12-slim + Node 20 + TZ=Africa/Casablanca
+│   ├── docker-compose.yml        # container elia-subworker-srv, ports 5656→host, 5655 internal, TZ + opencode-data volume
+│   ├── opencode-data/            # ← container's opencode DB (2.8M, bind-mounted, persists across docker rm)
 │   ├── requirements.txt
 │   ├── app/
 │   │   ├── main.py               # FastAPI app, /health endpoint
 │   │   ├── config/
 │   │   │   ├── server.json       # port 5656, opencode URL 5655, alert settings
 │   │   │   └── subworkers.json   # ★ ALL subworker definitions + schedules (14)
-│   │   ├── routes/               # subworkers.py, server.py, websocket.py
+│   │   ├── routes/               # subworkers.py (incl. POST /sessions/{name}/{id}/continue), server.py, websocket.py
 │   │   ├── services/             # scheduler, runner, session_monitor, health_manager, error_parser, alert_manager
 │   │   └── utils/                # opencode_client.py, exceptions.py
 │   └── tests/                    # pytest suite
@@ -577,30 +578,32 @@ The **primary runtime** is a Python FastAPI server in Docker. It replaces launch
 
 ### 8.2 Start / Stop
 
-Fully dockerized — no host `opencode serve` required. `entrypoint.sh` inside the container boots `opencode serve --port 5655 --hostname 127.0.0.1` before FastAPI, clears stale `models.json` cache, and healthchecks both.
+Fully dockerized — no host `opencode serve` required. `entrypoint.sh` inside the container boots `opencode serve --port 5655 --hostname 127.0.0.1` before FastAPI, clears stale `models.json` cache, and healthchecks both. `TZ=Africa/Casablanca` is baked in (`Dockerfile` ENV + `docker-compose.yml` `environment`) so `docker exec date` matches host.
 
 ```bash
 cd ~/EliaAI/subworkers/server && docker compose up --build   # start (builds opencode binary inside image)
-docker compose down                                          # stop (container only)
+docker compose down                                          # stop (container only, opencode-data persists)
+docker restart elia-subworker-srv                            # quick restart — sessions survive via opencode-data volume
 curl http://localhost:5656/health                            # health check → {"status":"ok",...}
 curl http://localhost:5656/models -H "Authorization: Bearer $ELIA_AUTH_TOKEN" | jq .total  # 6 models, no deprecated
+docker exec elia-subworker-srv date                          # should match host `date` (both +01)
 docker exec elia-subworker-srv curl -sf http://127.0.0.1:5655/global/health  # opencode health inside container
 lsof -i :5655 2>/dev/null || echo "host 5655 empty — opencode is inside Docker ✓"
 lsof -i :4096 2>/dev/null || echo "host 4096 empty — legacy port unused ✓"
 ```
 
-Container: `elia-subworker-srv`, `restart: unless-stopped`, ports **5656** (FastAPI) + **5655** (opencode internal, not host-published unless you add `5655:5655`). Healthcheck requires both `GET /health` (5656) and `GET /global/health` (5655).
+Container: `elia-subworker-srv`, `restart: unless-stopped`, ports **5656** (FastAPI host-exposed) + **5655** (opencode internal, not host-published). Healthcheck requires both `GET /health` (5656) and `GET /global/health` (5655). Volumes: `opencode-data` (2.8M) persists container DB, `logs` persists `scheduler_state.json`.
 
 ### 8.3 Configuration (JSON, hot-reloaded)
 
 | File | Purpose |
 |------|---------|
-| `server/app/config/server.json` | Port (5656), OpenCode server URL (http://127.0.0.1:5655), health-check interval, max restarts, alert settings |
+| `server/app/config/server.json` | Port (5656), OpenCode server URL (http://127.0.0.1:4096), health-check interval, max restarts, alert settings |
 | `server/app/config/subworkers.json` | All subworker definitions: `name`, `enabled`, `schedule` (`interval` = hours+minute / `cron`), `agent_id`, `max_retries`, `timeout_minutes`, `mcp_servers`, `notify_discord` |
 
-`subworkers.json` currently defines **4 example subworkers** (`your-main-agent`, `your-seo-agent`, `your-community-agent`, `your-promoter-agent`) — replace with your own agents.
+`subworkers.json` currently defines **14 subworkers** (refund-hunter, mirorpay-community-organic, mirrorpay-telegram, bene2luxe-promoter, bene2luxe-suppliers, cobou-promoter, mirorpay-seo, reddit-saas-scraper, teleorbit-community-organic, teleorbit-seo, tempack-dev, tiktok-content, vcam-community-organic, vcam-seo).
 
-### 8.4 API (localhost, no auth)
+### 8.4 API (localhost, Bearer $ELIA_AUTH_TOKEN)
 
 | Method | Path | Purpose |
 |--------|------|---------|
@@ -608,15 +611,17 @@ Container: `elia-subworker-srv`, `restart: unless-stopped`, ports **5656** (Fast
 | GET | `/status` | All subworkers `{name, enabled, running, next_run, schedule_type}` |
 | GET | `/status/{name}` | Detail + schedule + agent_id + model |
 | PUT | `/status/{name}` | Edit config (schedule, agent_id, model, timeout, retries) |
-| POST | `/trigger/{name}` | Run now (optional `{prompt, model}` body) |
+| POST | `/trigger/{name}` | Run now (optional `{prompt, model}` body) — creates NEW session |
+| POST | `/sessions/{name}/{session_id}/continue` | **Manual reinjection** — send `{"message":"continue the tasks"}` to an EXISTING session (old runs), used by EliaTopBar's **Continue** badge |
 | POST | `/enable/{name}` / `/disable/{name}` | Toggle enabled state |
 | POST | `/config/reload` | Hot-reload subworkers.json from disk |
 | GET | `/logs/{name}?lines=N` | Recent log lines from run files |
 | GET | `/sessions/{name}?limit=N` | OpenCode session messages (reasoning, tools, text) |
+| GET | `/sessions/{name}/list` | Session list for LogViewer (matches by `agent==agent_id` OR `directory startswith /data/subworkers/{name}`) |
 | GET/POST | `/main-agent` | Read / set the MAIN agent (`{"name": "..."}`) — persisted to `config/main-agent.json` |
 | GET | `/server/health` | OpenCode server subprocess state/pid/restarts |
 | POST | `/server/restart` | Restart OpenCode server subprocess |
-| WS | `/ws` | Live events: `initial_status`, `pong`, `subworker_completed`, `subworker_error` |
+| WS | `/ws?token=…` | Live events: `initial_status`, `pong`, `subworker_completed`, `subworker_error` (requires `?token=` or `Authorization: Bearer`) |
 
 Interactive docs: `http://localhost:5656/docs`.
 
@@ -644,16 +649,21 @@ uvicorn app.main:app --reload --port 5656   # local dev
 pytest -v                                    # test suite (routes, scheduler, runner, health, error_parser, ...)
 ```
 
-### 8.7 Session Persistence (survives `nuke_docker.sh`)
+### 8.7 Session Persistence (survives `docker restart` + `nuke_docker.sh` — verified 29/08)
 
-OpenCode session data lives on the **host** (`~/.local/share/opencode/opencode.db`) and run logs live in the bind-mounted `logs/` volume — both survive a full Docker nuke. What did NOT survive was reachability:
+Container opencode DB (`/root/.local/share/opencode/opencode.db` inside `elia-subworker-srv`, 2.8M) is **bind-mounted** to host `~/EliaAI/subworkers/server/opencode-data/opencode.db` — separate file from host TUI DB (`~/.local/share/opencode/opencode.db` 300M, 40k sessions), no concurrent corruption. Run logs live in bind-mounted `logs/` volume. Both survive `docker restart`, `docker rm`, `colima stop`, and `nuke_docker.sh`.
 
-| Failure point | Cause | Fix |
-|---------------|-------|-----|
-| Scheduler session map lost | `_last_session_ids` was an in-memory dict, wiped on container recreation | Persisted to `logs/scheduler_state.json` (bind-mounted → host); loaded at startup, saved after every run |
-| Old sessions unreachable via API | Fallback listing called `list_sessions()` without limit → server returns only the 100 most recent of ~40k sessions | Routes now request `limit=2000`; `OpenCodeClient.list_sessions(limit)` accepts any cap |
+| Failure point | Cause | Fix (verified) |
+|---------------|-------|----------------|
+| Scheduler session map lost | `_last_session_ids` was in-memory dict, wiped on container recreation | Persisted to `logs/scheduler_state.json` (bind-mounted → host `/data/logs/`); loaded at startup, saved after every run — verified `refund-hunter` still 5 sessions after `docker restart` |
+| Old sessions unreachable via API | `list_sessions()` without limit → server returns only 100 most recent | Routes now `list_sessions(limit=200)` + filter `agent==agent_id OR directory startswith /data/subworkers/{name}` (container path) → finds running session even when `x-opencode-directory` header used |
+| Stale ID after DB wipe | `scheduler_state.json` pointed to `ses_fb4dcb...` from 01:30 which 404s after DB recreate | `GET /sessions/{name}` now catches 404, tries `get_running_session_id()` before 500; `GET /sessions/{name}/list` always merges `running_sid` + `scheduler_sid` into list |
+| Only 1 session shown after restart | Container DB was ephemeral (no volume) → `down` wiped 2.9M DB, only stale fallback remained | Added volume `opencode-data:/root/.local/share/opencode:rw` — verified `opencode-data/opencode.db` persists 2.8M across `docker restart` |
+| Container shows UTC 01:30 when host is 02:30 | No `TZ` set, `tzdata` installed but default UTC | `Dockerfile` + `docker-compose.yml` set `TZ=Africa/Casablanca` — verified `docker exec date` (`02:39 +01`) matches host `date` |
 
-State file: `logs/scheduler_state.json` on host (`/data/logs/` in container), written atomically (tmp + rename) after each subworker run. Corrupt or missing file is logged and ignored — scheduler starts empty.
+State files:
+- `logs/scheduler_state.json` on host (`/data/logs/` in container), written atomically (tmp + rename) after each run. Verified `{"refund-hunter":"ses_fb2de82a…"}` persists.
+- `server/opencode-data/opencode.db` (2.8M) — **do NOT delete** unless you want to wipe all container sessions; host DB (`~/.local/share/opencode`) is untouched.
 
 ---
 
@@ -661,11 +671,12 @@ State file: `logs/scheduler_state.json` on host (`/data/logs/` in container), wr
 
 ColimaBar (menu bar app, source `~/Documents/EliaTopBar`) connects to the server for real-time control:
 
-- ⚡ Trigger Now / Manual Run → `POST /trigger/{name}`
+- ⚡ Trigger Now / Manual Run → `POST /trigger/{name}` (creates NEW session)
+- 🔄 Continue (LogViewer badge) → `POST /sessions/{name}/{session_id}/continue` `{"message":"continue the tasks"}` — re-injects into an EXISTING old session, manual retry
 - ▶️ Enable / ⏸️ Disable → `POST /enable|/disable/{name}`
-- 📋 View Logs… → `GET /sessions/{name}?limit=30` (reasoning, tools, text from OpenCode)
+- 📋 View Logs… → `GET /sessions/{name}/list` + `GET /sessions/{name}?session_id=…` (reasoning, tools, text; Continue badge on right of timestamp)
 - 🔗 Change Server URL… → UserDefaults `"subworkerServerURL"` (**default is `http://localhost:8080` — set it to `http://localhost:5656`** on fresh setups; the real server runs on 5656)
-- Live status: WS `/ws` with HTTP `/status` fallback (5s) + `/server/health` (30s)
+- Live status: WS `/ws?token=…` with HTTP `/status` fallback (5s) + `/server/health` (30s) — requires `?token=` or `Authorization: Bearer`
 
 > ⚠️ `lastError` / `lastCompleted` are only delivered over WebSocket events, not in HTTP `/status`. The WS error event currently carries only the subworker `name` → menu bar shows "Unknown error".
 
@@ -680,6 +691,9 @@ Full deep-dive: [`docs/SUBWORKERS_COLIMABAR_CONNECTION.md`](../docs/SUBWORKERS_C
 | Agent not responding | Check server: `curl http://localhost:5656/status` + `docker ps \| grep elia-subworker-srv` |
 | ColimaBar shows Disconnected | Set 🔗 Change Server URL… → `http://localhost:5656` (default is phantom 8080) |
 | Server container not running | `cd ~/EliaAI/subworkers/server && docker compose up --build` (or restart via `EliaUI.command`) |
+| OpenCode server down / `<defunct>` | `docker exec elia-subworker-srv ps aux` shows `[opencode] <defunct>` → `docker restart elia-subworker-srv` (healthcheck `global/health` fails, FastAPI `All connection attempts failed`) |
+| Only 1 session after `docker restart` | Container DB was ephemeral pre-`opencode-data` volume — now `server/opencode-data/opencode.db` (2.8M) persists; verify `curl /sessions/{name}/list` shows 4-5, not 1 stale fallback |
+| Time is 1h off (01:30 vs 02:30) | Check `TZ` — `docker exec date` must match host `date` (`Africa/Casablanca` `+01`); fix `Dockerfile` ENV + `docker-compose.yml` `environment: TZ` |
 | OpenCode server down (auto-restart exhausted) | Check `/server/health`, restart via `POST /server/restart` or `~/EliaAI/scripts/opencode-serve.sh 4096` |
 | Schedule not firing | Verify entry in `subworkers.json` (`enabled: true`, hours/minute) — server hot-reloads config |
 | Trigger skips with ".enabled not found" | Create `subworkers/<agent-id>/.enabled` or run with `--force` flag for manual terminal runs |
