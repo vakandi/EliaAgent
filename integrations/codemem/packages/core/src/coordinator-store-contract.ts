@@ -1,3 +1,21 @@
+import type { RecipientReviewedIntentV1 } from "./recipient-reviewed-intent.js";
+
+/**
+ * Normalize a caller-supplied invite expiry to a canonical UTC ISO-8601
+ * (`...Z`) string. Invite lookups filter with a SQL `expires_at > ?` string
+ * comparison against `new Date().toISOString()`, which is only correct when
+ * stored values share that exact format — a `+00:00` offset or date-only value
+ * would compare wrong. Shared by both coordinator store implementations.
+ */
+export function normalizeInviteExpiresAt(value: string): string {
+	const trimmed = value.trim();
+	const parsed = new Date(trimmed);
+	if (!trimmed || Number.isNaN(parsed.getTime())) {
+		throw new Error("expiresAt must be a valid date.");
+	}
+	return parsed.toISOString();
+}
+
 export interface CoordinatorGroup {
 	group_id: string;
 	display_name: string | null;
@@ -10,9 +28,14 @@ export interface CoordinatorEnrollment {
 	device_id: string;
 	public_key: string;
 	fingerprint: string;
+	identity_id: string | null;
 	display_name: string | null;
 	enabled: number;
 	created_at: string;
+	/** Authenticated presence expiry for this exact group/device enrollment. */
+	presence_expires_at?: string;
+	/** Token-free capabilities from the same authenticated presence record. */
+	presence_capabilities?: Record<string, unknown>;
 }
 
 export interface CoordinatorInvite {
@@ -25,6 +48,110 @@ export interface CoordinatorInvite {
 	created_by: string | null;
 	team_name_snapshot: string | null;
 	revoked_at: string | null;
+	/** Null/absent identifies a legacy enrollment invite, which grants no project intent by itself. */
+	operation_id?: string | null;
+	/** Digest reference only; the reviewed project set remains server-owned operation state. */
+	reviewed_project_set_digest?: string | null;
+	token_digest?: string | null;
+	inviter_actor_id?: string | null;
+	inviter_display_name?: string | null;
+	inviter_device_id?: string | null;
+	pending_person_id?: string | null;
+	project_summaries_json?: string | null;
+	project_intent_json?: string | null;
+	consumed_at?: string | null;
+	bound_device_id?: string | null;
+	bound_public_key?: string | null;
+	bound_fingerprint?: string | null;
+	recipient_actor_id?: string | null;
+	recipient_display_name?: string | null;
+	recipient_device_display_name?: string | null;
+	trust_state?: string | null;
+	bootstrap_grant_id?: string | null;
+	/** Explicit lifecycle kind. Null is retained only for pre-migration rows. */
+	invite_kind?: CoordinatorInviteKind | null;
+	/** Policy Team identifier for team-member invitations; never a coordinator group grant. */
+	policy_team_id?: string | null;
+	/** Identity fixed by an add-device invitation. */
+	target_identity_id?: string | null;
+	/** Opaque Identity minted by the coordinator for a Team-member invitation. */
+	assigned_identity_id?: string | null;
+	/** Digest of the server-owned preview reviewed before invitation creation. */
+	reviewed_preview_digest?: string | null;
+	/** Canonical JSON for the inviter-reviewed access intent. */
+	reviewed_intent_json?: string | null;
+}
+
+export type CoordinatorInviteKind =
+	| "legacy_enrollment"
+	| "project_share"
+	| "team_member"
+	| "add_device";
+
+export type CoordinatorRecipientInviteKind = Extract<
+	CoordinatorInviteKind,
+	"team_member" | "add_device"
+>;
+
+const COORDINATOR_ASSIGNED_IDENTITY_PATTERN = /^identity:[A-Za-z0-9_-]{18,24}$/u;
+
+export function isCoordinatorAssignedIdentityId(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		value === value.trim() &&
+		COORDINATOR_ASSIGNED_IDENTITY_PATTERN.test(value)
+	);
+}
+
+export function recipientInviteAuthoritativeIdentityId(value: {
+	kind: CoordinatorRecipientInviteKind;
+	assigned_identity_id?: unknown;
+	target_identity_id?: unknown;
+}): string {
+	return String(
+		value.kind === "team_member"
+			? (value.assigned_identity_id ?? "")
+			: (value.target_identity_id ?? ""),
+	).trim();
+}
+
+export interface CoordinatorProjectInviteSummary {
+	display_name: string;
+	existing_memory_count: number;
+}
+
+export interface CoordinatorProjectInviteAcceptance {
+	status: "accepted" | "existing";
+	invite: CoordinatorInvite;
+	enrollment: CoordinatorEnrollment;
+	seed_enrollment: CoordinatorEnrollment | null;
+	bootstrap_grant: CoordinatorBootstrapGrant | null;
+}
+
+export type CoordinatorRecipientInviteInspection =
+	| {
+			kind: "team_member";
+			invite: CoordinatorInvite;
+			policy_team_id: string;
+			assigned_identity_id: string;
+			reviewed_preview_digest: string;
+			reviewed_intent?: RecipientReviewedIntentV1;
+			bound: boolean;
+	  }
+	| {
+			kind: "add_device";
+			invite: CoordinatorInvite;
+			target_identity_id: string;
+			reviewed_preview_digest: string;
+			reviewed_intent?: RecipientReviewedIntentV1;
+			bound: boolean;
+	  };
+
+export interface CoordinatorRecipientInviteAcceptance {
+	status: "accepted" | "existing";
+	invite: CoordinatorInvite;
+	reviewed_intent?: RecipientReviewedIntentV1;
+	bootstrap_grant?: CoordinatorBootstrapGrant | null;
 }
 
 export interface CoordinatorJoinRequest {
@@ -92,11 +219,64 @@ export interface CoordinatorBootstrapGrant {
 	revoked_at: string | null;
 }
 
+export interface CoordinatorScope {
+	scope_id: string;
+	label: string;
+	kind: string;
+	authority_type: string;
+	coordinator_id: string | null;
+	group_id: string | null;
+	manifest_issuer_device_id: string | null;
+	membership_epoch: number;
+	manifest_hash: string | null;
+	status: string;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface CoordinatorScopeMembership {
+	scope_id: string;
+	device_id: string;
+	role: string;
+	status: string;
+	membership_epoch: number;
+	coordinator_id: string | null;
+	group_id: string | null;
+	manifest_issuer_device_id: string | null;
+	manifest_hash: string | null;
+	signed_manifest_json: string | null;
+	updated_at: string;
+}
+
+export type CoordinatorScopeMembershipAuditAction = "grant" | "revoke";
+
+export interface CoordinatorScopeMembershipAuditEvent {
+	event_id: number;
+	effect_id: string | null;
+	action: CoordinatorScopeMembershipAuditAction;
+	scope_id: string;
+	device_id: string;
+	role: string | null;
+	status: string;
+	membership_epoch: number;
+	previous_role: string | null;
+	previous_status: string | null;
+	previous_membership_epoch: number | null;
+	coordinator_id: string | null;
+	group_id: string | null;
+	actor_type: string | null;
+	actor_id: string | null;
+	manifest_hash: string | null;
+	created_at: string;
+}
+
 export interface CoordinatorEnrollDeviceInput {
 	deviceId: string;
 	fingerprint: string;
 	publicKey: string;
 	displayName?: string | null;
+	/** Null or omitted means the enrollment has no authoritative issuance binding. */
+	identityId?: string | null;
 }
 
 export interface CoordinatorCreateInviteInput {
@@ -104,6 +284,50 @@ export interface CoordinatorCreateInviteInput {
 	policy: string;
 	expiresAt: string;
 	createdBy?: string | null;
+	operationId?: string | null;
+	reviewedProjectSetDigest?: string | null;
+	inviterActorId?: string | null;
+	inviterDisplayName?: string | null;
+	inviterDeviceId?: string | null;
+	pendingPersonId?: string | null;
+	projectSummaries?: CoordinatorProjectInviteSummary[] | null;
+	projectIntent?: Array<CoordinatorProjectInviteSummary & { canonical_identity: string }> | null;
+	inviteKind?: CoordinatorInviteKind | null;
+	policyTeamId?: string | null;
+	targetIdentityId?: string | null;
+	reviewedPreviewDigest?: string | null;
+	reviewedIntent?: unknown;
+}
+
+export interface CoordinatorConsumeProjectInviteInput {
+	token: string;
+	operationId: string;
+	deviceId: string;
+	publicKey: string;
+	fingerprint: string;
+	recipientActorId: string;
+	recipientDisplayName: string;
+	deviceDisplayName: string;
+	/** Runtime-authoritative timestamp used for expiry, binding, and grant creation. */
+	now: string;
+}
+
+export interface CoordinatorInspectRecipientInviteInput {
+	token: string;
+	now: string;
+}
+
+export interface CoordinatorConsumeRecipientInviteInput {
+	token: string;
+	inviteKind: CoordinatorRecipientInviteKind;
+	identityId: string;
+	deviceId: string;
+	publicKey: string;
+	fingerprint: string;
+	recipientDisplayName?: string | null;
+	deviceDisplayName?: string | null;
+	/** Runtime-authoritative timestamp used for expiry and binding. */
+	now: string;
 }
 
 export interface CoordinatorCreateJoinRequestInput {
@@ -134,6 +358,19 @@ export interface CoordinatorCreateReciprocalApprovalInput {
 	groupId: string;
 	requestingDeviceId: string;
 	requestedDeviceId: string;
+	/** Complete only this exact pending request in the reverse direction. */
+	expectedIncomingRequestId?: string;
+}
+
+export const RECIPROCAL_APPROVAL_REQUEST_CHANGED = "reciprocal_approval_request_changed" as const;
+
+export class CoordinatorReciprocalApprovalRequestChangedError extends Error {
+	readonly code = RECIPROCAL_APPROVAL_REQUEST_CHANGED;
+
+	constructor() {
+		super(RECIPROCAL_APPROVAL_REQUEST_CHANGED);
+		this.name = "CoordinatorReciprocalApprovalRequestChangedError";
+	}
 }
 
 export interface CoordinatorCreateBootstrapGrantInput {
@@ -142,6 +379,77 @@ export interface CoordinatorCreateBootstrapGrantInput {
 	workerDeviceId: string;
 	expiresAt: string;
 	createdBy?: string | null;
+}
+
+export interface CoordinatorCreateScopeInput {
+	scopeId: string;
+	label: string;
+	kind?: string | null;
+	authorityType?: string | null;
+	coordinatorId?: string | null;
+	groupId?: string | null;
+	manifestIssuerDeviceId?: string | null;
+	membershipEpoch?: number | null;
+	manifestHash?: string | null;
+	status?: string | null;
+}
+
+export interface CoordinatorUpdateScopeInput {
+	/** Internal sharing-domain identifier (`scope_id`). */
+	scopeId: string;
+	/** User-facing Sharing domain label. Omitted fields keep existing metadata. */
+	label?: string | null;
+	kind?: string | null;
+	authorityType?: string | null;
+	coordinatorId?: string | null;
+	groupId?: string | null;
+	manifestIssuerDeviceId?: string | null;
+	membershipEpoch?: number | null;
+	manifestHash?: string | null;
+	status?: string | null;
+}
+
+export interface CoordinatorListScopesInput {
+	coordinatorId?: string | null;
+	groupId?: string | null;
+	status?: string | null;
+	includeInactive?: boolean;
+}
+
+export interface CoordinatorGrantScopeMembershipInput {
+	effectId: string;
+	scopeId: string;
+	deviceId: string;
+	role?: string | null;
+	membershipEpoch?: number | null;
+	/** Optional assertion; persisted authority is derived from the referenced scope. */
+	coordinatorId?: string | null;
+	/** Optional assertion; persisted authority is derived from the referenced scope. */
+	groupId?: string | null;
+	manifestIssuerDeviceId?: string | null;
+	manifestHash?: string | null;
+	signedManifestJson?: string | null;
+	actorType?: string | null;
+	actorId?: string | null;
+}
+
+export interface CoordinatorRevokeScopeMembershipInput {
+	effectId: string;
+	scopeId: string;
+	deviceId: string;
+	/** Optional assertion; persisted authority is derived from the referenced scope. */
+	groupId?: string | null;
+	membershipEpoch?: number | null;
+	manifestHash?: string | null;
+	signedManifestJson?: string | null;
+	actorType?: string | null;
+	actorId?: string | null;
+}
+
+export interface CoordinatorListScopeMembershipAuditInput {
+	scopeId: string;
+	deviceId?: string | null;
+	limit?: number | null;
 }
 
 export interface CoordinatorListReciprocalApprovalsInput {
@@ -161,7 +469,11 @@ export interface CoordinatorStore {
 	unarchiveGroup(groupId: string): Promise<boolean>;
 	enrollDevice(groupId: string, opts: CoordinatorEnrollDeviceInput): Promise<void>;
 	listEnrolledDevices(groupId: string, includeDisabled?: boolean): Promise<CoordinatorEnrollment[]>;
-	getEnrollment(groupId: string, deviceId: string): Promise<CoordinatorEnrollment | null>;
+	getEnrollment(
+		groupId: string,
+		deviceId: string,
+		includeDisabled?: boolean,
+	): Promise<CoordinatorEnrollment | null>;
 	renameDevice(groupId: string, deviceId: string, displayName: string): Promise<boolean>;
 	setDeviceEnabled(groupId: string, deviceId: string, enabled: boolean): Promise<boolean>;
 	removeDevice(groupId: string, deviceId: string): Promise<boolean>;
@@ -169,6 +481,16 @@ export interface CoordinatorStore {
 	cleanupNonces(cutoff: string): Promise<void>;
 	createInvite(opts: CoordinatorCreateInviteInput): Promise<CoordinatorInvite>;
 	getInviteByToken(token: string): Promise<CoordinatorInvite | null>;
+	getInviteByTokenForInspection(token: string): Promise<CoordinatorInvite | null>;
+	inspectRecipientInvite(
+		opts: CoordinatorInspectRecipientInviteInput,
+	): Promise<CoordinatorRecipientInviteInspection | null>;
+	consumeProjectInvite(
+		opts: CoordinatorConsumeProjectInviteInput,
+	): Promise<CoordinatorProjectInviteAcceptance>;
+	consumeRecipientInvite(
+		opts: CoordinatorConsumeRecipientInviteInput,
+	): Promise<CoordinatorRecipientInviteAcceptance>;
 	listInvites(groupId: string): Promise<CoordinatorInvite[]>;
 	createJoinRequest(opts: CoordinatorCreateJoinRequestInput): Promise<CoordinatorJoinRequest>;
 	listJoinRequests(groupId: string, status?: string): Promise<CoordinatorJoinRequest[]>;
@@ -181,6 +503,20 @@ export interface CoordinatorStore {
 	createBootstrapGrant(
 		opts: CoordinatorCreateBootstrapGrantInput,
 	): Promise<CoordinatorBootstrapGrant>;
+	createScope(opts: CoordinatorCreateScopeInput): Promise<CoordinatorScope>;
+	updateScope(opts: CoordinatorUpdateScopeInput): Promise<CoordinatorScope | null>;
+	listScopes(opts?: CoordinatorListScopesInput): Promise<CoordinatorScope[]>;
+	grantScopeMembership(
+		opts: CoordinatorGrantScopeMembershipInput,
+	): Promise<CoordinatorScopeMembership>;
+	revokeScopeMembership(opts: CoordinatorRevokeScopeMembershipInput): Promise<boolean>;
+	listScopeMemberships(
+		scopeId: string,
+		includeRevoked?: boolean,
+	): Promise<CoordinatorScopeMembership[]>;
+	listScopeMembershipAuditEvents(
+		opts: CoordinatorListScopeMembershipAuditInput,
+	): Promise<CoordinatorScopeMembershipAuditEvent[]>;
 	getBootstrapGrant(grantId: string): Promise<CoordinatorBootstrapGrant | null>;
 	listBootstrapGrants(groupId: string): Promise<CoordinatorBootstrapGrant[]>;
 	revokeBootstrapGrant(grantId: string, revokedAt?: string): Promise<boolean>;

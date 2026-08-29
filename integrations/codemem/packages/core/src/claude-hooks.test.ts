@@ -8,21 +8,335 @@
  *  - buildIngestPayloadFromHook: session context fields
  */
 
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-	buildIngestPayloadFromHook,
-	buildRawEventEnvelopeFromHook,
-	mapClaudeHookPayload,
+	buildIngestPayloadFromHook as buildIngestPayloadFromHookWithPolicy,
+	buildRawEventEnvelopeFromHook as buildRawEventEnvelopeFromHookWithPolicy,
+	mapClaudeHookPayload as mapClaudeHookPayloadWithPolicy,
+	TRUSTED_HOOK_MAPPER_OPTIONS,
 } from "./claude-hooks.js";
+import {
+	extractHookTranscript,
+	extractHookTranscriptWithOutcome,
+	MAX_HOOK_TRANSCRIPT_BYTES,
+} from "./hook-transcript.js";
+
+const goldenFixtures = JSON.parse(
+	readFileSync(new URL("./fixtures/adapter-normalizer-golden.json", import.meta.url), "utf8"),
+) as {
+	claude: Array<{
+		name: string;
+		now?: string;
+		transcript?: string;
+		input: Record<string, unknown>;
+		expected: Record<string, unknown>;
+	}>;
+};
+
+function restrictedTranscriptPolicy(root: string) {
+	return { trust: "restricted" as const, approvedRoots: [root] };
+}
+
+const mapClaudeHookPayload = (payload: Record<string, unknown>) =>
+	mapClaudeHookPayloadWithPolicy(payload, TRUSTED_HOOK_MAPPER_OPTIONS);
+const buildRawEventEnvelopeFromHook = (payload: Record<string, unknown>) =>
+	buildRawEventEnvelopeFromHookWithPolicy(payload, TRUSTED_HOOK_MAPPER_OPTIONS);
+const buildIngestPayloadFromHook = (payload: Record<string, unknown>) =>
+	buildIngestPayloadFromHookWithPolicy(payload, TRUSTED_HOOK_MAPPER_OPTIONS);
+
+describe("extractHookTranscript", () => {
+	it("reads an absolute transcript beneath an approved root", () => {
+		const root = mkdtempSync(join(tmpdir(), "codemem-transcript-root-"));
+		try {
+			const path = join(root, "session.jsonl");
+			writeFileSync(path, '{"role":"assistant","content":"allowed"}\n');
+			expect(extractHookTranscript(path, { policy: restrictedTranscriptPolicy(root) })).toEqual([
+				"allowed",
+				null,
+			]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a restricted relative transcript even beneath the real cwd", () => {
+		const cwd = mkdtempSync(join(tmpdir(), "codemem-transcript-cwd-"));
+		try {
+			writeFileSync(join(cwd, "session.jsonl"), '{"role":"assistant","content":"relative"}\n');
+			expect(
+				extractHookTranscript("session.jsonl", {
+					policy: restrictedTranscriptPolicy(join(cwd, "unused-root")),
+					cwd,
+				}),
+			).toEqual([null, null]);
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
+		"../outside.jsonl",
+		"../../outside.jsonl",
+	])("rejects relative traversal %s", (transcriptPath) => {
+		const parent = mkdtempSync(join(tmpdir(), "codemem-transcript-traversal-"));
+		const cwd = join(parent, "cwd");
+		mkdirSync(cwd);
+		writeFileSync(join(parent, "outside.jsonl"), '{"role":"assistant","content":"outside"}\n');
+		try {
+			expect(
+				extractHookTranscript(transcriptPath, {
+					policy: restrictedTranscriptPolicy(parent),
+					cwd,
+				}),
+			).toEqual([null, null]);
+		} finally {
+			rmSync(parent, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects an absolute path beneath a sibling with the same prefix", () => {
+		const parent = mkdtempSync(join(tmpdir(), "codemem-transcript-prefix-"));
+		const root = join(parent, "approved");
+		const sibling = join(parent, "approved-sibling");
+		mkdirSync(root);
+		mkdirSync(sibling);
+		const path = join(sibling, "session.jsonl");
+		writeFileSync(path, '{"role":"assistant","content":"outside"}\n');
+		try {
+			expect(extractHookTranscript(path, { policy: restrictedTranscriptPolicy(root) })).toEqual([
+				null,
+				null,
+			]);
+		} finally {
+			rmSync(parent, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a relative symlink escape from cwd", () => {
+		const parent = mkdtempSync(join(tmpdir(), "codemem-transcript-symlink-"));
+		const cwd = join(parent, "cwd");
+		mkdirSync(cwd);
+		const outside = join(parent, "outside.jsonl");
+		writeFileSync(outside, '{"role":"assistant","content":"outside"}\n');
+		symlinkSync(outside, join(cwd, "linked.jsonl"));
+		try {
+			expect(
+				extractHookTranscript("linked.jsonl", {
+					policy: restrictedTranscriptPolicy(cwd),
+					cwd,
+				}),
+			).toEqual([null, null]);
+		} finally {
+			rmSync(parent, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects an absolute symlink beneath an approved root that escapes it", () => {
+		const parent = mkdtempSync(join(tmpdir(), "codemem-transcript-root-symlink-"));
+		const root = join(parent, "approved");
+		mkdirSync(root);
+		const outside = join(parent, "outside.jsonl");
+		writeFileSync(outside, '{"role":"assistant","content":"outside"}\n');
+		const linked = join(root, "linked.jsonl");
+		symlinkSync(outside, linked);
+		try {
+			expect(extractHookTranscript(linked, { policy: restrictedTranscriptPolicy(root) })).toEqual([
+				null,
+				null,
+			]);
+		} finally {
+			rmSync(parent, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a non-file beneath an approved root", () => {
+		const root = mkdtempSync(join(tmpdir(), "codemem-transcript-directory-"));
+		const directory = join(root, "session.jsonl");
+		mkdirSync(directory);
+		try {
+			expect(
+				extractHookTranscript(directory, { policy: restrictedTranscriptPolicy(root) }),
+			).toEqual([null, null]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("returns no extraction for a missing file", () => {
+		const root = mkdtempSync(join(tmpdir(), "codemem-transcript-missing-"));
+		try {
+			expect(
+				extractHookTranscript(join(root, "missing.jsonl"), {
+					policy: restrictedTranscriptPolicy(root),
+				}),
+			).toEqual([null, null]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("finds the final assistant record in a transcript larger than 16 MiB", () => {
+		const root = mkdtempSync(join(tmpdir(), "codemem-transcript-tail-"));
+		try {
+			const path = join(root, "session.jsonl");
+			writeFileSync(
+				path,
+				`${"x".repeat(MAX_HOOK_TRANSCRIPT_BYTES + 1024)}\n{"role":"assistant","content":"tail record"}\n`,
+			);
+			expect(extractHookTranscript(path, { policy: restrictedTranscriptPolicy(root) })).toEqual([
+				"tail record",
+				null,
+			]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not read the full retained window when the final assistant record is near the tail", () => {
+		const root = mkdtempSync(join(tmpdir(), "codemem-transcript-bounded-scan-"));
+		try {
+			const path = join(root, "session.jsonl");
+			writeFileSync(
+				path,
+				`${"x".repeat(MAX_HOOK_TRANSCRIPT_BYTES + 1024)}\n{"role":"assistant","content":"tail record"}\n`,
+			);
+			let bytesRead = 0;
+			const result = extractHookTranscriptWithOutcome(path, {
+				policy: restrictedTranscriptPolicy(root),
+				onBytesRead: (count) => {
+					bytesRead += count;
+				},
+			});
+			expect(result).toEqual({ extraction: ["tail record", null], outcome: "ok" });
+			expect(bytesRead).toBeLessThan(256 * 1024);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("decodes UTF-8 correctly when a code point crosses a read-chunk boundary", () => {
+		const root = mkdtempSync(join(tmpdir(), "codemem-transcript-utf8-boundary-"));
+		try {
+			const path = join(root, "session.jsonl");
+			const prefix = '{"role":"assistant","content":"';
+			const filler = "a".repeat(64 * 1024 - Buffer.byteLength(prefix) - 1);
+			const content = `${filler}🙂tail`;
+			writeFileSync(path, `${prefix}${content}"}\r\n`);
+			expect(extractHookTranscript(path, { policy: restrictedTranscriptPolicy(root) })).toEqual([
+				content,
+				null,
+			]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("continues scanning after a non-assistant record spans read chunks", () => {
+		const root = mkdtempSync(join(tmpdir(), "codemem-transcript-spanning-record-"));
+		try {
+			const path = join(root, "session.jsonl");
+			const oversizedUserRecord = JSON.stringify({ role: "user", content: "u".repeat(96 * 1024) });
+			writeFileSync(
+				path,
+				`{"role":"assistant","content":"earlier result"}\n${oversizedUserRecord}\n`,
+			);
+			expect(extractHookTranscript(path, { policy: restrictedTranscriptPolicy(root) })).toEqual([
+				"earlier result",
+				null,
+			]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("preserves a complete record that starts at the retained tail boundary", () => {
+		const root = mkdtempSync(join(tmpdir(), "codemem-transcript-tail-boundary-"));
+		try {
+			const path = join(root, "session.jsonl");
+			const record = '{"role":"assistant","content":"boundary record"}\n';
+			writeFileSync(path, `x\n${record}${" ".repeat(MAX_HOOK_TRANSCRIPT_BYTES - record.length)}`);
+			expect(extractHookTranscript(path, { policy: restrictedTranscriptPolicy(root) })).toEqual([
+				"boundary record",
+				null,
+			]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("returns no extraction when the retained tail contains no complete record", () => {
+		const root = mkdtempSync(join(tmpdir(), "codemem-transcript-oversized-"));
+		try {
+			const path = join(root, "session.jsonl");
+			writeFileSync(path, `${"x".repeat(MAX_HOOK_TRANSCRIPT_BYTES + 1024)}\n`);
+			expect(
+				extractHookTranscriptWithOutcome(path, { policy: restrictedTranscriptPolicy(root) }),
+			).toEqual({ extraction: [null, null], outcome: "no_complete_record" });
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("distinguishes a complete transcript with no assistant record", () => {
+		const root = mkdtempSync(join(tmpdir(), "codemem-transcript-no-assistant-"));
+		try {
+			const path = join(root, "session.jsonl");
+			writeFileSync(path, '{"role":"user","content":"hello"}\n{malformed}\n');
+			expect(
+				extractHookTranscriptWithOutcome(path, { policy: restrictedTranscriptPolicy(root) }),
+			).toEqual({ extraction: [null, null], outcome: "no_assistant_record" });
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
 
 // ---------------------------------------------------------------------------
 // mapClaudeHookPayload — event type mapping
 // ---------------------------------------------------------------------------
 
 describe("mapClaudeHookPayload", () => {
+	describe("frozen normalizer fixtures", () => {
+		it.each(goldenFixtures.claude)("matches $name", (fixture) => {
+			const directory = fixture.transcript
+				? mkdtempSync(join(tmpdir(), "codemem-claude-golden-"))
+				: null;
+			try {
+				const transcriptPath = directory ? join(directory, "transcript.jsonl") : null;
+				if (transcriptPath && fixture.transcript) writeFileSync(transcriptPath, fixture.transcript);
+				const payload = Object.fromEntries(
+					Object.entries(fixture.input).map(([key, value]) => [
+						key,
+						value === "$TRANSCRIPT" ? transcriptPath : value,
+					]),
+				);
+				if (fixture.now) {
+					vi.useFakeTimers();
+					vi.setSystemTime(new Date(fixture.now));
+				}
+				const first = mapClaudeHookPayload(payload);
+				const retry = mapClaudeHookPayload(payload);
+				expect(first).not.toBeNull();
+				expect(retry?.event_id).toBe(first?.event_id);
+				expect(first?.source).toBe(fixture.expected.source);
+				expect(first?.event_type).toBe(fixture.expected.event_type);
+				expect(first?.meta.event_id_algo).toBe(fixture.expected.event_id_algo);
+				if (fixture.expected.payload) expect(first?.payload).toEqual(fixture.expected.payload);
+				if (fixture.expected.status) expect(first?.payload.status).toBe(fixture.expected.status);
+				if (fixture.expected.text) expect(first?.payload.text).toBe(fixture.expected.text);
+				if (fixture.expected.unknown_field) {
+					expect(first?.meta.hook_fields).toHaveProperty(String(fixture.expected.unknown_field));
+				}
+			} finally {
+				vi.useRealTimers();
+				if (directory) rmSync(directory, { recursive: true, force: true });
+			}
+		});
+	});
+
 	describe("UserPromptSubmit → prompt", () => {
 		it("maps prompt text and meta", () => {
 			const event = mapClaudeHookPayload({
@@ -216,6 +530,30 @@ describe("mapClaudeHookPayload", () => {
 			expect(event).not.toBeNull();
 			expect(event?.event_type).toBe("assistant");
 			expect(event?.payload.text).toBe("assistant from transcript");
+		});
+
+		it("keeps transcript fallback best-effort when the outcome callback throws", () => {
+			const dir = mkdtempSync(join(tmpdir(), "codemem-test-callback-"));
+			try {
+				const transcriptPath = join(dir, "transcript.jsonl");
+				writeFileSync(transcriptPath, '{"role":"assistant","content":"still mapped"}\n');
+				const event = mapClaudeHookPayloadWithPolicy(
+					{
+						hook_event_name: "Stop",
+						session_id: "sess-stop-callback",
+						transcript_path: transcriptPath,
+					},
+					{
+						...TRUSTED_HOOK_MAPPER_OPTIONS,
+						onTranscriptOutcome: () => {
+							throw new Error("diagnostics unavailable");
+						},
+					},
+				);
+				expect(event?.payload.text).toBe("still mapped");
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
 		});
 
 		it("uses relative transcript path with cwd", () => {
@@ -440,6 +778,7 @@ describe("mapClaudeHookPayload", () => {
 
 			expect(event?.schema_version).toBe("1.0");
 			expect(event?.source).toBe("claude");
+			expect(event?.meta.event_id_algo).toBe("claude/1");
 		});
 	});
 });
@@ -758,7 +1097,11 @@ describe("POST /api/claude-hooks via viewer-server", () => {
 		});
 
 		expect(res.status).toBe(200);
-		expect(await res.json()).toEqual({ inserted: 0, skipped: 1 });
+		expect(await res.json()).toEqual({
+			inserted: 0,
+			skipped: 1,
+			skip_reason: "unsupported_hook",
+		});
 	});
 
 	it("returns 400 for invalid JSON", async () => {
@@ -782,6 +1125,10 @@ describe("POST /api/claude-hooks via viewer-server", () => {
 
 		// Should NOT be 403 — CLI callers don't send Origin
 		expect(res.status).toBe(200);
-		expect(await res.json()).toEqual({ inserted: 0, skipped: 1 });
+		expect(await res.json()).toEqual({
+			inserted: 0,
+			skipped: 1,
+			skip_reason: "unsupported_hook",
+		});
 	});
 });

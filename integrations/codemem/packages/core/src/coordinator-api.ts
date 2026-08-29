@@ -9,15 +9,35 @@ import type { Context } from "hono";
 import { Hono } from "hono";
 import type { InvitePayload } from "./coordinator-invites.js";
 import { encodeInvitePayload, inviteLink } from "./coordinator-invites.js";
+import {
+	CoordinatorMembershipError,
+	SCOPE_MEMBERSHIP_EFFECT_CONFLICT,
+} from "./coordinator-membership-effects.js";
 import type {
 	CoordinatorBootstrapGrantVerification,
 	CoordinatorEnrollment,
+	CoordinatorInviteKind,
+	CoordinatorScope,
+	CoordinatorScopeMembership,
 	CoordinatorStore,
 } from "./coordinator-store-contract.js";
+import { CoordinatorReciprocalApprovalRequestChangedError } from "./coordinator-store-contract.js";
+import { PROJECT_INVITE_PENDING_STATUS } from "./project-invite-acceptance.js";
+import {
+	normalizeHumanPresentationName,
+	normalizeProjectInviteSummaries,
+} from "./project-invite-identity.js";
+import { acceptedProjectIntentDigest, parseAcceptedProjectIntent } from "./project-share-intent.js";
+import {
+	RecipientReviewedIntentError,
+	type RecipientReviewedIntentV1,
+	verifyRecipientReviewedIntent,
+} from "./recipient-reviewed-intent.js";
 import {
 	createInMemoryRequestRateLimiter,
 	type InMemoryRequestRateLimiter,
 } from "./request-rate-limit.js";
+import { explainScopeMembershipRevocation } from "./scope-membership-semantics.js";
 import { DEFAULT_TIME_WINDOW_S } from "./sync-auth-constants.js";
 import { fingerprintPublicKey } from "./sync-fingerprint.js";
 
@@ -27,6 +47,7 @@ import { fingerprintPublicKey } from "./sync-fingerprint.js";
 
 const MAX_BODY_BYTES = 64 * 1024;
 const ADMIN_HEADER = "X-Codemem-Coordinator-Admin";
+const ADMIN_ACTOR_HEADER = "X-Codemem-Coordinator-Admin-Actor";
 const DEFAULT_COORDINATOR_READ_LIMIT = 120;
 const DEFAULT_COORDINATOR_MUTATION_LIMIT = 30;
 
@@ -126,9 +147,19 @@ async function authorizeRequest(
 		return { ok: false, error: "missing_headers", enrollment: null };
 	}
 
-	const enrollment = await store.getEnrollment(opts.groupId, deviceId);
+	const enrollment = await store.getEnrollment(opts.groupId, deviceId, true);
 	if (!enrollment) {
 		return { ok: false, error: "unknown_device", enrollment: null };
+	}
+	if (enrollment.enabled !== 1) {
+		return { ok: false, error: "device_disabled", enrollment: null };
+	}
+	const group = await store.getGroup(opts.groupId);
+	if (!group) {
+		return { ok: false, error: "group_not_found", enrollment: null };
+	}
+	if (group.archived_at) {
+		return { ok: false, error: "group_archived", enrollment: null };
 	}
 
 	let valid: boolean;
@@ -156,12 +187,27 @@ async function authorizeRequest(
 		return { ok: false, error: "nonce_replay", enrollment: null };
 	}
 
+	// Clock-source note: the nonce timestamp/cutoff below is driven by the
+	// injected runtime.now(), while the request freshness window is enforced
+	// inside requestVerifier using real Date.now() (see the worker's
+	// request-verifier). In production both are wall-clock so they agree. Under
+	// an injected/frozen clock they can diverge; the freshness check is not
+	// reachable from runtime.now(), so tests that freeze runtime.now() must keep
+	// timestamps within DEFAULT_TIME_WINDOW_S of real time for the verifier to
+	// accept them. Unifying the two would require threading the clock into the
+	// verifier signature across the core/worker boundary.
 	const cutoff = new Date(
 		new Date(createdAt).getTime() - DEFAULT_TIME_WINDOW_S * 2 * 1000,
 	).toISOString();
 	await cleanupNonces(store, cutoff);
 
 	return { ok: true, error: "ok", enrollment };
+}
+
+function authErrorStatus(error: string): 401 | 403 | 409 {
+	if (error === "device_disabled") return 403;
+	if (error === "group_archived") return 409;
+	return 401;
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +307,146 @@ export function createCoordinatorApp(
 		}
 	}
 
+	function optionalString(data: Record<string, unknown>, key: string): string | null {
+		const value = data[key];
+		if (value == null) return null;
+		return String(value).trim() || null;
+	}
+
+	function optionalHeaderString(value: string | null | undefined): string | null {
+		return value?.trim() || null;
+	}
+
+	function optionalNumber(data: Record<string, unknown>, key: string): number | null {
+		const value = data[key];
+		if (value == null || value === "") return null;
+		if (typeof value !== "number" && typeof value !== "string") return Number.NaN;
+		if (typeof value === "string") {
+			const trimmed = value.trim();
+			if (!trimmed) return Number.NaN;
+			const number = Number(trimmed);
+			return Number.isFinite(number) ? Math.trunc(number) : Number.NaN;
+		}
+		const number = value;
+		return Number.isFinite(number) ? Math.trunc(number) : Number.NaN;
+	}
+
+	function queryFlag(value: string | undefined | null): boolean {
+		return ["1", "true", "yes"].includes(
+			String(value ?? "")
+				.trim()
+				.toLowerCase(),
+		);
+	}
+
+	function storedProjectIntent(value: string | null | undefined) {
+		try {
+			return parseAcceptedProjectIntent(JSON.parse(value ?? ""));
+		} catch {
+			throw new Error("operation_intent_invalid");
+		}
+	}
+
+	function buildAcceptedProjectIntent(invite: {
+		operation_id?: string | null;
+		reviewed_project_set_digest?: string | null;
+		project_intent_json?: string | null;
+	}) {
+		const operationId = String(invite.operation_id ?? "").trim();
+		const reviewedProjectSetDigest = String(invite.reviewed_project_set_digest ?? "").trim();
+		if (
+			!/^share_[a-f0-9]{40}$/u.test(operationId) ||
+			!/^[a-f0-9]{64}$/u.test(reviewedProjectSetDigest)
+		) {
+			throw new Error("operation_intent_invalid");
+		}
+		const projects = storedProjectIntent(invite.project_intent_json);
+		const computedDigest = acceptedProjectIntentDigest(projects);
+		if (computedDigest !== reviewedProjectSetDigest) {
+			throw new Error("operation_intent_invalid");
+		}
+		return {
+			operation_id: operationId,
+			reviewed_project_set_digest: reviewedProjectSetDigest,
+			projects,
+		};
+	}
+
+	function storedProjectSummaries(
+		value: string | null | undefined,
+	): ReturnType<typeof normalizeProjectInviteSummaries> {
+		try {
+			return normalizeProjectInviteSummaries(JSON.parse(value ?? ""));
+		} catch {
+			throw new Error("operation_intent_invalid");
+		}
+	}
+
+	async function requireActiveAdminGroup(store: CoordinatorStore, groupId: string, c: Context) {
+		if (!groupId) return c.json({ error: "group_id_required" }, 400);
+		const group = await store.getGroup(groupId);
+		if (!group) return c.json({ error: "group_not_found" }, 404);
+		if (group.archived_at) return c.json({ error: "group_archived" }, 409);
+		return null;
+	}
+
+	async function findAdminScope(
+		store: CoordinatorStore,
+		groupId: string,
+		scopeId: string,
+		c: Context,
+	): Promise<{ scope: CoordinatorScope | null; response: Response | null }> {
+		const groupError = await requireActiveAdminGroup(store, groupId, c);
+		if (groupError) return { scope: null, response: groupError };
+		if (!scopeId) return { scope: null, response: c.json({ error: "scope_id_required" }, 400) };
+		const matching = await store.listScopes({ groupId, includeInactive: true });
+		const scope = matching.find((item) => item.scope_id === scopeId) ?? null;
+		if (!scope) return { scope: null, response: c.json({ error: "scope_not_found" }, 404) };
+		return { scope, response: null };
+	}
+
+	async function authorizeGroupMember(store: CoordinatorStore, groupId: string, c: Context) {
+		const auth = await authorizeRequest(store, runtime, requestVerifier, {
+			method: c.req.method,
+			url: c.req.url,
+			groupId,
+			body: new Uint8Array(0),
+			deviceId: c.req.header("X-Opencode-Device") ?? null,
+			signature: c.req.header("X-Opencode-Signature") ?? null,
+			timestamp: c.req.header("X-Opencode-Timestamp") ?? null,
+			nonce: c.req.header("X-Opencode-Nonce") ?? null,
+		});
+		if (!auth.ok || !auth.enrollment) {
+			return {
+				auth,
+				response:
+					rateLimitedResponse(c, c.req.path, false) ??
+					c.json({ error: auth.error }, authErrorStatus(auth.error)),
+			};
+		}
+		const limited = rateLimitedResponse(c, String(auth.enrollment.device_id), true);
+		return { auth, response: limited };
+	}
+
+	function activeCurrentMembership(
+		membership: CoordinatorScopeMembership,
+		scope: CoordinatorScope,
+	): boolean {
+		return membership.status === "active" && membership.membership_epoch >= scope.membership_epoch;
+	}
+
+	async function requesterAuthorizedForScope(
+		store: CoordinatorStore,
+		scope: CoordinatorScope,
+		deviceId: string,
+	): Promise<boolean> {
+		const memberships = await store.listScopeMemberships(scope.scope_id, false);
+		return memberships.some(
+			(membership) =>
+				membership.device_id === deviceId && activeCurrentMembership(membership, scope),
+		);
+	}
+
 	// -----------------------------------------------------------------------
 	// POST /v1/presence — upsert device presence (authenticated)
 	// -----------------------------------------------------------------------
@@ -294,7 +480,9 @@ export function createCoordinatorApp(
 				nonce: c.req.header("X-Opencode-Nonce") ?? null,
 			});
 			if (!auth.ok || !auth.enrollment) {
-				return rateLimitedResponse(c, c.req.path, false) ?? c.json({ error: auth.error }, 401);
+				const limited = rateLimitedResponse(c, c.req.path, false);
+				if (limited) return limited;
+				return c.json({ error: auth.error }, authErrorStatus(auth.error));
 			}
 			const limited = rateLimitedResponse(c, String(auth.enrollment.device_id), true);
 			if (limited) return limited;
@@ -360,13 +548,73 @@ export function createCoordinatorApp(
 				nonce: c.req.header("X-Opencode-Nonce") ?? null,
 			});
 			if (!auth.ok || !auth.enrollment) {
-				return rateLimitedResponse(c, c.req.path, false) ?? c.json({ error: auth.error }, 401);
+				const limited = rateLimitedResponse(c, c.req.path, false);
+				if (limited) return limited;
+				return c.json({ error: auth.error }, authErrorStatus(auth.error));
 			}
 			const limited = rateLimitedResponse(c, String(auth.enrollment.device_id), true);
 			if (limited) return limited;
 
 			const items = await store.listGroupPeers(groupId, String(auth.enrollment.device_id));
 			return c.json({ items });
+		} finally {
+			await store.close();
+		}
+	});
+
+	// -----------------------------------------------------------------------
+	// GET /v1/scopes — list syncable scopes for the authenticated group member
+	// -----------------------------------------------------------------------
+
+	app.get("/v1/scopes", async (c) => {
+		const groupId = (c.req.query("group_id") ?? "").trim();
+		if (!groupId) return c.json({ error: "group_id_required" }, 400);
+		const store = createStore();
+		try {
+			const { auth, response } = await authorizeGroupMember(store, groupId, c);
+			if (response) return response;
+			if (!auth.enrollment) return c.json({ error: "unknown_device" }, 401);
+			const scopes = await store.listScopes({ groupId, includeInactive: false });
+			const items: CoordinatorScope[] = [];
+			for (const scope of scopes) {
+				if (scope.status !== "active") continue;
+				if (await requesterAuthorizedForScope(store, scope, String(auth.enrollment.device_id))) {
+					items.push(scope);
+				}
+			}
+			return c.json({ items });
+		} finally {
+			await store.close();
+		}
+	});
+
+	// -----------------------------------------------------------------------
+	// GET /v1/scopes/:scope_id/members — list members of an authorized scope
+	// -----------------------------------------------------------------------
+
+	app.get("/v1/scopes/:scope_id/members", async (c) => {
+		const groupId = (c.req.query("group_id") ?? "").trim();
+		const scopeId = String(c.req.param("scope_id") ?? "").trim();
+		if (!groupId) return c.json({ error: "group_id_required" }, 400);
+		if (!scopeId) return c.json({ error: "scope_id_required" }, 400);
+		const store = createStore();
+		try {
+			const { auth, response } = await authorizeGroupMember(store, groupId, c);
+			if (response) return response;
+			if (!auth.enrollment) return c.json({ error: "unknown_device" }, 401);
+			const scopes = await store.listScopes({ groupId, includeInactive: false });
+			const scope = scopes.find((item) => item.scope_id === scopeId) ?? null;
+			if (scope?.status !== "active") return c.json({ error: "scope_not_found" }, 404);
+			const memberships = await store.listScopeMemberships(scopeId, false);
+			const requesterAuthorized = memberships.some(
+				(membership) =>
+					membership.device_id === String(auth.enrollment?.device_id) &&
+					activeCurrentMembership(membership, scope),
+			);
+			if (!requesterAuthorized) return c.json({ error: "scope_not_authorized" }, 403);
+			return c.json({
+				items: memberships.filter((membership) => activeCurrentMembership(membership, scope)),
+			});
 		} finally {
 			await store.close();
 		}
@@ -400,7 +648,10 @@ export function createCoordinatorApp(
 				nonce: c.req.header("X-Opencode-Nonce") ?? null,
 			});
 			if (!auth.ok || !auth.enrollment) {
-				return rateLimitedResponse(c, c.req.path, false) ?? c.json({ error: auth.error }, 401);
+				return (
+					rateLimitedResponse(c, c.req.path, false) ??
+					c.json({ error: auth.error }, authErrorStatus(auth.error))
+				);
 			}
 			const limited = rateLimitedResponse(c, String(auth.enrollment.device_id), true);
 			if (limited) return limited;
@@ -433,6 +684,9 @@ export function createCoordinatorApp(
 
 		const groupId = String(data.group_id ?? "").trim();
 		const requestedDeviceId = String(data.requested_device_id ?? "").trim();
+		const expectedIncomingRequestId = Object.hasOwn(data, "expected_incoming_request_id")
+			? String(data.expected_incoming_request_id ?? "").trim()
+			: undefined;
 		if (!groupId || !requestedDeviceId) {
 			return c.json({ error: "group_id_and_requested_device_id_required" }, 400);
 		}
@@ -450,7 +704,10 @@ export function createCoordinatorApp(
 				nonce: c.req.header("X-Opencode-Nonce") ?? null,
 			});
 			if (!auth.ok || !auth.enrollment) {
-				return rateLimitedResponse(c, c.req.path, false) ?? c.json({ error: auth.error }, 401);
+				return (
+					rateLimitedResponse(c, c.req.path, false) ??
+					c.json({ error: auth.error }, authErrorStatus(auth.error))
+				);
 			}
 			const limited = rateLimitedResponse(c, String(auth.enrollment.device_id), true);
 			if (limited) return limited;
@@ -461,12 +718,141 @@ export function createCoordinatorApp(
 			if (!targetEnrollment) {
 				return c.json({ error: "requested_device_not_found" }, 404);
 			}
-			const request = await store.createReciprocalApproval({
+			try {
+				const request = await store.createReciprocalApproval({
+					groupId,
+					requestingDeviceId: String(auth.enrollment.device_id),
+					requestedDeviceId,
+					...(expectedIncomingRequestId !== undefined ? { expectedIncomingRequestId } : {}),
+				});
+				return c.json({ ok: true, request });
+			} catch (error) {
+				if (error instanceof CoordinatorReciprocalApprovalRequestChangedError) {
+					return c.json({ error: error.code }, 409);
+				}
+				throw error;
+			}
+		} finally {
+			await store.close();
+		}
+	});
+
+	// -----------------------------------------------------------------------
+	// POST /v1/invites/add-device — create an Identity-owned device invite
+	// -----------------------------------------------------------------------
+
+	app.post("/v1/invites/add-device", async (c) => {
+		const raw = await readRequestBytes(c);
+		if (raw == null) return c.json({ error: "body_too_large" }, 413);
+		const data = parseJsonObject(raw);
+		if (!data) return c.json({ error: "invalid_json" }, 400);
+
+		const allowedFields = new Set([
+			"group_id",
+			"expires_at",
+			"reviewed_preview_digest",
+			"reviewed_intent",
+		]);
+		if (Object.keys(data).some((key) => !allowedFields.has(key))) {
+			return c.json({ error: "unexpected_add_device_invite_fields" }, 400);
+		}
+
+		const groupId = String(data.group_id ?? "").trim();
+		const expiresAt = String(data.expires_at ?? "").trim();
+		const reviewedPreviewDigest = String(data.reviewed_preview_digest ?? "").trim();
+		if (!groupId || !expiresAt) {
+			return c.json({ error: "group_id_and_expires_at_required" }, 400);
+		}
+		if (Number.isNaN(new Date(expiresAt).getTime())) {
+			return c.json({ error: "invalid_expires_at" }, 400);
+		}
+		if (!/^[a-f0-9]{64}$/u.test(reviewedPreviewDigest)) {
+			return c.json({ error: "reviewed_preview_digest_invalid" }, 400);
+		}
+		if (data.reviewed_intent == null) {
+			return c.json({ error: "recipient_invite_review_unavailable" }, 400);
+		}
+
+		const store = createStore();
+		try {
+			const auth = await authorizeRequest(store, runtime, requestVerifier, {
+				method: c.req.method,
+				url: c.req.url,
 				groupId,
-				requestingDeviceId: String(auth.enrollment.device_id),
-				requestedDeviceId,
+				body: raw,
+				deviceId: c.req.header("X-Opencode-Device") ?? null,
+				signature: c.req.header("X-Opencode-Signature") ?? null,
+				timestamp: c.req.header("X-Opencode-Timestamp") ?? null,
+				nonce: c.req.header("X-Opencode-Nonce") ?? null,
 			});
-			return c.json({ ok: true, request });
+			if (!auth.ok || !auth.enrollment) {
+				return (
+					rateLimitedResponse(c, c.req.path, false) ??
+					c.json({ error: auth.error }, authErrorStatus(auth.error))
+				);
+			}
+			const limited = rateLimitedResponse(c, String(auth.enrollment.device_id), true);
+			if (limited) return limited;
+
+			const targetIdentityId = auth.enrollment.identity_id;
+			if (
+				!targetIdentityId ||
+				targetIdentityId !== targetIdentityId.trim() ||
+				targetIdentityId.length > 256 ||
+				/[\p{Cc}\p{Cf}]/u.test(targetIdentityId)
+			) {
+				return c.json({ error: "identity_binding_required" }, 403);
+			}
+
+			let reviewedIntent: RecipientReviewedIntentV1;
+			try {
+				reviewedIntent = await verifyRecipientReviewedIntent(data.reviewed_intent, {
+					target: { kind: "add_device", targetIdentityId },
+					digest: reviewedPreviewDigest,
+				});
+			} catch (error) {
+				if (
+					error instanceof RecipientReviewedIntentError &&
+					error.code === "recipient_invite_intent_mismatch"
+				) {
+					return c.json({ error: error.code }, 409);
+				}
+				return c.json({ error: "recipient_invite_review_unavailable" }, 400);
+			}
+
+			const invite = await store.createInvite({
+				groupId,
+				policy: "auto_admit",
+				expiresAt,
+				createdBy: targetIdentityId,
+				inviterDeviceId: String(auth.enrollment.device_id),
+				inviteKind: "add_device",
+				targetIdentityId,
+				reviewedPreviewDigest,
+				reviewedIntent,
+			});
+			const payload: InvitePayload = {
+				v: 1,
+				kind: "add_device",
+				coordinator_url: new URL(c.req.url).origin,
+				group_id: groupId,
+				policy: invite.policy,
+				token: String(invite.token ?? ""),
+				expires_at: invite.expires_at,
+				team_name: (invite.team_name_snapshot as string) ?? null,
+				target_identity_id: invite.target_identity_id ?? undefined,
+				inviter_device_id: invite.inviter_device_id ?? undefined,
+				reviewed_preview_digest: invite.reviewed_preview_digest ?? undefined,
+			};
+			const encoded = encodeInvitePayload(payload);
+			const { token: _token, ...inviteWithoutToken } = invite;
+			return c.json({
+				ok: true,
+				invite: inviteWithoutToken,
+				payload,
+				encoded,
+				link: inviteLink(encoded),
+			});
 		} finally {
 			await store.close();
 		}
@@ -644,6 +1030,282 @@ export function createCoordinatorApp(
 		}
 	});
 
+	// GET /v1/admin/groups/:group_id/scopes — list Sharing domains for a group
+	app.get("/v1/admin/groups/:group_id/scopes", async (c) => {
+		const adminAuth = authorizeAdmin(c.req.header(ADMIN_HEADER), runtime);
+		if (!adminAuth.ok)
+			return rateLimitedResponse(c, c.req.path, false) ?? c.json({ error: adminAuth.error }, 401);
+		const limited = rateLimitedResponse(c, "admin", true);
+		if (limited) return limited;
+
+		const groupId = String(c.req.param("group_id") ?? "").trim();
+		const store = createStore();
+		try {
+			const groupError = await requireActiveAdminGroup(store, groupId, c);
+			if (groupError) return groupError;
+			const includeInactive = queryFlag(c.req.query("include_inactive"));
+			return c.json({
+				items: await store.listScopes({ groupId, includeInactive }),
+			});
+		} finally {
+			await store.close();
+		}
+	});
+
+	// POST /v1/admin/groups/:group_id/scopes — create a Sharing domain
+	app.post("/v1/admin/groups/:group_id/scopes", async (c) => {
+		const adminAuth = authorizeAdmin(c.req.header(ADMIN_HEADER), runtime);
+		if (!adminAuth.ok)
+			return rateLimitedResponse(c, c.req.path, false) ?? c.json({ error: adminAuth.error }, 401);
+		const limited = rateLimitedResponse(c, "admin", true);
+		if (limited) return limited;
+
+		const raw = await readRequestBytes(c);
+		if (raw == null) return c.json({ error: "body_too_large" }, 413);
+		const data = parseJsonObject(raw);
+		if (!data) return c.json({ error: "invalid_json" }, 400);
+
+		const groupId = String(c.req.param("group_id") ?? "").trim();
+		const scopeId = optionalString(data, "scope_id");
+		const label = optionalString(data, "label");
+		const membershipEpoch = optionalNumber(data, "membership_epoch");
+		if (!scopeId || !label) return c.json({ error: "scope_id_and_label_required" }, 400);
+		if (Number.isNaN(membershipEpoch)) {
+			return c.json({ error: "membership_epoch_must_be_number" }, 400);
+		}
+
+		const store = createStore();
+		try {
+			const groupError = await requireActiveAdminGroup(store, groupId, c);
+			if (groupError) return groupError;
+			const scope = await store.createScope({
+				scopeId,
+				label,
+				kind: optionalString(data, "kind"),
+				authorityType: optionalString(data, "authority_type"),
+				coordinatorId: optionalString(data, "coordinator_id"),
+				groupId,
+				manifestIssuerDeviceId: optionalString(data, "manifest_issuer_device_id"),
+				membershipEpoch,
+				manifestHash: optionalString(data, "manifest_hash"),
+				status: optionalString(data, "status"),
+			});
+			return c.json({ ok: true, scope }, 201);
+		} catch (error) {
+			return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+		} finally {
+			await store.close();
+		}
+	});
+
+	// PATCH /v1/admin/groups/:group_id/scopes/:scope_id — update Sharing domain metadata
+	app.patch("/v1/admin/groups/:group_id/scopes/:scope_id", async (c) => {
+		const adminAuth = authorizeAdmin(c.req.header(ADMIN_HEADER), runtime);
+		if (!adminAuth.ok)
+			return rateLimitedResponse(c, c.req.path, false) ?? c.json({ error: adminAuth.error }, 401);
+		const limited = rateLimitedResponse(c, "admin", true);
+		if (limited) return limited;
+
+		const raw = await readRequestBytes(c);
+		if (raw == null) return c.json({ error: "body_too_large" }, 413);
+		const data = parseJsonObject(raw);
+		if (!data) return c.json({ error: "invalid_json" }, 400);
+
+		const groupId = String(c.req.param("group_id") ?? "").trim();
+		const scopeId = String(c.req.param("scope_id") ?? "").trim();
+		const membershipEpoch = optionalNumber(data, "membership_epoch");
+		if (!scopeId) return c.json({ error: "scope_id_required" }, 400);
+		if (Number.isNaN(membershipEpoch)) {
+			return c.json({ error: "membership_epoch_must_be_number" }, 400);
+		}
+
+		const store = createStore();
+		try {
+			const lookup = await findAdminScope(store, groupId, scopeId, c);
+			if (lookup.response) return lookup.response;
+			const scope = await store.updateScope({
+				scopeId,
+				label: data.label === undefined ? undefined : optionalString(data, "label"),
+				kind: data.kind === undefined ? undefined : optionalString(data, "kind"),
+				authorityType:
+					data.authority_type === undefined ? undefined : optionalString(data, "authority_type"),
+				coordinatorId:
+					data.coordinator_id === undefined ? undefined : optionalString(data, "coordinator_id"),
+				groupId,
+				manifestIssuerDeviceId:
+					data.manifest_issuer_device_id === undefined
+						? undefined
+						: optionalString(data, "manifest_issuer_device_id"),
+				membershipEpoch,
+				manifestHash:
+					data.manifest_hash === undefined ? undefined : optionalString(data, "manifest_hash"),
+				status: data.status === undefined ? undefined : optionalString(data, "status"),
+			});
+			if (!scope) return c.json({ error: "scope_not_found" }, 404);
+			return c.json({ ok: true, scope });
+		} catch (error) {
+			return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+		} finally {
+			await store.close();
+		}
+	});
+
+	// GET /v1/admin/groups/:group_id/scopes/:scope_id/members — list explicit grants
+	app.get("/v1/admin/groups/:group_id/scopes/:scope_id/members", async (c) => {
+		const adminAuth = authorizeAdmin(c.req.header(ADMIN_HEADER), runtime);
+		if (!adminAuth.ok)
+			return rateLimitedResponse(c, c.req.path, false) ?? c.json({ error: adminAuth.error }, 401);
+		const limited = rateLimitedResponse(c, "admin", true);
+		if (limited) return limited;
+
+		const groupId = String(c.req.param("group_id") ?? "").trim();
+		const scopeId = String(c.req.param("scope_id") ?? "").trim();
+		const store = createStore();
+		try {
+			const lookup = await findAdminScope(store, groupId, scopeId, c);
+			if (lookup.response) return lookup.response;
+			return c.json({
+				items: await store.listScopeMemberships(scopeId, queryFlag(c.req.query("include_revoked"))),
+			});
+		} finally {
+			await store.close();
+		}
+	});
+
+	// POST /v1/admin/groups/:group_id/scopes/:scope_id/members — grant device access
+	app.post("/v1/admin/groups/:group_id/scopes/:scope_id/members", async (c) => {
+		const adminAuth = authorizeAdmin(c.req.header(ADMIN_HEADER), runtime);
+		if (!adminAuth.ok)
+			return rateLimitedResponse(c, c.req.path, false) ?? c.json({ error: adminAuth.error }, 401);
+		const limited = rateLimitedResponse(c, "admin", true);
+		if (limited) return limited;
+
+		const raw = await readRequestBytes(c);
+		if (raw == null) return c.json({ error: "body_too_large" }, 413);
+		const data = parseJsonObject(raw);
+		if (!data) return c.json({ error: "invalid_json" }, 400);
+
+		const groupId = String(c.req.param("group_id") ?? "").trim();
+		const scopeId = String(c.req.param("scope_id") ?? "").trim();
+		const effectId = optionalString(data, "effect_id");
+		const deviceId = optionalString(data, "device_id");
+		const membershipEpoch = optionalNumber(data, "membership_epoch");
+		if (!effectId) return c.json({ error: "effect_id_required" }, 400);
+		if (!deviceId) return c.json({ error: "device_id_required" }, 400);
+		if (Number.isNaN(membershipEpoch)) {
+			return c.json({ error: "membership_epoch_must_be_number" }, 400);
+		}
+
+		const store = createStore();
+		try {
+			const lookup = await findAdminScope(store, groupId, scopeId, c);
+			if (lookup.response) return lookup.response;
+			const membership = await store.grantScopeMembership({
+				effectId,
+				scopeId,
+				deviceId,
+				role: optionalString(data, "role"),
+				membershipEpoch,
+				coordinatorId: optionalString(data, "coordinator_id"),
+				groupId,
+				manifestIssuerDeviceId: optionalString(data, "manifest_issuer_device_id"),
+				manifestHash: optionalString(data, "manifest_hash"),
+				signedManifestJson: optionalString(data, "signed_manifest_json"),
+				actorType: "admin",
+				actorId: optionalHeaderString(c.req.header(ADMIN_ACTOR_HEADER)),
+			});
+			return c.json({ ok: true, membership }, 201);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			if (
+				error instanceof CoordinatorMembershipError &&
+				(error.code === "scope_not_found" || error.code === "scope_group_mismatch")
+			) {
+				return c.json({ error: "scope_not_found" }, 404);
+			}
+			if (error instanceof CoordinatorMembershipError && error.code === "device_not_enrolled") {
+				return c.json({ error: "device_not_enrolled_for_scope_group" }, 404);
+			}
+			const scopeInactive =
+				error instanceof CoordinatorMembershipError && error.code === "scope_inactive";
+			return c.json(
+				{ error: scopeInactive ? "scope_not_active" : message },
+				message === SCOPE_MEMBERSHIP_EFFECT_CONFLICT || scopeInactive ? 409 : 400,
+			);
+		} finally {
+			await store.close();
+		}
+	});
+
+	// POST /v1/admin/groups/:group_id/scopes/:scope_id/members/:device_id/revoke
+	app.post("/v1/admin/groups/:group_id/scopes/:scope_id/members/:device_id/revoke", async (c) => {
+		const adminAuth = authorizeAdmin(c.req.header(ADMIN_HEADER), runtime);
+		if (!adminAuth.ok)
+			return rateLimitedResponse(c, c.req.path, false) ?? c.json({ error: adminAuth.error }, 401);
+		const limited = rateLimitedResponse(c, "admin", true);
+		if (limited) return limited;
+
+		const raw = await readRequestBytes(c);
+		if (raw == null) return c.json({ error: "body_too_large" }, 413);
+		const data = raw.byteLength > 0 ? parseJsonObject(raw) : {};
+		if (!data) return c.json({ error: "invalid_json" }, 400);
+
+		const groupId = String(c.req.param("group_id") ?? "").trim();
+		const scopeId = String(c.req.param("scope_id") ?? "").trim();
+		const deviceId = String(c.req.param("device_id") ?? "").trim();
+		const effectId = optionalString(data, "effect_id");
+		const membershipEpoch = optionalNumber(data, "membership_epoch");
+		if (!effectId) return c.json({ error: "effect_id_required" }, 400);
+		if (!deviceId) return c.json({ error: "device_id_required" }, 400);
+		if (Number.isNaN(membershipEpoch)) {
+			return c.json({ error: "membership_epoch_must_be_number" }, 400);
+		}
+
+		const store = createStore();
+		try {
+			const lookup = await findAdminScope(store, groupId, scopeId, c);
+			if (lookup.response) return lookup.response;
+			const ok = await store.revokeScopeMembership({
+				effectId,
+				scopeId,
+				deviceId,
+				groupId,
+				membershipEpoch,
+				manifestHash: optionalString(data, "manifest_hash"),
+				signedManifestJson: optionalString(data, "signed_manifest_json"),
+				actorType: "admin",
+				actorId: optionalHeaderString(c.req.header(ADMIN_ACTOR_HEADER)),
+			});
+			if (!ok) return c.json({ error: "membership_not_found" }, 404);
+			let revokedMembership: CoordinatorScopeMembership | undefined;
+			try {
+				revokedMembership = (await store.listScopeMemberships(scopeId, true)).find(
+					(membership) => membership.device_id === deviceId,
+				);
+			} catch {
+				revokedMembership = undefined;
+			}
+			return c.json({
+				ok: true,
+				scope_id: scopeId,
+				device_id: deviceId,
+				revocation: explainScopeMembershipRevocation({
+					scopeId,
+					deviceId,
+					membershipEpoch: revokedMembership?.membership_epoch ?? membershipEpoch,
+				}),
+			});
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			if (error instanceof CoordinatorMembershipError && error.code === "scope_group_mismatch") {
+				return c.json({ error: "scope_not_found" }, 404);
+			}
+			return c.json({ error: message }, message === SCOPE_MEMBERSHIP_EFFECT_CONFLICT ? 409 : 400);
+		} finally {
+			await store.close();
+		}
+	});
+
 	// GET /v1/admin/devices — list enrolled devices
 	app.get("/v1/admin/devices", async (c) => {
 		const adminAuth = authorizeAdmin(c.req.header(ADMIN_HEADER), runtime);
@@ -693,10 +1355,19 @@ export function createCoordinatorApp(
 		if (!displayName) {
 			return c.json({ error: "display_name_required" }, 400);
 		}
+		let normalizedDisplayName: string;
+		try {
+			normalizedDisplayName = normalizeHumanPresentationName(displayName, "display_name");
+		} catch (error) {
+			return c.json(
+				{ error: error instanceof Error ? error.message : "display_name_invalid" },
+				400,
+			);
+		}
 
 		const store = createStore();
 		try {
-			const ok = await store.renameDevice(groupId, deviceId, displayName);
+			const ok = await store.renameDevice(groupId, deviceId, normalizedDisplayName);
 			if (!ok) return c.json({ error: "device_not_found" }, 404);
 			const device = await store.getEnrollment(groupId, deviceId);
 			return c.json({ ok: true, device });
@@ -824,9 +1495,150 @@ export function createCoordinatorApp(
 		const policy = String(data.policy ?? "auto_admit").trim();
 		const expiresAt = String(data.expires_at ?? "").trim();
 		const createdBy = String(data.created_by ?? "").trim() || null;
+		const operationId = String(data.operation_id ?? "").trim() || null;
+		const reviewedProjectSetDigest = String(data.reviewed_project_set_digest ?? "").trim() || null;
+		const inviterActorId = String(data.inviter_actor_id ?? "").trim() || null;
+		const inviterDisplayName = String(data.inviter_display_name ?? "").trim() || null;
+		const inviterDeviceId = String(data.inviter_device_id ?? "").trim() || null;
+		const pendingPersonId = String(data.pending_person_id ?? "").trim() || null;
+		const requestedInviteKind = String(data.invite_kind ?? data.kind ?? "").trim();
+		const policyTeamId = String(data.policy_team_id ?? "").trim() || null;
+		const targetIdentityId = String(data.target_identity_id ?? "").trim() || null;
+		const reviewedPreviewDigest = String(data.reviewed_preview_digest ?? "").trim() || null;
+		let reviewedIntent: RecipientReviewedIntentV1 | undefined;
+		let projectSummaries: ReturnType<typeof normalizeProjectInviteSummaries> | null = null;
+		let projectIntent: Array<{
+			canonical_identity: string;
+			display_name: string;
+			existing_memory_count: number;
+		}> | null = null;
 
 		if (!groupId || !["auto_admit", "approval_required"].includes(policy) || !expiresAt) {
 			return c.json({ error: "group_id_policy_and_expires_at_required" }, 400);
+		}
+		if (Object.hasOwn(data, "assigned_identity_id")) {
+			return c.json({ error: "assigned_identity_id_forbidden" }, 400);
+		}
+		// Validate the date at the boundary so store.createInvite's
+		// normalizeInviteExpiresAt throw can't escape as an unhandled 500.
+		if (Number.isNaN(new Date(expiresAt).getTime())) {
+			return c.json({ error: "invalid_expires_at" }, 400);
+		}
+		if (Boolean(operationId) !== Boolean(reviewedProjectSetDigest)) {
+			return c.json({ error: "operation_intent_reference_incomplete" }, 400);
+		}
+		const inviteKind = (requestedInviteKind ||
+			(operationId ? "project_share" : "legacy_enrollment")) as CoordinatorInviteKind;
+		if (
+			!(["legacy_enrollment", "project_share", "team_member", "add_device"] as const).includes(
+				inviteKind,
+			)
+		) {
+			return c.json({ error: "invite_kind_invalid" }, 400);
+		}
+		if (inviteKind === "project_share" ? !operationId : Boolean(operationId)) {
+			return c.json({ error: "invite_kind_intent_mismatch" }, 400);
+		}
+		if (reviewedPreviewDigest && !/^[a-f0-9]{64}$/u.test(reviewedPreviewDigest)) {
+			return c.json({ error: "reviewed_preview_digest_invalid" }, 400);
+		}
+		if (
+			(inviteKind === "team_member" &&
+				(!policyTeamId || !reviewedPreviewDigest || Boolean(targetIdentityId))) ||
+			(inviteKind === "add_device" &&
+				(!targetIdentityId || !reviewedPreviewDigest || Boolean(policyTeamId))) ||
+			(!["team_member", "add_device"].includes(inviteKind) &&
+				Boolean(policyTeamId || targetIdentityId || reviewedPreviewDigest))
+		) {
+			return c.json({ error: "recipient_invite_metadata_invalid" }, 400);
+		}
+		if (
+			[policyTeamId, targetIdentityId]
+				.filter((value): value is string => Boolean(value))
+				.some((value) => value.length > 256 || /[\p{Cc}\p{Cf}]/u.test(value))
+		) {
+			return c.json({ error: "recipient_invite_identifier_invalid" }, 400);
+		}
+		if (inviteKind === "team_member" || inviteKind === "add_device") {
+			if (data.reviewed_intent == null) {
+				return c.json({ error: "recipient_invite_review_unavailable" }, 400);
+			}
+			try {
+				reviewedIntent = await verifyRecipientReviewedIntent(data.reviewed_intent, {
+					target:
+						inviteKind === "team_member"
+							? { kind: "team_member", policyTeamId: String(policyTeamId) }
+							: { kind: "add_device", targetIdentityId: String(targetIdentityId) },
+					digest: String(reviewedPreviewDigest),
+				});
+			} catch (error) {
+				if (
+					error instanceof RecipientReviewedIntentError &&
+					error.code === "recipient_invite_intent_mismatch"
+				) {
+					return c.json({ error: error.code }, 409);
+				}
+				return c.json({ error: "recipient_invite_review_unavailable" }, 400);
+			}
+		} else if (data.reviewed_intent != null) {
+			return c.json({ error: "recipient_invite_metadata_invalid" }, 400);
+		}
+		if (
+			(operationId && !/^share_[a-f0-9]{40}$/u.test(operationId)) ||
+			(reviewedProjectSetDigest && !/^[a-f0-9]{64}$/u.test(reviewedProjectSetDigest))
+		) {
+			return c.json({ error: "operation_intent_reference_invalid" }, 400);
+		}
+		if (operationId) {
+			if (!inviterActorId || !inviterDisplayName || !inviterDeviceId || !pendingPersonId) {
+				return c.json({ error: "project_invite_identity_context_required" }, 400);
+			}
+			if (
+				[inviterActorId, inviterDeviceId, pendingPersonId].some(
+					(value) => value.length > 256 || /[\p{Cc}\p{Cf}]/u.test(value),
+				)
+			) {
+				return c.json({ error: "project_invite_identity_context_invalid" }, 400);
+			}
+			try {
+				normalizeHumanPresentationName(inviterDisplayName, "inviter_display_name");
+				projectSummaries = normalizeProjectInviteSummaries(data.project_summaries);
+				if (
+					!Array.isArray(data.project_intent) ||
+					data.project_intent.length !== projectSummaries.length
+				) {
+					throw new Error("project_intent_invalid");
+				}
+				projectIntent = data.project_intent.map((item, index) => {
+					let parsed: ReturnType<typeof parseAcceptedProjectIntent>[number] | undefined;
+					try {
+						parsed = parseAcceptedProjectIntent([item])[0];
+					} catch {
+						throw new Error("project_intent_invalid");
+					}
+					const summary = projectSummaries?.[index];
+					if (
+						!parsed ||
+						!summary ||
+						parsed.display_name !== summary.display_name ||
+						parsed.existing_memory_count !== summary.existing_memory_count
+					) {
+						throw new Error("project_intent_invalid");
+					}
+					return parsed;
+				});
+				if (
+					new Set(projectIntent.map((item) => item.canonical_identity)).size !==
+					projectIntent.length
+				) {
+					throw new Error("project_intent_invalid");
+				}
+			} catch (error) {
+				return c.json(
+					{ error: error instanceof Error ? error.message : "project_invite_invalid" },
+					400,
+				);
+			}
 		}
 
 		const store = createStore();
@@ -840,17 +1652,54 @@ export function createCoordinatorApp(
 				policy,
 				expiresAt,
 				createdBy,
+				operationId,
+				reviewedProjectSetDigest,
+				inviterActorId,
+				inviterDisplayName,
+				inviterDeviceId,
+				pendingPersonId,
+				projectSummaries,
+				projectIntent,
+				inviteKind,
+				policyTeamId,
+				targetIdentityId,
+				reviewedPreviewDigest,
+				reviewedIntent,
 			});
 
 			const payload: InvitePayload = {
 				v: 1,
-				kind: "coordinator_team_invite",
+				kind:
+					invite.invite_kind === "team_member" || invite.invite_kind === "add_device"
+						? invite.invite_kind
+						: "coordinator_team_invite",
 				coordinator_url: String(data.coordinator_url ?? "").trim(),
 				group_id: groupId,
-				policy,
+				policy: invite.policy,
 				token: String(invite.token ?? ""),
-				expires_at: expiresAt,
+				expires_at: invite.expires_at,
 				team_name: (invite.team_name_snapshot as string) ?? null,
+				...(invite.operation_id
+					? {
+							operation_id: invite.operation_id,
+							inviter_name: invite.inviter_display_name ?? null,
+							project_summaries: projectSummaries ?? [],
+						}
+					: {}),
+				...(invite.invite_kind === "team_member"
+					? {
+							policy_team_id: invite.policy_team_id ?? undefined,
+							assigned_identity_id: invite.assigned_identity_id ?? undefined,
+							reviewed_preview_digest: invite.reviewed_preview_digest ?? undefined,
+						}
+					: {}),
+				...(invite.invite_kind === "add_device"
+					? {
+							target_identity_id: invite.target_identity_id ?? undefined,
+							inviter_device_id: invite.inviter_device_id ?? undefined,
+							reviewed_preview_digest: invite.reviewed_preview_digest ?? undefined,
+						}
+					: {}),
 			};
 			const encoded = encodeInvitePayload(payload);
 
@@ -863,6 +1712,85 @@ export function createCoordinatorApp(
 				payload,
 				encoded,
 				link: inviteLink(encoded),
+			});
+		} catch (error) {
+			if (error instanceof Error && error.message === "invite_operation_intent_conflict") {
+				return c.json({ error: "invite_operation_intent_conflict" }, 409);
+			}
+			if (error instanceof Error && error.message === "invite_already_bound") {
+				return c.json({ error: "invite_already_bound" }, 409);
+			}
+			throw error;
+		} finally {
+			await store.close();
+		}
+	});
+
+	app.post("/v1/invites/inspect", async (c) => {
+		const raw = await readRequestBytes(c);
+		if (raw == null) return c.json({ error: "body_too_large" }, 413);
+		const data = parseJsonObject(raw);
+		if (!data) return c.json({ error: "invalid_json" }, 400);
+		const token = String(data.token ?? "").trim();
+		if (!token) return c.json({ error: "invite_invalid" }, 404);
+		const store = createStore();
+		try {
+			const invite = await store.getInviteByTokenForInspection(token);
+			if (!invite || invite.revoked_at) return c.json({ error: "invite_invalid" }, 404);
+			if (invite.invite_kind === "team_member" || invite.invite_kind === "add_device") {
+				try {
+					const inspection = await store.inspectRecipientInvite({ token, now: runtime.now() });
+					if (!inspection) return c.json({ error: "invite_invalid" }, 404);
+					return c.json(
+						inspection.kind === "team_member"
+							? {
+									kind: inspection.kind,
+									policy_team_id: inspection.policy_team_id,
+									assigned_identity_id: inspection.assigned_identity_id,
+									reviewed_preview_digest: inspection.reviewed_preview_digest,
+									reviewed_intent: inspection.reviewed_intent,
+									bound: inspection.bound,
+								}
+							: {
+									kind: inspection.kind,
+									target_identity_id: inspection.target_identity_id,
+									reviewed_preview_digest: inspection.reviewed_preview_digest,
+									reviewed_intent: inspection.reviewed_intent,
+									bound: inspection.bound,
+								},
+					);
+				} catch (error) {
+					const code = error instanceof Error ? error.message : "invite_invalid";
+					const status = code === "invite_expired" ? 410 : code === "invite_invalid" ? 404 : 409;
+					return c.json({ error: code }, status);
+				}
+			}
+			const projectInvite = Boolean(invite.operation_id || invite.reviewed_project_set_digest);
+			if (
+				new Date(invite.expires_at) <= new Date(runtime.now()) &&
+				(!projectInvite || !invite.consumed_at)
+			) {
+				return c.json({ error: "invite_expired" }, 410);
+			}
+			if (!invite.operation_id) {
+				return c.json({ kind: "legacy_team_invite", team_name: invite.team_name_snapshot });
+			}
+			if (!invite.project_intent_json || !invite.project_summaries_json) {
+				return c.json({ error: "invite_invalid" }, 404);
+			}
+			let projects: ReturnType<typeof normalizeProjectInviteSummaries>;
+			try {
+				projects = storedProjectSummaries(invite.project_summaries_json);
+			} catch {
+				return c.json({ error: "invite_invalid" }, 409);
+			}
+			return c.json({
+				kind: "project_share_invite",
+				operation_id: invite.operation_id,
+				inviter_name: invite.inviter_display_name,
+				team_name: invite.team_name_snapshot,
+				projects,
+				bound: Boolean(invite.consumed_at),
 			});
 		} finally {
 			await store.close();
@@ -891,6 +1819,75 @@ export function createCoordinatorApp(
 		}
 	});
 
+	app.get("/v1/admin/project-invites/:operationId", async (c) => {
+		const adminAuth = authorizeAdmin(c.req.header(ADMIN_HEADER), runtime);
+		if (!adminAuth.ok) return c.json({ error: adminAuth.error }, 401);
+		const operationId = String(c.req.param("operationId") ?? "").trim();
+		const groupId = String(c.req.query("group_id") ?? "").trim();
+		if (!operationId || !groupId)
+			return c.json({ error: "operation_id_and_group_id_required" }, 400);
+		const store = createStore();
+		try {
+			const invite = (await store.listInvites(groupId)).find(
+				(item) => item.operation_id === operationId,
+			);
+			if (!invite) return c.json({ error: "operation_not_found" }, 404);
+			let projects: ReturnType<typeof storedProjectIntent>;
+			try {
+				projects = storedProjectIntent(invite.project_intent_json);
+			} catch {
+				return c.json({ error: "operation_intent_invalid" }, 409);
+			}
+			let inviteLinkValue: string | null = null;
+			if (
+				!invite.consumed_at &&
+				!invite.revoked_at &&
+				new Date(invite.expires_at) > new Date(runtime.now()) &&
+				invite.token &&
+				!invite.token.startsWith("consumed:")
+			) {
+				const summaries = projects.map((project) => ({
+					display_name: String(project.display_name ?? ""),
+					existing_memory_count: Number(project.existing_memory_count ?? 0),
+				}));
+				const payload: InvitePayload = {
+					v: 1,
+					kind: "coordinator_team_invite",
+					coordinator_url: new URL(c.req.url).origin,
+					group_id: invite.group_id,
+					policy: invite.policy,
+					token: invite.token,
+					expires_at: invite.expires_at,
+					team_name: invite.team_name_snapshot,
+					operation_id: operationId,
+					inviter_name: invite.inviter_display_name ?? null,
+					project_summaries: summaries,
+				};
+				inviteLinkValue = inviteLink(encodeInvitePayload(payload));
+			}
+			return c.json({
+				operation_id: invite.operation_id,
+				group_id: invite.group_id,
+				reviewed_project_set_digest: invite.reviewed_project_set_digest,
+				state: invite.consumed_at ? "accepted" : "waiting_for_acceptance",
+				pending_person_id: invite.pending_person_id,
+				recipient_actor_id: invite.recipient_actor_id,
+				recipient_display_name: invite.recipient_display_name,
+				recipient_device_id: invite.bound_device_id,
+				recipient_device_display_name: invite.recipient_device_display_name,
+				recipient_public_key: invite.bound_public_key,
+				recipient_fingerprint: invite.bound_fingerprint,
+				consumed_at: invite.consumed_at,
+				bootstrap_grant_id: invite.bootstrap_grant_id,
+				trust_state: invite.trust_state,
+				projects,
+				invite_link: inviteLinkValue,
+			});
+		} finally {
+			await store.close();
+		}
+	});
+
 	app.get("/v1/admin/bootstrap-grants/:grantId", async (c) => {
 		const adminAuth = authorizeAdmin(c.req.header(ADMIN_HEADER), runtime);
 		if (!adminAuth.ok)
@@ -912,6 +1909,46 @@ export function createCoordinatorApp(
 				worker_enrollment: workerEnrollment,
 			};
 			return c.json(payload);
+		} finally {
+			await store.close();
+		}
+	});
+
+	app.get("/v1/bootstrap-grants/:grantId", async (c) => {
+		const grantId = String(c.req.param("grantId") ?? "").trim();
+		const groupId = String(c.req.query("group_id") ?? "").trim();
+		if (!grantId || !groupId) return c.json({ error: "grant_id_and_group_id_required" }, 400);
+		const store = createStore();
+		try {
+			const auth = await authorizeRequest(store, runtime, requestVerifier, {
+				method: c.req.method,
+				url: c.req.url,
+				groupId,
+				body: new Uint8Array(0),
+				deviceId: c.req.header("X-Opencode-Device") ?? null,
+				signature: c.req.header("X-Opencode-Signature") ?? null,
+				timestamp: c.req.header("X-Opencode-Timestamp") ?? null,
+				nonce: c.req.header("X-Opencode-Nonce") ?? null,
+			});
+			if (!auth.ok || !auth.enrollment) {
+				return (
+					rateLimitedResponse(c, c.req.path, false) ??
+					c.json({ error: auth.error }, authErrorStatus(auth.error))
+				);
+			}
+			const limited = rateLimitedResponse(c, String(auth.enrollment.device_id), true);
+			if (limited) return limited;
+			const grant = await store.getBootstrapGrant(grantId);
+			if (
+				!grant ||
+				grant.group_id !== groupId ||
+				grant.seed_device_id !== String(auth.enrollment.device_id)
+			) {
+				return c.json({ error: "grant_not_found" }, 404);
+			}
+			const workerEnrollment = await store.getEnrollment(groupId, grant.worker_device_id);
+			if (!workerEnrollment) return c.json({ error: "worker_enrollment_not_found" }, 404);
+			return c.json({ grant, worker_enrollment: workerEnrollment });
 		} finally {
 			await store.close();
 		}
@@ -1007,6 +2044,10 @@ export function createCoordinatorApp(
 		const fingerprint = String(data.fingerprint ?? "").trim();
 		const publicKey = String(data.public_key ?? "").trim();
 		const displayName = String(data.display_name ?? "").trim() || null;
+		const operationId = String(data.operation_id ?? "").trim();
+		const recipientActorId = String(data.recipient_actor_id ?? "").trim();
+		const recipientDisplayName = String(data.recipient_display_name ?? "").trim();
+		const deviceDisplayName = String(data.device_display_name ?? "").trim();
 
 		if (!token || !deviceId || !fingerprint || !publicKey) {
 			return c.json({ error: "token_device_id_fingerprint_public_key_required" }, 400);
@@ -1017,21 +2058,212 @@ export function createCoordinatorApp(
 
 		const store = createStore();
 		try {
-			const invite = await store.getInviteByToken(token);
-			if (!invite) return c.json({ error: "invalid_token" }, 404);
+			const invite = await store.getInviteByTokenForInspection(token);
+			if (!invite) return c.json({ error: "invite_invalid" }, 404);
+			const projectInvite = Boolean(invite.operation_id || invite.reviewed_project_set_digest);
+			const recipientInvite =
+				invite.invite_kind === "team_member" || invite.invite_kind === "add_device";
+			if (invite.revoked_at) {
+				return c.json(
+					{ error: projectInvite || recipientInvite ? "invite_invalid" : "revoked_token" },
+					400,
+				);
+			}
+			if (!invite.consumed_at && new Date(invite.expires_at) <= new Date(runtime.now())) {
+				return c.json(
+					{ error: projectInvite || recipientInvite ? "invite_expired" : "expired_token" },
+					410,
+				);
+			}
+			if (recipientInvite) {
+				const allowedRecipientAcceptanceFields = new Set([
+					"token",
+					"invite_kind",
+					"kind",
+					"identity_id",
+					"device_id",
+					"public_key",
+					"fingerprint",
+					"recipient_display_name",
+					"device_display_name",
+				]);
+				if (Object.keys(data).some((key) => !allowedRecipientAcceptanceFields.has(key))) {
+					return c.json({ error: "unexpected_recipient_invite_fields" }, 400);
+				}
+				const requestedKind = String(data.invite_kind ?? data.kind ?? "").trim();
+				const identityId = String(data.identity_id ?? "").trim();
+				if (!identityId || requestedKind !== invite.invite_kind) {
+					return c.json({ error: "recipient_invite_binding_required" }, 400);
+				}
+				if (identityId.length > 256 || /[\p{Cc}\p{Cf}]/u.test(identityId)) {
+					return c.json({ error: "identity_id_invalid" }, 400);
+				}
+				let normalizedRecipientDisplayName: string | null = null;
+				let normalizedDeviceDisplayName: string | null = null;
+				try {
+					if (data.recipient_display_name != null) {
+						if (typeof data.recipient_display_name !== "string") {
+							throw new Error("recipient_display_name_invalid");
+						}
+						normalizedRecipientDisplayName = normalizeHumanPresentationName(
+							data.recipient_display_name,
+							"recipient_display_name",
+						);
+					}
+					if (data.device_display_name != null) {
+						if (typeof data.device_display_name !== "string") {
+							throw new Error("device_display_name_invalid");
+						}
+						normalizedDeviceDisplayName = normalizeHumanPresentationName(
+							data.device_display_name,
+							"device_display_name",
+						);
+					}
+				} catch (error) {
+					return c.json(
+						{
+							error: error instanceof Error ? error.message : "recipient_invite_identity_invalid",
+						},
+						400,
+					);
+				}
+				if (
+					invite.invite_kind === "add_device" &&
+					String(invite.inviter_device_id ?? "").trim() === deviceId
+				) {
+					return c.json({ error: "add_device_invite_self_acceptance_forbidden" }, 409);
+				}
+				try {
+					const acceptance = await store.consumeRecipientInvite({
+						token,
+						inviteKind: invite.invite_kind as "team_member" | "add_device",
+						identityId,
+						deviceId,
+						publicKey,
+						fingerprint,
+						recipientDisplayName: normalizedRecipientDisplayName,
+						deviceDisplayName: normalizedDeviceDisplayName,
+						now: runtime.now(),
+					});
+					return c.json({
+						ok: true,
+						status: acceptance.status,
+						kind: acceptance.invite.invite_kind,
+						group_id: acceptance.invite.group_id,
+						identity_id: acceptance.invite.recipient_actor_id,
+						policy_team_id: acceptance.invite.policy_team_id ?? null,
+						target_identity_id: acceptance.invite.target_identity_id ?? null,
+						assigned_identity_id: acceptance.invite.assigned_identity_id ?? null,
+						bootstrap_grant_id: acceptance.bootstrap_grant?.grant_id ?? null,
+						inviter_device: acceptance.bootstrap_grant
+							? await store.getEnrollment(
+									acceptance.invite.group_id,
+									acceptance.bootstrap_grant.seed_device_id,
+								)
+							: null,
+						reviewed_preview_digest: acceptance.invite.reviewed_preview_digest,
+						reviewed_intent: acceptance.reviewed_intent,
+					});
+				} catch (error) {
+					const code = error instanceof Error ? error.message : "invite_invalid";
+					const status = code === "invite_expired" ? 410 : code === "invite_invalid" ? 404 : 409;
+					return c.json({ error: code }, status);
+				}
+			}
+			if (invite.operation_id || invite.reviewed_project_set_digest) {
+				const allowedProjectAcceptanceFields = new Set([
+					"token",
+					"operation_id",
+					"device_id",
+					"public_key",
+					"fingerprint",
+					"display_name",
+					"recipient_actor_id",
+					"recipient_display_name",
+					"device_display_name",
+				]);
+				if (Object.keys(data).some((key) => !allowedProjectAcceptanceFields.has(key))) {
+					return c.json({ error: "unexpected_project_invite_fields" }, 400);
+				}
+				if (!operationId || !recipientActorId || !recipientDisplayName || !deviceDisplayName) {
+					return c.json({ error: "project_invite_identity_required" }, 400);
+				}
+				if (String(invite.inviter_device_id ?? "").trim() === deviceId) {
+					return c.json({ error: "project_invite_self_acceptance_forbidden" }, 409);
+				}
+				if (recipientActorId.length > 256 || /[\p{Cc}\p{Cf}]/u.test(recipientActorId)) {
+					return c.json({ error: "recipient_actor_id_invalid" }, 400);
+				}
+				let normalizedRecipientName: string;
+				let normalizedDeviceName: string;
+				try {
+					normalizedRecipientName = normalizeHumanPresentationName(
+						recipientDisplayName,
+						"recipient_display_name",
+					);
+					normalizedDeviceName = normalizeHumanPresentationName(
+						deviceDisplayName,
+						"device_display_name",
+					);
+				} catch (error) {
+					return c.json(
+						{ error: error instanceof Error ? error.message : "project_invite_identity_invalid" },
+						400,
+					);
+				}
+				let acceptedIntent: ReturnType<typeof buildAcceptedProjectIntent>;
+				try {
+					acceptedIntent = buildAcceptedProjectIntent(invite);
+				} catch {
+					return c.json({ error: "operation_intent_invalid" }, 409);
+				}
+				try {
+					const acceptance = await store.consumeProjectInvite({
+						token,
+						operationId,
+						deviceId,
+						publicKey,
+						fingerprint,
+						recipientActorId,
+						recipientDisplayName: normalizedRecipientName,
+						deviceDisplayName: normalizedDeviceName,
+						now: runtime.now(),
+					});
+					return c.json({
+						ok: true,
+						status: PROJECT_INVITE_PENDING_STATUS,
+						group_id: acceptance.invite.group_id,
+						operation_id: acceptance.invite.operation_id,
+						trust_state: acceptance.invite.trust_state,
+						bootstrap_grant_id: acceptance.bootstrap_grant?.grant_id ?? null,
+						inviter_device: acceptance.seed_enrollment
+							? {
+									device_id: acceptance.seed_enrollment.device_id,
+									public_key: acceptance.seed_enrollment.public_key,
+									fingerprint: acceptance.seed_enrollment.fingerprint,
+									display_name: acceptance.seed_enrollment.display_name,
+								}
+							: null,
+						accepted_project_intent: acceptedIntent,
+					});
+				} catch (error) {
+					const code = error instanceof Error ? error.message : "invite_invalid";
+					const status = code === "invite_expired" ? 410 : code === "invite_invalid" ? 404 : 409;
+					return c.json({ error: code }, status);
+				}
+			}
+			const projectAcceptanceFields = [
+				"operation_id",
+				"recipient_actor_id",
+				"recipient_display_name",
+				"device_display_name",
+			];
+			if (projectAcceptanceFields.some((field) => Object.hasOwn(data, field))) {
+				return c.json({ error: "unexpected_project_invite_fields" }, 400);
+			}
 			const group = await store.getGroup(String(invite.group_id));
 			if (!group) return c.json({ error: "group_not_found" }, 404);
 			if (group.archived_at) return c.json({ error: "group_archived" }, 409);
-
-			if (invite.revoked_at) return c.json({ error: "revoked_token" }, 400);
-
-			const expiresAtStr = String(invite.expires_at ?? "");
-			if (expiresAtStr) {
-				const expiresAt = new Date(expiresAtStr.replace("Z", "+00:00"));
-				if (expiresAt <= new Date(runtime.now())) {
-					return c.json({ error: "expired_token" }, 400);
-				}
-			}
 
 			const inviteGroupId = String(invite.group_id);
 			const existing = await store.getEnrollment(inviteGroupId, deviceId);

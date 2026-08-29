@@ -5,13 +5,13 @@
 	"scripts": {
 		"clean": "rm -rf ../viewer-server/static",
 		"dev": "node ./scripts/make-dev-html.mjs && vite",
-		"build": "vite build --mode production && node ./scripts/stage-viewer-static.mjs",
+		"build": "vite build --mode production && node ./scripts/stage-viewer-static.mjs --precompress",
 		"build:watch": "node ./scripts/stage-viewer-static.mjs && vite build --watch --mode development",
 		"test": "pnpm exec vitest run",
 		"typecheck": "tsc -p tsconfig.json --noEmit"
 	},
 	"dependencies": {
-		"@preact/signals": "^2.5.1",
+		"@preact/signals": "^2.9.1",
 		"@radix-ui/react-collapsible": "^1.1.12",
 		"@radix-ui/react-dialog": "^1.1.15",
 		"@radix-ui/react-dropdown-menu": "^2.1.16",
@@ -23,12 +23,14 @@
 		"@radix-ui/react-toast": "^1.2.15",
 		"@radix-ui/react-toggle-group": "^1.1.11",
 		"@radix-ui/react-tooltip": "^1.2.8",
-		"preact": "^10.27.2",
+		"dompurify": "^3.4.11",
+		"marked": "^18.0.5",
+		"preact": "^10.29.2",
 		"tslib": "^2.8.1"
 	},
 	"devDependencies": {
-		"@preact/preset-vite": "^2.10.2",
-		"jsdom": "^27.0.1",
+		"@preact/preset-vite": "^2.10.5",
+		"jsdom": "^27.4.0",
 		"typescript": "catalog:",
 		"vite": "catalog:"
 	}

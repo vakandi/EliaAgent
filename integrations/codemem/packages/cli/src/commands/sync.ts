@@ -11,13 +11,15 @@ import { dirname, join } from "node:path";
 import * as p from "@clack/prompts";
 import {
 	applyBootstrapSnapshot,
-	buildAuthHeaders,
 	buildBaseUrl,
+	buildDirectPeerAuthHeaders,
+	DeviceIdentityError,
 	ensureDeviceIdentity,
 	fetchAllSnapshotPages,
 	fingerprintPublicKey,
 	getSemanticIndexDiagnostics,
 	hasUnsyncedSharedMemoryChanges,
+	listPerPeerScopeSyncState,
 	loadPublicKey,
 	MemoryStore,
 	mdnsEnabled,
@@ -243,6 +245,15 @@ attemptsCmd.action((opts: { db?: string; dbPath?: string; limit: string; json?: 
 		for (const row of rows) {
 			console.log(formatSyncAttempt(row));
 		}
+	} catch (error) {
+		const message = error instanceof Error ? error.message : "Failed to read sync attempts";
+		if (opts.json) {
+			emitJsonError("invalid_input", message);
+		} else {
+			p.log.error(message);
+			process.exitCode = 1;
+		}
+		return;
 	} finally {
 		store.close();
 	}
@@ -328,7 +339,11 @@ onceCmd.action(async (opts: { db?: string; dbPath?: string; peer?: string; json?
 			error?: string;
 		}> = [];
 		for (const row of rows) {
-			const result = await runSyncPass(store.db, row.peer_device_id, { keysDir });
+			const result = await runSyncPass(store.db, row.peer_device_id, {
+				keysDir,
+				dbPath: store.dbPath,
+				scanner: store.scanner,
+			});
 			if (!result.ok) hadFailure = true;
 			results.push({
 				peer_device_id: row.peer_device_id,
@@ -525,11 +540,29 @@ pairCmd.action(async (opts: SyncPairOptions) => {
 				process.exitCode = 1;
 				return;
 			}
+			const existingPeer = drizzle(store.db, { schema })
+				.select({ pinned_fingerprint: schema.syncPeers.pinned_fingerprint })
+				.from(schema.syncPeers)
+				.where(eq(schema.syncPeers.peer_device_id, deviceId))
+				.get();
+			const existingFingerprint = String(existingPeer?.pinned_fingerprint ?? "").trim();
+			if (existingFingerprint && existingFingerprint !== fingerprint) {
+				const msg =
+					"Pairing payload conflicts with the existing trusted fingerprint for this device. Remove or repair the old peer before accepting this pairing payload.";
+				if (opts.json) {
+					emitJsonError("peer_conflict", msg);
+					return;
+				}
+				p.log.error(msg);
+				process.exitCode = 1;
+				return;
+			}
 
 			updatePeerAddresses(store.db, deviceId, resolvedAddresses, {
 				name: opts.name,
 				pinnedFingerprint: fingerprint,
 				publicKey,
+				replaceTrust: true,
 			});
 
 			if (opts.default) {
@@ -598,6 +631,15 @@ pairCmd.action(async (opts: SyncPairOptions) => {
 		console.log(
 			"On the accepting device, --include/--exclude control both what it sends and what it accepts from that peer.",
 		);
+	} catch (error) {
+		const code = error instanceof DeviceIdentityError ? error.code : "pairing_failed";
+		const message = error instanceof Error ? error.message : "Pairing failed";
+		if (opts.json) {
+			emitJsonError(code, message);
+			return;
+		}
+		p.log.error(message);
+		process.exitCode = 1;
 	} finally {
 		store.close();
 	}
@@ -640,6 +682,7 @@ doctorCmd.action(
 				.all();
 
 			const issues: string[] = [];
+			let identityError: string | null = null;
 			const syncHost = typeof config.sync_host === "string" ? config.sync_host : "0.0.0.0";
 			const syncPort = typeof config.sync_port === "number" ? config.sync_port : 7337;
 			const viewerBinding = readViewerBinding(dbPath);
@@ -650,6 +693,16 @@ doctorCmd.action(
 
 			if (!reachable) issues.push("daemon not running");
 			if (!device) issues.push("identity missing");
+			if (device) {
+				try {
+					ensureDeviceIdentity(store.db, {
+						keysDir: process.env.CODEMEM_KEYS_DIR?.trim() || undefined,
+					});
+				} catch (error) {
+					identityError = error instanceof Error ? error.message : "device_identity_unavailable";
+					issues.push(identityError);
+				}
+			}
 			if (
 				daemonState?.last_error &&
 				(!daemonState.last_ok_at || daemonState.last_ok_at < (daemonState.last_error_at ?? ""))
@@ -705,6 +758,7 @@ doctorCmd.action(
 						mdns_source: mdnsSource,
 						daemon: reachable ? "running" : "not running",
 						identity: device?.device_id ?? null,
+						identity_error: identityError,
 						daemon_error: daemonState?.last_error ?? null,
 						peers: peerDetails,
 						issues: [...new Set(issues)],
@@ -724,6 +778,7 @@ doctorCmd.action(
 				console.log("- Identity: missing (run `codemem sync enable`)");
 			} else {
 				console.log(`- Identity: ${device.device_id}`);
+				if (identityError) console.log(`- Identity error: ${identityError}`);
 			}
 
 			if (
@@ -751,6 +806,15 @@ doctorCmd.action(
 			} else {
 				console.log("OK: sync looks healthy");
 			}
+		} catch (error) {
+			const code = error instanceof DeviceIdentityError ? error.code : "doctor_failed";
+			const message = error instanceof Error ? error.message : "Sync diagnostics failed";
+			if (opts.json) {
+				emitJsonError(code, message);
+				return;
+			}
+			p.log.error(message);
+			process.exitCode = 1;
 		} finally {
 			store.close();
 		}
@@ -790,6 +854,21 @@ statusCmd.action((opts: { db?: string; dbPath?: string; config?: string; json?: 
 			.all();
 		const semanticIndex = getSemanticIndexDiagnostics(store.db);
 
+		// Per-Space sync state per peer. Uses the shared
+		// `listPerPeerScopeSyncState` helper so this surface stays byte-for-byte
+		// consistent with the viewer's /api/sync/status payload — they are the
+		// two surfaces that close the codemem-ruu6 diagnostic gap where peers
+		// showed `status=ok` while 99% of scoped data was silently missing.
+		const localDeviceId = deviceRow?.device_id ?? null;
+		const peersWithScopes = peers.map((peer) => {
+			const peerDeviceId = String(peer.peer_device_id ?? "").trim();
+			const scopes = listPerPeerScopeSyncState(store.db, {
+				localDeviceId,
+				peerDeviceId,
+			});
+			return { peer, scopes };
+		});
+
 		if (opts.json) {
 			console.log(
 				JSON.stringify(
@@ -802,11 +881,12 @@ statusCmd.action((opts: { db?: string; dbPath?: string; config?: string; json?: 
 						device_id: deviceRow?.device_id ?? null,
 						fingerprint: deviceRow?.fingerprint ?? null,
 						coordinator_url: config.sync_coordinator_url ?? null,
-						peers: peers.map((peer) => ({
+						peers: peersWithScopes.map(({ peer, scopes }) => ({
 							device_id: peer.peer_device_id,
 							name: peer.name,
 							last_sync: peer.last_sync_at,
 							status: peer.last_error ?? "ok",
+							scopes,
 						})),
 					},
 					null,
@@ -834,11 +914,18 @@ statusCmd.action((opts: { db?: string; dbPath?: string; config?: string; json?: 
 		if (peers.length === 0) {
 			p.log.info("Peers: none");
 		} else {
-			for (const peer of peers) {
+			for (const { peer, scopes } of peersWithScopes) {
 				const label = peer.name || peer.peer_device_id;
-				p.log.message(
-					`  ${label}: last_sync=${peer.last_sync_at ?? "never"}, status=${peer.last_error ?? "ok"}`,
-				);
+				const peerHeader = `  ${label}: last_sync=${peer.last_sync_at ?? "never"}, status=${peer.last_error ?? "ok"}`;
+				if (scopes.length === 0) {
+					p.log.message(peerHeader);
+				} else {
+					const scopeLines = scopes.map((scope) => {
+						const state = scope.bootstrapped ? "received" : "pending";
+						return `      - ${scope.label} (${scope.scope_id}): ${state}`;
+					});
+					p.log.message([peerHeader, "    Spaces:", ...scopeLines].join("\n"));
+				}
 			}
 		}
 		p.log.info(
@@ -895,7 +982,8 @@ enableCmd.action(
 
 		const store = new MemoryStore(resolveDbPath(resolveDbOpt(opts)));
 		try {
-			const [deviceId, fingerprint] = ensureDeviceIdentity(store.db);
+			const keysDir = process.env.CODEMEM_KEYS_DIR?.trim() || undefined;
+			const [deviceId, fingerprint] = ensureDeviceIdentity(store.db, { keysDir });
 			const config = readCliConfig(opts.config);
 			config.sync_enabled = true;
 			if (effectiveHost) config.sync_host = effectiveHost;
@@ -930,6 +1018,15 @@ enableCmd.action(
 				].join("\n"),
 			);
 			p.outro("Sync enabled — restart `codemem serve` to activate");
+		} catch (error) {
+			const message = error instanceof Error ? error.message : "Failed to enable sync";
+			if (opts.json) {
+				emitJsonError("invalid_input", message);
+			} else {
+				p.log.error(message);
+				process.exitCode = 1;
+			}
+			return;
 		} finally {
 			store.close();
 		}
@@ -1176,8 +1273,10 @@ bootstrapCmd.action(
 				const candidate = buildBaseUrl(address);
 				if (!candidate) continue;
 				const statusUrl = `${candidate}/v1/status`;
-				const headers = buildAuthHeaders({
+				const headers = buildDirectPeerAuthHeaders({
 					deviceId,
+					recipientId: peerDeviceId,
+					dbPath: store.dbPath,
 					method: "GET",
 					url: statusUrl,
 					bodyBytes: Buffer.alloc(0),
@@ -1249,11 +1348,19 @@ bootstrapCmd.action(
 
 			const { items } = await fetchAllSnapshotPages(baseUrl, resetInfo, deviceId, {
 				keysDir,
+				dbPath: store.dbPath,
 				bootstrapGrantId: opts.bootstrapGrant,
+				recipientId: peerDeviceId,
 				pageSize,
 			});
 
-			const result = applyBootstrapSnapshot(store.db, peerDeviceId, items, resetInfo);
+			const result = applyBootstrapSnapshot(
+				store.db,
+				peerDeviceId,
+				items,
+				resetInfo,
+				store.scanner,
+			);
 
 			if (opts.json) {
 				console.log(
@@ -1273,6 +1380,15 @@ bootstrapCmd.action(
 				p.outro(result.ok ? "Bootstrap complete" : "Bootstrap failed");
 			}
 			if (!result.ok) process.exitCode = 1;
+		} catch (error) {
+			const code = error instanceof DeviceIdentityError ? error.code : "bootstrap_failed";
+			const message = error instanceof Error ? error.message : "Bootstrap failed";
+			if (opts.json) {
+				emitJsonError(code, message);
+				return;
+			}
+			p.log.error(message);
+			process.exitCode = 1;
 		} finally {
 			store.close();
 		}
@@ -1313,4 +1429,4 @@ syncCoordinatorAlias.hook("preAction", (_thisCmd: Command, actionCmd: Command) =
 	emitDeprecationWarning(`codemem sync coordinator ${subName}`, `codemem coordinator ${subName}`);
 });
 
-syncCommand.addCommand(syncCoordinatorAlias);
+syncCommand.addCommand(syncCoordinatorAlias, { hidden: true });

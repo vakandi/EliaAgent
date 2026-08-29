@@ -2,76 +2,221 @@
  * Memory routes — observations, summaries, sessions, projects, pack, artifacts.
  */
 
-import type { MemoryStore } from "@codemem/core";
+import type { MemoryFilters, MemoryStore } from "@codemem/core";
 import {
 	buildFilterClausesWithContext,
 	canonicalMemoryKind,
 	fromJson,
-	isSummaryLikeMemory as isCoreSummaryLikeMemory,
+	normalizeHumanPresentationName,
+	parsePositiveMemoryId,
 	parseStrictInteger,
 	schema,
 } from "@codemem/core";
-import { desc, eq, inArray, isNotNull } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import { Hono } from "hono";
 import { queryInt } from "../helpers.js";
 
 type StoreFactory = () => MemoryStore;
 
-type OwnershipContext = {
-	actorId: string;
-	claimedPeerIds: Set<string>;
-	deviceId: string;
-	legacyActorIds: Set<string>;
-};
+type OwnershipPredicate = (item: Record<string, unknown>) => boolean;
 
-function cleanOwnershipValue(value: unknown): string | null {
-	if (typeof value !== "string") return null;
-	const trimmed = value.trim();
-	return trimmed ? trimmed : null;
+const MAX_FEED_QUERY_CODE_UNITS = 256;
+const searchFunctionsRegisteredStores = new WeakSet<MemoryStore>();
+
+function casefold(value: unknown): string {
+	return String(value ?? "").toLowerCase();
 }
 
-function buildOwnershipContext(store: MemoryStore): OwnershipContext {
-	const claimedPeerIds = new Set(store.sameActorPeerIds());
-	return {
-		actorId: store.actorId,
-		claimedPeerIds,
-		deviceId: store.deviceId,
-		legacyActorIds: new Set(Array.from(claimedPeerIds, (peerId) => `legacy-sync:${peerId}`)),
+function normalizeMemorySearchQuery(value: string | undefined): string | undefined {
+	const normalized = casefold(value?.trim()).slice(0, MAX_FEED_QUERY_CODE_UNITS);
+	return normalized || undefined;
+}
+
+function ensureMemorySearchFunctions(store: MemoryStore): void {
+	if (searchFunctionsRegisteredStores.has(store)) return;
+	store.db.function("codemem_casefold", { deterministic: true }, casefold);
+	store.db.function("codemem_project_basename", { deterministic: true }, (value: unknown) =>
+		projectBasename(String(value ?? "").trim()),
+	);
+	searchFunctionsRegisteredStores.add(store);
+}
+
+interface ActorPresentationRow {
+	actor_id: string;
+	display_name: string;
+	status: string;
+	merged_into_actor_id: string | null;
+}
+
+interface DevicePresentationRow {
+	device_id: string;
+	display_name: string;
+}
+
+interface PeerPresentationRow {
+	peer_device_id: string;
+	name: string | null;
+	actor_id: string | null;
+}
+
+const IDENTITY_LOOKUP_BATCH_SIZE = 500;
+
+function identityValue(item: Record<string, unknown>, key: string): string {
+	const direct = String(item[key] ?? "").trim();
+	if (direct) return direct;
+	const rawMetadata = item.metadata ?? item.metadata_json;
+	const metadata = typeof rawMetadata === "string" ? fromJson(rawMetadata) : rawMetadata;
+	if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return "";
+	return String((metadata as Record<string, unknown>)[key] ?? "").trim();
+}
+
+function uniqueStrings(items: Record<string, unknown>[], key: string): string[] {
+	return [...new Set(items.map((item) => identityValue(item, key)).filter(Boolean))];
+}
+
+function batchedLookup<T>(
+	store: MemoryStore,
+	values: string[],
+	query: (placeholders: string) => string,
+): T[] {
+	const rows: T[] = [];
+	for (let offset = 0; offset < values.length; offset += IDENTITY_LOOKUP_BATCH_SIZE) {
+		const batch = values.slice(offset, offset + IDENTITY_LOOKUP_BATCH_SIZE);
+		const placeholders = batch.map(() => "?").join(", ");
+		rows.push(...(store.db.prepare(query(placeholders)).all(...batch) as T[]));
+	}
+	return rows;
+}
+
+function humanName(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	try {
+		return normalizeHumanPresentationName(value, "display_name");
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Add presentation-only identity labels without changing persisted provenance.
+ * Resolved names are display hints, not authority or ownership evidence; legacy
+ * metadata receives the same top-level-first fallback as existing read paths.
+ */
+function attachResolvedIdentityFieldsUnsafe(
+	store: MemoryStore,
+	items: Record<string, unknown>[],
+): void {
+	const actorIds = uniqueStrings(items, "actor_id");
+	const deviceIds = uniqueStrings(items, "origin_device_id");
+	const peers = batchedLookup<PeerPresentationRow>(
+		store,
+		deviceIds,
+		(placeholders) =>
+			`SELECT peer_device_id, name, actor_id FROM sync_peers
+		 WHERE peer_device_id IN (${placeholders})
+		   AND TRIM(COALESCE(pinned_fingerprint, '')) <> ''`,
+	);
+	const peerByDevice = new Map(peers.map((peer) => [peer.peer_device_id, peer]));
+	const peerActorIds = peers
+		.map((peer) => String(peer.actor_id ?? "").trim())
+		.filter((actorId) => actorId.length > 0);
+	const actorRows = batchedLookup<ActorPresentationRow>(
+		store,
+		[...new Set([...actorIds, ...peerActorIds])],
+		(placeholders) =>
+			`SELECT actor_id, display_name, status, merged_into_actor_id FROM actors
+			 WHERE actor_id IN (${placeholders})`,
+	);
+	const devices = batchedLookup<DevicePresentationRow>(
+		store,
+		deviceIds,
+		(placeholders) =>
+			`SELECT device_id, display_name FROM identity_devices
+		 WHERE device_id IN (${placeholders}) AND status = 'active'`,
+	);
+	const actorById = new Map(actorRows.map((actor) => [actor.actor_id, actor] as const));
+	let pendingMergeTargets = [
+		...new Set(
+			actorRows
+				.map((actor) => String(actor.merged_into_actor_id ?? "").trim())
+				.filter((actorId) => actorId && !actorById.has(actorId)),
+		),
+	];
+	while (pendingMergeTargets.length > 0) {
+		const targetRows = batchedLookup<ActorPresentationRow>(
+			store,
+			pendingMergeTargets,
+			(placeholders) =>
+				`SELECT actor_id, display_name, status, merged_into_actor_id FROM actors
+				 WHERE actor_id IN (${placeholders})`,
+		);
+		for (const actor of targetRows) actorById.set(actor.actor_id, actor);
+		pendingMergeTargets = [
+			...new Set(
+				targetRows
+					.map((actor) => String(actor.merged_into_actor_id ?? "").trim())
+					.filter((actorId) => actorId && !actorById.has(actorId)),
+			),
+		];
+	}
+	const resolvedActorName = (actorId: string): string | undefined => {
+		const seen = new Set<string>();
+		let currentActorId = actorId;
+		while (currentActorId && !seen.has(currentActorId)) {
+			seen.add(currentActorId);
+			const actor = actorById.get(currentActorId);
+			if (!actor) return undefined;
+			if (actor.status === "active" && actor.merged_into_actor_id === null) {
+				return humanName(actor.display_name);
+			}
+			currentActorId = String(actor.merged_into_actor_id ?? "").trim();
+		}
+		return undefined;
 	};
+	const deviceNameById = new Map(
+		devices
+			.map((device) => [device.device_id, humanName(device.display_name)] as const)
+			.filter((entry): entry is readonly [string, string] => entry[1] !== undefined),
+	);
+
+	for (const item of items) {
+		const actorId = identityValue(item, "actor_id");
+		const deviceId = identityValue(item, "origin_device_id");
+		const peer = peerByDevice.get(deviceId);
+		const peerActorId = String(peer?.actor_id ?? "").trim();
+		const knownMemoryActor = actorById.has(actorId);
+		const actorName = knownMemoryActor
+			? (resolvedActorName(actorId) ?? humanName(item.actor_display_name))
+			: (resolvedActorName(peerActorId) ?? humanName(item.actor_display_name));
+		const deviceName = deviceNameById.get(deviceId) ?? humanName(peer?.name);
+		if (actorName) item.resolved_actor_display_name = actorName;
+		if (deviceName) item.resolved_device_display_name = deviceName;
+	}
 }
 
-function memoryOwnedBySelf(
-	row: Record<string, unknown>,
-	ownership: OwnershipContext,
-	metadata = fromJson((row.metadata_json as string) ?? null),
-): boolean {
-	const meta = metadata as Record<string, unknown>;
-	const actorId = cleanOwnershipValue(row.actor_id) ?? cleanOwnershipValue(meta.actor_id);
-	if (actorId === ownership.actorId) return true;
-
-	const deviceId =
-		cleanOwnershipValue(row.origin_device_id) ?? cleanOwnershipValue(meta.origin_device_id);
-	if (deviceId === ownership.deviceId) return true;
-	if (deviceId && ownership.claimedPeerIds.has(deviceId)) return true;
-	if (actorId && ownership.legacyActorIds.has(actorId)) return true;
-
-	return false;
+function attachResolvedIdentityFields(store: MemoryStore, items: Record<string, unknown>[]): void {
+	try {
+		attachResolvedIdentityFieldsUnsafe(store, items);
+	} catch {
+		// Presentation enrichment is optional; neutral Feed fallbacks must remain
+		// available for legacy or partially initialized databases.
+	}
 }
 
 function serializeMemoryRow(
-	ownership: OwnershipContext,
+	ownedBySelf: OwnershipPredicate,
 	row: Record<string, unknown>,
 ): Record<string, unknown> {
 	const metadata = fromJson((row.metadata_json as string) ?? null);
-	const item = {
+	// Evaluate ownership against the raw row (top-level columns + metadata_json
+	// fallback) before we overwrite metadata_json with the parsed object.
+	const owned_by_self = ownedBySelf(row);
+	return {
 		...row,
 		kind: canonicalMemoryKind((row.kind as string | null | undefined) ?? null, row.metadata_json),
 		metadata_json: metadata,
-	};
-	return {
-		...item,
-		owned_by_self: memoryOwnedBySelf(row, ownership, metadata),
+		owned_by_self,
 	};
 }
 
@@ -138,6 +283,144 @@ function normalizeScope(raw: string | undefined): "mine" | "theirs" | undefined 
 	return undefined;
 }
 
+function buildViewerMemoryFilters(store: MemoryStore, filters?: MemoryFilters | null) {
+	return buildFilterClausesWithContext(filters, store.ownershipFilterContext());
+}
+
+function countVisibleMemoryRows(store: MemoryStore, filters?: MemoryFilters | null): number {
+	const filterResult = buildViewerMemoryFilters(store, filters);
+	const clauses = ["memory_items.active = 1", ...filterResult.clauses];
+	const from = filterResult.joinSessions
+		? "memory_items JOIN sessions ON sessions.id = memory_items.session_id"
+		: "memory_items";
+	const row = store.db
+		.prepare(`SELECT COUNT(*) AS total FROM ${from} WHERE ${clauses.join(" AND ")}`)
+		.get(...filterResult.params) as Record<string, unknown> | undefined;
+	return Number(row?.total ?? 0);
+}
+
+function summaryLikeSqlPredicate(): string {
+	return `(
+		LOWER(TRIM(COALESCE(memory_items.kind, ''))) = 'session_summary'
+		OR (
+			json_valid(COALESCE(memory_items.metadata_json, ''))
+			AND (
+				COALESCE(json_type(memory_items.metadata_json, '$.is_summary') = 'true', 0)
+				OR LOWER(TRIM(COALESCE(json_extract(memory_items.metadata_json, '$.source'), ''))) = 'observer_summary'
+			)
+		)
+	)`;
+}
+
+function memorySearchSql(query: string): { clause: string; params: unknown[] } {
+	const textClause = `INSTR(codemem_casefold(
+		COALESCE(memory_items.title, '') || CHAR(10) ||
+		COALESCE(memory_items.body_text, '') || CHAR(10) ||
+		CASE WHEN ${summaryLikeSqlPredicate()} THEN 'session_summary' ELSE
+			COALESCE(NULLIF(LOWER(TRIM(COALESCE(memory_items.kind, ''))), ''), 'change')
+		END || CHAR(10) ||
+		COALESCE(
+			memory_items.project,
+			codemem_project_basename(
+				(SELECT sessions.project FROM sessions WHERE sessions.id = memory_items.session_id)
+			),
+			''
+		) || CHAR(10) ||
+		COALESCE(memory_items.tags_text, '') || CHAR(10) ||
+		COALESCE(memory_items.facts, '') || CHAR(10) ||
+		COALESCE(memory_items.subtitle, '') || CHAR(10) ||
+		COALESCE(memory_items.narrative, '') || CHAR(10) ||
+		CASE WHEN json_valid(COALESCE(memory_items.metadata_json, '')) THEN
+			COALESCE(json_extract(memory_items.metadata_json, '$.request'), '') || CHAR(10) ||
+			COALESCE(json_extract(memory_items.metadata_json, '$.subtitle'), '') || CHAR(10) ||
+			COALESCE(json_extract(memory_items.metadata_json, '$.narrative'), '') || CHAR(10) ||
+			COALESCE(json_extract(memory_items.metadata_json, '$.facts'), '') || CHAR(10) ||
+			COALESCE(json_extract(memory_items.metadata_json, '$.summary'), '')
+		ELSE '' END
+	), codemem_casefold(?)) > 0`;
+	const parsedMemoryId = parsePositiveMemoryId(query);
+	const memoryId =
+		parsedMemoryId != null && String(parsedMemoryId) === query ? parsedMemoryId : null;
+	if (memoryId != null) {
+		return { clause: `(memory_items.id = ? OR ${textClause})`, params: [memoryId, query] };
+	}
+	return { clause: textClause, params: [query] };
+}
+
+function countVisibleObservationRows(store: MemoryStore, filters?: MemoryFilters | null): number {
+	const filterResult = buildViewerMemoryFilters(store, filters);
+	const clauses = [
+		"memory_items.active = 1",
+		`NOT ${summaryLikeSqlPredicate()}`,
+		...filterResult.clauses,
+	];
+	const from = filterResult.joinSessions
+		? "memory_items JOIN sessions ON sessions.id = memory_items.session_id"
+		: "memory_items";
+	const row = store.db
+		.prepare(`SELECT COUNT(*) AS total FROM ${from} WHERE ${clauses.join(" AND ")}`)
+		.get(...filterResult.params) as Record<string, unknown> | undefined;
+	return Number(row?.total ?? 0);
+}
+
+function sessionAllowsArtifactAccess(store: MemoryStore, sessionId: number): boolean {
+	const visibleCount = countVisibleMemoryRows(store, { session_id: sessionId });
+	if (visibleCount === 0) return false;
+	const row = store.db
+		.prepare(
+			`SELECT COUNT(*) AS total FROM memory_items
+			 WHERE session_id = ? AND active = 1`,
+		)
+		.get(sessionId) as Record<string, unknown> | undefined;
+	return visibleCount === Number(row?.total ?? 0);
+}
+
+function countVisiblePromptRows(store: MemoryStore, project?: string | null): number {
+	const filterResult = buildViewerMemoryFilters(store, null);
+	const clauses = [
+		"user_prompts.session_id IS NOT NULL",
+		`EXISTS (
+			SELECT 1 FROM memory_items
+			WHERE memory_items.session_id = user_prompts.session_id
+			  AND memory_items.active = 1
+			  AND ${filterResult.clauses.join(" AND ")}
+		)`,
+	];
+	const params: unknown[] = [...filterResult.params];
+	if (project) {
+		clauses.unshift("user_prompts.project = ?");
+		params.unshift(project);
+	}
+	const row = store.db
+		.prepare(`SELECT COUNT(*) AS total FROM user_prompts WHERE ${clauses.join(" AND ")}`)
+		.get(...params) as Record<string, unknown> | undefined;
+	return Number(row?.total ?? 0);
+}
+
+function countVisibleArtifactRows(store: MemoryStore, project?: string | null): number {
+	const filterResult = buildViewerMemoryFilters(store, null);
+	const clauses = [
+		`EXISTS (
+			SELECT 1 FROM memory_items
+			WHERE memory_items.session_id = artifacts.session_id
+			  AND memory_items.active = 1
+			  AND ${filterResult.clauses.join(" AND ")}
+		)`,
+	];
+	const params: unknown[] = [...filterResult.params];
+	const from = project
+		? "artifacts JOIN sessions ON sessions.id = artifacts.session_id"
+		: "artifacts";
+	if (project) {
+		clauses.unshift("sessions.project = ?");
+		params.unshift(project);
+	}
+	const row = store.db
+		.prepare(`SELECT COUNT(*) AS total FROM ${from} WHERE ${clauses.join(" AND ")}`)
+		.get(...params) as Record<string, unknown> | undefined;
+	return Number(row?.total ?? 0);
+}
+
 function queryMemoryPage(
 	store: MemoryStore,
 	options: {
@@ -145,17 +428,28 @@ function queryMemoryPage(
 		offset: number;
 		project?: string;
 		scope?: "mine" | "theirs";
+		q?: string;
+		classification: "observation" | "summary";
 	},
 ): Record<string, unknown>[] {
-	const filters: Record<string, unknown> = {};
+	ensureMemorySearchFunctions(store);
+	const filters: MemoryFilters = {};
 	if (options.project) filters.project = options.project;
 	if (options.scope) filters.ownership_scope = options.scope;
 
-	const filterResult = buildFilterClausesWithContext(filters, {
-		actorId: store.actorId,
-		deviceId: store.deviceId,
-	});
-	const clauses = ["memory_items.active = 1", ...filterResult.clauses];
+	const filterResult = buildViewerMemoryFilters(store, filters);
+	const summaryPredicate = summaryLikeSqlPredicate();
+	const clauses = [
+		"memory_items.active = 1",
+		options.classification === "summary" ? summaryPredicate : `NOT ${summaryPredicate}`,
+		...filterResult.clauses,
+	];
+	const params: unknown[] = [...filterResult.params];
+	if (options.q) {
+		const search = memorySearchSql(options.q);
+		clauses.push(search.clause);
+		params.push(...search.params);
+	}
 	const where = clauses.join(" AND ");
 	const from = filterResult.joinSessions
 		? "memory_items JOIN sessions ON sessions.id = memory_items.session_id"
@@ -165,50 +459,13 @@ function queryMemoryPage(
 		.prepare(
 			`SELECT memory_items.* FROM ${from}
 			 WHERE ${where}
-			 ORDER BY memory_items.created_at DESC
+			 ORDER BY memory_items.created_at DESC, memory_items.id DESC
 			 LIMIT ? OFFSET ?`,
 		)
-		.all(...filterResult.params, options.limit + 1, options.offset) as Record<string, unknown>[];
+		.all(...params, options.limit + 1, options.offset) as Record<string, unknown>[];
 
-	const ownership = buildOwnershipContext(store);
-	return rows.map((row) => serializeMemoryRow(ownership, row));
-}
-
-function isSummaryLikeMemory(item: Record<string, unknown>): boolean {
-	return isCoreSummaryLikeMemory({
-		kind: item.kind as string | null | undefined,
-		metadata: item.metadata_json,
-	});
-}
-
-function selectMemoryPage(
-	store: MemoryStore,
-	options: {
-		limit: number;
-		offset: number;
-		project?: string;
-		scope?: "mine" | "theirs";
-		matcher: (item: Record<string, unknown>) => boolean;
-	},
-): Record<string, unknown>[] {
-	const pageSize = Math.max(options.limit + options.offset + 10, 50);
-	let rawOffset = 0;
-	const matched: Record<string, unknown>[] = [];
-
-	while (matched.length < options.offset + options.limit + 1) {
-		const page = queryMemoryPage(store, {
-			limit: pageSize,
-			offset: rawOffset,
-			project: options.project,
-			scope: options.scope,
-		});
-		if (page.length === 0) break;
-		matched.push(...page.filter(options.matcher));
-		if (page.length < pageSize) break;
-		rawOffset += page.length;
-	}
-
-	return matched.slice(options.offset, options.offset + options.limit + 1);
+	const ownedBySelf = store.buildOwnershipPredicate();
+	return rows.map((row) => serializeMemoryRow(ownedBySelf, row));
 }
 
 export function memoryRoutes(getStore: StoreFactory) {
@@ -219,16 +476,23 @@ export function memoryRoutes(getStore: StoreFactory) {
 		const store = getStore();
 		{
 			const limit = queryInt(c.req.query("limit"), 20);
-			const d = drizzle(store.db, { schema });
-			const rows = d
-				.select()
-				.from(schema.sessions)
-				.orderBy(desc(schema.sessions.started_at))
-				.limit(limit)
-				.all();
+			const filterResult = buildViewerMemoryFilters(store, null);
+			const clauses = [
+				"memory_items.session_id = sessions.id",
+				"memory_items.active = 1",
+				...filterResult.clauses,
+			];
+			const rows = store.db
+				.prepare(
+					`SELECT sessions.* FROM sessions
+					 WHERE EXISTS (SELECT 1 FROM memory_items WHERE ${clauses.join(" AND ")})
+					 ORDER BY sessions.started_at DESC
+					 LIMIT ?`,
+				)
+				.all(...filterResult.params, limit) as Record<string, unknown>[];
 			const items = rows.map((row) => ({
 				...row,
-				metadata_json: fromJson(row.metadata_json),
+				metadata_json: fromJson((row.metadata_json as string | null | undefined) ?? null),
 			}));
 			return c.json({ items });
 		}
@@ -238,12 +502,20 @@ export function memoryRoutes(getStore: StoreFactory) {
 	app.get("/api/projects", (c) => {
 		const store = getStore();
 		{
-			const d = drizzle(store.db, { schema });
-			const rows = d
-				.selectDistinct({ project: schema.sessions.project })
-				.from(schema.sessions)
-				.where(isNotNull(schema.sessions.project))
-				.all();
+			const filterResult = buildViewerMemoryFilters(store, null);
+			const clauses = [
+				"memory_items.session_id = sessions.id",
+				"memory_items.active = 1",
+				"sessions.project IS NOT NULL",
+				...filterResult.clauses,
+			];
+			const rows = store.db
+				.prepare(
+					`SELECT DISTINCT sessions.project AS project FROM sessions
+					 JOIN memory_items ON memory_items.session_id = sessions.id
+					 WHERE ${clauses.join(" AND ")}`,
+				)
+				.all(...filterResult.params) as Record<string, unknown>[];
 			const projects = [
 				...new Set(
 					rows
@@ -270,17 +542,20 @@ export function memoryRoutes(getStore: StoreFactory) {
 			const offset = Math.max(0, queryInt(c.req.query("offset"), 0));
 			const project = c.req.query("project") || undefined;
 			const scope = normalizeScope(c.req.query("scope"));
-			const items = selectMemoryPage(store, {
+			const q = normalizeMemorySearchQuery(c.req.query("q"));
+			const items = queryMemoryPage(store, {
 				limit,
 				offset,
 				project,
 				scope,
-				matcher: (item) => !isSummaryLikeMemory(item),
+				q,
+				classification: "observation",
 			});
 			const hasMore = items.length > limit;
 			const result = hasMore ? items.slice(0, limit) : items;
 			const asRecords = result as unknown as Record<string, unknown>[];
 			attachSessionFields(store, asRecords);
+			attachResolvedIdentityFields(store, asRecords);
 			return c.json({
 				items: asRecords,
 				pagination: {
@@ -301,17 +576,20 @@ export function memoryRoutes(getStore: StoreFactory) {
 			const offset = Math.max(0, queryInt(c.req.query("offset"), 0));
 			const project = c.req.query("project") || undefined;
 			const scope = normalizeScope(c.req.query("scope"));
-			const items = selectMemoryPage(store, {
+			const q = normalizeMemorySearchQuery(c.req.query("q"));
+			const items = queryMemoryPage(store, {
 				limit,
 				offset,
 				project,
 				scope,
-				matcher: (item) => isSummaryLikeMemory(item),
+				q,
+				classification: "summary",
 			});
 			const hasMore = items.length > limit;
 			const result = hasMore ? items.slice(0, limit) : items;
 			const asRecords = result as unknown as Record<string, unknown>[];
 			attachSessionFields(store, asRecords);
+			attachResolvedIdentityFields(store, asRecords);
 			return c.json({
 				items: asRecords,
 				pagination: {
@@ -329,51 +607,20 @@ export function memoryRoutes(getStore: StoreFactory) {
 		const store = getStore();
 		{
 			const project = c.req.query("project") || null;
-			const count = (sql: string, ...params: unknown[]): number => {
-				const row = store.db.prepare(sql).get(...params) as Record<string, unknown> | undefined;
-				return Number(row?.total ?? 0);
-			};
-
 			let prompts: number;
 			let artifacts: number;
 			let memories: number;
 			let observations: number;
-			const countObservations = (scopeProject?: string) => {
-				let offset = 0;
-				let total = 0;
-				while (true) {
-					const page = queryMemoryPage(store, {
-						limit: 200,
-						offset,
-						project: scopeProject,
-					});
-					if (page.length === 0) break;
-					total += page.filter((item) => !isSummaryLikeMemory(item)).length;
-					if (page.length < 200) break;
-					offset += page.length;
-				}
-				return total;
-			};
 			if (project) {
-				prompts = count("SELECT COUNT(*) AS total FROM user_prompts WHERE project = ?", project);
-				artifacts = count(
-					`SELECT COUNT(*) AS total FROM artifacts
-					 JOIN sessions ON sessions.id = artifacts.session_id
-					 WHERE sessions.project = ?`,
-					project,
-				);
-				memories = count(
-					`SELECT COUNT(*) AS total FROM memory_items
-					 JOIN sessions ON sessions.id = memory_items.session_id
-					 WHERE sessions.project = ?`,
-					project,
-				);
-				observations = countObservations(project);
+				prompts = countVisiblePromptRows(store, project);
+				artifacts = countVisibleArtifactRows(store, project);
+				memories = countVisibleMemoryRows(store, { project });
+				observations = countVisibleObservationRows(store, { project });
 			} else {
-				prompts = count("SELECT COUNT(*) AS total FROM user_prompts");
-				artifacts = count("SELECT COUNT(*) AS total FROM artifacts");
-				memories = count("SELECT COUNT(*) AS total FROM memory_items");
-				observations = countObservations();
+				prompts = countVisiblePromptRows(store);
+				artifacts = countVisibleArtifactRows(store);
+				memories = countVisibleMemoryRows(store);
+				observations = countVisibleObservationRows(store);
 			}
 			const total = prompts + artifacts + memories;
 			return c.json({ total, memories, artifacts, prompts, observations });
@@ -467,12 +714,13 @@ export function memoryRoutes(getStore: StoreFactory) {
 			const limit = queryInt(c.req.query("limit"), 20);
 			const kind = c.req.query("kind") || undefined;
 			const project = c.req.query("project") || undefined;
-			const filters: Record<string, unknown> = {};
+			const filters: MemoryFilters = {};
 			if (kind) filters.kind = kind;
 			if (project) filters.project = project;
 			const items = store.recent(limit, filters);
 			const asRecords = items as unknown as Record<string, unknown>[];
 			attachSessionFields(store, asRecords);
+			attachResolvedIdentityFields(store, asRecords);
 			return c.json({ items: asRecords });
 		}
 	});
@@ -488,6 +736,9 @@ export function memoryRoutes(getStore: StoreFactory) {
 			const sessionId = parseStrictInteger(sessionIdStr);
 			if (sessionId == null) {
 				return c.json({ error: "session_id must be int" }, 400);
+			}
+			if (!sessionAllowsArtifactAccess(store, sessionId)) {
+				return c.json({ error: "session not found" }, 404);
 			}
 			const d = drizzle(store.db, { schema });
 			const rows = d
@@ -513,6 +764,9 @@ export function memoryRoutes(getStore: StoreFactory) {
 		);
 		if (memoryId == null || memoryId <= 0) {
 			return c.json({ error: "memory_id must be int" }, 400);
+		}
+		if (!store.get(memoryId)) {
+			return c.json({ error: "memory not found" }, 404);
 		}
 		const visibility = String(body.visibility ?? "").trim();
 		if (visibility !== "private" && visibility !== "shared") {
@@ -548,6 +802,9 @@ export function memoryRoutes(getStore: StoreFactory) {
 		if (!project) {
 			return c.json({ error: "project must be a non-empty string" }, 400);
 		}
+		if (!store.get(memoryId)) {
+			return c.json({ error: "memory not found" }, 404);
+		}
 		try {
 			const result = store.moveMemoryProject(memoryId, project);
 			return c.json(result);
@@ -574,6 +831,9 @@ export function memoryRoutes(getStore: StoreFactory) {
 		if (memoryId == null || memoryId <= 0) {
 			return c.json({ error: "memory_id must be int" }, 400);
 		}
+		if (!store.get(memoryId)) {
+			return c.json({ error: "memory not found" }, 404);
+		}
 
 		const row = drizzle(store.db, { schema })
 			.select()
@@ -583,8 +843,7 @@ export function memoryRoutes(getStore: StoreFactory) {
 		if (!row) {
 			return c.json({ error: "memory not found" }, 404);
 		}
-		const ownership = buildOwnershipContext(store);
-		if (!memoryOwnedBySelf(row, ownership)) {
+		if (!store.memoryOwnedBySelf(row as Record<string, unknown>)) {
 			return c.json({ error: "memory not owned by this device" }, 403);
 		}
 		if (Number(row.active ?? 1) === 0 || row.deleted_at != null) {

@@ -11,6 +11,7 @@ import {
 	dedupNearDuplicateMemories,
 	getRawEventStatus,
 	initDatabase,
+	listRetentionScopeIds,
 	MemoryStore,
 	planReplicationOpsAgePrune,
 	pruneReplicationOpsUntilCaughtUp,
@@ -18,6 +19,7 @@ import {
 	resolveDbPath,
 	resolveProject,
 	retryRawEventFailures,
+	scanSecretsRetroactive,
 	vacuumDatabase,
 } from "@codemem/core";
 import { Command } from "commander";
@@ -26,9 +28,14 @@ import {
 	addDbOption,
 	addJsonOption,
 	type DbOpts,
+	emitJsonError,
 	type JsonOpts,
 	resolveDbOpt,
 } from "../shared-options.js";
+
+function escapeSqlLikePattern(value: string): string {
+	return value.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_");
+}
 
 function formatBytes(bytes: number): string {
 	if (bytes < 1024) return `${bytes} B`;
@@ -81,10 +88,15 @@ const initCmd = new Command("init")
 	.description("Create or verify the SQLite database and schema");
 addDbOption(initCmd);
 initCmd.action((opts: DbOpts) => {
-	const result = initDatabase(resolveDbOpt(opts));
-	p.intro("codemem db init");
-	p.log.success(`Database ready: ${result.path}`);
-	p.outro(`Size: ${result.sizeBytes.toLocaleString()} bytes`);
+	try {
+		const result = initDatabase(resolveDbOpt(opts));
+		p.intro("codemem db init");
+		p.log.success(`Database ready: ${result.path}`);
+		p.outro(`Size: ${result.sizeBytes.toLocaleString()} bytes`);
+	} catch (error) {
+		p.log.error(error instanceof Error ? error.message : String(error));
+		process.exitCode = 1;
+	}
 });
 dbCommand.addCommand(initCmd);
 
@@ -94,10 +106,15 @@ const vacuumCmd = new Command("vacuum")
 	.description("Run VACUUM on the SQLite database");
 addDbOption(vacuumCmd);
 vacuumCmd.action((opts: DbOpts) => {
-	const result = vacuumDatabase(resolveDbOpt(opts));
-	p.intro("codemem db vacuum");
-	p.log.success(`Vacuumed: ${result.path}`);
-	p.outro(`Size: ${result.sizeBytes.toLocaleString()} bytes`);
+	try {
+		const result = vacuumDatabase(resolveDbOpt(opts));
+		p.intro("codemem db vacuum");
+		p.log.success(`Vacuumed: ${result.path}`);
+		p.outro(`Size: ${result.sizeBytes.toLocaleString()} bytes`);
+	} catch (error) {
+		p.log.error(error instanceof Error ? error.message : String(error));
+		process.exitCode = 1;
+	}
 });
 dbCommand.addCommand(vacuumCmd);
 
@@ -109,7 +126,7 @@ const pruneReplCmd = new Command("prune-replication-ops")
 	)
 	.option("--dry-run", "show current size/targets without deleting")
 	.option("--max-age-days <days>", "retention age threshold in days", "30")
-	.option("--max-size-mb <mb>", "target replication log budget in MB", "512")
+	.option("--max-size-mb <mb>", "target per-scope replication log budget in MB", "512")
 	.option("--batch-ops <n>", "max ops deleted per batch", "5000")
 	.option("--batch-runtime-ms <ms>", "max runtime per batch in ms", "2000")
 	.option("--vacuum", "run VACUUM explicitly after prune completes");
@@ -137,12 +154,19 @@ pruneReplCmd.action(
 			p.intro("codemem db prune-replication-ops");
 			p.log.info(`Replication ops size: ${formatBytes(beforeBytes)}`);
 			p.log.info(
-				`Policy: approximately prune oldest-first toward <= ${maxSizeMb} MB while removing history older than ${maxAgeDays} day(s), subject to per-pass batch/runtime limits`,
+				`Policy: across all replication scopes, approximately prune oldest-first toward <= ${maxSizeMb} MB PER SCOPE while removing history older than ${maxAgeDays} day(s), subject to per-pass batch/runtime limits (the size budget is applied per scope, matching the background retention runner; total ops across scopes may exceed it)`,
 			);
+			// Enumerate every replication scope present in the DB (DEFAULT first).
+			// The background retention runner prunes all of them; the offline CLI
+			// must too, otherwise scopes like legacy-shared-review/oss are never
+			// reclaimed and the command is useless for a bloated multi-scope DB.
+			const scopeIds = listRetentionScopeIds(db);
+			// planReplicationOpsAgePrune is whole-table (no scope filter), so the
+			// candidate count already reflects every scope the real prune will cover.
 			const agePlan = planReplicationOpsAgePrune(db, maxAgeDays, batchOps);
 			if (agePlan.candidate_ops > 0) {
 				p.log.info(
-					`Age pass plan: ${agePlan.candidate_ops.toLocaleString()} ops, ~${formatBytes(agePlan.estimated_candidate_bytes)} in ~${agePlan.estimated_batches.toLocaleString()} batch(es), cutoff ${agePlan.cutoff_cursor}`,
+					`Age pass plan (all scopes): ${agePlan.candidate_ops.toLocaleString()} ops, ~${formatBytes(agePlan.estimated_candidate_bytes)} in ~${agePlan.estimated_batches.toLocaleString()} batch(es), cutoff ${agePlan.cutoff_cursor}`,
 				);
 			} else {
 				p.log.info("Age pass plan: no ops older than cutoff");
@@ -153,26 +177,42 @@ pruneReplCmd.action(
 				return;
 			}
 
-			const loopResult = pruneReplicationOpsUntilCaughtUp(db, {
-				maxAgeDays,
-				maxSizeBytes: maxSizeMb * 1024 * 1024,
-				maxDeleteOps: batchOps,
-				maxRuntimeMs: batchRuntimeMs,
-				onPass: (pass) => {
-					if (pass.deleted === 0 && !pass.stoppedByBudget) return;
-					const suffix = pass.stoppedByBudget ? " (budget-limited)" : "";
-					p.log.step(
-						`Pass ${pass.passNumber}: deleted ${pass.deleted.toLocaleString()} ops, remaining size ~${formatBytes(pass.afterBytes)}${suffix}`,
-					);
-				},
-			});
+			let totalDeleted = 0;
+			let anyStoppedByBudget = false;
+			let lastFloor: string | null = null;
+			for (const scopeId of scopeIds) {
+				const loopResult = pruneReplicationOpsUntilCaughtUp(db, {
+					maxAgeDays,
+					maxSizeBytes: maxSizeMb * 1024 * 1024,
+					maxDeleteOps: batchOps,
+					maxRuntimeMs: batchRuntimeMs,
+					scopeId,
+					onPass: (pass) => {
+						if (pass.deleted === 0 && !pass.stoppedByBudget) return;
+						const suffix = pass.stoppedByBudget ? " (budget-limited)" : "";
+						p.log.step(
+							`scope ${scopeId} pass ${pass.passNumber}: deleted ${pass.deleted.toLocaleString()} ops${suffix}`,
+						);
+					},
+				});
+				totalDeleted += loopResult.totalDeleted;
+				if (loopResult.totalDeleted > 0) {
+					p.log.info(`scope ${scopeId}: deleted ${loopResult.totalDeleted.toLocaleString()} ops`);
+				}
+				if (loopResult.lastFloor) lastFloor = loopResult.lastFloor;
+				if (loopResult.stoppedByBudget) anyStoppedByBudget = true;
+			}
 
-			p.log.info(`Deleted ops: ${loopResult.totalDeleted.toLocaleString()}`);
+			p.log.info(`Deleted ops (all scopes): ${totalDeleted.toLocaleString()}`);
+			// Recompute the whole-table physical size so before/after are the same
+			// dbstat measure. (Per-scope afterBytes is a logical content estimate and
+			// is not comparable to the whole-table before-size.)
+			const afterBytes = estimateReplicationOpsBytes(db);
 			p.log.info(
-				`Estimated replication ops size after prune: ${formatBytes(loopResult.afterBytes)} (approximate)`,
+				`Estimated replication ops size after prune: ${formatBytes(afterBytes)} (approximate)`,
 			);
-			if (loopResult.lastFloor) p.log.info(`Retained floor: ${loopResult.lastFloor}`);
-			if (loopResult.stoppedByBudget) {
+			if (lastFloor) p.log.info(`Retained floor: ${lastFloor}`);
+			if (anyStoppedByBudget) {
 				p.log.warn(
 					"Prune stopped because the current batch/runtime budget was exhausted before retention caught up. Re-run with higher --batch-ops or --batch-runtime-ms for faster catch-up.",
 				);
@@ -195,6 +235,87 @@ pruneReplCmd.action(
 );
 dbCommand.addCommand(pruneReplCmd);
 
+// --- db prune-raw-events ---
+const pruneRawEventsCmd = new Command("prune-raw-events")
+	.configureHelp(helpStyle)
+	.description("Delete raw_events older than a cutoff (age-based), with dry-run and VACUUM support")
+	.option("--dry-run", "show current size/targets without deleting")
+	.option("--max-age-days <days>", "retention age threshold in days", "90")
+	.option("--vacuum", "run VACUUM explicitly after prune completes");
+addDbOption(pruneRawEventsCmd);
+pruneRawEventsCmd.action(
+	(
+		opts: DbOpts & {
+			dryRun?: boolean;
+			maxAgeDays: string;
+			vacuum?: boolean;
+		},
+	) => {
+		// Validate before opening the DB. This is a destructive command and
+		// raw_events are the re-extraction source, so a mistyped/zero age must be
+		// rejected rather than silently coerced to a real purge window. Match the
+		// WHOLE string against digits: Number.parseInt would accept "1foo"/"1.5"
+		// as 1 and proceed to delete.
+		const rawAge = opts.maxAgeDays.trim();
+		const maxAgeDays = Number.parseInt(rawAge, 10);
+		if (!/^\d+$/.test(rawAge) || !Number.isInteger(maxAgeDays) || maxAgeDays < 1) {
+			p.log.error(
+				`--max-age-days must be a positive integer (got "${opts.maxAgeDays}"). ` +
+					"Refusing to run a destructive prune on invalid input.",
+			);
+			process.exitCode = 1;
+			return;
+		}
+		const dbPath = resolveDbPath(resolveDbOpt(opts));
+		// Construct the store inside the guarded block so an unreadable or
+		// schema-incompatible DB surfaces a clean error + exit code rather than an
+		// uncaught throw from the command handler.
+		let store: MemoryStore | null = null;
+		try {
+			store = new MemoryStore(dbPath);
+			const maxAgeMs = maxAgeDays * 86_400_000;
+			const status = store.rawEventsRetentionStatus(maxAgeMs);
+			p.intro("codemem db prune-raw-events");
+			p.log.warn(
+				"raw_events is the re-extraction source. Age-based purge is NOT extraction-aware: " +
+					"pruning a window shorter than your extraction lag can delete un-extracted events. " +
+					"The 90-day default mitigates this.",
+			);
+			p.log.info(
+				`raw_events: ${status.total_rows.toLocaleString()} rows, ~${formatBytes(status.estimated_bytes)} on disk`,
+			);
+			p.log.info(
+				`Older than ${maxAgeDays} day(s): ${status.candidate_rows.toLocaleString()} row(s) to delete`,
+			);
+
+			if (opts.dryRun) {
+				p.outro("Dry run only; no changes made");
+				return;
+			}
+
+			const deleted = store.purgeRawEvents(maxAgeMs);
+			p.log.info(`Deleted raw_events: ${deleted.toLocaleString()}`);
+			if (opts.vacuum) {
+				p.log.step("Running VACUUM as requested...");
+				store.close();
+				store = null;
+				const vacuumed = vacuumDatabase(dbPath);
+				p.outro(`Done. VACUUM complete. File size is now ${formatBytes(vacuumed.sizeBytes)}.`);
+				return;
+			}
+			p.outro(
+				"Done. SQLite file size may not shrink until you run `codemem db vacuum` explicitly (or re-run this command with --vacuum).",
+			);
+		} catch (error) {
+			p.log.error(error instanceof Error ? error.message : String(error));
+			process.exitCode = 1;
+		} finally {
+			store?.close();
+		}
+	},
+);
+dbCommand.addCommand(pruneRawEventsCmd);
+
 // --- db raw-events-status ---
 const rawEventsStatusCmd = new Command("raw-events-status")
 	.configureHelp(helpStyle)
@@ -203,26 +324,36 @@ const rawEventsStatusCmd = new Command("raw-events-status")
 addDbOption(rawEventsStatusCmd);
 addJsonOption(rawEventsStatusCmd);
 rawEventsStatusCmd.action((opts: DbOpts & JsonOpts & { limit: string }) => {
-	const result = getRawEventStatus(resolveDbOpt(opts), Number.parseInt(opts.limit, 10) || 25);
-	if (opts.json) {
-		console.log(JSON.stringify(result, null, 2));
-		return;
-	}
-	p.intro("codemem db raw-events-status");
-	p.log.info(
-		`Totals: ${result.totals.pending.toLocaleString()} pending across ${result.totals.sessions.toLocaleString()} session(s)`,
-	);
-	if (result.items.length === 0) {
-		p.outro("No pending raw events");
-		return;
-	}
-	for (const item of result.items) {
-		p.log.message(
-			`${item.source}:${item.stream_id} pending=${Math.max(0, item.last_received_event_seq - item.last_flushed_event_seq)} ` +
-				`received=${item.last_received_event_seq} flushed=${item.last_flushed_event_seq} project=${item.project ?? ""}`,
+	try {
+		const result = getRawEventStatus(resolveDbOpt(opts), Number.parseInt(opts.limit, 10) || 25);
+		if (opts.json) {
+			console.log(JSON.stringify(result, null, 2));
+			return;
+		}
+		p.intro("codemem db raw-events-status");
+		p.log.info(
+			`Totals: ${result.totals.pending.toLocaleString()} pending across ${result.totals.sessions.toLocaleString()} session(s)`,
 		);
+		if (result.items.length === 0) {
+			p.outro("No pending raw events");
+			return;
+		}
+		for (const item of result.items) {
+			p.log.message(
+				`${item.source}:${item.stream_id} pending=${Math.max(0, item.last_received_event_seq - item.last_flushed_event_seq)} ` +
+					`received=${item.last_received_event_seq} flushed=${item.last_flushed_event_seq} project=${item.project ?? ""}`,
+			);
+		}
+		p.outro("done");
+	} catch (error) {
+		const message = error instanceof Error ? error.message : "Failed to read raw-event status";
+		if (opts.json) {
+			emitJsonError("raw_events_status_failed", message);
+		} else {
+			p.log.error(message);
+			process.exitCode = 1;
+		}
 	}
-	p.outro("done");
 });
 dbCommand.addCommand(rawEventsStatusCmd);
 
@@ -233,9 +364,14 @@ const rawEventsRetryCmd = new Command("raw-events-retry")
 	.option("-n, --limit <n>", "max failed batches to requeue", "25");
 addDbOption(rawEventsRetryCmd);
 rawEventsRetryCmd.action((opts: DbOpts & { limit: string }) => {
-	const result = retryRawEventFailures(resolveDbOpt(opts), Number.parseInt(opts.limit, 10) || 25);
-	p.intro("codemem db raw-events-retry");
-	p.outro(`Requeued ${result.retried.toLocaleString()} failed batch(es)`);
+	try {
+		const result = retryRawEventFailures(resolveDbOpt(opts), Number.parseInt(opts.limit, 10) || 25);
+		p.intro("codemem db raw-events-retry");
+		p.outro(`Requeued ${result.retried.toLocaleString()} failed batch(es)`);
+	} catch (error) {
+		p.log.error(error instanceof Error ? error.message : String(error));
+		process.exitCode = 1;
+	}
 });
 dbCommand.addCommand(rawEventsRetryCmd);
 
@@ -307,7 +443,7 @@ renameProjectCmd.action((oldName: string, newName: string, opts: DbOpts & { appl
 	const store = new MemoryStore(resolveDbPath(resolveDbOpt(opts)));
 	try {
 		const dryRun = !opts.apply;
-		const escapedOld = oldName.replace(/%/g, "\\%").replace(/_/g, "\\_");
+		const escapedOld = escapeSqlLikePattern(oldName);
 		const suffixPattern = `%/${escapedOld}`;
 		const tables = ["sessions", "raw_event_sessions"] as const;
 		const counts: Record<string, number> = {};
@@ -349,6 +485,9 @@ renameProjectCmd.action((oldName: string, newName: string, opts: DbOpts & { appl
 		} else {
 			p.outro("done");
 		}
+	} catch (error) {
+		p.log.error(error instanceof Error ? error.message : String(error));
+		process.exitCode = 1;
 	} finally {
 		store.close();
 	}
@@ -422,6 +561,9 @@ normalizeProjectsCmd.action((opts: DbOpts & { apply?: boolean }) => {
 		} else {
 			p.outro("done");
 		}
+	} catch (error) {
+		p.log.error(error instanceof Error ? error.message : String(error));
+		process.exitCode = 1;
 	} finally {
 		store.close();
 	}
@@ -534,6 +676,7 @@ backfillTagsCmd.action(
 				project,
 				activeOnly: !opts.inactive,
 				dryRun: opts.dryRun === true,
+				scanner: store.scanner,
 			});
 
 			if (opts.json) {
@@ -761,6 +904,7 @@ backfillNarrativeCmd.action(
 			const result = backfillNarrativeFromBody(store.db, {
 				limit,
 				dryRun: opts.dryRun === true,
+				scanner: store.scanner,
 			});
 
 			if (opts.json) {
@@ -816,6 +960,7 @@ aiBackfillStructuredCmd.action(
 				kinds,
 				overwrite: opts.overwrite === true,
 				dryRun: opts.dryRun === true,
+				scanner: store.scanner,
 			});
 
 			if (opts.json) {
@@ -838,3 +983,62 @@ aiBackfillStructuredCmd.action(
 	},
 );
 dbCommand.addCommand(aiBackfillStructuredCmd);
+
+// --- db scan-secrets ---
+const scanSecretsCmd = new Command("scan-secrets")
+	.configureHelp(helpStyle)
+	.description("Sweep existing memories and redact any secrets found in stored content")
+	.option("--limit <n>", "max memories to scan in this run")
+	.option("--dry-run", "report detections without rewriting any rows");
+addDbOption(scanSecretsCmd);
+addJsonOption(scanSecretsCmd);
+scanSecretsCmd.action(
+	(
+		opts: DbOpts &
+			JsonOpts & {
+				limit?: string;
+				dryRun?: boolean;
+			},
+	) => {
+		const store = new MemoryStore(resolveDbPath(resolveDbOpt(opts)));
+		try {
+			const limit = parseOptionalPositiveInt(opts.limit);
+			const result = scanSecretsRetroactive(store.db, {
+				limit,
+				dryRun: opts.dryRun === true,
+				scanner: store.scanner,
+			});
+
+			if (opts.json) {
+				console.log(JSON.stringify(result, null, 2));
+				return;
+			}
+
+			const action = opts.dryRun ? "Would redact" : "Redacted";
+			p.intro("codemem db scan-secrets");
+			p.log.success(`${action} ${result.updated} of ${result.checked} memories`);
+			if (result.skippedOversized > 0) {
+				p.log.warn(`Skipped ${result.skippedOversized} oversized rows (above default 1 MiB cap)`);
+			}
+			if (result.detections.length > 0) {
+				const summary = result.detections.map((d) => `${d.kind}=${d.count}`).join(", ");
+				p.log.info(`Detections: ${summary}`);
+			}
+			if (result.samples.length > 0) {
+				const lines = result.samples.map((s) => {
+					const kinds = s.detections.map((d) => `${d.kind}=${d.count}`).join(", ");
+					const title = (s.redactedTitle ?? "").slice(0, 80);
+					return `  #${s.id} [${kinds}]  ${title}`;
+				});
+				p.log.info(`Affected memories:\n${lines.join("\n")}`);
+			}
+			p.outro("Re-run with no changes to confirm idempotency");
+		} catch (error) {
+			p.log.error(error instanceof Error ? error.message : String(error));
+			process.exitCode = 1;
+		} finally {
+			store.close();
+		}
+	},
+);
+dbCommand.addCommand(scanSecretsCmd);

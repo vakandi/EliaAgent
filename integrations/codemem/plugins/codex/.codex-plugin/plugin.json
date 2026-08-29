@@ -1,0 +1,35 @@
+{
+  "name": "codemem",
+  "version": "0.43.1",
+  "description": "Persistent memory for Codex. Capture work across sessions and recall relevant context.",
+  "author": {
+    "name": "Adam Kunicki"
+  },
+  "repository": "https://github.com/kunickiaj/codemem",
+  "homepage": "https://github.com/kunickiaj/codemem",
+  "license": "MIT",
+  "keywords": [
+    "codemem",
+    "memory",
+    "codex",
+    "mcp"
+  ],
+  "mcpServers": "./.mcp.json",
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "codemem",
+    "shortDescription": "Persistent memory for Codex sessions.",
+    "longDescription": "Capture Codex session context across projects and recall relevant memories through hooks and MCP tools.",
+    "developerName": "Adam Kunicki",
+    "category": "Engineering",
+    "capabilities": [
+      "Read"
+    ],
+    "websiteURL": "https://github.com/kunickiaj/codemem",
+    "defaultPrompt": [
+      "Recall relevant codemem context for this repo."
+    ],
+    "brandColor": "#4F46E5",
+    "screenshots": []
+  }
+}

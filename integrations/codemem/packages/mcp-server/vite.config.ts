@@ -10,12 +10,23 @@ export default defineConfig({
 	},
 	build: {
 		lib: {
-			entry: "src/index.ts",
+			entry: {
+				http: "src/http.ts",
+				index: "src/index.ts",
+				stdio: "src/stdio.ts",
+			},
 			formats: ["es"],
-			fileName: "index",
+			fileName: (_format, entryName) => `${entryName}.js`,
 		},
 		rollupOptions: {
-			external: [/^@codemem\//, /^node:/, /^@modelcontextprotocol\//, "zod", "better-sqlite3"],
+			external: [
+				/^@codemem\//,
+				/^node:/,
+				/^@modelcontextprotocol\//,
+				/^express(?:\/.*)?$/,
+				"zod",
+				"better-sqlite3",
+			],
 		},
 		outDir: "dist",
 		sourcemap: true,

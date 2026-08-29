@@ -1,10 +1,28 @@
 /* Global application state — shared across tabs. */
 
-import type { UiSyncViewModel } from "../tabs/sync/view-model";
+import type {
+	TeamSyncDaemonState,
+	TeamSyncPresenceState,
+	UiSyncViewModel,
+} from "../tabs/sync/view-model";
+import type { DeviceIdentityInventoryV1, ShareOperationReadModel } from "./api/sync";
+import type { UpdateStatus } from "./api/types";
 
 export type RefreshState = "idle" | "refreshing" | "paused" | "error";
-export type TabId = "feed" | "health" | "sync" | "coordinator-admin";
-export const ALL_TAB_IDS: TabId[] = ["feed", "health", "sync", "coordinator-admin"];
+export type CanonicalTabId = "feed" | "projects" | "sharing" | "devices" | "health" | "advanced";
+export type LegacyTabId = "sync" | "coordinator-admin";
+export type TabId = CanonicalTabId | LegacyTabId;
+export type RoutableTabId = TabId;
+export type AdvancedSection = "sync" | "teams";
+export const ALL_TAB_IDS: CanonicalTabId[] = [
+	"feed",
+	"projects",
+	"sharing",
+	"devices",
+	"health",
+	"advanced",
+];
+export const LEGACY_TAB_IDS: LegacyTabId[] = ["sync", "coordinator-admin"];
 
 /* ── Cached server payload shapes ─────────────────────────── */
 
@@ -66,7 +84,8 @@ export interface CachedRawEventsPayload {
 }
 
 export interface CachedSyncStatus {
-	daemon_state?: string;
+	daemon_state?: TeamSyncDaemonState;
+	daemon_running?: boolean;
 	enabled?: boolean;
 	last_sync_at?: string;
 	last_sync_at_utc?: string;
@@ -75,6 +94,9 @@ export interface CachedSyncStatus {
 	summary?: unknown;
 	discovered_devices?: unknown[];
 	paired_peer_count?: number;
+	coordinator_enrollment_reconciliation_issues?: {
+		counts?: { open?: number; resolved?: number };
+	};
 }
 
 export interface SyncActor {
@@ -105,6 +127,8 @@ export interface SyncPeer {
 	scope_label?: string;
 	status?: SyncPeerStatus;
 	last_error?: string;
+	runtime_version?: string | null;
+	runtime_version_observed_at?: string | null;
 }
 
 export interface SyncSharingReviewRow {
@@ -117,23 +141,44 @@ export interface SyncSharingReviewRow {
 	shareable_count?: number;
 }
 
+export interface CachedLegacySharedReview {
+	scope_id?: string;
+	memory_count?: number;
+	has_data?: boolean;
+	last_updated_at?: string | null;
+	groups?: unknown[];
+	total_group_count?: number;
+	target_scopes?: unknown[];
+}
+
 export interface DiscoveredDevice {
 	device_id?: string;
 	display_name?: string;
-	fingerprint?: string;
+	fingerprint?: string | null;
 	groups?: string[];
 	stale?: boolean;
+	address_count?: number;
 	addresses?: string[];
 	needs_local_approval?: boolean;
 	waiting_for_peer_approval?: boolean;
+	incoming_reciprocal_request_id?: string | null;
+	outgoing_reciprocal_request_id?: string | null;
+}
+
+export interface PendingCoordinatorApproval {
+	coordinatorUrl: string;
+	incomingRequestId: string;
 }
 
 export interface CachedSyncCoordinator {
 	configured?: boolean;
+	sync_enabled?: boolean;
 	groups?: unknown[];
-	coordinator_url?: string;
+	coordinator_url?: string | null;
 	discovered_devices?: DiscoveredDevice[];
-	presence_status?: string;
+	lookup_error?: string | null;
+	reciprocal_approval_error?: string | null;
+	presence_status?: TeamSyncPresenceState;
 	paired_peer_count?: number;
 }
 
@@ -177,10 +222,12 @@ export interface CachedPairingPayload {
 export interface CachedSyncJoinRequest {
 	display_name?: string;
 	device_id?: string;
+	fingerprint?: string;
 	request_id?: string;
 }
 
 const TAB_KEY = "codemem-tab";
+const ADVANCED_SECTION_KEY = "codemem-advanced-section";
 const FEED_FILTER_KEY = "codemem-feed-filter";
 const FEED_SCOPE_KEY = "codemem-feed-scope";
 const DETAILS_OPEN_KEY = "codemem-details-open";
@@ -193,14 +240,12 @@ export type FeedFilter = (typeof FEED_FILTERS)[number];
 export const FEED_SCOPES = ["all", "mine", "theirs"] as const;
 export type FeedScope = (typeof FEED_SCOPES)[number];
 
-export const AGENT_FILTERS = ["all", "elia", "gilfoyle", "setbon", "bene2luxe", "cobou-agency", "zovaboost", "cobou-promoter", "bene2luxe-promoter"] as const;
-export type AgentFilter = (typeof AGENT_FILTERS)[number];
-
 /* ── Mutable application state ─────────────────────────────── */
 
 export const state = {
 	/* Tab */
 	activeTab: "feed" as TabId,
+	advancedSection: "sync" as AdvancedSection,
 
 	/* Project filter */
 	currentProject: "",
@@ -214,9 +259,6 @@ export const state = {
 	/* Feed */
 	feedTypeFilter: "all" as FeedFilter,
 	feedScopeFilter: "all" as FeedScope,
-	agentFilter: "all" as AgentFilter,
-	/** Set when the last feed API load failed; cleared on successful load start. */
-	feedLoadError: null as string | null,
 	feedQuery: "",
 	lastFeedItems: [] as unknown[],
 	lastFeedFilteredCount: 0,
@@ -232,12 +274,20 @@ export const state = {
 	lastStatsPayload: null as CachedStatsPayload | null,
 	lastUsagePayload: null as CachedUsagePayload | null,
 	lastRawEventsPayload: null as CachedRawEventsPayload | null,
+	lastUpdateStatus: null as UpdateStatus | null,
 	lastSyncStatus: null as CachedSyncStatus | null,
+	lastDeviceIdentityInventory: null as DeviceIdentityInventoryV1 | null,
+	deviceIdentityInventoryLoadError: false,
+	pendingDeviceIdentityFocus: undefined as string | null | undefined,
 	lastSyncActors: [] as SyncActor[],
 	lastSyncPeers: [] as SyncPeer[],
+	lastShareOperations: [] as ShareOperationReadModel[],
+	shareOperationsLoadError: false,
 	pendingAcceptedSyncPeers: [] as SyncPeer[],
 	lastSyncSharingReview: [] as SyncSharingReviewRow[],
+	lastSyncLegacySharedReview: null as CachedLegacySharedReview | null,
 	lastSyncCoordinator: null as CachedSyncCoordinator | null,
+	lastSyncCoordinatorAdminStatus: null as CachedCoordinatorAdminStatus | null,
 	lastCoordinatorAdminStatus: null as CachedCoordinatorAdminStatus | null,
 	coordinatorAdminTargetGroup: "",
 	/**
@@ -246,6 +296,7 @@ export const state = {
 	 * clickable project chips without re-fetching per render.
 	 */
 	knownProjects: [] as string[],
+	lastProjectCoordinatorAdminGroups: [] as CachedCoordinatorAdminGroup[],
 	lastCoordinatorAdminGroups: [] as CachedCoordinatorAdminGroup[],
 	lastCoordinatorAdminJoinRequests: [] as CachedSyncJoinRequest[],
 	lastCoordinatorAdminDevices: [] as CachedCoordinatorAdminDevice[],
@@ -254,14 +305,21 @@ export const state = {
 	lastTeamJoin: null as CachedTeamJoin | null,
 	syncJoinFlowFeedback: null as { message: string; tone: "success" | "warning" } | null,
 	syncPeerFeedbackById: new Map<string, { message: string; tone: "success" | "warning" }>(),
-	syncPeersSectionFeedback: null as { message: string; tone: "success" | "warning" } | null,
+	syncPeersSectionFeedback: null as {
+		message: string;
+		tone: "success" | "warning";
+		// Optional peer_device_id this feedback is about (e.g. a peer just
+		// removed). When that peer reappears in state.lastSyncPeers (e.g.
+		// because the user re-paired it), the feedback is stale and should
+		// be cleared on the next render — see shouldClearStalePeersFeedback.
+		relatedPeerDeviceId?: string;
+	} | null,
 	syncJoinRequestsFeedback: null as { message: string; tone: "success" | "warning" } | null,
 	syncDiscoveredFeedback: null as { message: string; tone: "success" | "warning" } | null,
+	pendingCoordinatorApprovalsByDeviceId: new Map<string, PendingCoordinatorApproval>(),
 	lastSyncAttempts: [] as unknown[],
 	lastSyncLegacyDevices: [] as unknown[],
 	lastSyncViewModel: null as UiSyncViewModel | null,
-	/* Observer */
-	lastObserverReport: null as unknown | null,
 	lastSyncDuplicatePersonDecisions: {} as Record<string, string>,
 	pairingPayloadRaw: null as CachedPairingPayload | null,
 	pairingCommandRaw: "",
@@ -283,42 +341,72 @@ export function shouldShowCoordinatorAdminTab(
 	return status.has_admin_secret === true;
 }
 
-export function getVisibleTabs(status: CachedCoordinatorAdminStatus | null | undefined): TabId[] {
-	return shouldShowCoordinatorAdminTab(status)
-		? [...ALL_TAB_IDS]
-		: ALL_TAB_IDS.filter((tabId) => tabId !== "coordinator-admin");
+export function getVisibleTabs(
+	status: CachedCoordinatorAdminStatus | null | undefined,
+): CanonicalTabId[] {
+	void status;
+	return [...ALL_TAB_IDS];
 }
 
 export function resolveAccessibleTab(
-	tab: TabId,
+	tab: RoutableTabId,
 	status: CachedCoordinatorAdminStatus | null | undefined,
-): TabId {
-	return getVisibleTabs(status).includes(tab) ? tab : "sync";
+): CanonicalTabId {
+	void status;
+	if (tab === "sync" || tab === "coordinator-admin") return "advanced";
+	return ALL_TAB_IDS.includes(tab) ? tab : "feed";
 }
 
 /* ── Persistence helpers ───────────────────────────────────── */
 
 /**
- * Parse `window.location.hash` into its top-level tab segment. Hashes with
- * sub-view segments (e.g. `#sync/diagnostics`) return their leading tab
- * (`sync`); sub-view state is owned per-tab.
+ * Parse `window.location.hash` into its canonical top-level tab. Legacy Sync
+ * and coordinator-admin hashes remain valid, but resolve under Advanced.
  */
-export function parseTabFromHash(hash = window.location.hash): TabId | null {
-	const first = hash.replace(/^#/, "").split("/")[0] as TabId;
-	return ALL_TAB_IDS.includes(first) ? first : null;
+export function parseTabFromHash(hash = window.location.hash): CanonicalTabId | null {
+	const first = hash.replace(/^#/, "").split("/")[0] as RoutableTabId;
+	if (LEGACY_TAB_IDS.includes(first as LegacyTabId)) return "advanced";
+	return ALL_TAB_IDS.includes(first as CanonicalTabId) ? (first as CanonicalTabId) : null;
 }
 
-export function getActiveTab(): TabId {
+export function parseAdvancedSectionFromHash(hash = window.location.hash): AdvancedSection | null {
+	const [first, second] = hash.replace(/^#/, "").split("/");
+	if (first === "sync") return "sync";
+	if (first === "coordinator-admin") return "teams";
+	if (first !== "advanced") return null;
+	return second === "teams" ? "teams" : "sync";
+}
+
+export function getActiveTab(): CanonicalTabId {
 	const fromHash = parseTabFromHash();
 	if (fromHash) return resolveAccessibleTab(fromHash, state.lastCoordinatorAdminStatus);
 	const saved = localStorage.getItem(TAB_KEY);
-	if (saved && ALL_TAB_IDS.includes(saved as TabId)) {
-		return resolveAccessibleTab(saved as TabId, state.lastCoordinatorAdminStatus);
+	if (
+		saved &&
+		(ALL_TAB_IDS.includes(saved as CanonicalTabId) || LEGACY_TAB_IDS.includes(saved as LegacyTabId))
+	) {
+		return resolveAccessibleTab(saved as RoutableTabId, state.lastCoordinatorAdminStatus);
 	}
 	return "feed";
 }
 
-export function setActiveTab(tab: TabId) {
+export function getActiveAdvancedSection(): AdvancedSection {
+	const fromHash = parseAdvancedSectionFromHash();
+	if (fromHash) return fromHash;
+	const savedTab = localStorage.getItem(TAB_KEY);
+	if (savedTab === "coordinator-admin") return "teams";
+	if (savedTab === "sync") return "sync";
+	const savedSection = localStorage.getItem(ADVANCED_SECTION_KEY);
+	return savedSection === "teams" ? "teams" : "sync";
+}
+
+export function setAdvancedSection(section: AdvancedSection, writeHash = false) {
+	state.advancedSection = section;
+	localStorage.setItem(ADVANCED_SECTION_KEY, section);
+	if (writeHash) window.location.hash = `advanced/${section}`;
+}
+
+export function setActiveTab(tab: RoutableTabId, options: { canonicalHash?: boolean } = {}) {
 	const nextTab = resolveAccessibleTab(tab, state.lastCoordinatorAdminStatus);
 	state.activeTab = nextTab;
 	localStorage.setItem(TAB_KEY, nextTab);
@@ -328,8 +416,10 @@ export function setActiveTab(tab: TabId) {
 	// active tab — otherwise the sub-view fragment is clobbered before the
 	// sync view controller can read it.
 	const currentTop = parseTabFromHash();
-	if (currentTop !== nextTab) {
+	if (options.canonicalHash) {
 		window.location.hash = nextTab;
+	} else if (currentTop !== nextTab) {
+		window.location.hash = nextTab === "advanced" ? `advanced/${state.advancedSection}` : nextTab;
 	}
 }
 
@@ -351,17 +441,6 @@ export function setFeedTypeFilter(value: string) {
 export function setFeedScopeFilter(value: string) {
 	state.feedScopeFilter = FEED_SCOPES.includes(value as FeedScope) ? (value as FeedScope) : "all";
 	localStorage.setItem(FEED_SCOPE_KEY, state.feedScopeFilter);
-}
-
-const AGENT_FILTER_KEY = "codemem-agent-filter";
-export function getAgentFilter(): AgentFilter {
-	const saved = localStorage.getItem(AGENT_FILTER_KEY);
-	return AGENT_FILTERS.includes(saved as AgentFilter) ? (saved as AgentFilter) : "all";
-}
-
-export function setAgentFilter(value: string) {
-	state.agentFilter = AGENT_FILTERS.includes(value as AgentFilter) ? (value as AgentFilter) : "all";
-	localStorage.setItem(AGENT_FILTER_KEY, state.agentFilter);
 }
 
 export function isSyncDiagnosticsOpen(): boolean {
@@ -404,10 +483,9 @@ export function setDetailsOpen(open: boolean) {
 
 export function initState() {
 	state.activeTab = getActiveTab();
+	state.advancedSection = getActiveAdvancedSection();
 	state.feedTypeFilter = getFeedTypeFilter();
 	state.feedScopeFilter = getFeedScopeFilter();
-	state.agentFilter = getAgentFilter();
-	state.feedLoadError = null;
 	state.syncDiagnosticsOpen = isSyncDiagnosticsOpen();
 	try {
 		state.syncPairingOpen = localStorage.getItem(SYNC_PAIRING_KEY) === "1";

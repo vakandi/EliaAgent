@@ -4,33 +4,90 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to publish (e.g. v0.31.1). Use to re-run a failed release; npm publish is idempotent per package version."
+        required: true
+        type: string
 
 permissions:
   contents: write
+
+env:
+  # Fully-qualified ref used by actions/checkout. For workflow_dispatch we
+  # always force the ref to a tag so non-tag inputs (branches, SHAs) fail to
+  # check out instead of silently publishing untagged code.
+  RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+  # Bare tag name (e.g. v0.31.1) for dist-tag selection and Release naming.
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
   preflight-tag:
     name: Release Tag Preflight
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
+      - name: Validate dispatch input
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          DISPATCH_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$DISPATCH_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.+-]+)?$ ]]; then
+            echo "Refusing to dispatch release for '$DISPATCH_TAG'." >&2
+            echo "Tag input must match v<MAJOR>.<MINOR>.<PATCH>[-PRERELEASE], e.g. v0.31.1 or v0.32.0-rc.1." >&2
+            exit 1
+          fi
+
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          ref: ${{ env.RELEASE_REF }}
 
-      - name: Verify tag points at merged main or release branch
+      - name: Verify tag points at merged main
         env:
-          RELEASE_TAG_COMMIT: ${{ github.sha }}
-        run: bash scripts/release-tag-preflight.sh
+          IS_DISPATCH: ${{ github.event_name == 'workflow_dispatch' }}
+          PUSH_SHA: ${{ github.sha }}
+          EXPECTED_TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          set -euo pipefail
+          # Confirm the checked-out HEAD is exactly the named tag's commit.
+          # actions/checkout was given refs/tags/<tag>, but we verify the local
+          # tag ref still resolves and matches HEAD as defense-in-depth.
+          HEAD_SHA="$(git rev-parse HEAD)"
+          TAG_SHA="$(git rev-parse "refs/tags/${EXPECTED_TAG}^{commit}" 2>/dev/null || true)"
+          if [[ -z "$TAG_SHA" ]]; then
+            echo "Refusing to publish: tag '${EXPECTED_TAG}' did not resolve in the checked-out repo." >&2
+            exit 1
+          fi
+          if [[ "$HEAD_SHA" != "$TAG_SHA" ]]; then
+            echo "Refusing to publish: HEAD ($HEAD_SHA) does not match refs/tags/${EXPECTED_TAG} ($TAG_SHA)." >&2
+            exit 1
+          fi
+          if [[ "$IS_DISPATCH" == "true" ]]; then
+            RELEASE_TAG_COMMIT="$HEAD_SHA"
+          else
+            RELEASE_TAG_COMMIT="$PUSH_SHA"
+          fi
+          export RELEASE_TAG_COMMIT
+          bash scripts/release-tag-preflight.sh
 
   ci:
     name: CI
     needs: preflight-tag
+    if: github.event_name == 'push'
     uses: ./.github/workflows/ci.yml
 
   publish-npm:
     name: Publish to npm
-    needs: ci
+    needs: [preflight-tag, ci]
+    if: |
+      always() &&
+      needs.preflight-tag.result == 'success' &&
+      (github.event_name != 'push' || needs.ci.result == 'success')
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -39,6 +96,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_REF }}
 
       - name: Install pnpm
         uses: pnpm/action-setup@v5
@@ -64,7 +123,8 @@ jobs:
       - name: Determine npm dist-tag
         id: dist-tag
         run: |
-          TAG="${GITHUB_REF_NAME}"
+          set -euo pipefail
+          TAG="${{ env.RELEASE_TAG }}"
           if [[ "$TAG" == *"-alpha"* ]]; then
             echo "tag=alpha" >> "$GITHUB_OUTPUT"
           elif [[ "$TAG" == *"-beta"* ]]; then
@@ -78,39 +138,70 @@ jobs:
       - name: Publish packages
         env:
           NODE_AUTH_TOKEN: ""
+          DIST_TAG: ${{ steps.dist-tag.outputs.tag }}
         run: |
-          DIST_TAG="${{ steps.dist-tag.outputs.tag }}"
+          set -euo pipefail
+          # Idempotent publish: skip any package whose exact version is already on
+          # the npm registry. Lets us safely re-run after a partial failure
+          # (e.g. transient OIDC fluke) without choking on duplicate versions.
+          publish_if_missing() {
+            local filter="$1"
+            local pkg_dir="$2"
+            local name version view
+            name="$(jq -r .name "${pkg_dir}/package.json")"
+            version="$(jq -r .version "${pkg_dir}/package.json")"
+            view="$(npm view "${name}@${version}" version 2>/dev/null || true)"
+            if [[ -z "${view}" ]]; then
+              sleep 2
+              view="$(npm view "${name}@${version}" version 2>/dev/null || true)"
+            fi
+            if [[ "${view}" == "${version}" ]]; then
+              echo "skip: ${name}@${version} already published on npm (dist-tag=${DIST_TAG})"
+              return 0
+            fi
+            echo "publish: ${name}@${version} (dist-tag=${DIST_TAG})"
+            pnpm --filter "${filter}" publish --tag "${DIST_TAG}" --provenance --access public --no-git-checks
+          }
           # pnpm publish resolves workspace:^ to actual version ranges.
-          # Publish in dependency order: core → mcp, server → cli, opencode-plugin
-          pnpm --filter @codemem/core publish --tag "$DIST_TAG" --provenance --access public --no-git-checks
-          pnpm --filter @codemem/mcp publish --tag "$DIST_TAG" --provenance --access public --no-git-checks
-          pnpm --filter @codemem/server publish --tag "$DIST_TAG" --provenance --access public --no-git-checks
-          pnpm --filter codemem publish --tag "$DIST_TAG" --provenance --access public --no-git-checks
-          pnpm --filter @codemem/opencode-plugin publish --tag "$DIST_TAG" --provenance --access public --no-git-checks
+          # Publish in dependency order: core → mcp, server → cli → opencode-plugin.
+          publish_if_missing "@codemem/core" "packages/core"
+          publish_if_missing "@codemem/mcp" "packages/mcp-server"
+          publish_if_missing "@codemem/server" "packages/viewer-server"
+          publish_if_missing "codemem" "packages/cli"
+          publish_if_missing "@codemem/opencode-plugin" "packages/opencode-plugin"
 
   release:
     name: Create GitHub Release
-    needs: [ci, publish-npm]
+    needs: [publish-npm]
+    # Use always() to bypass the implicit success() check, otherwise this job
+    # is skipped on workflow_dispatch reruns where the upstream `ci` job is
+    # skipped — the implicit success() requires all transitive needs to have
+    # succeeded, not just direct ones.
+    if: always() && needs.publish-npm.result == 'success'
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_REF }}
 
       - name: Create GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
         run: |
+          set -euo pipefail
           PRERELEASE_FLAG=""
-          if [[ "${{ github.ref_name }}" == *"-alpha"* ]] || \
-             [[ "${{ github.ref_name }}" == *"-beta"* ]] || \
-             [[ "${{ github.ref_name }}" == *"-rc"* ]]; then
+          if [[ "$RELEASE_TAG" == *"-alpha"* ]] || \
+             [[ "$RELEASE_TAG" == *"-beta"* ]] || \
+             [[ "$RELEASE_TAG" == *"-rc"* ]]; then
             PRERELEASE_FLAG="--prerelease"
           fi
-          if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
-            echo "Release already exists"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists"
           else
-            gh release create "${{ github.ref_name }}" \
+            gh release create "$RELEASE_TAG" \
               --generate-notes \
-              --title "Release ${{ github.ref_name }}" \
+              --title "Release $RELEASE_TAG" \
               $PRERELEASE_FLAG
           fi

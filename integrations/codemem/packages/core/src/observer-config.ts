@@ -185,9 +185,12 @@ export const CODEMEM_CONFIG_ENV_OVERRIDES: Record<string, string> = {
 	actor_id: "CODEMEM_ACTOR_ID",
 	actor_display_name: "CODEMEM_ACTOR_DISPLAY_NAME",
 	claude_command: "CODEMEM_CLAUDE_COMMAND",
+	codex_command: "CODEMEM_CODEX_COMMAND",
 	observer_provider: "CODEMEM_OBSERVER_PROVIDER",
 	observer_model: "CODEMEM_OBSERVER_MODEL",
 	observer_temperature: "CODEMEM_OBSERVER_TEMPERATURE",
+	observer_reasoning_effort: "CODEMEM_OBSERVER_REASONING_EFFORT",
+	observer_reasoning_summary: "CODEMEM_OBSERVER_REASONING_SUMMARY",
 	observer_tier_routing_enabled: "CODEMEM_OBSERVER_TIER_ROUTING_ENABLED",
 	observer_simple_model: "CODEMEM_OBSERVER_SIMPLE_MODEL",
 	observer_simple_temperature: "CODEMEM_OBSERVER_SIMPLE_TEMPERATURE",
@@ -208,6 +211,7 @@ export const CODEMEM_CONFIG_ENV_OVERRIDES: Record<string, string> = {
 	pack_observation_limit: "CODEMEM_PACK_OBSERVATION_LIMIT",
 	pack_session_limit: "CODEMEM_PACK_SESSION_LIMIT",
 	sync_enabled: "CODEMEM_SYNC_ENABLED",
+	sync_device_name: "CODEMEM_SYNC_DEVICE_NAME",
 	sync_host: "CODEMEM_SYNC_HOST",
 	sync_port: "CODEMEM_SYNC_PORT",
 	sync_interval_s: "CODEMEM_SYNC_INTERVAL_S",
@@ -229,7 +233,34 @@ export const CODEMEM_CONFIG_ENV_OVERRIDES: Record<string, string> = {
 	sync_projects_exclude: "CODEMEM_SYNC_PROJECTS_EXCLUDE",
 	sync_ops_limit: "CODEMEM_SYNC_OPS_LIMIT",
 	raw_events_sweeper_interval_s: "CODEMEM_RAW_EVENTS_SWEEPER_INTERVAL_S",
+	raw_events_retention_enabled: "CODEMEM_RAW_EVENTS_RETENTION_ENABLED",
+	raw_events_retention_max_age_days: "CODEMEM_RAW_EVENTS_RETENTION_MAX_AGE_DAYS",
 };
+
+/** Normalize a configured sidecar command from argv or a shell-style string. */
+export function coerceObserverCommand(value: unknown): string[] | null {
+	if (value == null) return null;
+	if (Array.isArray(value)) {
+		const parts = value.filter((item): item is string => {
+			return typeof item === "string" && item.trim() !== "";
+		});
+		return parts.length > 0 ? parts : null;
+	}
+	if (typeof value !== "string") return null;
+	const trimmed = value.trim();
+	if (!trimmed) return null;
+	try {
+		const parsed = JSON.parse(trimmed) as unknown;
+		if (Array.isArray(parsed) && parsed.every((item) => typeof item === "string")) {
+			const parts = parsed.filter((item) => item.trim() !== "");
+			return parts.length > 0 ? parts : null;
+		}
+	} catch {
+		// Non-JSON command strings use the same whitespace splitting as existing config.
+	}
+	const parts = trimmed.split(/\s+/).filter((item) => item !== "");
+	return parts.length > 0 ? parts : null;
+}
 
 // ---------------------------------------------------------------------------
 // Unified config path resolver with full traceability
@@ -541,7 +572,9 @@ export function resolveBuiltInProviderModel(
 		return [null, modelName || resolveBuiltInProviderDefaultModel(provider), {}];
 	}
 	const name = modelName || resolveBuiltInProviderDefaultModel(provider) || "";
-	return ["https://opencode.ai/zen/v1", name || "big-pickle", {}];
+	const prefix = `${provider}/`;
+	const shortName = name.startsWith(prefix) ? name.slice(prefix.length) : name;
+	return ["https://opencode.ai/zen/v1", shortName || null, {}];
 }
 
 /** Extract provider prefix from a model string like `"myprovider/model-name"`. */
@@ -571,25 +604,78 @@ export function resolvePlaceholder(value: string): string {
 
 /** Expand `$VAR` and `${VAR}` environment variable references. */
 function expandEnvVars(value: string): string {
-	return value.replace(/\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g, (match, braced, bare) => {
-		const name = braced ?? bare;
-		return process.env[name] ?? match;
-	});
+	let result = "";
+	for (let i = 0; i < value.length; i++) {
+		if (value[i] !== "$" || i === value.length - 1) {
+			result += value[i];
+			continue;
+		}
+		if (value[i + 1] === "{") {
+			const end = value.indexOf("}", i + 2);
+			if (end > i + 2) {
+				const name = value.slice(i + 2, end);
+				result += process.env[name] ?? value.slice(i, end + 1);
+				i = end;
+				continue;
+			}
+		}
+		const start = i + 1;
+		let end = start;
+		while (end < value.length) {
+			const code = value.charCodeAt(end);
+			const isLetter = (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+			const isDigit = code >= 48 && code <= 57;
+			if (!isLetter && !isDigit && code !== 95) break;
+			end++;
+		}
+		const name = value.slice(start, end);
+		if (!name || !Number.isNaN(Number(name[0]))) {
+			result += "$";
+			continue;
+		}
+		result += process.env[name] ?? value.slice(i, end);
+		i = end - 1;
+	}
+	return result;
 }
 
 /** Expand `{file:path}` placeholders by reading the referenced file. */
 function resolveFilePlaceholder(value: string): string {
 	if (!value.includes("{file:")) return value;
-	return value.replace(/\{file:([^}]+)\}/g, (match, rawPath: string) => {
-		const trimmed = rawPath.trim();
-		if (!trimmed) return match;
-		const resolved = expandEnvVars(trimmed).replace(/^~/, codememHomeDir());
-		try {
-			return readFileSync(resolved, "utf-8").trim();
-		} catch {
-			return match;
+	let result = "";
+	let index = 0;
+	while (index < value.length) {
+		const start = value.indexOf("{file:", index);
+		if (start < 0) {
+			result += value.slice(index);
+			break;
 		}
-	});
+		const end = value.indexOf("}", start + 6);
+		if (end < 0) {
+			result += value.slice(index);
+			break;
+		}
+		result += value.slice(index, start);
+		const match = value.slice(start, end + 1);
+		const rawPath = value.slice(start + 6, end);
+		const trimmed = rawPath.trim();
+		if (!trimmed) {
+			result += match;
+			index = end + 1;
+			continue;
+		}
+		const expanded = expandEnvVars(trimmed);
+		const resolved = expanded.startsWith("~")
+			? `${codememHomeDir()}${expanded.slice(1)}`
+			: expanded;
+		try {
+			result += readFileSync(resolved, "utf-8").trim();
+		} catch {
+			result += match;
+		}
+		index = end + 1;
+	}
+	return result;
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,1198 @@
+import { createHash } from "node:crypto";
+import { mkdtempSync } from "node:fs";
+import { request } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { queryRetrievalAttempts } from "@codemem/core";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { OAuthAuditEvent } from "./audit.js";
+import {
+	authenticatedRetrievalPrincipal,
+	type CodememMcpHttpServer,
+	DEFAULT_MCP_HTTP_HOST,
+	DEFAULT_MCP_HTTP_PORT,
+	isAllowedMcpHttpRequestHost,
+	isAllowedMcpHttpRequestOrigin,
+	isAllowedMcpHttpRequestRemoteAddress,
+	isUnsafePublicBindAllowed,
+	MCP_HTTP_MAX_JSON_BODY_BYTES,
+	MCP_HTTP_RETRIEVAL_RETRY_WINDOW_MS,
+	parseMcpHttpPort,
+	startCodememMcpHttpServer,
+	validateMcpHttpHost,
+} from "./http.js";
+import { createInMemoryOAuthAccessTokenStore } from "./oauth.js";
+
+const servers: CodememMcpHttpServer[] = [];
+
+const FORBIDDEN_AUDIT_FIELDS = new Set([
+	"access_token",
+	"refresh_token",
+	"id_token",
+	"code",
+	"code_verifier",
+	"code_challenge",
+	"client_secret",
+	"authorization",
+	"password",
+	"secret",
+	"token",
+]);
+
+function captureAuditEmitter(): {
+	emit: (event: OAuthAuditEvent) => void;
+	events: OAuthAuditEvent[];
+} {
+	const events: OAuthAuditEvent[] = [];
+	return {
+		emit: (event) => {
+			events.push(event);
+		},
+		events,
+	};
+}
+
+function assertAuditEventsAreRedacted(events: OAuthAuditEvent[]): void {
+	for (const event of events) {
+		for (const key of Object.keys(event)) {
+			expect(FORBIDDEN_AUDIT_FIELDS.has(key.toLowerCase())).toBe(false);
+		}
+		const serialized = JSON.stringify(event);
+		for (const forbidden of FORBIDDEN_AUDIT_FIELDS) {
+			expect(serialized.toLowerCase()).not.toContain(`"${forbidden}":`);
+		}
+	}
+}
+
+beforeEach(() => {
+	vi.stubEnv("HOME", mkdtempSync(join(tmpdir(), "codemem-mcp-home-")));
+});
+
+afterEach(async () => {
+	await Promise.all(servers.splice(0).map((server) => server.close()));
+	vi.unstubAllEnvs();
+});
+
+describe("MCP HTTP transport", () => {
+	it("defaults to loopback host and validates host values", () => {
+		expect(validateMcpHttpHost(undefined)).toBe(DEFAULT_MCP_HTTP_HOST);
+		expect(validateMcpHttpHost("localhost")).toBe("localhost");
+		expect(validateMcpHttpHost("::1")).toBe("::1");
+		expect(() => validateMcpHttpHost("http://127.0.0.1")).toThrow(/Invalid MCP HTTP host/);
+		expect(() => validateMcpHttpHost("127.0.0.1/mcp")).toThrow(/Invalid MCP HTTP host/);
+		expect(() => validateMcpHttpHost("0.0.0.0")).toThrow(/Refusing unsafe MCP HTTP host/);
+		expect(() => validateMcpHttpHost("192.168.1.10")).toThrow(/Refusing unsafe MCP HTTP host/);
+		expect(validateMcpHttpHost("0.0.0.0", true)).toBe("0.0.0.0");
+	});
+
+	it("parses the explicit unsafe public bind switch", () => {
+		expect(isUnsafePublicBindAllowed("1")).toBe(true);
+		expect(isUnsafePublicBindAllowed("true")).toBe(true);
+		expect(isUnsafePublicBindAllowed("yes")).toBe(true);
+		expect(isUnsafePublicBindAllowed("0")).toBe(false);
+	});
+
+	it("allows only loopback Host and Origin headers for the selected port", () => {
+		expect(isAllowedMcpHttpRequestHost("127.0.0.1:38889", 38889)).toBe(true);
+		expect(isAllowedMcpHttpRequestHost("localhost:38889", 38889)).toBe(true);
+		expect(isAllowedMcpHttpRequestHost("[::1]:38889", 38889)).toBe(true);
+		expect(isAllowedMcpHttpRequestHost("evil.test:38889", 38889)).toBe(false);
+		expect(isAllowedMcpHttpRequestHost("127.0.0.1:38888", 38889)).toBe(false);
+
+		expect(isAllowedMcpHttpRequestOrigin(undefined, 38889)).toBe(true);
+		expect(isAllowedMcpHttpRequestOrigin("http://localhost:38889", 38889)).toBe(true);
+		expect(isAllowedMcpHttpRequestOrigin("http://[::1]:38889", 38889)).toBe(true);
+		expect(isAllowedMcpHttpRequestOrigin("http://evil.test:38889", 38889)).toBe(false);
+		expect(isAllowedMcpHttpRequestOrigin("http://localhost:38888", 38889)).toBe(false);
+		expect(isAllowedMcpHttpRequestOrigin("http://localhost:38889/path", 38889)).toBe(false);
+
+		expect(isAllowedMcpHttpRequestRemoteAddress("127.0.0.1")).toBe(true);
+		expect(isAllowedMcpHttpRequestRemoteAddress("::ffff:127.0.0.1")).toBe(true);
+		expect(isAllowedMcpHttpRequestRemoteAddress("203.0.113.10")).toBe(false);
+	});
+
+	it("accepts loopback Host headers without an explicit port when bound to HTTP default (PR 1120 P2 regression)", () => {
+		// RFC-compliant clients may send `Host: localhost` (no `:port`) when the
+		// server listens on port 80. Reject anything that is not loopback or that
+		// would inherit a default port other than the bound one.
+		expect(isAllowedMcpHttpRequestHost("localhost", 80)).toBe(true);
+		expect(isAllowedMcpHttpRequestHost("127.0.0.1", 80)).toBe(true);
+		expect(isAllowedMcpHttpRequestHost("[::1]", 80)).toBe(true);
+		expect(isAllowedMcpHttpRequestHost("evil.test", 80)).toBe(false);
+		expect(isAllowedMcpHttpRequestHost("localhost", 38889)).toBe(false);
+	});
+
+	it("defaults and validates port values", () => {
+		expect(parseMcpHttpPort(undefined)).toBe(DEFAULT_MCP_HTTP_PORT);
+		expect(parseMcpHttpPort("0")).toBe(0);
+		expect(parseMcpHttpPort(38889)).toBe(38889);
+		expect(() => parseMcpHttpPort("abc")).toThrow(/Invalid MCP HTTP port/);
+		expect(() => parseMcpHttpPort(65_536)).toThrow(/Invalid MCP HTTP port/);
+	});
+
+	it("exposes only POST /mcp", async () => {
+		const server = await startCodememMcpHttpServer({ dbPath: tempDbPath(), port: 0 });
+		servers.push(server);
+
+		const getResponse = await fetch(server.url);
+		expect(getResponse.status).toBe(405);
+		expect(getResponse.headers.get("allow")).toBe("POST");
+
+		const missingResponse = await fetch(server.url.replace("/mcp", "/health"), { method: "POST" });
+		expect(missingResponse.status).toBe(404);
+	});
+
+	it("serves OAuth authorization server and protected resource metadata", async () => {
+		const server = await startCodememMcpHttpServer({
+			dbPath: tempDbPath(),
+			port: 0,
+			publicUrl: "https://codemem.example.test/mcp",
+		});
+		servers.push(server);
+
+		const baseUrl = server.url.replace("/mcp", "");
+		const authorizationMetadata = await fetch(`${baseUrl}/.well-known/oauth-authorization-server`);
+		const protectedResourceMetadata = await fetch(
+			`${baseUrl}/.well-known/oauth-protected-resource/mcp`,
+		);
+
+		expect(authorizationMetadata.status).toBe(200);
+		expect(await authorizationMetadata.json()).toMatchObject({
+			issuer: "https://codemem.example.test/",
+			registration_endpoint: "https://codemem.example.test/register",
+			code_challenge_methods_supported: ["S256"],
+			grant_types_supported: ["authorization_code", "refresh_token"],
+			token_endpoint_auth_methods_supported: ["none"],
+			revocation_endpoint: "https://codemem.example.test/revoke",
+			scopes_supported: ["memory:read", "memory:write"],
+		});
+		expect(protectedResourceMetadata.status).toBe(200);
+		expect(await protectedResourceMetadata.json()).toMatchObject({
+			resource: "https://codemem.example.test/mcp",
+			authorization_servers: ["https://codemem.example.test/"],
+			resource_name: "codemem MCP",
+			scopes_supported: ["memory:read", "memory:write"],
+		});
+	});
+
+	it("derives default OAuth metadata from the bound HTTP host", async () => {
+		const server = await startCodememMcpHttpServer({
+			dbPath: tempDbPath(),
+			host: "::1",
+			port: 0,
+		});
+		servers.push(server);
+
+		const response = await fetch(
+			`${server.url.replace("/mcp", "")}/.well-known/oauth-protected-resource/mcp`,
+		);
+
+		expect(response.status).toBe(200);
+		expect(await response.json()).toMatchObject({ resource: server.url });
+	});
+
+	it("registers OAuth clients through Dynamic Client Registration", async () => {
+		const server = await startCodememMcpHttpServer({
+			dbPath: tempDbPath(),
+			port: 0,
+			publicUrl: "https://codemem.example.test/mcp",
+		});
+		servers.push(server);
+
+		const response = await fetch(server.url.replace("/mcp", "/register"), {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				redirect_uris: ["https://claude.ai/api/mcp/auth_callback"],
+				client_name: "Claude",
+				token_endpoint_auth_method: "none",
+			}),
+		});
+		const registered = await response.json();
+
+		expect(response.status).toBe(201);
+		expect(registered).toMatchObject({
+			redirect_uris: ["https://claude.ai/api/mcp/auth_callback"],
+			client_name: "Claude",
+			token_endpoint_auth_method: "none",
+			grant_types: ["authorization_code", "refresh_token"],
+		});
+		expect(registered.client_id).toMatch(/[0-9a-f-]{36}/);
+		expect(registered.client_secret).toBeUndefined();
+	});
+
+	it("keeps Dynamic Client Registration clients across HTTP server restarts", async () => {
+		const statePath = join(mkdtempSync(join(tmpdir(), "codemem-mcp-oauth-")), "state.json");
+		const firstServer = await startCodememMcpHttpServer({
+			dbPath: tempDbPath(),
+			port: 0,
+			publicUrl: "https://codemem.example.test/mcp",
+			oauthStatePath: statePath,
+		});
+		const register = await fetch(firstServer.url.replace("/mcp", "/register"), {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				redirect_uris: ["https://claude.ai/api/mcp/auth_callback"],
+				token_endpoint_auth_method: "none",
+			}),
+		});
+		const client = await register.json();
+		await firstServer.close();
+
+		const restartedServer = await startCodememMcpHttpServer({
+			dbPath: tempDbPath(),
+			port: 0,
+			publicUrl: "https://codemem.example.test/mcp",
+			oauthStatePath: statePath,
+		});
+		servers.push(restartedServer);
+		const refresh = await fetch(restartedServer.url.replace("/mcp", "/token"), {
+			method: "POST",
+			headers: { "content-type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({
+				client_id: client.client_id,
+				grant_type: "refresh_token",
+				refresh_token: "missing-refresh-token",
+			}),
+		});
+
+		expect(register.status).toBe(201);
+		expect(refresh.status).toBe(400);
+		expect(await refresh.json()).toMatchObject({ error: "invalid_grant" });
+	});
+
+	it("rejects local Dynamic Client Registration from non-loopback origins", async () => {
+		const server = await startCodememMcpHttpServer({ dbPath: tempDbPath(), port: 0 });
+		servers.push(server);
+
+		const register = await fetch(server.url.replace("/mcp", "/register"), {
+			method: "POST",
+			headers: { "content-type": "application/json", origin: "http://evil.test" },
+			body: JSON.stringify({ redirect_uris: ["https://claude.ai/api/mcp/auth_callback"] }),
+		});
+		const authorize = await fetch(server.url.replace("/mcp", "/authorize"), {
+			headers: { origin: "http://evil.test" },
+		});
+		const token = await fetch(server.url.replace("/mcp", "/token"), {
+			method: "POST",
+			headers: {
+				"content-type": "application/x-www-form-urlencoded",
+				origin: "http://evil.test",
+			},
+		});
+
+		expect(register.status).toBe(403);
+		expect(authorize.status).toBe(403);
+		expect(token.status).toBe(403);
+	});
+
+	it("rejects hostile browser origins on OAuth endpoints when a public URL is configured", async () => {
+		const server = await startCodememMcpHttpServer({
+			dbPath: tempDbPath(),
+			port: 0,
+			publicUrl: "https://codemem.example.test/mcp",
+		});
+		servers.push(server);
+		const baseUrl = server.url.replace("/mcp", "");
+
+		const register = await fetch(`${baseUrl}/register`, {
+			method: "POST",
+			headers: { "content-type": "application/json", origin: "http://evil.test" },
+			body: JSON.stringify({ redirect_uris: ["https://claude.ai/api/mcp/auth_callback"] }),
+		});
+		const authorize = await fetch(`${baseUrl}/authorize`, {
+			headers: { origin: "http://evil.test" },
+		});
+		const token = await fetch(`${baseUrl}/token`, {
+			method: "POST",
+			headers: {
+				"content-type": "application/x-www-form-urlencoded",
+				origin: "http://evil.test",
+			},
+		});
+
+		expect(register.status).toBe(403);
+		expect(authorize.status).toBe(403);
+		expect(token.status).toBe(403);
+	});
+
+	it("allows trusted hosted connector browser preflight requests on public OAuth and MCP routes", async () => {
+		const server = await startCodememMcpHttpServer({
+			dbPath: tempDbPath(),
+			port: 0,
+			publicUrl: "https://codemem.example.test/mcp",
+		});
+		servers.push(server);
+		const baseUrl = server.url.replace("/mcp", "");
+
+		const register = await requestWithHost(`${baseUrl}/register`, {
+			method: "OPTIONS",
+			host: "codemem.example.test",
+			headers: {
+				origin: "https://claude.ai",
+				"access-control-request-method": "POST",
+				"access-control-request-headers": "content-type",
+			},
+		});
+		const mcp = await requestWithHost(server.url, {
+			method: "OPTIONS",
+			host: "codemem.example.test",
+			headers: {
+				origin: "https://claude.ai",
+				"access-control-request-method": "POST",
+				"access-control-request-headers": "authorization,content-type,mcp-session-id",
+			},
+		});
+
+		expect(register.statusCode).toBe(204);
+		expect(register.headers["access-control-allow-origin"]).toBe("https://claude.ai");
+		expect(register.headers["access-control-allow-headers"]).toBe("content-type");
+		expect(mcp.statusCode).toBe(204);
+		expect(mcp.headers["access-control-allow-origin"]).toBe("https://claude.ai");
+		expect(mcp.headers["access-control-allow-headers"]).toBe(
+			"authorization,content-type,mcp-session-id",
+		);
+
+		const chatGpt = await requestWithHost(`${baseUrl}/register`, {
+			method: "OPTIONS",
+			host: "codemem.example.test",
+			headers: {
+				origin: "https://chatgpt.com",
+				"access-control-request-method": "POST",
+				"access-control-request-headers": "content-type",
+			},
+		});
+
+		expect(chatGpt.statusCode).toBe(204);
+		expect(chatGpt.headers["access-control-allow-origin"]).toBe("https://chatgpt.com");
+		expect(chatGpt.headers["access-control-allow-headers"]).toBe("content-type");
+
+		const registration = await requestWithHost(`${baseUrl}/register`, {
+			method: "POST",
+			host: "codemem.example.test",
+			headers: { origin: "https://chatgpt.com" },
+			body: JSON.stringify({
+				redirect_uris: ["https://chatgpt.com/connector/oauth/QvWoF4AUziOy"],
+				token_endpoint_auth_method: "none",
+			}),
+		});
+
+		expect(registration.statusCode).toBe(201);
+	});
+
+	it("logs early public Host and Origin guard denials", async () => {
+		const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const server = await startCodememMcpHttpServer({
+				dbPath: tempDbPath(),
+				port: 0,
+				publicUrl: "https://codemem.example.test/mcp",
+			});
+			servers.push(server);
+
+			const response = await requestWithHost(server.url.replace("/mcp", "/register"), {
+				method: "OPTIONS",
+				host: "codemem.example.test",
+				headers: {
+					origin: "https://evil.test",
+					"access-control-request-method": "POST",
+				},
+			});
+
+			expect(response.statusCode).toBe(403);
+			expect(consoleWarn).toHaveBeenCalledTimes(1);
+			const event = JSON.parse(String(consoleWarn.mock.calls[0]?.[0])) as Record<string, unknown>;
+			expect(event).toMatchObject({
+				source: "codemem-mcp-http-guard",
+				outcome: "denied",
+				reason: "host_or_origin_mismatch",
+				method: "OPTIONS",
+				path: "/register",
+				host: "codemem.example.test",
+				origin: "https://evil.test",
+				expectedOrigin: "https://codemem.example.test",
+			});
+		} finally {
+			consoleWarn.mockRestore();
+		}
+	});
+
+	it("accepts proxied OAuth token requests without rate-limit trust-proxy warnings", async () => {
+		const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			const server = await startCodememMcpHttpServer({
+				dbPath: tempDbPath(),
+				port: 0,
+				publicUrl: "https://codemem.example.test/mcp",
+			});
+			servers.push(server);
+
+			const response = await fetch(server.url.replace("/mcp", "/token"), {
+				method: "POST",
+				headers: {
+					"content-type": "application/x-www-form-urlencoded",
+					"x-forwarded-for": "203.0.113.10",
+				},
+				body: new URLSearchParams({
+					client_id: "missing-client",
+					grant_type: "refresh_token",
+					refresh_token: "missing-refresh-token",
+				}),
+			});
+
+			expect(response.status).toBe(400);
+			expect(await response.json()).toMatchObject({ error: "invalid_client" });
+			expect(consoleError).not.toHaveBeenCalledWith(
+				expect.objectContaining({ code: "ERR_ERL_UNEXPECTED_X_FORWARDED_FOR" }),
+			);
+		} finally {
+			consoleError.mockRestore();
+		}
+	});
+
+	it("rejects public OAuth requests with non-public Host headers", async () => {
+		const server = await startCodememMcpHttpServer({
+			dbPath: tempDbPath(),
+			port: 0,
+			publicUrl: "https://codemem.example.test/mcp",
+		});
+		servers.push(server);
+
+		const response = await postWithHost(server.url.replace("/mcp", "/register"), "evil.test");
+		const trailingSlash = await postWithHost(server.url.replace("/mcp", "/register/"), "evil.test");
+		const mcpTrailingSlash = await postWithHost(`${server.url}/`, "evil.test");
+
+		expect(response.statusCode).toBe(403);
+		expect(trailingSlash.statusCode).toBe(403);
+		expect(mcpTrailingSlash.statusCode).toBe(403);
+	});
+
+	it("rejects bare public Host headers when the configured public URL uses a non-default port", async () => {
+		const server = await startCodememMcpHttpServer({
+			dbPath: tempDbPath(),
+			port: 0,
+			publicUrl: "https://codemem.example.test:10000/mcp",
+		});
+		servers.push(server);
+
+		const bareHost = await postWithHost(
+			server.url.replace("/mcp", "/register"),
+			"codemem.example.test",
+		);
+		const explicitHost = await postWithHost(
+			server.url.replace("/mcp", "/register"),
+			"codemem.example.test:10000",
+		);
+
+		expect(bareHost.statusCode).toBe(403);
+		expect(explicitHost.statusCode).toBe(400);
+	});
+
+	it("rejects unsupported OAuth redirect URIs", async () => {
+		const server = await startCodememMcpHttpServer({ dbPath: tempDbPath(), port: 0 });
+		servers.push(server);
+
+		const response = await fetch(server.url.replace("/mcp", "/register"), {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ redirect_uris: ["https://evil.test/callback"] }),
+		});
+
+		expect(response.status).toBe(400);
+		expect(await response.json()).toMatchObject({ error: "invalid_client_metadata" });
+	});
+
+	it("fails closed at authorize when OIDC is not configured", async () => {
+		const { emit, events } = captureAuditEmitter();
+		const server = await startCodememMcpHttpServer({
+			dbPath: tempDbPath(),
+			port: 0,
+			publicUrl: "https://codemem.example.test/mcp",
+			auditEmitter: emit,
+		});
+		servers.push(server);
+		const baseUrl = server.url.replace("/mcp", "");
+
+		const registration = await fetch(`${baseUrl}/register`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				redirect_uris: ["https://claude.ai/api/mcp/auth_callback"],
+				token_endpoint_auth_method: "none",
+			}),
+		});
+		const client = await registration.json();
+		const authorizeUrl = new URL(`${baseUrl}/authorize`);
+		authorizeUrl.searchParams.set("client_id", client.client_id);
+		authorizeUrl.searchParams.set("redirect_uri", "https://claude.ai/api/mcp/auth_callback");
+		authorizeUrl.searchParams.set("response_type", "code");
+		authorizeUrl.searchParams.set("code_challenge_method", "S256");
+		authorizeUrl.searchParams.set("code_challenge", pkceS256("d".repeat(43)));
+		authorizeUrl.searchParams.set("state", "state-123");
+
+		const authorize = await fetch(authorizeUrl, { redirect: "manual" });
+
+		expect(authorize.status).toBe(302);
+		expect(authorize.headers.get("location")).toContain("error=temporarily_unavailable");
+		expect(events).toContainEqual(
+			expect.objectContaining({
+				kind: "authorize",
+				outcome: "denied",
+				reason: "temporarily_unavailable",
+			}),
+		);
+	});
+
+	it("requires valid bearer tokens for public MCP requests", async () => {
+		const tokenStore = createInMemoryOAuthAccessTokenStore();
+		const issued = tokenStore.issueToken("client-123");
+		if (!issued) throw new Error("expected access token");
+		const server = await startCodememMcpHttpServer({
+			dbPath: tempDbPath(),
+			port: 0,
+			publicUrl: "https://codemem.example.test/mcp",
+			oauthAccessTokenStore: tokenStore,
+		});
+		servers.push(server);
+
+		const missing = await fetch(server.url, {
+			method: "POST",
+			headers: {
+				accept: "application/json, text/event-stream",
+				"content-type": "application/json",
+			},
+			body: initializeBody(1),
+		});
+		const invalid = await fetch(server.url, {
+			method: "POST",
+			headers: {
+				accept: "application/json, text/event-stream",
+				authorization: "Bearer not-a-token",
+				"content-type": "application/json",
+			},
+			body: initializeBody(2),
+		});
+		const valid = await initialize(server.url, 3, { authorization: `Bearer ${issued.token}` });
+
+		expect(missing.status).toBe(401);
+		expect(missing.headers.get("www-authenticate")).toContain("Bearer");
+		expect(invalid.status).toBe(401);
+		expect(valid.result?.serverInfo?.name).toBe("codemem");
+	});
+
+	it("allows valid public bearer requests with the configured external Host", async () => {
+		const tokenStore = createInMemoryOAuthAccessTokenStore();
+		const issued = tokenStore.issueToken("client-public");
+		if (!issued) throw new Error("expected access token");
+		const server = await startCodememMcpHttpServer({
+			dbPath: tempDbPath(),
+			port: 0,
+			publicUrl: "https://codemem.example.test/mcp",
+			oauthAccessTokenStore: tokenStore,
+		});
+		servers.push(server);
+
+		const response = await postWithHost(server.url, "codemem.example.test", {
+			authorization: `Bearer ${issued.token}`,
+		});
+
+		expect(response.statusCode).toBe(200);
+	});
+
+	it("emits redacted audit events for the full OAuth + bearer flow", async () => {
+		const tokenStore = createInMemoryOAuthAccessTokenStore();
+		const issued = tokenStore.issueToken("client-audit");
+		if (!issued) throw new Error("expected access token");
+		const { emit, events } = captureAuditEmitter();
+		const server = await startCodememMcpHttpServer({
+			dbPath: tempDbPath(),
+			port: 0,
+			publicUrl: "https://codemem.example.test/mcp",
+			oauthAccessTokenStore: tokenStore,
+			auditEmitter: emit,
+		});
+		servers.push(server);
+		const baseUrl = server.url.replace("/mcp", "");
+
+		const register = await fetch(`${baseUrl}/register`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				redirect_uris: ["https://claude.ai/api/mcp/auth_callback"],
+				token_endpoint_auth_method: "none",
+			}),
+		});
+		expect(register.status).toBe(201);
+		const registeredForRevocation = await register.json();
+		await fetch(`${baseUrl}/revoke`, {
+			method: "POST",
+			headers: { "content-type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({
+				client_id: registeredForRevocation.client_id,
+				token: "ignored-since-unknown",
+			}),
+		});
+		const missingBearer = await fetch(server.url, {
+			method: "POST",
+			headers: {
+				accept: "application/json, text/event-stream",
+				"content-type": "application/json",
+			},
+			body: initializeBody(1),
+		});
+		expect(missingBearer.status).toBe(401);
+		const validBearer = await initialize(server.url, 2, {
+			authorization: `Bearer ${issued.token}`,
+		});
+		expect(validBearer.result?.serverInfo?.name).toBe("codemem");
+
+		const kinds = events.map((e) => e.kind);
+		expect(kinds).toContain("registration");
+		expect(kinds).toContain("revocation");
+		expect(kinds).toContain("bearer");
+
+		const registration = events.find((e) => e.kind === "registration");
+		expect(registration?.outcome).toBe("success");
+		expect(registration?.clientId).toMatch(/[0-9a-f-]{36}/);
+
+		const denied = events.find((e) => e.kind === "bearer" && e.outcome === "denied");
+		expect(denied?.reason).toBe("missing_authorization_header");
+
+		const accepted = events.find((e) => e.kind === "bearer" && e.outcome === "success");
+		expect(accepted?.clientId).toBe("client-audit");
+
+		assertAuditEventsAreRedacted(events);
+	});
+
+	it("rejects expired and revoked bearer tokens", async () => {
+		const tokenStore = createInMemoryOAuthAccessTokenStore();
+		const clientId = "client-revoked";
+		const revocable = tokenStore.issueToken(clientId);
+		const expired = tokenStore.issueToken("client-expired", Date.now() - 60 * 60 * 1000 - 1);
+		if (!expired || !revocable) throw new Error("expected access tokens");
+		const { emit, events } = captureAuditEmitter();
+		const server = await startCodememMcpHttpServer({
+			dbPath: tempDbPath(),
+			port: 0,
+			publicUrl: "https://codemem.example.test/mcp",
+			oauthAccessTokenStore: tokenStore,
+			auditEmitter: emit,
+		});
+		servers.push(server);
+		const baseUrl = server.url.replace("/mcp", "");
+		const registration = await fetch(`${baseUrl}/register`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				redirect_uris: ["https://claude.ai/api/mcp/auth_callback"],
+				token_endpoint_auth_method: "none",
+			}),
+		});
+		const client = await registration.json();
+
+		const expiredResponse = await fetch(server.url, {
+			method: "POST",
+			headers: {
+				accept: "application/json, text/event-stream",
+				authorization: `Bearer ${expired.token}`,
+				"content-type": "application/json",
+			},
+			body: initializeBody(1),
+		});
+		const revoke = await fetch(`${baseUrl}/revoke`, {
+			method: "POST",
+			headers: { "content-type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({ client_id: client.client_id, token: revocable.token }),
+		});
+		const revokedResponse = await fetch(server.url, {
+			method: "POST",
+			headers: {
+				accept: "application/json, text/event-stream",
+				authorization: `Bearer ${revocable.token}`,
+				"content-type": "application/json",
+			},
+			body: initializeBody(2),
+		});
+
+		expect(expiredResponse.status).toBe(401);
+		expect(revoke.status).toBe(200);
+		expect(await revoke.json()).toEqual({});
+		expect(revokedResponse.status).toBe(401);
+		expect(events).toContainEqual(
+			expect.objectContaining({ kind: "bearer", outcome: "denied", reason: "expired_token" }),
+		);
+		expect(events).toContainEqual(
+			expect.objectContaining({ kind: "bearer", outcome: "denied", reason: "revoked_token" }),
+		);
+	});
+
+	it("handles repeated MCP initialize requests over POST", async () => {
+		const server = await startCodememMcpHttpServer({ dbPath: tempDbPath(), port: 0 });
+		servers.push(server);
+
+		const first = await initialize(server.url, 1);
+		const second = await initialize(server.url, 2);
+
+		expect(first.result?.serverInfo?.name).toBe("codemem");
+		expect(second.result?.serverInfo?.name).toBe("codemem");
+	});
+
+	it("accepts valid MCP JSON bodies larger than Express's default limit", async () => {
+		const server = await startCodememMcpHttpServer({ dbPath: tempDbPath(), port: 0 });
+		servers.push(server);
+
+		const response = await callTool(server.url, "large-valid-request", "memory_recent", {
+			limit: 1,
+			padding: "x".repeat(128 * 1024),
+		});
+
+		expect(response).toHaveProperty("result");
+	});
+
+	it("returns JSON-RPC errors for malformed and oversized MCP JSON bodies", async () => {
+		const server = await startCodememMcpHttpServer({ dbPath: tempDbPath(), port: 0 });
+		servers.push(server);
+
+		const malformed = await postRawMcpJson(server.url, '{"jsonrpc":"2.0",');
+		const oversized = await postRawMcpJson(
+			server.url,
+			JSON.stringify({
+				jsonrpc: "2.0",
+				id: "oversized-request",
+				method: "tools/call",
+				params: {
+					name: "memory_recent",
+					arguments: { padding: "x".repeat(MCP_HTTP_MAX_JSON_BODY_BYTES) },
+				},
+			}),
+		);
+
+		expect(malformed.status).toBe(400);
+		expect(malformed.headers.get("content-type")).toContain("application/json");
+		expect(await malformed.json()).toEqual({
+			jsonrpc: "2.0",
+			error: { code: -32_700, message: "Parse error" },
+			id: null,
+		});
+		expect(oversized.status).toBe(413);
+		expect(oversized.headers.get("content-type")).toContain("application/json");
+		expect(await oversized.json()).toEqual({
+			jsonrpc: "2.0",
+			error: { code: -32_000, message: "Request body too large" },
+			id: null,
+		});
+	});
+
+	it("records matching anonymous HTTP calls as separate retrieval attempts", async () => {
+		const server = await startCodememMcpHttpServer({ dbPath: tempDbPath(), port: 0 });
+		servers.push(server);
+
+		const first = await callTool(server.url, "retry-request-1", "memory_recent", { limit: 5 });
+		const second = await callTool(server.url, "retry-request-1", "memory_recent", { limit: 5 });
+
+		expect(second).toEqual(first);
+		const attempts = queryRetrievalAttempts(server.store.db, { surface: "mcp_recent" });
+		expect(attempts).toHaveLength(2);
+		expect(new Set(attempts.map((attempt) => attempt.requestId)).size).toBe(2);
+		expect(new Set(attempts.map((attempt) => attempt.streamId)).size).toBe(2);
+	});
+
+	it("deduplicates authenticated retries by principal, content, and JSON-RPC ID", async () => {
+		const tokenStore = createInMemoryOAuthAccessTokenStore();
+		const client = tokenStore.issueToken("stable-retry-client");
+		if (!client) throw new Error("expected access token");
+		const server = await startCodememMcpHttpServer({
+			dbPath: tempDbPath(),
+			port: 0,
+			publicUrl: "https://codemem.example.test/mcp",
+			oauthAccessTokenStore: tokenStore,
+		});
+		servers.push(server);
+		const headers = { authorization: `Bearer ${client.token}` };
+
+		const first = await callTool(
+			server.url,
+			"retry-request-1",
+			"memory_recent",
+			{ limit: 5 },
+			headers,
+		);
+		const retry = await callTool(
+			server.url,
+			"retry-request-1",
+			"memory_recent",
+			{ limit: 5 },
+			headers,
+		);
+		const changedParams = await callTool(
+			server.url,
+			"retry-request-1",
+			"memory_recent",
+			{
+				limit: 6,
+			},
+			headers,
+		);
+		const distinct = await callTool(
+			server.url,
+			"request-2",
+			"memory_recent",
+			{ limit: 5 },
+			headers,
+		);
+
+		expect(retry).toEqual(first);
+		expect(changedParams).toHaveProperty("result");
+		expect(distinct).toHaveProperty("result");
+		const attempts = queryRetrievalAttempts(server.store.db, { surface: "mcp_recent" });
+		expect(attempts).toHaveLength(3);
+		expect(new Set(attempts.map((attempt) => attempt.requestId)).size).toBe(3);
+		expect(new Set(attempts.map((attempt) => attempt.streamId)).size).toBe(3);
+	});
+
+	it("separates authenticated retrieval principals by OAuth client", () => {
+		const first = authenticatedRetrievalPrincipal({
+			clientId: "client-a",
+			token: "token-a",
+			extra: { sub: "shared-subject" },
+		});
+		const retry = authenticatedRetrievalPrincipal({
+			clientId: "client-a",
+			token: "token-b",
+			extra: { sub: "shared-subject" },
+		});
+		const otherClient = authenticatedRetrievalPrincipal({
+			clientId: "client-b",
+			token: "token-c",
+			extra: { sub: "shared-subject" },
+		});
+
+		expect(retry).toBe(first);
+		expect(otherClient).not.toBe(first);
+	});
+
+	it("keeps stateless retries together across an aligned boundary until first-observation expiry", async () => {
+		const firstObservedAt = MCP_HTTP_RETRIEVAL_RETRY_WINDOW_MS * 100 - 1;
+		let now = firstObservedAt;
+		const tokenStore = createInMemoryOAuthAccessTokenStore();
+		const client = tokenStore.issueToken("boundary-retry-client");
+		if (!client) throw new Error("expected access token");
+		const server = await startCodememMcpHttpServer({
+			dbPath: tempDbPath(),
+			port: 0,
+			publicUrl: "https://codemem.example.test/mcp",
+			oauthAccessTokenStore: tokenStore,
+			retrievalLedgerNow: () => now,
+		});
+		servers.push(server);
+		const headers = { authorization: `Bearer ${client.token}` };
+
+		await callTool(server.url, "reusable-request-id", "memory_recent", { limit: 5 }, headers);
+		now = MCP_HTTP_RETRIEVAL_RETRY_WINDOW_MS * 100 + 1;
+		await callTool(server.url, "reusable-request-id", "memory_recent", { limit: 5 }, headers);
+		now = firstObservedAt + MCP_HTTP_RETRIEVAL_RETRY_WINDOW_MS - 1;
+		await callTool(server.url, "reusable-request-id", "memory_recent", { limit: 5 }, headers);
+
+		let attempts = queryRetrievalAttempts(server.store.db, { surface: "mcp_recent" });
+		expect(attempts).toHaveLength(1);
+
+		now = firstObservedAt + MCP_HTTP_RETRIEVAL_RETRY_WINDOW_MS;
+		await callTool(server.url, "reusable-request-id", "memory_recent", { limit: 5 }, headers);
+
+		attempts = queryRetrievalAttempts(server.store.db, { surface: "mcp_recent" });
+		expect(attempts).toHaveLength(2);
+		expect(new Set(attempts.map((attempt) => attempt.streamId)).size).toBe(2);
+	});
+
+	it("canonicalizes stateless request object ordering within the retry window", async () => {
+		const tokenStore = createInMemoryOAuthAccessTokenStore();
+		const client = tokenStore.issueToken("canonical-retry-client");
+		if (!client) throw new Error("expected access token");
+		const server = await startCodememMcpHttpServer({
+			dbPath: tempDbPath(),
+			port: 0,
+			publicUrl: "https://codemem.example.test/mcp",
+			oauthAccessTokenStore: tokenStore,
+		});
+		servers.push(server);
+		const headers = { authorization: `Bearer ${client.token}` };
+
+		await callTool(
+			server.url,
+			"canonical-request-id",
+			"memory_recent",
+			{
+				limit: 5,
+				project: "codemem",
+			},
+			headers,
+		);
+		await callTool(
+			server.url,
+			"canonical-request-id",
+			"memory_recent",
+			{
+				project: "codemem",
+				limit: 5,
+			},
+			headers,
+		);
+
+		expect(queryRetrievalAttempts(server.store.db, { surface: "mcp_recent" })).toHaveLength(1);
+	});
+
+	it("partitions retry identity by authenticated client without leaking request context", async () => {
+		const tokenStore = createInMemoryOAuthAccessTokenStore();
+		const firstClient = tokenStore.issueToken("private-client-one");
+		const secondClient = tokenStore.issueToken("private-client-two");
+		if (!firstClient || !secondClient) throw new Error("expected access tokens");
+		const server = await startCodememMcpHttpServer({
+			dbPath: tempDbPath(),
+			port: 0,
+			publicUrl: "https://codemem.example.test/mcp",
+			oauthAccessTokenStore: tokenStore,
+		});
+		servers.push(server);
+		const query = "private query text must not leak";
+		const userAgent = "private-caller-agent/1.0";
+		const forwardedFor = "203.0.113.77";
+		const request = { query, limit: 5 };
+
+		await callTool(server.url, "shared-request-id", "memory_search", request, {
+			authorization: `Bearer ${firstClient.token}`,
+			"user-agent": userAgent,
+			"x-forwarded-for": forwardedFor,
+		});
+		await callTool(server.url, "shared-request-id", "memory_search", request, {
+			authorization: `Bearer ${secondClient.token}`,
+		});
+
+		const attempts = queryRetrievalAttempts(server.store.db, { surface: "mcp_search" });
+		expect(attempts).toHaveLength(2);
+		expect(new Set(attempts.map((attempt) => attempt.streamId)).size).toBe(2);
+		for (const attempt of attempts) {
+			expect(attempt.streamId).toMatch(/^mcp-http:[a-f0-9]{64}$/);
+		}
+		const persisted = JSON.stringify(attempts);
+		expect(persisted).not.toContain(query);
+		expect(persisted).not.toContain("private-client-one");
+		expect(persisted).not.toContain("private-client-two");
+		expect(persisted).not.toContain("codemem.example.test");
+		expect(persisted).not.toContain(firstClient.token);
+		expect(persisted).not.toContain(secondClient.token);
+		expect(persisted).not.toContain(userAgent);
+		expect(persisted).not.toContain(forwardedFor);
+	});
+
+	it("partitions retry identity for distinct tokens issued to the same authenticated client", async () => {
+		const tokenStore = createInMemoryOAuthAccessTokenStore();
+		const firstUser = tokenStore.issueToken("shared-team-client");
+		const secondUser = tokenStore.issueToken("shared-team-client");
+		if (!firstUser || !secondUser) throw new Error("expected access tokens");
+		const server = await startCodememMcpHttpServer({
+			dbPath: tempDbPath(),
+			port: 0,
+			publicUrl: "https://codemem.example.test/mcp",
+			oauthAccessTokenStore: tokenStore,
+		});
+		servers.push(server);
+
+		await callTool(
+			server.url,
+			"shared-request-id",
+			"memory_recent",
+			{ limit: 5 },
+			{
+				authorization: `Bearer ${firstUser.token}`,
+			},
+		);
+		await callTool(
+			server.url,
+			"shared-request-id",
+			"memory_recent",
+			{ limit: 5 },
+			{
+				authorization: `Bearer ${secondUser.token}`,
+			},
+		);
+
+		const attempts = queryRetrievalAttempts(server.store.db, { surface: "mcp_recent" });
+		expect(attempts).toHaveLength(2);
+		expect(new Set(attempts.map((attempt) => attempt.streamId)).size).toBe(2);
+		const persisted = JSON.stringify(attempts);
+		expect(persisted).not.toContain(firstUser.token);
+		expect(persisted).not.toContain(secondUser.token);
+		expect(persisted).not.toContain("shared-team-client");
+	});
+
+	it("rejects browser requests from non-loopback origins", async () => {
+		const server = await startCodememMcpHttpServer({ dbPath: tempDbPath(), port: 0 });
+		servers.push(server);
+
+		const response = await fetch(server.url, {
+			method: "POST",
+			headers: {
+				accept: "application/json, text/event-stream",
+				"content-type": "application/json",
+				origin: "http://evil.test",
+			},
+			body: initializeBody(1),
+		});
+
+		expect(response.status).toBe(403);
+	});
+
+	it("rejects requests with non-loopback Host headers", async () => {
+		const server = await startCodememMcpHttpServer({ dbPath: tempDbPath(), port: 0 });
+		servers.push(server);
+
+		const response = await postWithHost(server.url, "evil.test:38889");
+		expect(response.statusCode).toBe(403);
+	});
+
+	it("closes idempotently", async () => {
+		const server = await startCodememMcpHttpServer({ dbPath: tempDbPath(), port: 0 });
+		await Promise.all([server.close(), server.close()]);
+	});
+});
+
+async function initialize(
+	url: string,
+	id: number,
+	extraHeaders: Record<string, string> = {},
+): Promise<{ result?: { serverInfo?: { name?: string } } }> {
+	const response = await fetch(url, {
+		method: "POST",
+		headers: {
+			accept: "application/json, text/event-stream",
+			"content-type": "application/json",
+			...extraHeaders,
+		},
+		body: initializeBody(id),
+	});
+
+	expect(response.status).toBe(200);
+	expect(response.headers.get("content-type")).toContain("text/event-stream");
+	return parseSseJson(await response.text()) as { result?: { serverInfo?: { name?: string } } };
+}
+
+function initializeBody(id: number): string {
+	return JSON.stringify({
+		jsonrpc: "2.0",
+		id,
+		method: "initialize",
+		params: {
+			protocolVersion: "2024-11-05",
+			capabilities: {},
+			clientInfo: { name: "codemem-test", version: "0.0.0" },
+		},
+	});
+}
+
+async function callTool(
+	url: string,
+	id: string | number,
+	name: string,
+	args: Record<string, unknown>,
+	extraHeaders: Record<string, string> = {},
+): Promise<unknown> {
+	const response = await fetch(url, {
+		method: "POST",
+		headers: {
+			accept: "application/json, text/event-stream",
+			"content-type": "application/json",
+			...extraHeaders,
+		},
+		body: JSON.stringify({
+			jsonrpc: "2.0",
+			id,
+			method: "tools/call",
+			params: { name, arguments: args },
+		}),
+	});
+
+	expect(response.status).toBe(200);
+	return parseSseJson(await response.text());
+}
+
+function postRawMcpJson(url: string, body: string): Promise<Response> {
+	return fetch(url, {
+		method: "POST",
+		headers: {
+			accept: "application/json, text/event-stream",
+			"content-type": "application/json",
+		},
+		body,
+	});
+}
+
+function parseSseJson(body: string): unknown {
+	const dataLine = body.split("\n").find((line) => line.startsWith("data: "));
+	if (!dataLine) throw new Error(`Missing SSE data line: ${body}`);
+	return JSON.parse(dataLine.slice("data: ".length));
+}
+
+async function postWithHost(
+	url: string,
+	host: string,
+	extraHeaders: Record<string, string> = {},
+): Promise<{ statusCode: number | undefined }> {
+	const response = await requestWithHost(url, {
+		method: "POST",
+		host,
+		headers: extraHeaders,
+		body: initializeBody(1),
+	});
+	return { statusCode: response.statusCode };
+}
+
+async function requestWithHost(
+	url: string,
+	options: {
+		method: string;
+		host: string;
+		headers?: Record<string, string>;
+		body?: string;
+	},
+): Promise<{
+	statusCode: number | undefined;
+	headers: Record<string, string | string[] | undefined>;
+}> {
+	const target = new URL(url);
+	return await new Promise((resolve, reject) => {
+		const req = request(
+			{
+				hostname: target.hostname,
+				port: target.port,
+				path: target.pathname,
+				method: options.method,
+				headers: {
+					accept: "application/json, text/event-stream",
+					"content-type": "application/json",
+					host: options.host,
+					...options.headers,
+				},
+			},
+			(res) => {
+				res.resume();
+				res.on("end", () =>
+					resolve({
+						statusCode: res.statusCode,
+						headers: res.headers,
+					}),
+				);
+			},
+		);
+		req.on("error", reject);
+		req.end(options.body);
+	});
+}
+
+function tempDbPath(): string {
+	return join(mkdtempSync(join(tmpdir(), "codemem-mcp-http-")), "mem.sqlite");
+}
+
+function pkceS256(verifier: string): string {
+	return createHash("sha256").update(verifier).digest("base64url");
+}

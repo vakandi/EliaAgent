@@ -89,6 +89,10 @@ describe("createCloudflareCoordinatorWorker", () => {
 		tmpDir = mkdtempSync(join(tmpdir(), "cloudflare-coord-worker-test-"));
 		db = connectCoordinator(join(tmpDir, "coordinator.sqlite"));
 		db.exec(`
+			DROP TABLE IF EXISTS coordinator_scope_membership_effect_receipts;
+			DROP TABLE IF EXISTS coordinator_scope_membership_audit_log;
+			DROP TABLE IF EXISTS coordinator_scope_memberships;
+			DROP TABLE IF EXISTS coordinator_scopes;
 			DROP TABLE IF EXISTS coordinator_reciprocal_approvals;
 			DROP TABLE IF EXISTS coordinator_join_requests;
 			DROP TABLE IF EXISTS coordinator_invites;
@@ -100,6 +104,54 @@ describe("createCloudflareCoordinatorWorker", () => {
 		schemaSql = readFileSync(join(import.meta.dirname, "../schema.sql"), "utf8");
 		db.exec(schemaSql);
 		d1db = new SqliteD1Database(db);
+	});
+
+	it("migration 0010 preserves audit history and adds immutable effect receipts", () => {
+		db.exec("DROP TABLE coordinator_scope_membership_effect_receipts");
+		db.exec("DROP INDEX idx_coordinator_scope_membership_audit_effect");
+		db.exec("ALTER TABLE coordinator_scope_membership_audit_log RENAME TO audit_with_effect");
+		db.exec(`
+			CREATE TABLE coordinator_scope_membership_audit_log (
+				event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+				action TEXT NOT NULL,
+				scope_id TEXT NOT NULL,
+				device_id TEXT NOT NULL,
+				role TEXT,
+				status TEXT NOT NULL,
+				membership_epoch INTEGER NOT NULL,
+				previous_role TEXT,
+				previous_status TEXT,
+				previous_membership_epoch INTEGER,
+				coordinator_id TEXT,
+				group_id TEXT,
+				actor_type TEXT,
+				actor_id TEXT,
+				manifest_hash TEXT,
+				created_at TEXT NOT NULL
+			);
+			INSERT INTO coordinator_scope_membership_audit_log(
+				action, scope_id, device_id, status, membership_epoch, created_at
+			) VALUES ('grant', 'scope-a', 'device-a', 'active', 1, '2026-07-21T00:00:00Z');
+			DROP TABLE audit_with_effect;
+		`);
+		const migration = readFileSync(
+			join(import.meta.dirname, "../migrations/0010_add_scope_membership_effect_receipts.sql"),
+			"utf8",
+		);
+
+		db.exec(migration);
+
+		expect(
+			db.prepare("SELECT action, effect_id FROM coordinator_scope_membership_audit_log").get(),
+		).toEqual({ action: "grant", effect_id: null });
+		expect(
+			db
+				.prepare(
+					"SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'coordinator_scope_membership_effect_receipts'",
+				)
+				.pluck()
+				.get(),
+		).toBe("coordinator_scope_membership_effect_receipts");
 	});
 
 	afterEach(() => {
@@ -115,6 +167,248 @@ describe("createCloudflareCoordinatorWorker", () => {
 		);
 		expect(res.status).toBe(500);
 		expect(await res.json()).toEqual({ error: "missing_d1_binding" });
+	});
+
+	it("migration 0007 preserves legacy invites while adding project-intent columns", () => {
+		db.exec("DROP TABLE coordinator_invites");
+		db.exec(`
+			CREATE TABLE coordinator_invites (
+				invite_id TEXT PRIMARY KEY,
+				group_id TEXT NOT NULL,
+				token TEXT NOT NULL UNIQUE,
+				policy TEXT NOT NULL,
+				expires_at TEXT NOT NULL,
+				created_at TEXT NOT NULL,
+				created_by TEXT,
+				team_name_snapshot TEXT,
+				revoked_at TEXT
+			);
+			INSERT INTO coordinator_invites(
+				invite_id, group_id, token, policy, expires_at, created_at
+			) VALUES (
+				'legacy-invite', 'g1', 'legacy-token', 'auto_admit',
+				'2099-01-01T00:00:00Z', '2026-03-28T00:00:00Z'
+			);
+		`);
+		const migration = readFileSync(
+			join(import.meta.dirname, "../migrations/0007_add_invite_project_intent_reference.sql"),
+			"utf8",
+		);
+
+		db.exec(migration);
+
+		expect(
+			db
+				.prepare(
+					`SELECT invite_id, token, operation_id, reviewed_project_set_digest
+					 FROM coordinator_invites WHERE invite_id = 'legacy-invite'`,
+				)
+				.get(),
+		).toEqual({
+			invite_id: "legacy-invite",
+			token: "legacy-token",
+			operation_id: null,
+			reviewed_project_set_digest: null,
+		});
+	});
+
+	it("migration 0008 preserves legacy invites while adding atomic binding columns", () => {
+		db.exec(`
+			DROP TABLE coordinator_invites;
+			CREATE TABLE coordinator_invites (
+				invite_id TEXT PRIMARY KEY, group_id TEXT NOT NULL, token TEXT NOT NULL UNIQUE,
+				policy TEXT NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL,
+				created_by TEXT, team_name_snapshot TEXT, revoked_at TEXT, operation_id TEXT,
+				reviewed_project_set_digest TEXT
+			);
+			INSERT INTO coordinator_invites(invite_id, group_id, token, policy, expires_at, created_at)
+			VALUES ('legacy-invite', 'g1', 'legacy-token', 'auto_admit', '2099-01-01T00:00:00Z',
+				'2026-03-28T00:00:00Z');
+		`);
+		const migration = readFileSync(
+			join(import.meta.dirname, "../migrations/0008_add_project_invite_acceptance.sql"),
+			"utf8",
+		);
+		db.exec(migration);
+		expect(
+			db
+				.prepare(
+					`SELECT invite_id, token, token_digest, consumed_at, bound_device_id,
+						recipient_actor_id, trust_state
+					 FROM coordinator_invites WHERE invite_id = 'legacy-invite'`,
+				)
+				.get(),
+		).toEqual({
+			invite_id: "legacy-invite",
+			token: "legacy-token",
+			token_digest: null,
+			consumed_at: null,
+			bound_device_id: null,
+			recipient_actor_id: null,
+			trust_state: null,
+		});
+	});
+
+	it("migration 0009 classifies existing invites and adds recipient invitation metadata", () => {
+		db.exec(`
+			DROP TABLE coordinator_invites;
+			CREATE TABLE coordinator_invites (
+				invite_id TEXT PRIMARY KEY, group_id TEXT NOT NULL, token TEXT NOT NULL UNIQUE,
+				policy TEXT NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL,
+				created_by TEXT, team_name_snapshot TEXT, revoked_at TEXT, operation_id TEXT
+			);
+			INSERT INTO coordinator_invites(invite_id, group_id, token, policy, expires_at, created_at, operation_id)
+			VALUES
+				('legacy-invite', 'g1', 'legacy-token', 'auto_admit', '2099-01-01T00:00:00Z',
+					'2026-03-28T00:00:00Z', NULL),
+				('project-invite', 'g1', 'project-token', 'auto_admit', '2099-01-01T00:00:00Z',
+					'2026-03-28T00:00:00Z', 'share_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+		`);
+		const migration = readFileSync(
+			join(import.meta.dirname, "../migrations/0009_add_recipient_invite_kinds.sql"),
+			"utf8",
+		);
+		db.exec(migration);
+
+		expect(
+			db
+				.prepare(`SELECT invite_id, invite_kind, policy_team_id, target_identity_id,
+					reviewed_preview_digest FROM coordinator_invites ORDER BY invite_id`)
+				.all(),
+		).toEqual([
+			{
+				invite_id: "legacy-invite",
+				invite_kind: "legacy_enrollment",
+				policy_team_id: null,
+				target_identity_id: null,
+				reviewed_preview_digest: null,
+			},
+			{
+				invite_id: "project-invite",
+				invite_kind: "project_share",
+				policy_team_id: null,
+				target_identity_id: null,
+				reviewed_preview_digest: null,
+			},
+		]);
+	});
+
+	it("migration 0011 adds nullable reviewed intent without changing existing invitations", () => {
+		db.exec(`
+			DROP TABLE coordinator_invites;
+			CREATE TABLE coordinator_invites (
+				invite_id TEXT PRIMARY KEY,
+				group_id TEXT NOT NULL,
+				token TEXT NOT NULL UNIQUE,
+				policy TEXT NOT NULL,
+				expires_at TEXT NOT NULL,
+				created_at TEXT NOT NULL
+			);
+			INSERT INTO coordinator_invites(invite_id, group_id, token, policy, expires_at, created_at)
+			VALUES ('legacy-invite', 'g1', 'legacy-token', 'auto_admit', '2099-01-01T00:00:00Z',
+				'2026-03-28T00:00:00Z');
+		`);
+		const migration = readFileSync(
+			join(import.meta.dirname, "../migrations/0011_add_recipient_reviewed_intent.sql"),
+			"utf8",
+		);
+
+		db.exec(migration);
+
+		expect(
+			db.prepare("SELECT invite_id, reviewed_intent_json FROM coordinator_invites").get(),
+		).toEqual({ invite_id: "legacy-invite", reviewed_intent_json: null });
+	});
+
+	it("migration 0012 adds nullable enrollment identity binding and preserves existing rows", () => {
+		// Arrange
+		db.exec(`
+			DROP TABLE enrolled_devices;
+			CREATE TABLE enrolled_devices (
+				group_id TEXT NOT NULL,
+				device_id TEXT NOT NULL,
+				public_key TEXT NOT NULL,
+				fingerprint TEXT NOT NULL,
+				display_name TEXT,
+				enabled INTEGER NOT NULL DEFAULT 1,
+				created_at TEXT NOT NULL,
+				PRIMARY KEY (group_id, device_id)
+			);
+			INSERT INTO enrolled_devices(
+				group_id, device_id, public_key, fingerprint, display_name, enabled, created_at
+			) VALUES (
+				'g1', 'legacy-device', 'legacy-key', 'legacy-fingerprint', 'Legacy device', 1,
+				'2026-07-24T00:00:00Z'
+			);
+		`);
+		const migration = readFileSync(
+			join(import.meta.dirname, "../migrations/0012_add_enrolled_device_identity.sql"),
+			"utf8",
+		);
+
+		// Act
+		db.exec(migration);
+
+		// Assert
+		const columns = db.prepare("PRAGMA table_info(enrolled_devices)").all() as Array<{
+			name: string;
+		}>;
+		expect(columns.map((column) => column.name)).toContain("identity_id");
+		expect(
+			db
+				.prepare(
+					"SELECT device_id, identity_id FROM enrolled_devices WHERE device_id = 'legacy-device'",
+				)
+				.get(),
+		).toEqual({ device_id: "legacy-device", identity_id: null });
+	});
+
+	it("migration 0013 adds nullable assigned Team identity and preserves existing invitations", () => {
+		// Arrange
+		db.exec(`
+			DROP TABLE coordinator_invites;
+			CREATE TABLE coordinator_invites (
+				invite_id TEXT PRIMARY KEY,
+				group_id TEXT NOT NULL,
+				token TEXT NOT NULL UNIQUE,
+				policy TEXT NOT NULL,
+				expires_at TEXT NOT NULL,
+				created_at TEXT NOT NULL,
+				invite_kind TEXT,
+				policy_team_id TEXT
+			);
+			INSERT INTO coordinator_invites(
+				invite_id, group_id, token, policy, expires_at, created_at, invite_kind, policy_team_id
+			) VALUES (
+				'legacy-team-invite', 'g1', 'legacy-team-token', 'auto_admit',
+				'2099-01-01T00:00:00Z', '2026-07-24T00:00:00Z', 'team_member', 'policy-team-1'
+			);
+		`);
+		const migration = readFileSync(
+			join(import.meta.dirname, "../migrations/0013_add_invite_assigned_identity.sql"),
+			"utf8",
+		);
+
+		// Act
+		db.exec(migration);
+
+		// Assert
+		const columns = db.prepare("PRAGMA table_info(coordinator_invites)").all() as Array<{
+			name: string;
+		}>;
+		expect(columns.map((column) => column.name)).toContain("assigned_identity_id");
+		expect(
+			db
+				.prepare(
+					"SELECT invite_id, invite_kind, policy_team_id, assigned_identity_id FROM coordinator_invites",
+				)
+				.get(),
+		).toEqual({
+			invite_id: "legacy-team-invite",
+			invite_kind: "team_member",
+			policy_team_id: "policy-team-1",
+			assigned_identity_id: null,
+		});
 	});
 
 	it("serves coordinator admin data through the worker entrypoint", async () => {
@@ -147,6 +441,7 @@ describe("createCloudflareCoordinatorWorker", () => {
 					device_id: "d1",
 					public_key: "pk1",
 					fingerprint: "fp1",
+					identity_id: null,
 					display_name: "Laptop",
 					enabled: 1,
 					created_at: expect.any(String),
@@ -174,6 +469,73 @@ describe("createCloudflareCoordinatorWorker", () => {
 		);
 		expect(res.status).toBe(413);
 		expect(await res.json()).toEqual({ error: "body_too_large" });
+	});
+
+	it("accepts the legacy v2 canonical request and rejects v3 in its signature slot", async () => {
+		// Arrange
+		const identityDb = connect(join(tmpDir, "signature-invariance.sqlite"));
+		const keysDir = join(tmpDir, "signature-invariance-keys");
+		try {
+			initTestSchema(identityDb);
+			const [deviceId, fingerprint] = ensureDeviceIdentity(identityDb, { keysDir });
+			const publicKey = loadPublicKey(keysDir);
+			if (!publicKey) throw new Error("expected device public key");
+
+			const store = new D1CoordinatorStore(d1db);
+			await store.createGroup("g1", "Team One");
+			await store.enrollDevice("g1", { deviceId, fingerprint, publicKey });
+			await store.close();
+
+			const worker = createCloudflareCoordinatorWorker();
+			const body = JSON.stringify({
+				group_id: "g1",
+				fingerprint,
+				addresses: ["http://127.0.0.1:7337"],
+				ttl_s: 180,
+			});
+			const headers = buildAuthHeaders({
+				deviceId,
+				method: "POST",
+				url: "https://coord.example.test/v1/presence",
+				bodyBytes: Buffer.from(body),
+				keysDir,
+				timestamp: String(Math.floor(Date.now() / 1000)),
+				nonce: "worker-coordinator-v2-fixture",
+			});
+			const env = {
+				COORDINATOR_DB: d1db,
+				CODEMEM_SYNC_COORDINATOR_ADMIN_SECRET: "test-secret",
+			};
+
+			// Act
+			const accepted = await worker.fetch(
+				new Request("https://coord.example.test/v1/presence", {
+					method: "POST",
+					headers: { ...headers, "Content-Type": "application/json" },
+					body,
+				}),
+				env,
+			);
+			const rejected = await worker.fetch(
+				new Request("https://coord.example.test/v1/presence", {
+					method: "POST",
+					headers: {
+						...headers,
+						"Content-Type": "application/json",
+						"X-Opencode-Signature": headers["X-Opencode-Signature"].replace(/^v2:/u, "v3:"),
+					},
+					body,
+				}),
+				env,
+			);
+
+			// Assert
+			expect(accepted.status).toBe(200);
+			expect(rejected.status).toBe(401);
+			expect(await rejected.json()).toEqual({ error: "invalid_signature" });
+		} finally {
+			identityDb.close();
+		}
 	});
 
 	it("supports invite, join approval, signed presence, and signed peer lookup through the worker entrypoint", async () => {

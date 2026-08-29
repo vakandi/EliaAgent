@@ -6,7 +6,7 @@
  * Dynamic filter queries use raw SQL since the filter builder returns SQL strings.
  */
 
-import { and, eq, inArray } from "drizzle-orm";
+import { inArray } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import type { Database } from "./db.js";
 import { fromJson } from "./db.js";
@@ -15,6 +15,7 @@ import {
 	normalizeFilterStrings,
 	normalizeVisibilityValues,
 	normalizeWorkspaceKinds,
+	type OwnershipFilterContext,
 } from "./filters.js";
 import { parsePositiveMemoryId } from "./integers.js";
 import { inferMemoryRole } from "./memory-quality.js";
@@ -23,6 +24,7 @@ import { sanitizeSearchQuery } from "./query-sanitizer.js";
 import { memoryLooksRecapLike, queryPrefersRecap, recapPenaltyMultiplier } from "./recap-policy.js";
 import { findByConcept, findByFile } from "./ref-queries.js";
 import * as schema from "./schema.js";
+import { resolveVisibleScopeIds } from "./scope-resolution.js";
 import { canonicalMemoryKind } from "./summary-memory.js";
 import type {
 	ExplainError,
@@ -52,6 +54,10 @@ export interface StoreHandle {
 	readonly deviceId: string;
 	get(memoryId: number): MemoryItemResponse | null;
 	memoryOwnedBySelf(item: MemoryItem | MemoryResult | Record<string, unknown>): boolean;
+	sameActorPeerIds?(): string[];
+	buildOwnershipPredicate?(): (
+		item: MemoryItem | MemoryResult | Record<string, unknown>,
+	) => boolean;
 	recent(limit?: number, filters?: MemoryFilters | null, offset?: number): MemoryItemResponse[];
 	recentByKinds(
 		kinds: string[],
@@ -75,6 +81,18 @@ const MEMORY_KIND_BONUS: Record<string, number> = {
 	entities: 0.05,
 };
 
+export function ownershipFilterContext(store: StoreHandle): OwnershipFilterContext {
+	const claimedDeviceIds = store.sameActorPeerIds?.() ?? [];
+	return {
+		actorId: store.actorId,
+		deviceId: store.deviceId,
+		claimedDeviceIds,
+		legacyActorIds: claimedDeviceIds.map((peerId) => `legacy-sync:${peerId}`),
+		enforceScopeVisibility: true,
+		visibleScopeIds: resolveVisibleScopeIds(store.db, store.deviceId),
+	};
+}
+
 const PERSONAL_FIRST_BONUS = 0.45;
 const TRUST_BIAS_LEGACY_UNKNOWN_PENALTY = 0.18;
 const TRUST_BIAS_UNREVIEWED_PENALTY = 0.12;
@@ -91,6 +109,7 @@ const DURABLE_ROLE_BONUS = 0.12;
 const GENERAL_ROLE_BONUS = 0.05;
 const EPHEMERAL_ROLE_PENALTY = 0.45;
 const EXPLICIT_RECAP_ROLE_BONUS = 0.08;
+const MAX_TIMELINE_DEPTH = 200;
 const PERSONAL_QUERY_PATTERNS = [
 	/\bwhat did i\b/i,
 	/\bmy notes\b/i,
@@ -195,6 +214,12 @@ function trustBiasMode(filters: MemoryFilters | undefined): "off" | "soft" {
 		.trim()
 		.toLowerCase();
 	return value === "soft" ? "soft" : "off";
+}
+
+function clampTimelineDepth(value: number): number {
+	if (value === Number.POSITIVE_INFINITY) return MAX_TIMELINE_DEPTH;
+	if (!Number.isFinite(value)) return 0;
+	return Math.min(Math.max(0, Math.trunc(value)), MAX_TIMELINE_DEPTH);
 }
 
 function widenSharedWhenWeakEnabled(filters: MemoryFilters | undefined): boolean {
@@ -345,12 +370,12 @@ function markWideningMetadata(items: MemoryResult[]): MemoryResult[] {
 }
 
 function personalBias(
-	store: StoreHandle,
+	ownedByOwner: (item: MemoryResult) => boolean,
 	item: MemoryResult,
 	filters: MemoryFilters | undefined,
 ): number {
 	if (!personalFirstEnabled(filters)) return 0.0;
-	return store.memoryOwnedBySelf(item) ? PERSONAL_FIRST_BONUS : 0.0;
+	return ownedByOwner(item) ? PERSONAL_FIRST_BONUS : 0.0;
 }
 
 function searchQueryLooksTaskLike(query: string): boolean {
@@ -488,12 +513,12 @@ function itemLooksTaskLikeForSearch(item: MemoryResult): boolean {
 }
 
 function sharedTrustPenalty(
-	store: StoreHandle,
+	ownedByOwner: (item: MemoryResult) => boolean,
 	item: MemoryResult,
 	filters: MemoryFilters | undefined,
 ): number {
 	if (trustBiasMode(filters) !== "soft") return 0.0;
-	if (store.memoryOwnedBySelf(item)) return 0.0;
+	if (ownedByOwner(item)) return 0.0;
 	const metadata = item.metadata ?? {};
 	const visibility = String(metadata.visibility ?? "")
 		.trim()
@@ -692,10 +717,7 @@ function fetchResultsByIds(
 	const placeholders = ids.map(() => "?").join(", ");
 	const params: unknown[] = [...ids];
 	const whereClauses = [`memory_items.id IN (${placeholders})`, "memory_items.active = 1"];
-	const filterResult = buildFilterClausesWithContext(filters, {
-		actorId: store.actorId,
-		deviceId: store.deviceId,
-	});
+	const filterResult = buildFilterClausesWithContext(filters, ownershipFilterContext(store));
 	whereClauses.push(...filterResult.clauses);
 	params.push(...filterResult.params);
 	const joinClause = filterResult.joinSessions
@@ -749,13 +771,36 @@ function workingSetOverlapBoost(item: MemoryResult, workingSetPaths: string[]): 
 	return Math.min(0.32, boost);
 }
 
+/**
+ * Build an ownership predicate from `store`, falling back to a closure over
+ * `memoryOwnedBySelf` when the optional `buildOwnershipPredicate` method is
+ * not implemented. The fallback path preserves correctness for older
+ * `StoreHandle` implementers (e.g. external JS callers compiled against a
+ * prior version of this interface) at the cost of re-querying sync_peers
+ * per item.
+ */
+function ownershipPredicateFor(
+	store: StoreHandle,
+): (item: MemoryItem | MemoryResult | Record<string, unknown>) => boolean {
+	if (typeof store.buildOwnershipPredicate === "function") {
+		return store.buildOwnershipPredicate();
+	}
+	return (item) => store.memoryOwnedBySelf(item);
+}
+
 export function scoreResult(
 	store: StoreHandle,
 	item: MemoryResult,
 	filters?: MemoryFilters,
 	query = "",
 	referenceNow = new Date(),
+	ownedByOwner?: (item: MemoryResult) => boolean,
 ): PackTraceCandidateScores {
+	// Per-item rankers (personalBias / sharedTrustPenalty) check whether
+	// the result is owned by this device's actor. Building a fresh
+	// predicate here would re-query sync_peers per item; callers that
+	// already snapshotted the predicate (rerankResults) pass theirs in.
+	const ownership = ownedByOwner ?? ownershipPredicateFor(store);
 	const workingSetPaths = normalizeWorkingSetPaths(filters?.working_set_paths);
 	const preferSummary = queryPrefersRecap(query);
 	const taskLikeQuery = searchQueryLooksTaskLike(query);
@@ -765,8 +810,8 @@ export function scoreResult(
 	const roleAdjustment = roleAdjustmentForSearch(item, preferSummary, taskLikeQuery);
 	const workingSetOverlap = workingSetOverlapBoost(item, workingSetPaths);
 	const queryPathOverlap = queryPathOverlapBoost(item, query);
-	const personalBiasValue = personalBias(store, item, filters);
-	const sharedTrustPenaltyValue = sharedTrustPenalty(store, item, filters);
+	const personalBiasValue = personalBias(ownership, item, filters);
+	const sharedTrustPenaltyValue = sharedTrustPenalty(ownership, item, filters);
 	const recapPenalty = recapPenaltyForSearch(item, preferSummary);
 	const tasklikePenalty =
 		!taskLikeQuery && itemLooksTaskLikeForSearch(item) ? NON_TASK_TASKLIKE_PENALTY : 0.0;
@@ -816,11 +861,14 @@ export function rerankResults(
 	query = "",
 ): MemoryResult[] {
 	const referenceNow = new Date();
+	// Snapshot ownership once per rerank pass so per-item scoring does not
+	// re-query sync_peers for every candidate.
+	const ownedByOwner = ownershipPredicateFor(store);
 
 	const scored = results.map((item) => ({
 		item,
 		combinedScore:
-			scoreResult(store, item, filters, query, referenceNow).combined_score ??
+			scoreResult(store, item, filters, query, referenceNow, ownedByOwner).combined_score ??
 			Number.NEGATIVE_INFINITY,
 	}));
 
@@ -863,7 +911,10 @@ function applySharedWidening(
 		return primary;
 	}
 
-	const personalResults = primary.filter((item) => store.memoryOwnedBySelf(item));
+	// Snapshot ownership once for the two filter passes below; the predicate
+	// captures the current sync_peers state so per-result checks stay O(1).
+	const ownedByOwner = ownershipPredicateFor(store);
+	const personalResults = primary.filter((item) => ownedByOwner(item));
 	const strongestPersonalScore = personalResults[0]?.score ?? -Infinity;
 	const personalStrongEnough =
 		personalResults.length >= widenSharedMinPersonalResults(filters) &&
@@ -876,7 +927,7 @@ function applySharedWidening(
 			effectiveQuery,
 			WIDEN_SHARED_MAX_SHARED_RESULTS,
 			sharedWideningFilters(filters),
-		).filter((item) => !store.memoryOwnedBySelf(item)),
+		).filter((item) => !ownedByOwner(item)),
 	);
 	const seen = new Set(primary.map((item) => item.id));
 	const combined = [...primary];
@@ -960,10 +1011,7 @@ function searchOnce(
 	const params: unknown[] = [expanded];
 	const whereClauses = ["memory_items.active = 1", "memory_fts MATCH ?"];
 
-	const filterResult = buildFilterClausesWithContext(filters, {
-		actorId: store.actorId,
-		deviceId: store.deviceId,
-	});
+	const filterResult = buildFilterClausesWithContext(filters, ownershipFilterContext(store));
 	whereClauses.push(...filterResult.clauses);
 	params.push(...filterResult.params);
 
@@ -1070,15 +1118,14 @@ function timelineAround(
 	const anchorId = anchor.id;
 	const anchorCreatedAt = anchor.created_at;
 	const anchorSessionId = anchor.session_id;
+	const effectiveDepthBefore = clampTimelineDepth(depthBefore);
+	const effectiveDepthAfter = clampTimelineDepth(depthAfter);
 
 	if (!anchorId || !anchorCreatedAt) {
 		return [];
 	}
 
-	const filterResult = buildFilterClausesWithContext(filters, {
-		actorId: store.actorId,
-		deviceId: store.deviceId,
-	});
+	const filterResult = buildFilterClausesWithContext(filters, ownershipFilterContext(store));
 	const whereParts = ["memory_items.active = 1", ...filterResult.clauses];
 	const baseParams = [...filterResult.params];
 
@@ -1091,6 +1138,21 @@ function timelineAround(
 	const joinClause = filterResult.joinSessions
 		? "JOIN sessions ON sessions.id = memory_items.session_id"
 		: "";
+
+	// Re-fetch anchor row to get full columns (anchor from search may be partial),
+	// but keep it behind the same scope/filter gate as the surrounding window.
+	const anchorRow = store.db
+		.prepare(
+			`SELECT memory_items.*
+			 FROM memory_items
+			 ${joinClause}
+			 WHERE ${whereClause}
+			   AND memory_items.id = ?
+			 LIMIT 1`,
+		)
+		.get(...baseParams, anchorId) as MemoryItem | undefined;
+
+	if (!anchorRow) return [];
 
 	// Before: older memories, descending (we'll reverse later)
 	const beforeRows = store.db
@@ -1106,7 +1168,13 @@ function timelineAround(
 			 ORDER BY memory_items.created_at DESC, memory_items.id DESC
 			 LIMIT ?`,
 		)
-		.all(...baseParams, anchorCreatedAt, anchorCreatedAt, anchorId, depthBefore) as MemoryItem[];
+		.all(
+			...baseParams,
+			anchorCreatedAt,
+			anchorCreatedAt,
+			anchorId,
+			effectiveDepthBefore,
+		) as MemoryItem[];
 
 	// After: newer memories, ascending
 	const afterRows = store.db
@@ -1122,21 +1190,17 @@ function timelineAround(
 			 ORDER BY memory_items.created_at ASC, memory_items.id ASC
 			 LIMIT ?`,
 		)
-		.all(...baseParams, anchorCreatedAt, anchorCreatedAt, anchorId, depthAfter) as MemoryItem[];
-
-	// Re-fetch anchor row to get full columns (anchor from search may be partial)
-	const d = getDrizzle(store.db);
-	const anchorRow = d
-		.select()
-		.from(schema.memoryItems)
-		.where(and(eq(schema.memoryItems.id, anchorId), eq(schema.memoryItems.active, 1)))
-		.get() as MemoryItem | undefined;
+		.all(
+			...baseParams,
+			anchorCreatedAt,
+			anchorCreatedAt,
+			anchorId,
+			effectiveDepthAfter,
+		) as MemoryItem[];
 
 	// Combine: reversed(before) + anchor + after
 	const rows: MemoryItem[] = [...beforeRows.reverse()];
-	if (anchorRow) {
-		rows.push(anchorRow);
-	}
+	rows.push(anchorRow);
 	rows.push(...afterRows);
 
 	return rows.map((row) => {
@@ -1253,25 +1317,24 @@ function loadItemsByIdsForExplain(
 		};
 	}
 
-	const d = getDrizzle(store.db);
-	const allRows = d
-		.select()
-		.from(schema.memoryItems)
-		.where(and(eq(schema.memoryItems.active, 1), inArray(schema.memoryItems.id, ids)))
-		.all() as MemoryItem[];
-	const allFoundIds = new Set(allRows.map((item) => item.id));
-
 	// Placeholders for the dynamic-filter raw SQL queries below
 	const placeholders = ids.map(() => "?").join(", ");
+	const scopeContext = ownershipFilterContext(store);
+	const visibilityFilter = buildFilterClausesWithContext(null, scopeContext);
+	const visibleRows = store.db
+		.prepare(
+			`SELECT memory_items.*
+			 FROM memory_items
+			 WHERE ${["memory_items.active = 1", `memory_items.id IN (${placeholders})`, ...visibilityFilter.clauses].join(" AND ")}`,
+		)
+		.all(...ids, ...visibilityFilter.params) as MemoryItem[];
+	const visibleFoundIds = new Set(visibleRows.map((item) => item.id));
 
-	let projectScopedRows = allRows;
-	let projectScopedIds = new Set(allFoundIds);
+	let projectScopedRows = visibleRows;
+	let projectScopedIds = new Set(visibleFoundIds);
 	if (filters.project) {
 		const projectFiltersOnly: MemoryFilters = { project: filters.project };
-		const projectFilterResult = buildFilterClausesWithContext(projectFiltersOnly, {
-			actorId: store.actorId,
-			deviceId: store.deviceId,
-		});
+		const projectFilterResult = buildFilterClausesWithContext(projectFiltersOnly, scopeContext);
 		if (projectFilterResult.clauses.length > 0) {
 			const projectJoin = projectFilterResult.joinSessions
 				? "JOIN sessions ON sessions.id = memory_items.session_id"
@@ -1290,10 +1353,7 @@ function loadItemsByIdsForExplain(
 		}
 	}
 
-	const filterResult = buildFilterClausesWithContext(filters, {
-		actorId: store.actorId,
-		deviceId: store.deviceId,
-	});
+	const filterResult = buildFilterClausesWithContext(filters, scopeContext);
 	const joinClause = filterResult.joinSessions
 		? "JOIN sessions ON sessions.id = memory_items.session_id"
 		: "";
@@ -1307,9 +1367,9 @@ function loadItemsByIdsForExplain(
 		.all(...ids, ...filterResult.params) as MemoryItem[];
 	const scopedIds = new Set(scopedRows.map((item) => item.id));
 
-	const missingNotFound = ids.filter((memoryId) => !allFoundIds.has(memoryId));
+	const missingNotFound = ids.filter((memoryId) => !visibleFoundIds.has(memoryId));
 	const missingProjectMismatch = ids.filter(
-		(memoryId) => allFoundIds.has(memoryId) && !projectScopedIds.has(memoryId),
+		(memoryId) => visibleFoundIds.has(memoryId) && !projectScopedIds.has(memoryId),
 	);
 	const missingFilterMismatch = ids.filter(
 		(memoryId) => projectScopedIds.has(memoryId) && !scopedIds.has(memoryId),

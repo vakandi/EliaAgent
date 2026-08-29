@@ -1,0 +1,1821 @@
+import type { Database } from "./db.js";
+import {
+	assignIdentityDeviceInTransaction,
+	IdentityDeviceAssignmentError,
+} from "./identity-device-assignment.js";
+import { derivePolicyTeamDeviceEligibility } from "./policy-team-device-eligibility.js";
+import { normalizeIdentityDisplayName } from "./project-invite-identity.js";
+import {
+	isStrictRecipientPolicyId,
+	isStrictRecipientPolicyProjectIdentity,
+	legacyRecipientPolicyDigest,
+} from "./recipient-policy-identifiers.js";
+import {
+	normalizeRecipientReviewedIntent,
+	type RecipientReviewedIntentV1,
+} from "./recipient-reviewed-intent.js";
+import { canonicalWorkspaceIdentity } from "./scope-resolution.js";
+import { managedProjectScopeId } from "./share-operation.js";
+import { SYNC_BOOTSTRAP_CWD_PREFIX } from "./sync-bootstrap-constants.js";
+import { fingerprintPublicKey } from "./sync-fingerprint.js";
+import { buildBaseUrl } from "./sync-http-client.js";
+import {
+	planInviteDeviceDecisionTransition,
+	planInviteMembershipTransition,
+} from "./team-ownership-transitions.js";
+
+export type RecipientPolicyOnboardingJourneyV1 = "team" | "direct_project" | "add_device";
+
+export interface RecipientPolicyOnboardingBindingV1 {
+	invitationId: string;
+	identityId: string;
+	deviceId: string;
+	deviceKeyFingerprint: string;
+	deviceDisplayName: string;
+}
+
+interface RecipientPolicyOnboardingRequestBaseV1 {
+	version: 1;
+	invitationId: string;
+	identityId: string;
+	deviceId: string;
+	devicePublicKey: string;
+	deviceDisplayName: string;
+}
+
+export interface RecipientPolicyTeamOnboardingRequestV1
+	extends RecipientPolicyOnboardingRequestBaseV1 {
+	journey: "team";
+	teamId: string;
+}
+
+export interface RecipientPolicyDirectProjectOnboardingRequestV1
+	extends RecipientPolicyOnboardingRequestBaseV1 {
+	journey: "direct_project";
+	canonicalProjectIdentities: string[];
+}
+
+export interface RecipientPolicyAddDeviceOnboardingRequestV1
+	extends RecipientPolicyOnboardingRequestBaseV1 {
+	journey: "add_device";
+}
+
+export type RecipientPolicyOnboardingPreviewRequestV1 =
+	| RecipientPolicyTeamOnboardingRequestV1
+	| RecipientPolicyDirectProjectOnboardingRequestV1
+	| RecipientPolicyAddDeviceOnboardingRequestV1;
+
+export type RecipientPolicyOnboardingCommitRequestV1 = RecipientPolicyOnboardingPreviewRequestV1 & {
+	reviewedOnboardingDigest: string;
+};
+
+export type RecipientPolicyReviewedIntentPreviewRequestV1 =
+	| RecipientPolicyTeamOnboardingRequestV1
+	| RecipientPolicyAddDeviceOnboardingRequestV1;
+
+export type RecipientPolicyReviewedIntentCommitRequestV1 =
+	RecipientPolicyReviewedIntentPreviewRequestV1 & {
+		identityDisplayName: string;
+		reviewedIntent: RecipientReviewedIntentV1;
+		reviewedOnboardingDigest: string;
+	};
+
+export type RecipientPolicyOnboardingProjectSourceV1 =
+	| { kind: "direct" }
+	| { kind: "team"; teamId: string; displayName: string };
+
+export interface RecipientPolicyOnboardingProjectV1 {
+	canonicalProjectIdentity: string;
+	displayName: string;
+	existingMemoryCount: number;
+	futureMemoriesShared: true;
+	sources: RecipientPolicyOnboardingProjectSourceV1[];
+}
+
+export interface RecipientPolicyOnboardingExcludedProjectV1 {
+	canonicalProjectIdentity: string;
+	displayName: string;
+	existingMemoryCount: number;
+}
+
+export interface RecipientPolicyOnboardingPreviewV1 {
+	version: 1;
+	journey: RecipientPolicyOnboardingJourneyV1;
+	binding: RecipientPolicyOnboardingBindingV1;
+	team: { teamId: string; displayName: string; futureProjectsInherit: true } | null;
+	projects: RecipientPolicyOnboardingProjectV1[];
+	excludedProjects: RecipientPolicyOnboardingExcludedProjectV1[];
+	reviewedOnboardingDigest: string;
+}
+
+export interface RecipientPolicyOnboardingCommitResultV1 {
+	version: 1;
+	status: "applied" | "stale" | "invalid" | "not_found" | "conflict";
+	journey: RecipientPolicyOnboardingJourneyV1 | null;
+	reviewedOnboardingDigest: string;
+	errorCode: string | null;
+	writeCount: number;
+	idempotent: boolean;
+}
+
+export interface DirectProjectSharePolicyCommitInput {
+	operationId: string;
+	inviterIdentityId: string;
+	inviterDevices: Array<{ deviceId: string; displayName: string }>;
+	recipientIdentityId: string;
+	recipientDeviceId: string;
+	recipientDevicePublicKey: string;
+	recipientDeviceDisplayName: string;
+	canonicalProjectIdentities: string[];
+	now: string;
+}
+
+export class RecipientPolicyOnboardingRequestError extends Error {
+	readonly status: "invalid" | "not_found";
+	readonly errorCode: string;
+
+	constructor(status: "invalid" | "not_found", errorCode: string) {
+		super(errorCode);
+		this.name = "RecipientPolicyOnboardingRequestError";
+		this.status = status;
+		this.errorCode = errorCode;
+	}
+}
+
+interface NormalizedRequestBase {
+	version: 1;
+	journey: RecipientPolicyOnboardingJourneyV1;
+	binding: RecipientPolicyOnboardingBindingV1;
+}
+
+type NormalizedRequest =
+	| (NormalizedRequestBase & { journey: "team"; teamId: string })
+	| (NormalizedRequestBase & {
+			journey: "direct_project";
+			canonicalProjectIdentities: string[];
+	  })
+	| (NormalizedRequestBase & { journey: "add_device" });
+
+interface ProjectFact {
+	canonicalProjectIdentity: string;
+	displayName: string;
+	existingMemoryCount: number;
+}
+
+interface IntentRow {
+	table: "policy_team_memberships" | "identity_devices" | "project_recipients";
+	key: Record<string, string>;
+	values: Record<string, string | null>;
+}
+
+const CONTROL_CHARACTER = /\p{Cc}/u;
+
+function compareText(left: string, right: string): number {
+	return left < right ? -1 : left > right ? 1 : 0;
+}
+
+const digest = legacyRecipientPolicyDigest;
+
+function strictId(value: unknown, field: string, maxLength = 512): string {
+	if (
+		typeof value !== "string" ||
+		!value ||
+		value !== value.trim() ||
+		value.length > maxLength ||
+		CONTROL_CHARACTER.test(value)
+	) {
+		throw new RecipientPolicyOnboardingRequestError("invalid", `${field}_invalid`);
+	}
+	return value;
+}
+
+function strictPrincipalId(value: unknown, field: string): string {
+	if (!isStrictRecipientPolicyId(value)) {
+		throw new RecipientPolicyOnboardingRequestError("invalid", `${field}_invalid`);
+	}
+	return value;
+}
+
+function normalizeRequest(request: RecipientPolicyOnboardingPreviewRequestV1): NormalizedRequest {
+	if (request?.version !== 1) {
+		throw new RecipientPolicyOnboardingRequestError("invalid", "request_invalid");
+	}
+	const invitationId = strictId(request.invitationId, "invitation_id", 256);
+	const identityId = strictPrincipalId(request.identityId, "identity_id");
+	const deviceId = strictPrincipalId(request.deviceId, "device_id");
+	const publicKey = String(request.devicePublicKey ?? "").trim();
+	if (!publicKey || publicKey.length > 16_384) {
+		throw new RecipientPolicyOnboardingRequestError("invalid", "device_public_key_invalid");
+	}
+	let deviceDisplayName: string;
+	try {
+		deviceDisplayName = normalizeIdentityDisplayName(
+			String(request.deviceDisplayName ?? ""),
+			"device_display_name",
+		);
+	} catch (error) {
+		throw new RecipientPolicyOnboardingRequestError(
+			"invalid",
+			error instanceof Error ? error.message : "device_display_name_invalid",
+		);
+	}
+	const binding = {
+		invitationId,
+		identityId,
+		deviceId,
+		deviceKeyFingerprint: fingerprintPublicKey(publicKey),
+		deviceDisplayName,
+	};
+	if (request.journey === "team") {
+		return {
+			version: 1,
+			journey: "team",
+			binding,
+			teamId: strictPrincipalId(request.teamId, "team_id"),
+		};
+	}
+	if (request.journey === "direct_project") {
+		if (
+			!Array.isArray(request.canonicalProjectIdentities) ||
+			request.canonicalProjectIdentities.length < 1 ||
+			request.canonicalProjectIdentities.length > 100
+		) {
+			throw new RecipientPolicyOnboardingRequestError("invalid", "project_set_invalid");
+		}
+		const projects = request.canonicalProjectIdentities.map((projectId) => {
+			if (!isStrictRecipientPolicyProjectIdentity(projectId)) {
+				throw new RecipientPolicyOnboardingRequestError(
+					"invalid",
+					"canonical_project_identity_invalid",
+				);
+			}
+			return projectId;
+		});
+		if (new Set(projects).size !== projects.length) {
+			throw new RecipientPolicyOnboardingRequestError("invalid", "project_set_invalid");
+		}
+		return {
+			version: 1,
+			journey: "direct_project",
+			binding,
+			canonicalProjectIdentities: projects.toSorted(compareText),
+		};
+	}
+	if (request.journey === "add_device") return { version: 1, journey: "add_device", binding };
+	throw new RecipientPolicyOnboardingRequestError("invalid", "journey_invalid");
+}
+
+function projectFacts(db: Database): Map<string, ProjectFact> {
+	const rows = db
+		.prepare(
+			`SELECT s.id, s.cwd, s.project, s.git_remote, s.git_branch,
+			 (SELECT mi.workspace_id FROM memory_items mi
+			  WHERE mi.session_id = s.id AND mi.workspace_id IS NOT NULL AND TRIM(mi.workspace_id) <> ''
+			  ORDER BY mi.id DESC LIMIT 1) AS workspace_id,
+			 COUNT(mi_count.id) AS memory_count
+			 FROM sessions s
+			 LEFT JOIN memory_items mi_count ON mi_count.session_id = s.id
+			  AND mi_count.active = 1 AND mi_count.deleted_at IS NULL
+			 WHERE (COALESCE(TRIM(s.git_remote), TRIM(s.cwd), TRIM(s.project), '') <> '' OR mi_count.id IS NOT NULL)
+			  AND (s.cwd IS NULL OR substr(s.cwd, 1, length(?)) <> ?)
+			 GROUP BY s.id ORDER BY s.id`,
+		)
+		.all(SYNC_BOOTSTRAP_CWD_PREFIX, SYNC_BOOTSTRAP_CWD_PREFIX) as Array<{
+		cwd: string | null;
+		project: string | null;
+		git_remote: string | null;
+		git_branch: string | null;
+		workspace_id: string | null;
+		memory_count: number;
+	}>;
+	const projects = new Map<string, ProjectFact>();
+	for (const row of rows) {
+		const identity = canonicalWorkspaceIdentity({
+			cwd: row.cwd,
+			project: row.project,
+			gitRemote: row.git_remote,
+			gitBranch: row.git_branch,
+			workspaceId: row.workspace_id,
+		});
+		if (identity.value.startsWith("unmapped:")) continue;
+		const existing = projects.get(identity.value);
+		projects.set(identity.value, {
+			canonicalProjectIdentity: identity.value,
+			displayName: existing?.displayName ?? identity.displayProject ?? identity.value,
+			existingMemoryCount: (existing?.existingMemoryCount ?? 0) + Number(row.memory_count ?? 0),
+		});
+	}
+	const add = (projectId: unknown, displayName: unknown): void => {
+		if (typeof projectId !== "string" || !projectId || projectId.startsWith("unmapped:")) return;
+		if (projects.has(projectId)) return;
+		projects.set(projectId, {
+			canonicalProjectIdentity: projectId,
+			displayName:
+				typeof displayName === "string" && displayName.trim() ? displayName.trim() : projectId,
+			existingMemoryCount: 0,
+		});
+	};
+	for (const row of db
+		.prepare(
+			`SELECT canonical_project_identity, display_name
+			 FROM share_operation_projects ORDER BY operation_id, ordinal`,
+		)
+		.all() as Array<Record<string, unknown>>) {
+		add(row.canonical_project_identity, row.display_name);
+	}
+	for (const row of db
+		.prepare(
+			`SELECT canonical_project_identity FROM project_recipients
+			 ORDER BY canonical_project_identity`,
+		)
+		.all() as Array<Record<string, unknown>>) {
+		add(row.canonical_project_identity, row.canonical_project_identity);
+	}
+	for (const row of db
+		.prepare(
+			`SELECT canonical_project_identity, display_name
+			 FROM recipient_managed_project_projections
+			 ORDER BY source_operation_id, canonical_project_identity`,
+		)
+		.all() as Array<Record<string, unknown>>) {
+		add(row.canonical_project_identity, row.display_name);
+	}
+	return projects;
+}
+
+function managedProjectFact(db: Database, projectId: string): ProjectFact | null {
+	for (const row of db
+		.prepare(
+			`SELECT scope.scope_id, scope.label, scope.group_id
+			 FROM project_scope_mappings mapping
+			 JOIN replication_scopes scope ON scope.scope_id = mapping.scope_id
+			  AND scope.kind = 'managed_project' AND scope.authority_type = 'coordinator'
+			  AND scope.status = 'active'
+			 WHERE mapping.workspace_identity = ? AND mapping.project_pattern = ?
+			 ORDER BY mapping.id`,
+		)
+		.all(projectId, projectId) as Array<{
+		scope_id: string;
+		label: string;
+		group_id: string | null;
+	}>) {
+		const groupId = String(row.group_id ?? "").trim();
+		if (groupId && row.scope_id === managedProjectScopeId(groupId, projectId)) {
+			return {
+				canonicalProjectIdentity: projectId,
+				displayName: row.label.trim() || projectId,
+				existingMemoryCount: 0,
+			};
+		}
+	}
+	return null;
+}
+
+function assertActiveIdentity(db: Database, identityId: string): void {
+	const row = db.prepare("SELECT status FROM actors WHERE actor_id = ?").get(identityId) as
+		| { status: string }
+		| undefined;
+	if (row?.status !== "active") {
+		throw new RecipientPolicyOnboardingRequestError("not_found", "identity_not_found");
+	}
+}
+
+function assertActiveLocalIdentity(db: Database, identityId: string): void {
+	const row = db
+		.prepare("SELECT is_local, status FROM actors WHERE actor_id = ?")
+		.get(identityId) as { is_local: number; status: string } | undefined;
+	if (row?.status !== "active" || row.is_local !== 1) {
+		throw new Error("inviter_identity_conflict");
+	}
+}
+
+function sourceKey(source: RecipientPolicyOnboardingProjectSourceV1): string {
+	return source.kind === "direct" ? "direct" : `team\u0000${source.teamId}`;
+}
+
+function addSource(
+	sources: Map<string, RecipientPolicyOnboardingProjectSourceV1[]>,
+	projectId: string,
+	source: RecipientPolicyOnboardingProjectSourceV1,
+): void {
+	const current = sources.get(projectId) ?? [];
+	if (!current.some((candidate) => sourceKey(candidate) === sourceKey(source)))
+		current.push(source);
+	sources.set(projectId, current);
+}
+
+function teamFact(db: Database, teamId: string): { teamId: string; displayName: string } {
+	const row = db
+		.prepare(
+			"SELECT team_id, display_name FROM policy_teams WHERE team_id = ? AND status = 'active'",
+		)
+		.get(teamId) as { team_id: string; display_name: string } | undefined;
+	if (!row) throw new RecipientPolicyOnboardingRequestError("not_found", "team_not_found");
+	return { teamId: row.team_id, displayName: row.display_name };
+}
+
+function teamSources(
+	db: Database,
+	team: { teamId: string; displayName: string },
+): Map<string, RecipientPolicyOnboardingProjectSourceV1[]> {
+	const result = new Map<string, RecipientPolicyOnboardingProjectSourceV1[]>();
+	for (const row of db
+		.prepare(
+			`SELECT canonical_project_identity FROM project_recipients
+			 WHERE recipient_kind = 'team' AND recipient_id = ? AND status = 'active'
+			 ORDER BY canonical_project_identity`,
+		)
+		.all(team.teamId) as Array<{ canonical_project_identity: string }>) {
+		addSource(result, row.canonical_project_identity, {
+			kind: "team",
+			teamId: team.teamId,
+			displayName: team.displayName,
+		});
+	}
+	return result;
+}
+
+function sameCoordinatorBoundary(...values: Array<string | null>): boolean {
+	const normalized = values.map((value) => buildBaseUrl(value ?? ""));
+	return normalized[0] !== "" && normalized.every((value) => value === normalized[0]);
+}
+
+function inheritedSources(
+	db: Database,
+	identityId: string,
+	deviceId: string,
+	options: { addDeviceTeamEligibility?: "binding_device" | "prospective_device" } = {},
+): Map<string, RecipientPolicyOnboardingProjectSourceV1[]> {
+	const result = new Map<string, RecipientPolicyOnboardingProjectSourceV1[]>();
+	for (const row of db
+		.prepare(
+			`SELECT canonical_project_identity FROM project_recipients
+			 WHERE recipient_kind = 'identity' AND recipient_id = ? AND status = 'active'
+			 ORDER BY canonical_project_identity`,
+		)
+		.all(identityId) as Array<{ canonical_project_identity: string }>) {
+		addSource(result, row.canonical_project_identity, { kind: "direct" });
+	}
+	for (const row of db
+		.prepare(
+			`SELECT projection.canonical_project_identity, projection.managed_scope_id,
+				projection.coordinator_id AS projection_coordinator_id, projection.group_id,
+				scope.coordinator_id AS scope_coordinator_id,
+				membership.coordinator_id AS membership_coordinator_id
+			 FROM recipient_managed_project_projections projection
+			 JOIN replication_scopes scope
+			  ON scope.scope_id = projection.managed_scope_id
+			 AND scope.kind = 'managed_project'
+			 AND scope.authority_type = 'coordinator'
+			 AND scope.status = 'active'
+			 AND scope.group_id = projection.group_id
+			 JOIN scope_memberships membership
+			  ON membership.scope_id = projection.managed_scope_id
+			 AND membership.device_id = projection.accepting_device_id
+			 AND membership.status = 'active'
+			 AND membership.membership_epoch >= scope.membership_epoch
+			 AND COALESCE(membership.group_id, scope.group_id) = projection.group_id
+			 WHERE projection.recipient_identity_id = ?
+			  AND projection.status = 'active'
+			  AND projection.revoked_at IS NULL
+			 ORDER BY projection.canonical_project_identity, projection.source_operation_id`,
+		)
+		.all(identityId) as Array<{
+		canonical_project_identity: string;
+		managed_scope_id: string;
+		projection_coordinator_id: string;
+		scope_coordinator_id: string | null;
+		membership_coordinator_id: string | null;
+		group_id: string;
+	}>) {
+		if (
+			row.managed_scope_id !==
+				managedProjectScopeId(row.group_id, row.canonical_project_identity) ||
+			!sameCoordinatorBoundary(
+				row.projection_coordinator_id,
+				row.scope_coordinator_id,
+				row.membership_coordinator_id ?? row.scope_coordinator_id,
+			)
+		) {
+			continue;
+		}
+		addSource(result, row.canonical_project_identity, { kind: "direct" });
+	}
+	for (const row of db
+		.prepare(
+			`SELECT mapping.workspace_identity AS canonical_project_identity, scope.scope_id,
+				scope.coordinator_id AS scope_coordinator_id, scope.group_id,
+				membership.coordinator_id AS membership_coordinator_id
+			 FROM actors actor
+			 CROSS JOIN sync_device device
+			 JOIN scope_memberships membership ON membership.device_id = device.device_id
+			  AND membership.status = 'active'
+			 JOIN replication_scopes scope ON scope.scope_id = membership.scope_id
+			  AND scope.kind = 'managed_project' AND scope.authority_type = 'coordinator'
+			  AND scope.status = 'active'
+			  AND membership.membership_epoch >= scope.membership_epoch
+			  AND COALESCE(membership.group_id, scope.group_id) = scope.group_id
+			 JOIN project_scope_mappings mapping ON mapping.scope_id = scope.scope_id
+			  AND mapping.workspace_identity IS NOT NULL
+			  AND mapping.workspace_identity = mapping.project_pattern
+			 WHERE actor.actor_id = ? AND actor.is_local = 1 AND actor.status = 'active'
+			  AND (SELECT COUNT(*) FROM actors WHERE is_local = 1 AND status = 'active') = 1
+			  AND (SELECT COUNT(*) FROM sync_device) = 1
+			 ORDER BY mapping.workspace_identity, mapping.id`,
+		)
+		.all(identityId) as Array<{
+		canonical_project_identity: string;
+		scope_id: string;
+		scope_coordinator_id: string | null;
+		membership_coordinator_id: string | null;
+		group_id: string | null;
+	}>) {
+		const groupId = String(row.group_id ?? "").trim();
+		if (
+			!groupId ||
+			row.scope_id !== managedProjectScopeId(groupId, row.canonical_project_identity) ||
+			!sameCoordinatorBoundary(
+				row.scope_coordinator_id,
+				row.membership_coordinator_id ?? row.scope_coordinator_id,
+			)
+		) {
+			continue;
+		}
+		addSource(result, row.canonical_project_identity, { kind: "direct" });
+	}
+	const teamProjectRows = db
+		.prepare(
+			`SELECT pr.canonical_project_identity, pt.team_id, pt.display_name,
+			 pt.device_eligibility_mode
+			 FROM policy_team_memberships tm
+			 JOIN policy_teams pt ON pt.team_id = tm.team_id AND pt.status = 'active'
+			 JOIN project_recipients pr ON pr.recipient_kind = 'team'
+			  AND pr.recipient_id = tm.team_id AND pr.status = 'active'
+			 WHERE tm.identity_id = ?
+			 ORDER BY pr.canonical_project_identity, pt.team_id`,
+		)
+		.all(identityId) as Array<{
+		canonical_project_identity: string;
+		team_id: string;
+		display_name: string;
+		device_eligibility_mode: string;
+	}>;
+	if (teamProjectRows.length === 0) return result;
+	const factsByTeam = new Map<
+		string,
+		{
+			memberships: Array<{ identityId: string; status: string }>;
+			decisions: Array<{ deviceId: string; decision: string; assignmentVersion: number }>;
+		}
+	>();
+	for (const row of db
+		.prepare(
+			`WITH referenced_teams AS (
+			 SELECT DISTINCT tm.team_id
+			 FROM policy_team_memberships tm
+			 JOIN policy_teams pt ON pt.team_id = tm.team_id AND pt.status = 'active'
+			 JOIN project_recipients pr ON pr.recipient_kind = 'team'
+			  AND pr.recipient_id = tm.team_id AND pr.status = 'active'
+			 WHERE tm.identity_id = ?
+			)
+			SELECT 'membership' AS fact_kind, membership.team_id,
+			 membership.identity_id AS reference_id, membership.status AS value,
+			 NULL AS assignment_version
+			FROM policy_team_memberships membership
+			JOIN referenced_teams referenced ON referenced.team_id = membership.team_id
+			UNION ALL
+			SELECT 'decision' AS fact_kind, decision.team_id,
+			 decision.device_id AS reference_id, decision.decision AS value,
+			 decision.assignment_version
+			FROM policy_team_device_decisions decision
+			JOIN referenced_teams referenced ON referenced.team_id = decision.team_id`,
+		)
+		.all(identityId) as Array<{
+		fact_kind: "membership" | "decision";
+		team_id: string;
+		reference_id: string;
+		value: string;
+		assignment_version: number | null;
+	}>) {
+		const facts = factsByTeam.get(row.team_id) ?? { memberships: [], decisions: [] };
+		if (row.fact_kind === "membership") {
+			facts.memberships.push({ identityId: row.reference_id, status: row.value });
+		} else {
+			facts.decisions.push({
+				deviceId: row.reference_id,
+				decision: row.value,
+				assignmentVersion: Number(row.assignment_version),
+			});
+		}
+		factsByTeam.set(row.team_id, facts);
+	}
+	const referencedMembersCte = `WITH referenced_teams AS (
+		SELECT DISTINCT tm.team_id
+		FROM policy_team_memberships tm
+		JOIN policy_teams pt ON pt.team_id = tm.team_id AND pt.status = 'active'
+		JOIN project_recipients pr ON pr.recipient_kind = 'team'
+		 AND pr.recipient_id = tm.team_id AND pr.status = 'active'
+		WHERE tm.identity_id = ?
+	), referenced_members AS (
+		SELECT DISTINCT membership.identity_id
+		FROM policy_team_memberships membership
+		JOIN referenced_teams referenced ON referenced.team_id = membership.team_id
+	)`;
+	const identities = (
+		db
+			.prepare(
+				`${referencedMembersCte}
+				 SELECT actor.actor_id, actor.status, actor.merged_into_actor_id
+				 FROM actors actor
+				 JOIN referenced_members member ON member.identity_id = actor.actor_id
+				 ORDER BY actor.actor_id`,
+			)
+			.all(identityId) as Array<Record<string, unknown>>
+	).map((identity) => ({
+		identityId: String(identity.actor_id ?? ""),
+		status: String(identity.status ?? ""),
+		mergedIntoIdentityId:
+			typeof identity.merged_into_actor_id === "string" && identity.merged_into_actor_id
+				? identity.merged_into_actor_id
+				: null,
+	}));
+	const identityById = new Map(identities.map((identity) => [identity.identityId, identity]));
+	const devicesByIdentity = new Map<
+		string,
+		Array<{ identityId: string; deviceId: string; status: string; assignmentVersion: number }>
+	>();
+	const deviceFacts = (
+		db
+			.prepare(
+				`${referencedMembersCte}
+				 SELECT device.identity_id, device.device_id, device.status, device.assignment_version
+				 FROM identity_devices device
+				 JOIN referenced_members member ON member.identity_id = device.identity_id
+				 UNION
+				 SELECT identity_id, device_id, status, assignment_version
+				 FROM identity_devices WHERE device_id = ?
+				 ORDER BY device_id`,
+			)
+			.all(identityId, deviceId) as Array<Record<string, unknown>>
+	).map((row) => ({
+		identityId: String(row.identity_id ?? ""),
+		deviceId: String(row.device_id ?? ""),
+		status: String(row.status ?? ""),
+		assignmentVersion: Number(row.assignment_version),
+	}));
+	for (const device of deviceFacts) {
+		const devices = devicesByIdentity.get(device.identityId) ?? [];
+		devices.push(device);
+		devicesByIdentity.set(device.identityId, devices);
+	}
+	const prospectiveDevice = options.addDeviceTeamEligibility === "prospective_device";
+	const eligibilityDeviceId = prospectiveDevice ? `prospective:${deviceId}` : deviceId;
+	const bindingDevice = prospectiveDevice
+		? undefined
+		: deviceFacts.find((device) => device.deviceId === deviceId);
+	const inheritableTeamIds = new Set<string>();
+	for (const row of new Map(teamProjectRows.map((team) => [team.team_id, team])).values()) {
+		if (prospectiveDevice && row.device_eligibility_mode === "reviewed_allowlist") {
+			continue;
+		}
+		if (bindingDevice && bindingDevice.identityId !== identityId) continue;
+		const facts = factsByTeam.get(row.team_id) ?? { memberships: [], decisions: [] };
+		const memberIdentityIds = new Set(facts.memberships.map((membership) => membership.identityId));
+		const teamIdentities = [...memberIdentityIds].flatMap((memberIdentityId) => {
+			const identity = identityById.get(memberIdentityId);
+			return identity ? [identity] : [];
+		});
+		const teamDevices = [...memberIdentityIds].flatMap(
+			(memberIdentityId) => devicesByIdentity.get(memberIdentityId) ?? [],
+		);
+		if (memberIdentityIds.has(identityId) && !bindingDevice) {
+			// No persisted binding exists for the onboarding device. Model it as a
+			// separate active v0 fact so real device facts still participate in blocking.
+			teamDevices.push({
+				identityId,
+				deviceId: eligibilityDeviceId,
+				status: "active",
+				assignmentVersion: 0,
+			});
+		}
+		const eligibility = derivePolicyTeamDeviceEligibility({
+			teamId: row.team_id,
+			mode: row.device_eligibility_mode,
+			memberships: facts.memberships,
+			identities: teamIdentities,
+			devices: teamDevices,
+			decisions: facts.decisions,
+		});
+		// Validate every decision before checking for the binding device. Duplicate
+		// or unknown decisions must block instead of being shadowed by a valid row.
+		if (
+			eligibility.status !== "eligible" ||
+			!eligibility.activeMemberIdentityIds.includes(identityId) ||
+			!eligibility.eligibleDeviceIds.includes(eligibilityDeviceId)
+		) {
+			// Onboarding recipients cannot repair Team policy drift. Omit blocked
+			// Team sources rather than exposing owner-facing policy diagnostics.
+			continue;
+		}
+		inheritableTeamIds.add(row.team_id);
+	}
+	for (const row of teamProjectRows) {
+		if (!inheritableTeamIds.has(row.team_id)) continue;
+		addSource(result, row.canonical_project_identity, {
+			kind: "team",
+			teamId: row.team_id,
+			displayName: row.display_name,
+		});
+	}
+	return result;
+}
+
+function buildPreview(
+	db: Database,
+	request: NormalizedRequest,
+	options: { addDeviceTeamEligibility?: "binding_device" | "prospective_device" } = {},
+): RecipientPolicyOnboardingPreviewV1 {
+	assertActiveIdentity(db, request.binding.identityId);
+	const facts = projectFacts(db);
+	let team: RecipientPolicyOnboardingPreviewV1["team"] = null;
+	let sources = new Map<string, RecipientPolicyOnboardingProjectSourceV1[]>();
+	if (request.journey === "team") {
+		const selectedTeam = teamFact(db, request.teamId);
+		team = { ...selectedTeam, futureProjectsInherit: true };
+		sources = teamSources(db, selectedTeam);
+	}
+	if (request.journey === "direct_project") {
+		for (const projectId of request.canonicalProjectIdentities) {
+			if (!facts.has(projectId)) {
+				throw new RecipientPolicyOnboardingRequestError("not_found", "project_not_found");
+			}
+			addSource(sources, projectId, { kind: "direct" });
+		}
+	}
+	if (request.journey === "add_device") {
+		sources = inheritedSources(db, request.binding.identityId, request.binding.deviceId, options);
+	}
+	const projects = [...sources.entries()]
+		.map(([projectId, projectSources]): RecipientPolicyOnboardingProjectV1 => {
+			const fact = facts.get(projectId) ??
+				managedProjectFact(db, projectId) ?? {
+					canonicalProjectIdentity: projectId,
+					displayName: projectId,
+					existingMemoryCount: 0,
+				};
+			return {
+				...fact,
+				futureMemoriesShared: true,
+				sources: projectSources.toSorted((left, right) =>
+					compareText(sourceKey(left), sourceKey(right)),
+				),
+			};
+		})
+		.toSorted((left, right) =>
+			compareText(left.canonicalProjectIdentity, right.canonicalProjectIdentity),
+		);
+	const excludedProjects = [...facts.values()]
+		.filter((project) => !sources.has(project.canonicalProjectIdentity))
+		.toSorted((left, right) =>
+			compareText(left.canonicalProjectIdentity, right.canonicalProjectIdentity),
+		);
+	const reviewedOnboardingDigest = digest("recipient-onboarding-preview-v1", {
+		journey: request.journey,
+		binding: request.binding,
+		team,
+		projects,
+		excludedProjectIdentities: excludedProjects.map((project) => project.canonicalProjectIdentity),
+	});
+	return {
+		version: 1,
+		journey: request.journey,
+		binding: request.binding,
+		team,
+		projects,
+		excludedProjects,
+		reviewedOnboardingDigest,
+	};
+}
+
+export function previewRecipientPolicyOnboarding(
+	db: Database,
+	request: RecipientPolicyOnboardingPreviewRequestV1,
+	options: { addDeviceTeamEligibility?: "binding_device" | "prospective_device" } = {},
+): RecipientPolicyOnboardingPreviewV1 {
+	return buildPreview(db, normalizeRequest(request), options);
+}
+
+function reviewedIntentTarget(request: NormalizedRequest) {
+	if (request.journey === "team") {
+		return { kind: "team_member" as const, policyTeamId: request.teamId };
+	}
+	if (request.journey === "add_device") {
+		return { kind: "add_device" as const, targetIdentityId: request.binding.identityId };
+	}
+	throw new RecipientPolicyOnboardingRequestError("invalid", "journey_invalid");
+}
+
+function buildReviewedIntentPreview(
+	request: NormalizedRequest,
+	reviewedIntentValue: RecipientReviewedIntentV1,
+): RecipientPolicyOnboardingPreviewV1 {
+	const reviewedIntent = normalizeRecipientReviewedIntent(
+		reviewedIntentValue,
+		reviewedIntentTarget(request),
+	);
+	const team = reviewedIntent.journey === "team" ? reviewedIntent.team : null;
+	const reviewedOnboardingDigest = digest("recipient-onboarding-preview-v1", {
+		journey: request.journey,
+		binding: request.binding,
+		team,
+		projects: reviewedIntent.projects,
+		excludedProjectIdentities: reviewedIntent.excludedProjects.map(
+			(project) => project.canonicalProjectIdentity,
+		),
+	});
+	return {
+		version: 1,
+		journey: request.journey,
+		binding: request.binding,
+		team,
+		projects: reviewedIntent.projects,
+		excludedProjects: reviewedIntent.excludedProjects,
+		reviewedOnboardingDigest,
+	};
+}
+
+export function previewRecipientPolicyOnboardingFromReviewedIntent(
+	reviewedIntent: RecipientReviewedIntentV1,
+	request: RecipientPolicyReviewedIntentPreviewRequestV1,
+): RecipientPolicyOnboardingPreviewV1 {
+	return buildReviewedIntentPreview(normalizeRequest(request), reviewedIntent);
+}
+
+function relationshipMetadata(
+	kind: string,
+	revisionIdentity: unknown,
+	idempotencyIdentity: unknown,
+): { revision: string; idempotencyKey: string } {
+	return {
+		revision: digest(`recipient-policy-${kind}-revision-v1`, revisionIdentity),
+		idempotencyKey: digest(`recipient-policy-${kind}-idempotency-v1`, idempotencyIdentity),
+	};
+}
+
+function baseValues(input: {
+	provenance: string;
+	revision: string;
+	idempotencyKey: string;
+	sourceFingerprint: string;
+	now: string;
+}): Record<string, string> & { revision: string } {
+	return {
+		status: "active",
+		provenance: input.provenance,
+		migration_state: "user_managed",
+		source_fingerprint: input.sourceFingerprint,
+		idempotency_key: input.idempotencyKey,
+		created_at: input.now,
+		updated_at: input.now,
+		revision: input.revision,
+	};
+}
+
+function deviceRow(request: NormalizedRequest, now: string): IntentRow {
+	const stableBinding = {
+		identityId: request.binding.identityId,
+		deviceId: request.binding.deviceId,
+		deviceKeyFingerprint: request.binding.deviceKeyFingerprint,
+	};
+	const sourceFingerprint = digest("recipient-onboarding-binding-v1", stableBinding);
+	const metadata = relationshipMetadata("identity-device", stableBinding, [
+		request.binding.invitationId,
+		"device",
+	]);
+	return {
+		table: "identity_devices",
+		key: { device_id: request.binding.deviceId },
+		values: {
+			identity_id: request.binding.identityId,
+			display_name: request.binding.deviceDisplayName,
+			...baseValues({
+				provenance: "recipient_invite",
+				revision: metadata.revision,
+				idempotencyKey: metadata.idempotencyKey,
+				sourceFingerprint,
+				now,
+			}),
+		},
+	};
+}
+
+function membershipRow(
+	request: NormalizedRequest & { journey: "team" },
+	now: string,
+	membershipStatus: "active" | "reviewed_active",
+): IntentRow {
+	const identity = [request.journey, request.binding, request.teamId];
+	const metadata = relationshipMetadata("team-membership", identity, [
+		request.journey,
+		request.binding.invitationId,
+		"membership",
+	]);
+	return {
+		table: "policy_team_memberships",
+		key: { team_id: request.teamId, identity_id: request.binding.identityId },
+		values: {
+			role: "member",
+			...baseValues({
+				provenance: "team_invite",
+				revision: metadata.revision,
+				idempotencyKey: metadata.idempotencyKey,
+				sourceFingerprint: digest("recipient-onboarding-binding-v1", identity),
+				now,
+			}),
+			// Reviewed Teams accept only reviewed-mode membership statuses; a
+			// plain `active` row would block eligibility for the whole Team.
+			status: membershipStatus,
+		},
+	};
+}
+
+function teamDeviceEligibilityMode(db: Database, teamId: string): string {
+	return (
+		(db
+			.prepare("SELECT device_eligibility_mode FROM policy_teams WHERE team_id = ?")
+			.pluck()
+			.get(teamId) as string | undefined) ?? "person_all_devices"
+	);
+}
+
+/**
+ * Mirrors the coordinator reconciler for reviewed Teams: the invited device
+ * enters as an unresolved decision that review must include explicitly, and
+ * the cleared Team fingerprint sends the guided candidate back through setup.
+ */
+function applyReviewedTeamInviteDecision(
+	db: Database,
+	request: NormalizedRequest & { journey: "team" },
+	now: string,
+): number {
+	const assignmentVersion = db
+		.prepare(
+			`SELECT assignment_version FROM identity_devices
+			 WHERE device_id = ? AND identity_id = ? AND status = 'active'`,
+		)
+		.pluck()
+		.get(request.binding.deviceId, request.binding.identityId) as number | undefined;
+	if (assignmentVersion == null) return 0;
+	const stableDecision = {
+		teamId: request.teamId,
+		identityId: request.binding.identityId,
+		invitationId: request.binding.invitationId,
+		deviceId: request.binding.deviceId,
+		assignmentVersion,
+	};
+	const existingDecision = db
+		.prepare(
+			`SELECT decision, provenance FROM policy_team_device_decisions
+			 WHERE team_id = ? AND device_id = ?`,
+		)
+		.get(request.teamId, request.binding.deviceId) as
+		| { decision: string; provenance: string }
+		| undefined;
+	const transition = planInviteDeviceDecisionTransition(existingDecision, false);
+	if (transition === "preserve") return 0;
+	const revision = digest("recipient-onboarding-device-decision-revision-v1", stableDecision);
+	const result =
+		transition === "insert_unresolved"
+			? db
+					.prepare(
+						`INSERT INTO policy_team_device_decisions(
+						 team_id, device_id, decision, assignment_version, provenance, revision,
+						 created_at, updated_at
+						 ) VALUES (?, ?, 'unresolved', ?, 'team_invite', ?, ?, ?)`,
+					)
+					.run(request.teamId, request.binding.deviceId, assignmentVersion, revision, now, now)
+			: db
+					.prepare(
+						`UPDATE policy_team_device_decisions
+						 SET provenance = 'team_invite', revision = ?, updated_at = ?
+						 WHERE team_id = ? AND device_id = ?`,
+					)
+					.run(revision, now, request.teamId, request.binding.deviceId);
+	const introducedUnresolvedDecision =
+		!existingDecision ||
+		(transition === "adopt_setup" && existingDecision.decision === "unresolved");
+	if (result.changes > 0 && introducedUnresolvedDecision) {
+		db.prepare(
+			`UPDATE policy_teams SET source_fingerprint = NULL, updated_at = ?
+			 WHERE team_id = ? AND device_eligibility_mode = 'reviewed_allowlist'`,
+		).run(now, request.teamId);
+	}
+	return result.changes;
+}
+
+function projectRow(
+	request: NormalizedRequest & { journey: "direct_project" },
+	projectId: string,
+	now: string,
+): IntentRow {
+	const identity = [request.journey, request.binding, projectId];
+	const metadata = relationshipMetadata("project-recipient", identity, [
+		request.journey,
+		request.binding.invitationId,
+		"project",
+		projectId,
+	]);
+	const values = baseValues({
+		provenance: "exact_project_invite",
+		revision: metadata.revision,
+		idempotencyKey: metadata.idempotencyKey,
+		sourceFingerprint: digest("recipient-onboarding-binding-v1", identity),
+		now,
+	});
+	const { revision, ...rest } = values;
+	return {
+		table: "project_recipients",
+		key: {
+			canonical_project_identity: projectId,
+			recipient_kind: "identity",
+			recipient_id: request.binding.identityId,
+		},
+		values: { ...rest, policy_revision: revision },
+	};
+}
+
+function inviterDeviceRow(input: {
+	identityId: string;
+	deviceId: string;
+	displayName: string;
+	now: string;
+}): IntentRow {
+	const stableBinding = { identityId: input.identityId, deviceId: input.deviceId };
+	const metadata = relationshipMetadata(
+		"identity-device",
+		["direct_project_inviter", stableBinding],
+		["direct_project_inviter", stableBinding],
+	);
+	return {
+		table: "identity_devices",
+		key: { device_id: input.deviceId },
+		values: {
+			identity_id: input.identityId,
+			display_name: input.displayName,
+			...baseValues({
+				provenance: "exact_project_invite",
+				revision: metadata.revision,
+				idempotencyKey: metadata.idempotencyKey,
+				sourceFingerprint: digest("recipient-onboarding-inviter-device-v1", stableBinding),
+				now: input.now,
+			}),
+		},
+	};
+}
+
+function inviterProjectRow(input: {
+	identityId: string;
+	projectId: string;
+	now: string;
+}): IntentRow {
+	const stableBinding = {
+		canonicalProjectIdentity: input.projectId,
+		recipientKind: "identity",
+		recipientId: input.identityId,
+	};
+	const metadata = relationshipMetadata(
+		"project-recipient",
+		["direct_project_inviter", stableBinding],
+		["direct_project_inviter", stableBinding],
+	);
+	const values = baseValues({
+		provenance: "exact_project_invite",
+		revision: metadata.revision,
+		idempotencyKey: metadata.idempotencyKey,
+		sourceFingerprint: digest("recipient-onboarding-inviter-project-v1", stableBinding),
+		now: input.now,
+	});
+	const { revision, ...rest } = values;
+	return {
+		table: "project_recipients",
+		key: {
+			canonical_project_identity: input.projectId,
+			recipient_kind: "identity",
+			recipient_id: input.identityId,
+		},
+		values: { ...rest, policy_revision: revision },
+	};
+}
+
+function planRows(
+	db: Database,
+	request: NormalizedRequest,
+	now: string,
+	options: { preserveInviteMembership?: boolean } = {},
+): IntentRow[] {
+	const rows = [deviceRow(request, now)];
+	if (request.journey === "team" && !options.preserveInviteMembership) {
+		const reviewedTeam = teamDeviceEligibilityMode(db, request.teamId) === "reviewed_allowlist";
+		rows.push(membershipRow(request, now, reviewedTeam ? "reviewed_active" : "active"));
+	}
+	if (request.journey === "direct_project") {
+		rows.push(
+			...request.canonicalProjectIdentities.map((projectId) => projectRow(request, projectId, now)),
+		);
+	}
+	return rows;
+}
+
+function applyTeamJourneySideEffects(
+	db: Database,
+	request: NormalizedRequest,
+	now: string,
+): number {
+	if (request.journey !== "team") return 0;
+	if (teamDeviceEligibilityMode(db, request.teamId) !== "reviewed_allowlist") return 0;
+	return applyReviewedTeamInviteDecision(db, request, now);
+}
+
+/**
+ * A consumed invite owns the recipient's membership from now on. Setup-owned
+ * rows transition to this invite's exact intent before validation. Existing
+ * invite-owned rows retain their original invite metadata; reviewed Teams may
+ * normalize only their active status. Without that distinction, exact-row
+ * validation either rejects a valid invite-owned member or replaces metadata
+ * owned by an earlier invite flow.
+ */
+function applyInviteOwnedTeamMembershipTransition(
+	db: Database,
+	request: NormalizedRequest,
+	now: string,
+): {
+	preserveInviteMembership: boolean;
+	writes: 0 | 1;
+} {
+	if (request.journey !== "team") {
+		return { preserveInviteMembership: false, writes: 0 };
+	}
+	const existing = db
+		.prepare(
+			`SELECT provenance, status FROM policy_team_memberships
+			 WHERE team_id = ? AND identity_id = ?`,
+		)
+		.get(request.teamId, request.binding.identityId) as
+		| { provenance: string; status: string }
+		| undefined;
+	const reviewedTeam = teamDeviceEligibilityMode(db, request.teamId) === "reviewed_allowlist";
+	const targetStatus = reviewedTeam ? "reviewed_active" : "active";
+	const transition = planInviteMembershipTransition(existing, targetStatus);
+	if (!["adopt_setup", "reauthorize_setup", "normalize_invite"].includes(transition)) {
+		return {
+			preserveInviteMembership: transition === "preserve",
+			writes: 0,
+		};
+	}
+	if (transition === "normalize_invite") {
+		const result = db
+			.prepare(
+				`UPDATE policy_team_memberships SET status = ?, updated_at = ?
+			 WHERE team_id = ? AND identity_id = ?`,
+			)
+			.run(targetStatus, now, request.teamId, request.binding.identityId);
+		return {
+			preserveInviteMembership: true,
+			writes: result.changes > 0 ? 1 : 0,
+		};
+	}
+	const row = membershipRow(request, now, targetStatus);
+	const result = db
+		.prepare(
+			`UPDATE policy_team_memberships
+		 SET role = ?, status = ?, provenance = ?, revision = ?, migration_state = ?,
+		     source_fingerprint = ?, idempotency_key = ?, updated_at = ?
+		 WHERE team_id = ? AND identity_id = ?`,
+		)
+		.run(
+			row.values.role,
+			row.values.status,
+			row.values.provenance,
+			row.values.revision,
+			row.values.migration_state,
+			row.values.source_fingerprint,
+			row.values.idempotency_key,
+			now,
+			request.teamId,
+			request.binding.identityId,
+		);
+	return {
+		preserveInviteMembership: false,
+		writes: result.changes > 0 ? 1 : 0,
+	};
+}
+
+function isPristineBootstrapIdentity(
+	db: Database,
+	identityId: string,
+	deviceId: string,
+	targetIdentityId: string,
+): boolean {
+	if (identityId !== `local:${deviceId}`) return false;
+	const actor = db
+		.prepare(
+			`SELECT is_local, status, merged_into_actor_id
+			 FROM actors WHERE actor_id = ?`,
+		)
+		.get(identityId) as
+		| {
+				is_local: number;
+				status: string;
+				merged_into_actor_id: string | null;
+		  }
+		| undefined;
+	const pristineActor =
+		!actor ||
+		(actor.is_local === 1 && actor.status === "active" && actor.merged_into_actor_id === null);
+	const alreadyAdoptedActor =
+		actor?.is_local === 0 &&
+		actor.status === "merged" &&
+		actor.merged_into_actor_id === targetIdentityId;
+	if (!pristineActor && !alreadyAdoptedActor) return false;
+	const references = [
+		Number(
+			db.prepare("SELECT COUNT(*) FROM memory_items WHERE actor_id = ?").pluck().get(identityId),
+		),
+		Number(
+			db
+				.prepare("SELECT COUNT(*) FROM identity_devices WHERE identity_id = ?")
+				.pluck()
+				.get(identityId),
+		),
+		Number(
+			db
+				.prepare("SELECT COUNT(*) FROM policy_team_memberships WHERE identity_id = ?")
+				.pluck()
+				.get(identityId),
+		),
+		Number(
+			db
+				.prepare(
+					`SELECT COUNT(*) FROM project_recipients
+					 WHERE recipient_kind = 'identity' AND recipient_id = ?`,
+				)
+				.pluck()
+				.get(identityId),
+		),
+		Number(
+			db
+				.prepare(
+					"SELECT COUNT(*) FROM recipient_policy_review_resolutions WHERE decided_by_identity_id = ?",
+				)
+				.pluck()
+				.get(identityId),
+		),
+		Number(
+			db
+				.prepare("SELECT COUNT(*) FROM sync_peers WHERE actor_id = ? OR claimed_local_actor = 1")
+				.pluck()
+				.get(identityId),
+		),
+	];
+	return references.every((count) => count === 0);
+}
+
+export function assertAddDeviceIdentityAdoptionAllowed(
+	db: Database,
+	targetIdentityId: string,
+	deviceId: string,
+): void {
+	const targetId = strictPrincipalId(targetIdentityId, "identity_id");
+	const localDeviceId = strictPrincipalId(deviceId, "device_id");
+	const localIdentities = new Set([
+		...(db
+			.prepare(
+				`SELECT actor_id FROM actors
+			 WHERE is_local = 1 AND status = 'active' AND merged_into_actor_id IS NULL
+			 ORDER BY actor_id`,
+			)
+			.pluck()
+			.all() as string[]),
+		`local:${localDeviceId}`,
+	]);
+	const target = db
+		.prepare("SELECT is_local, status, merged_into_actor_id FROM actors WHERE actor_id = ?")
+		.get(targetId) as
+		| { is_local: number; status: string; merged_into_actor_id: string | null }
+		| undefined;
+	if (
+		target &&
+		(target.is_local !== 1 || target.status !== "active" || target.merged_into_actor_id)
+	) {
+		throw new Error("invite_identity_conflict");
+	}
+	for (const identityId of localIdentities) {
+		if (identityId === targetId) continue;
+		if (!isPristineBootstrapIdentity(db, identityId, localDeviceId, targetId)) {
+			throw new Error("invite_identity_conflict");
+		}
+	}
+}
+
+function materializeLocalIdentity(
+	db: Database,
+	input: {
+		identityId: string;
+		displayName: string;
+		deviceId: string;
+		allowBootstrapAdoption: boolean;
+	},
+	now: string,
+): boolean {
+	if (input.allowBootstrapAdoption) {
+		assertAddDeviceIdentityAdoptionAllowed(db, input.identityId, input.deviceId);
+		db.prepare(
+			`UPDATE actors SET is_local = 0, status = 'merged', merged_into_actor_id = ?, updated_at = ?
+			 WHERE actor_id <> ? AND is_local = 1 AND status = 'active'`,
+		).run(input.identityId, now, input.identityId);
+	}
+	const existing = db
+		.prepare("SELECT is_local, status, merged_into_actor_id FROM actors WHERE actor_id = ?")
+		.get(input.identityId) as
+		| { is_local: number; status: string; merged_into_actor_id: string | null }
+		| undefined;
+	if (existing) {
+		if (existing.is_local !== 1 || existing.status !== "active" || existing.merged_into_actor_id) {
+			throw new Error("invite_identity_conflict");
+		}
+		return false;
+	}
+	db.prepare(
+		`INSERT INTO actors(
+		 actor_id, display_name, is_local, status, merged_into_actor_id, created_at, updated_at
+		 ) VALUES (?, ?, 1, 'active', NULL, ?, ?)`,
+	).run(input.identityId, input.displayName, now, now);
+	return true;
+}
+
+function materializeReviewedTeam(
+	db: Database,
+	team: { teamId: string; displayName: string; futureProjectsInherit: true },
+	now: string,
+): boolean {
+	const existing = db
+		.prepare("SELECT display_name, status FROM policy_teams WHERE team_id = ?")
+		.get(team.teamId) as { display_name: string; status: string } | undefined;
+	if (existing) {
+		if (existing.display_name !== team.displayName || existing.status !== "active") {
+			throw new Error("intent_conflict");
+		}
+		return false;
+	}
+	const stableTeam = { teamId: team.teamId, displayName: team.displayName };
+	const metadata = relationshipMetadata("team", stableTeam, stableTeam);
+	db.prepare(
+		`INSERT INTO policy_teams(
+		 team_id, display_name, status, provenance, revision, migration_state,
+		 source_fingerprint, idempotency_key, created_at, updated_at
+		 ) VALUES (?, ?, 'active', 'team_invite', ?, 'user_managed', ?, ?, ?, ?)`,
+	).run(
+		team.teamId,
+		team.displayName,
+		metadata.revision,
+		digest("recipient-onboarding-team-v1", stableTeam),
+		metadata.idempotencyKey,
+		now,
+		now,
+	);
+	return true;
+}
+
+function rowWhere(key: Record<string, string>): { clause: string; parameters: string[] } {
+	return {
+		clause: Object.keys(key)
+			.map((column) => `${column} = ?`)
+			.join(" AND "),
+		parameters: Object.values(key),
+	};
+}
+
+function hasMatchingLocalDeviceKey(db: Database, expected: Record<string, string | null>): boolean {
+	const publicKey = db
+		.prepare("SELECT public_key FROM sync_device WHERE device_id = ?")
+		.pluck()
+		.get(expected.device_id);
+	if (typeof publicKey !== "string" || !publicKey.trim()) return false;
+	return (
+		expected.source_fingerprint ===
+		digest("recipient-onboarding-binding-v1", {
+			identityId: expected.identity_id,
+			deviceId: expected.device_id,
+			deviceKeyFingerprint: fingerprintPublicKey(publicKey),
+		})
+	);
+}
+
+function transitionExactProjectDevice(
+	db: Database,
+	row: IntentRow,
+	where: { clause: string; parameters: string[] },
+): void {
+	const entries = Object.entries(row.values).filter(
+		([column]) => column !== "created_at" && column !== "identity_id",
+	);
+	const result = db
+		.prepare(
+			`UPDATE identity_devices SET ${entries.map(([column]) => `${column} = ?`).join(", ")}
+			 WHERE ${where.clause}`,
+		)
+		.run(...entries.map(([, value]) => value), ...where.parameters);
+	if (result.changes !== 1) throw new Error("device_binding_conflict");
+}
+
+function applyIdentityDeviceAssignment(
+	db: Database,
+	row: IntentRow,
+	keyMatch: Record<string, unknown> | undefined,
+	where: { clause: string; parameters: string[] },
+): boolean {
+	const expected = { ...row.key, ...row.values };
+	const deviceId = expected.device_id;
+	const targetIdentityId = expected.identity_id;
+	if (typeof deviceId !== "string" || typeof targetIdentityId !== "string") {
+		throw new Error("device_binding_conflict");
+	}
+
+	try {
+		if (!keyMatch) {
+			const result = assignIdentityDeviceInTransaction(db, {
+				deviceId,
+				targetIdentityId,
+				expectation: { kind: "absent" },
+				insert: {
+					displayName: String(expected.display_name),
+					provenance: String(expected.provenance),
+					revision: String(expected.revision),
+					migrationState: String(expected.migration_state),
+					sourceFingerprint:
+						typeof expected.source_fingerprint === "string" ? expected.source_fingerprint : null,
+					idempotencyKey: String(expected.idempotency_key),
+				},
+				now: String(expected.created_at),
+			});
+			return result.changed;
+		}
+
+		const existingIdentityId = keyMatch.identity_id;
+		const assignmentVersion = keyMatch.assignment_version;
+		if (
+			typeof existingIdentityId !== "string" ||
+			typeof assignmentVersion !== "number" ||
+			keyMatch.status !== "active"
+		) {
+			throw new Error("device_binding_conflict");
+		}
+		const recipientKeyBinding =
+			keyMatch.provenance === "recipient_invite" && expected.provenance === "recipient_invite";
+		// A NULL stored fingerprint means a reviewed reassignment cleared the
+		// former invite binding; the new invite may key the row afresh instead
+		// of being rejected against stale metadata forever.
+		if (
+			recipientKeyBinding &&
+			keyMatch.source_fingerprint != null &&
+			keyMatch.source_fingerprint !== expected.source_fingerprint
+		) {
+			throw new Error("device_binding_conflict");
+		}
+		const exactProjectTransition =
+			keyMatch.provenance === "exact_project_invite" && expected.provenance === "recipient_invite";
+		if (existingIdentityId !== targetIdentityId && !exactProjectTransition) {
+			throw new Error("device_binding_conflict");
+		}
+		if (exactProjectTransition && !hasMatchingLocalDeviceKey(db, expected)) {
+			throw new Error("device_binding_conflict");
+		}
+
+		const result = assignIdentityDeviceInTransaction(db, {
+			deviceId,
+			targetIdentityId,
+			expectation: {
+				kind: "existing",
+				identityId: existingIdentityId,
+				assignmentVersion,
+			},
+			now: String(expected.updated_at),
+		});
+		if (exactProjectTransition) {
+			transitionExactProjectDevice(db, row, where);
+			return true;
+		}
+		// A reviewed-cleared binding (NULL stored fingerprint) that accepted
+		// this invite must be RE-KEYED with the invite's fingerprint: leaving
+		// it unkeyed would let a future invite carrying a different public key
+		// bypass the changed-key rejection as well.
+		if (
+			recipientKeyBinding &&
+			keyMatch.source_fingerprint == null &&
+			typeof expected.source_fingerprint === "string" &&
+			expected.source_fingerprint.length > 0
+		) {
+			db.prepare(
+				`UPDATE identity_devices SET source_fingerprint = ?, updated_at = ?
+				 WHERE device_id = ? AND identity_id = ?`,
+			).run(expected.source_fingerprint, String(expected.updated_at), deviceId, targetIdentityId);
+			return true;
+		}
+		return result.changed;
+	} catch (error) {
+		if (error instanceof IdentityDeviceAssignmentError || isSqliteConstraint(error)) {
+			throw new Error("device_binding_conflict");
+		}
+		throw error;
+	}
+}
+
+function validateOrWriteRow(db: Database, row: IntentRow): boolean {
+	const idempotencyMatch = db
+		.prepare(`SELECT * FROM ${row.table} WHERE idempotency_key = ?`)
+		.get(row.values.idempotency_key) as Record<string, unknown> | undefined;
+	const where = rowWhere(row.key);
+	const keyMatch = db
+		.prepare(`SELECT * FROM ${row.table} WHERE ${where.clause}`)
+		.get(...where.parameters) as Record<string, unknown> | undefined;
+	if (row.table === "identity_devices" && !idempotencyMatch) {
+		return applyIdentityDeviceAssignment(db, row, keyMatch, where);
+	}
+	const existing = idempotencyMatch ?? keyMatch;
+	if (existing) {
+		const expected = { ...row.key, ...row.values };
+		if (row.table === "project_recipients" && keyMatch && !idempotencyMatch) {
+			if (keyMatch.status !== "active") throw new Error("intent_conflict");
+			return false;
+		}
+		const comparableColumns = Object.keys(expected).filter(
+			(column) => column !== "created_at" && column !== "updated_at",
+		);
+		if (comparableColumns.some((column) => existing[column] !== expected[column])) {
+			throw new Error(
+				row.table === "identity_devices" ? "device_binding_conflict" : "intent_conflict",
+			);
+		}
+		return false;
+	}
+	const columns = [...Object.keys(row.key), ...Object.keys(row.values)];
+	db.prepare(
+		`INSERT INTO ${row.table}(${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`,
+	).run(...Object.values(row.key), ...Object.values(row.values));
+	return true;
+}
+
+export function commitDirectProjectSharePolicyInTransaction(
+	db: Database,
+	input: DirectProjectSharePolicyCommitInput,
+): number {
+	if (!db.inTransaction) throw new Error("direct_share_policy_transaction_required");
+	const normalized = normalizeRequest({
+		version: 1,
+		journey: "direct_project",
+		invitationId: input.operationId,
+		identityId: input.recipientIdentityId,
+		deviceId: input.recipientDeviceId,
+		devicePublicKey: input.recipientDevicePublicKey,
+		deviceDisplayName: input.recipientDeviceDisplayName,
+		canonicalProjectIdentities: input.canonicalProjectIdentities,
+	});
+	if (normalized.journey !== "direct_project") throw new Error("journey_invalid");
+	assertActiveIdentity(db, normalized.binding.identityId);
+	assertActiveLocalIdentity(db, input.inviterIdentityId);
+	if (input.inviterDevices.length === 0) throw new Error("inviter_device_binding_missing");
+	const inviterDevices = input.inviterDevices
+		.map((device) => ({
+			deviceId: strictPrincipalId(device.deviceId, "inviter_device_id"),
+			displayName: normalizeIdentityDisplayName(device.displayName, "device_display_name"),
+		}))
+		.toSorted((left, right) => compareText(left.deviceId, right.deviceId));
+	if (new Set(inviterDevices.map((device) => device.deviceId)).size !== inviterDevices.length) {
+		throw new Error("inviter_device_binding_invalid");
+	}
+	const rows = [
+		...inviterDevices.map((device) =>
+			inviterDeviceRow({
+				identityId: input.inviterIdentityId,
+				deviceId: device.deviceId,
+				displayName: device.displayName,
+				now: input.now,
+			}),
+		),
+		...normalized.canonicalProjectIdentities.map((projectId) =>
+			inviterProjectRow({ identityId: input.inviterIdentityId, projectId, now: input.now }),
+		),
+		...planRows(db, normalized, input.now),
+	];
+	let writeCount = 0;
+	for (const row of rows) {
+		if (validateOrWriteRow(db, row)) writeCount += 1;
+	}
+	return writeCount;
+}
+
+function emptyResult(
+	status: RecipientPolicyOnboardingCommitResultV1["status"],
+	errorCode: string,
+	journey: RecipientPolicyOnboardingJourneyV1 | null,
+	reviewedOnboardingDigest: string,
+): RecipientPolicyOnboardingCommitResultV1 {
+	return {
+		version: 1,
+		status,
+		journey,
+		reviewedOnboardingDigest,
+		errorCode,
+		writeCount: 0,
+		idempotent: false,
+	};
+}
+
+function isSqliteBusy(error: unknown): boolean {
+	if (!error || typeof error !== "object") return false;
+	const code = "code" in error ? String((error as { code?: unknown }).code ?? "") : "";
+	return (
+		code === "SQLITE_BUSY" ||
+		(error instanceof Error && error.message.includes("database is locked"))
+	);
+}
+
+function isSqliteConstraint(error: unknown): boolean {
+	if (!error || typeof error !== "object") return false;
+	const code = "code" in error ? String((error as { code?: unknown }).code ?? "") : "";
+	return code.startsWith("SQLITE_CONSTRAINT");
+}
+
+export function commitRecipientPolicyOnboarding(
+	db: Database,
+	request: RecipientPolicyOnboardingCommitRequestV1,
+	options: { now?: () => string } = {},
+): RecipientPolicyOnboardingCommitResultV1 {
+	let normalized: NormalizedRequest;
+	try {
+		normalized = normalizeRequest(request);
+	} catch (error) {
+		if (error instanceof RecipientPolicyOnboardingRequestError) {
+			return emptyResult(error.status, error.errorCode, null, "");
+		}
+		return emptyResult("invalid", "request_invalid", null, "");
+	}
+	if (!/^recipient-onboarding-preview-v1:[a-f0-9]{64}$/u.test(request.reviewedOnboardingDigest)) {
+		return emptyResult("invalid", "reviewed_onboarding_digest_invalid", normalized.journey, "");
+	}
+	try {
+		db.exec("BEGIN IMMEDIATE");
+		try {
+			const preview = buildPreview(db, normalized);
+			if (preview.reviewedOnboardingDigest !== request.reviewedOnboardingDigest) {
+				db.exec("ROLLBACK");
+				return emptyResult(
+					"stale",
+					"reviewed_onboarding_stale",
+					normalized.journey,
+					preview.reviewedOnboardingDigest,
+				);
+			}
+			const now = (options.now ?? (() => new Date().toISOString()))();
+			let writeCount = 0;
+			const membershipTransition = applyInviteOwnedTeamMembershipTransition(db, normalized, now);
+			writeCount += membershipTransition.writes;
+			for (const row of planRows(db, normalized, now, {
+				preserveInviteMembership: membershipTransition.preserveInviteMembership,
+			})) {
+				if (validateOrWriteRow(db, row)) writeCount += 1;
+			}
+			writeCount += applyTeamJourneySideEffects(db, normalized, now);
+			db.exec("COMMIT");
+			return {
+				version: 1,
+				status: "applied",
+				journey: normalized.journey,
+				reviewedOnboardingDigest: preview.reviewedOnboardingDigest,
+				errorCode: null,
+				writeCount,
+				idempotent: writeCount === 0,
+			};
+		} catch (error) {
+			if (db.inTransaction) db.exec("ROLLBACK");
+			throw error;
+		}
+	} catch (error) {
+		if (isSqliteBusy(error)) throw error;
+		if (error instanceof RecipientPolicyOnboardingRequestError) {
+			return emptyResult(
+				error.status,
+				error.errorCode,
+				normalized.journey,
+				request.reviewedOnboardingDigest,
+			);
+		}
+		const errorCode =
+			error instanceof Error && error.message === "device_binding_conflict"
+				? "device_binding_conflict"
+				: "onboarding_intent_conflict";
+		return emptyResult("conflict", errorCode, normalized.journey, request.reviewedOnboardingDigest);
+	}
+}
+
+export function commitRecipientPolicyOnboardingFromReviewedIntent(
+	db: Database,
+	request: RecipientPolicyReviewedIntentCommitRequestV1,
+	options: { now?: () => string } = {},
+): RecipientPolicyOnboardingCommitResultV1 {
+	let normalized: NormalizedRequest;
+	try {
+		normalized = normalizeRequest(request);
+		if (normalized.journey === "direct_project") {
+			return emptyResult("invalid", "journey_invalid", normalized.journey, "");
+		}
+	} catch (error) {
+		if (error instanceof RecipientPolicyOnboardingRequestError) {
+			return emptyResult(error.status, error.errorCode, null, "");
+		}
+		return emptyResult("invalid", "request_invalid", null, "");
+	}
+	if (!/^recipient-onboarding-preview-v1:[a-f0-9]{64}$/u.test(request.reviewedOnboardingDigest)) {
+		return emptyResult("invalid", "reviewed_onboarding_digest_invalid", normalized.journey, "");
+	}
+	try {
+		db.exec("BEGIN IMMEDIATE");
+		try {
+			const reviewedIntent = normalizeRecipientReviewedIntent(
+				request.reviewedIntent,
+				reviewedIntentTarget(normalized),
+			);
+			const preview = buildReviewedIntentPreview(normalized, reviewedIntent);
+			if (preview.reviewedOnboardingDigest !== request.reviewedOnboardingDigest) {
+				db.exec("ROLLBACK");
+				return emptyResult(
+					"stale",
+					"reviewed_onboarding_stale",
+					normalized.journey,
+					preview.reviewedOnboardingDigest,
+				);
+			}
+			const now = (options.now ?? (() => new Date().toISOString()))();
+			const identityDisplayName =
+				normalized.journey === "add_device" && reviewedIntent.journey === "add_device"
+					? reviewedIntent.targetIdentity.displayName
+					: normalizeIdentityDisplayName(request.identityDisplayName, "identity_display_name");
+			let writeCount = materializeLocalIdentity(
+				db,
+				{
+					identityId: normalized.binding.identityId,
+					displayName: identityDisplayName,
+					deviceId: normalized.binding.deviceId,
+					allowBootstrapAdoption:
+						normalized.journey === "add_device" || normalized.journey === "team",
+				},
+				now,
+			)
+				? 1
+				: 0;
+			if (normalized.journey === "team") {
+				if (reviewedIntent.journey !== "team") throw new Error("intent_conflict");
+				if (materializeReviewedTeam(db, reviewedIntent.team, now)) writeCount += 1;
+			}
+			const membershipTransition = applyInviteOwnedTeamMembershipTransition(db, normalized, now);
+			writeCount += membershipTransition.writes;
+			for (const row of planRows(db, normalized, now, {
+				preserveInviteMembership: membershipTransition.preserveInviteMembership,
+			})) {
+				if (validateOrWriteRow(db, row)) writeCount += 1;
+			}
+			writeCount += applyTeamJourneySideEffects(db, normalized, now);
+			db.exec("COMMIT");
+			return {
+				version: 1,
+				status: "applied",
+				journey: normalized.journey,
+				reviewedOnboardingDigest: preview.reviewedOnboardingDigest,
+				errorCode: null,
+				writeCount,
+				idempotent: writeCount === 0,
+			};
+		} catch (error) {
+			if (db.inTransaction) db.exec("ROLLBACK");
+			throw error;
+		}
+	} catch (error) {
+		if (isSqliteBusy(error)) throw error;
+		if (error instanceof RecipientPolicyOnboardingRequestError) {
+			return emptyResult(
+				error.status,
+				error.errorCode,
+				normalized.journey,
+				request.reviewedOnboardingDigest,
+			);
+		}
+		const message = error instanceof Error ? error.message : "";
+		const errorCode =
+			message === "device_binding_conflict"
+				? "device_binding_conflict"
+				: message === "invite_identity_conflict"
+					? "invite_identity_conflict"
+					: "onboarding_intent_conflict";
+		return emptyResult("conflict", errorCode, normalized.journey, request.reviewedOnboardingDigest);
+	}
+}

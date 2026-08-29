@@ -13,8 +13,16 @@ import {
 	titleCase,
 } from "../../../lib/format";
 import { state } from "../../../lib/state";
-import { buildHealthCard, renderActionList, renderHealthCards, renderIcons } from "../components";
+import {
+	buildHealthCard,
+	renderActionList,
+	renderHealthCards,
+	renderIcons,
+	renderUpdateBanner,
+} from "../components";
 import type { HealthAction, HealthCardInput } from "../types";
+
+const SCOPE_BACKFILL_JOB = "scope_id_backfill";
 
 export function renderHealthOverview() {
 	const healthGrid = document.getElementById("healthGrid");
@@ -22,6 +30,7 @@ export function renderHealthOverview() {
 	const healthActions = document.getElementById("healthActions");
 	const healthDot = document.getElementById("healthDot");
 	if (!healthGrid || !healthMeta) return;
+	renderUpdateBanner(document.getElementById("healthUpdateBanner"), state.lastUpdateStatus);
 
 	const stats = state.lastStatsPayload || {};
 	const usagePayload = state.lastUsagePayload || {};
@@ -38,6 +47,7 @@ export function renderHealthOverview() {
 		error?: string | null;
 		progress?: { current?: number; total?: number | null; unit?: string };
 	}> = Array.isArray(stats.maintenance_jobs) ? stats.maintenance_jobs : [];
+	const scopeBackfillJob = maintenanceJobs.find((job) => job.kind === SCOPE_BACKFILL_JOB);
 	const reliability = stats.reliability || {};
 	const counts = reliability.counts || {};
 	const rates = reliability.rates || {};
@@ -81,16 +91,6 @@ export function renderHealthOverview() {
 	// even if a single peer is flagged "degraded", so soften the risk signal.
 	const syncRecentlyOk = syncAgeSeconds !== null && syncAgeSeconds <= 300;
 	const hasBacklog = rawPending >= 200;
-
-	// Observer dashboard (plugin observer)
-	const observerReport =
-		state.lastObserverReport && typeof state.lastObserverReport === "object"
-			? (state.lastObserverReport as Record<string, any>)
-			: null;
-	const observerCounts = observerReport?.batches?.counts || null;
-	const observerErrored = observerCounts ? Number(observerCounts.errored || 0) : 0;
-	const observerClaimed = observerCounts ? Number(observerCounts.claimed || 0) : 0;
-	const observerPending = observerCounts ? Number(observerCounts.pending || 0) : 0;
 
 	// Risk scoring
 	let riskScore = 0;
@@ -203,12 +203,17 @@ export function renderHealthOverview() {
 				: `${current.toLocaleString()} ${unit}`;
 		const isFailed = job.status === "failed";
 		const isCompleted = job.status === "completed";
+		const isScopeBackfill = job.kind === SCOPE_BACKFILL_JOB;
 		const value = isFailed ? "Failed" : isCompleted ? "Complete" : progress;
 		const detail = isFailed
 			? String(job.error || "unknown error").trim()
 			: isCompleted
-				? progress
-				: undefined;
+				? isScopeBackfill
+					? `${progress} · one-time Sharing-domain upgrade finished`
+					: progress
+				: isScopeBackfill
+					? "One-time upgrade backfill; totals include memories and replication ops"
+					: undefined;
 		return buildHealthCard({
 			key: String(job.kind || job.title || "background-maintenance"),
 			label: String(job.title || job.kind || "Background maintenance"),
@@ -220,7 +225,9 @@ export function renderHealthOverview() {
 				? `Error: ${job.error || "unknown"}`
 				: isCompleted
 					? `${String(job.title || "Maintenance")} finished`
-					: `${String(job.title || "Maintenance")} in progress`,
+					: isScopeBackfill
+						? `${String(job.title || "Maintenance")} in progress; inspect with codemem maintenance status`
+						: `${String(job.title || "Maintenance")} in progress`,
 		});
 	});
 
@@ -244,17 +251,6 @@ export function renderHealthOverview() {
 			detail: pipelineDetail,
 			icon: "workflow",
 			title: "Raw-event queue pressure and flush reliability",
-		}),
-		buildHealthCard({
-			key: "observer-health",
-			label: "Observer",
-			value: observerReport ? `${observerErrored.toLocaleString()} errors` : "—",
-			detail: observerReport
-				? `${observerPending.toLocaleString()} pending · ${observerClaimed.toLocaleString()} claimed`
-				: "Observer report unavailable",
-			icon: observerErrored > 0 ? "alert-triangle" : "check-circle",
-			className: observerErrored > 0 ? "status-attention" : undefined,
-			title: "Plugin observer batches and per-agent memory attribution",
 		}),
 		buildHealthCard({
 			key: "retrieval-impact",
@@ -282,79 +278,6 @@ export function renderHealthOverview() {
 		}),
 	];
 	renderHealthCards(healthGrid, cards);
-
-	// Render observer section + retry button in the actions area.
-	if (healthActions) {
-		const recent: any[] = Array.isArray(observerReport?.batches?.recent)
-			? observerReport!.batches.recent
-			: [];
-		const byActor: any[] = Array.isArray(observerReport?.memories?.by_actor)
-			? observerReport!.memories.by_actor
-			: [];
-
-		const rows = recent
-			.slice(0, 8)
-			.map((b) => {
-				const id = String(b?.id ?? "");
-				const status = String(b?.status ?? "");
-				const stream = String(b?.stream_id ?? "");
-				const updated = String(b?.updated_at ?? "");
-				const attempts = String(b?.attempt_count ?? "");
-				const err = String(b?.error_message ?? "");
-				const errShort = err ? ` — ${err.slice(0, 80)}` : "";
-				return `<div class="section-meta" style="margin: 6px 0 0 0; font-size: 12px;">
-          <span style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace;">#${id}</span>
-          <span> ${status}</span>
-          <span style="opacity:0.75;"> ${attempts ? `· attempts ${attempts}` : ""} · ${updated}</span>
-          <span style="opacity:0.75;"> ${stream ? `· ${stream}` : ""}${errShort}</span>
-        </div>`;
-			})
-			.join("");
-
-		const actorRows = byActor
-			.slice(0, 8)
-			.map((a) => {
-				const actorId = String(a?.actor_id ?? "unknown");
-				const count = Number(a?.count || 0);
-				const last = String(a?.last_created_at ?? "");
-				return `<div class="section-meta" style="margin: 4px 0 0 0; font-size: 12px;">
-          <span style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace;">${actorId}</span>
-          <span style="opacity:0.8;"> · ${count.toLocaleString()} items</span>
-          <span style="opacity:0.7;"> · last ${last}</span>
-        </div>`;
-			})
-			.join("");
-
-		const retryDisabled = observerErrored <= 0;
-		const retryLabel = retryDisabled ? "No observer errors" : `Retry ${observerErrored} observer errors`;
-
-		healthActions.innerHTML = `
-      <div class="card" style="margin-top: 12px;">
-        <div class="section-header" style="margin-bottom: 6px;">
-          <h3 style="margin: 0;">Observer</h3>
-          <div class="section-actions">
-            <button class="settings-button" id="observerRetryButton" ${retryDisabled ? "disabled" : ""}>${retryLabel}</button>
-          </div>
-        </div>
-        <div class="section-meta">Recent batches</div>
-        ${rows || `<div class="section-meta">No recent batches.</div>`}
-        <div class="section-meta" style="margin-top: 10px;">Memories by actor</div>
-        ${actorRows || `<div class="section-meta">No actor attribution yet.</div>`}
-      </div>
-    `;
-
-		const btn = document.getElementById("observerRetryButton");
-		if (btn && !retryDisabled) {
-			btn.onclick = async () => {
-				try {
-					await api.retryObserverErrors();
-					await api.loadObserverStatus().catch(() => {});
-				} catch {
-					// ignore
-				}
-			};
-		}
-	}
 
 	// Recommendations
 	const triggerSync = async () => {
@@ -403,6 +326,13 @@ export function renderHealthOverview() {
 		recommendations.push({
 			label: "Tag coverage is low. Preview backfill impact.",
 			command: "codemem db backfill-tags --dry-run",
+		});
+	}
+	if (scopeBackfillJob && scopeBackfillJob.status !== "completed" && recommendations.length < 3) {
+		recommendations.push({
+			label:
+				"Sharing-domain upgrade backfill is expected one-time work. Inspect progress if startup feels busy.",
+			command: "codemem maintenance status",
 		});
 	}
 	renderActionList(healthActions, recommendations);

@@ -6,6 +6,7 @@ import {
 	addDbOption,
 	addJsonOption,
 	type DbOpts,
+	emitJsonError,
 	type JsonOpts,
 	resolveDbOpt,
 } from "../shared-options.js";
@@ -17,8 +18,7 @@ const searchCmd = new Command("search")
 	.option("-n, --limit <n>", "max results", "5")
 	.option("--project <project>", "project identifier (defaults to git repo root)")
 	.option("--all-projects", "search across all projects")
-	.option("--kind <kind>", "filter by memory kind")
-	.option("--actor-id <actorId>", "filter by actor ID (agent name)");
+	.option("--kind <kind>", "filter by memory kind");
 
 addDbOption(searchCmd);
 addJsonOption(searchCmd);
@@ -37,9 +37,8 @@ export const searchCommand = searchCmd.action(
 		const store = new MemoryStore(resolveDbPath(resolveDbOpt(opts)));
 		try {
 			const limit = Math.max(1, Number.parseInt(opts.limit, 10) || 5);
-	const filters: { kind?: string; project?: string; include_actor_ids?: string[] } = {};
-		if (opts.kind) filters.kind = opts.kind;
-		if (opts.actorId) filters.include_actor_ids = [opts.actorId];
+			const filters: { kind?: string; project?: string } = {};
+			if (opts.kind) filters.kind = opts.kind;
 			if (!opts.allProjects) {
 				const defaultProject = process.env.CODEMEM_PROJECT?.trim() || null;
 				const project = defaultProject || resolveProject(process.cwd(), opts.project ?? null);
@@ -71,6 +70,15 @@ export const searchCommand = searchCmd.action(
 			}
 
 			p.outro("done");
+		} catch (error) {
+			const message = error instanceof Error ? error.message : "Search failed";
+			if (opts.json) {
+				emitJsonError("search_failed", message);
+			} else {
+				p.log.error(message);
+				process.exitCode = 1;
+			}
+			return;
 		} finally {
 			store.close();
 		}

@@ -3,7 +3,10 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { relative, resolve } from "node:path";
 
-const SEMVER_RE = /^\d+\.\d+\.\d+$/;
+// Plain X.Y.Z plus the prerelease tags the Release workflow already
+// recognizes for npm dist-tag routing (alpha/beta/rc; see .github/workflows/release.yml).
+const SEMVER_RE = /^\d+\.\d+\.\d+(?:-(?:alpha|beta|rc)\.\d+)?$/;
+const SEMVER_FORMAT = "X.Y.Z or X.Y.Z-{alpha,beta,rc}.N";
 const CORE_VERSION_RE = /^(export\s+const\s+VERSION\s*=\s*")([^"]+)(";\s*)$/m;
 const CORE_TEST_VERSION_RE = /^(\s*expect\(VERSION\)\.toBe\(")([^"]+)("\);\s*)$/m;
 const PLUGIN_PIN_RE = /^(const\s+PINNED_BACKEND_VERSION\s*=\s*")([^"]+)(";\s*)$/m;
@@ -19,11 +22,12 @@ const REQUIRED_REPO_MARKERS = [
 	"packages/opencode-plugin/.opencode/plugins/codemem.js",
 	"plugins/claude/.claude-plugin/plugin.json",
 	".claude-plugin/marketplace.json",
+	"plugins/codex/.codex-plugin/plugin.json",
 ];
 
 function validateSemver(version) {
 	if (!SEMVER_RE.test(version)) {
-		throw new Error(`Invalid version '${version}'. Expected format: X.Y.Z`);
+		throw new Error(`Invalid version '${version}'. Expected format: ${SEMVER_FORMAT}`);
 	}
 }
 
@@ -141,6 +145,10 @@ export function readVersions(root) {
 		resolveManagedPath(repoRoot, ".claude-plugin/marketplace.json"),
 		".claude-plugin/marketplace.json",
 	);
+	const codexPlugin = loadJson(
+		resolveManagedPath(repoRoot, "plugins/codex/.codex-plugin/plugin.json"),
+		"plugins/codex/.codex-plugin/plugin.json",
+	);
 	const metadata = expectObject(
 		marketplace.metadata,
 		".claude-plugin/marketplace.json metadata",
@@ -185,6 +193,7 @@ export function readVersions(root) {
 		claude_plugin_manifest: String(claudePlugin.version ?? ""),
 		marketplace_metadata: String(metadata.version ?? ""),
 		marketplace_plugin: String(codememPlugin.version ?? ""),
+		codex_plugin_manifest: String(codexPlugin.version ?? ""),
 	};
 }
 
@@ -294,6 +303,15 @@ export function setVersion(root, version, { dryRun = false } = {}) {
 	if (marketplaceChanged) {
 		writes.set(marketplacePath, dumpJson(marketplace, detectJsonIndent(marketplaceText)));
 		changed.push(".claude-plugin/marketplace.json");
+	}
+
+	const codexPluginPath = resolveManagedPath(repoRoot, "plugins/codex/.codex-plugin/plugin.json");
+	const codexPluginText = readText(codexPluginPath);
+	const codexPlugin = loadJson(codexPluginPath, "plugins/codex/.codex-plugin/plugin.json");
+	if (codexPlugin.version !== version) {
+		codexPlugin.version = version;
+		writes.set(codexPluginPath, dumpJson(codexPlugin, detectJsonIndent(codexPluginText)));
+		changed.push("plugins/codex/.codex-plugin/plugin.json");
 	}
 
 	if (!dryRun) {

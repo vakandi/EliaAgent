@@ -16,6 +16,7 @@ import { drizzle } from "drizzle-orm/better-sqlite3";
 import type { Database } from "./db.js";
 import {
 	assertSchemaReady,
+	columnExists,
 	connect,
 	DEFAULT_DB_PATH,
 	ensureAdditiveSchemaCompatibility,
@@ -28,25 +29,38 @@ import {
 	toJson,
 	toJsonNullable,
 } from "./db.js";
-import { buildFilterClauses } from "./filters.js";
+import { buildFilterClausesWithContext, type OwnershipFilterContext } from "./filters.js";
 import { buildMemoryDedupKey, normalizeMemoryDedupTitle } from "./memory-dedup.js";
+import { validateMemoryKind } from "./memory-kinds.js";
 import { readCodememConfigFile } from "./observer-config.js";
+import type { PackArtifacts } from "./pack.js";
 import {
 	buildMemoryPack,
 	buildMemoryPackAsync,
 	buildMemoryPackTrace,
 	buildMemoryPackTraceAsync,
+	buildMemoryPackWithTrace,
+	buildMemoryPackWithTraceAsync,
 } from "./pack.js";
 import { populateMemoryRefs } from "./ref-populate.js";
 import type { RefQueryOptions, RefQueryResult } from "./ref-queries.js";
 import { findByConcept as findByConceptFn, findByFile as findByFileFn } from "./ref-queries.js";
 import * as schema from "./schema.js";
+import { resolveVisibleScopeIds } from "./scope-resolution.js";
+import { ensureMemoryScopeId, resolveSessionScopeId } from "./scope-stamping.js";
 import {
 	type ExplainOptions,
 	explain as explainFn,
 	search as searchFn,
 	timeline as timelineFn,
 } from "./search.js";
+import {
+	loadScannerOptionsFromConfig,
+	mergeDetections,
+	type ScanDetection,
+	SecretScanner,
+} from "./secret-scanner.js";
+import { fingerprintPublicKey } from "./sync-fingerprint.js";
 import { recordReplicationOp } from "./sync-replication.js";
 import type {
 	ExplainResponse,
@@ -62,29 +76,14 @@ import type {
 } from "./types.js";
 import { storeVectors } from "./vectors.js";
 
-// Memory kind validation (mirrors codemem/memory_kinds.py)
-
-const ALLOWED_MEMORY_KINDS = new Set([
-	"discovery",
-	"change",
-	"feature",
-	"bugfix",
-	"refactor",
-	"decision",
-	"exploration",
-	"session_summary",
+// Locally reviewed flows that can establish same-person ownership. Coordinator
+// enrollment remains discovery evidence and must never grant write authority.
+const SAME_PERSON_BINDING_PROVENANCE = new Set([
+	"user_confirmed_identity_setup",
+	"recipient_invite",
+	"exact_project_invite",
+	"review_resolution",
 ]);
-
-/** Normalize and validate a memory kind. Throws on invalid kinds. */
-function validateMemoryKind(kind: string): string {
-	const normalized = kind.trim().toLowerCase();
-	if (!ALLOWED_MEMORY_KINDS.has(normalized)) {
-		throw new Error(
-			`Invalid memory kind "${kind}". Allowed: ${[...ALLOWED_MEMORY_KINDS].join(", ")}`,
-		);
-	}
-	return normalized;
-}
 
 // Helpers
 
@@ -200,10 +199,18 @@ function parseMetadata(row: MemoryItem): MemoryItemResponse {
 export class MemoryStore {
 	readonly db: Database;
 	readonly dbPath: string;
-	readonly deviceId: string;
-	readonly actorId: string;
-	readonly actorDisplayName: string;
+	deviceId: string;
+	actorId: string;
+	actorDisplayName: string;
 	readonly crossSessionDedupWindowMs: number;
+	private actorIdUsesDeviceFallback: boolean;
+	/**
+	 * Per-store secret scanner. Lives on the instance (not as a module global)
+	 * so workspace-level rule overrides and allowlists can be wired without
+	 * coupling between stores in the same process. Mutable so tests and
+	 * follow-on issues (codemem-ben8, codemem-jasn) can swap it.
+	 */
+	scanner: SecretScanner;
 	private readonly pendingVectorWrites = new Set<Promise<void>>();
 
 	/** Lazy Drizzle ORM wrapper — shares the same better-sqlite3 connection. */
@@ -225,6 +232,12 @@ export class MemoryStore {
 			this.db.close();
 			throw err;
 		}
+
+		// Read config once and use it for both actor identity and scanner
+		// rule overrides. Workspace-scoped rules and allowlist live under the
+		// `secret_scanner` block (see loadScannerOptionsFromConfig).
+		const config = readCodememConfigFile();
+		this.scanner = new SecretScanner(loadScannerOptionsFromConfig(config));
 
 		// Resolve device ID: env var → sync_device table → stable "local" fallback.
 		// Python uses exactly this order and fallback.
@@ -249,10 +262,10 @@ export class MemoryStore {
 
 		// Resolve actor identity — matches Python load_config() precedence:
 		// config file, then env override, then local fallbacks.
-		const config = readCodememConfigFile();
 		const configActorId = Object.hasOwn(process.env, "CODEMEM_ACTOR_ID")
 			? cleanStr(process.env.CODEMEM_ACTOR_ID)
 			: (cleanStr(config.actor_id) ?? null);
+		this.actorIdUsesDeviceFallback = !configActorId;
 		this.actorId = configActorId || `local:${this.deviceId}`;
 
 		const configDisplayName = Object.hasOwn(process.env, "CODEMEM_ACTOR_DISPLAY_NAME")
@@ -263,11 +276,140 @@ export class MemoryStore {
 		this.crossSessionDedupWindowMs = resolveCrossSessionDedupWindowMs();
 	}
 
+	hasCurrentIdentity(): boolean {
+		const envDeviceId = process.env.CODEMEM_DEVICE_ID?.trim();
+		let dbDeviceId: string | undefined;
+		if (!envDeviceId) {
+			try {
+				const row = this.d
+					.select({ device_id: schema.syncDevice.device_id })
+					.from(schema.syncDevice)
+					.limit(1)
+					.get();
+				dbDeviceId = row?.device_id;
+			} catch {
+				// Older/minimal schemas use the stable local fallback.
+			}
+		}
+		const deviceId = envDeviceId || dbDeviceId || "local";
+		const config = readCodememConfigFile();
+		const configActorId = Object.hasOwn(process.env, "CODEMEM_ACTOR_ID")
+			? cleanStr(process.env.CODEMEM_ACTOR_ID)
+			: (cleanStr(config.actor_id) ?? null);
+		const actorId = configActorId || `local:${deviceId}`;
+		return deviceId === this.deviceId && actorId === this.actorId;
+	}
+
+	refreshPersistedLocalIdentity(expectedActorId: string): boolean {
+		const actorId = cleanStr(expectedActorId);
+		if (!actorId) return false;
+		try {
+			if (!tableExists(this.db, "actors")) return false;
+			const actor = this.db
+				.prepare(
+					`SELECT display_name FROM actors
+					 WHERE actor_id = ? AND is_local = 1 AND status = 'active'
+					   AND merged_into_actor_id IS NULL`,
+				)
+				.get(actorId) as { display_name: string } | undefined;
+			const displayName = cleanStr(actor?.display_name);
+			if (!actor || !displayName) return false;
+			this.actorId = actorId;
+			this.actorDisplayName = displayName;
+			this.actorIdUsesDeviceFallback = false;
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	adoptEnsuredDeviceIdentity(deviceId: string): void {
+		const normalizedDeviceId = deviceId.trim();
+		if (!normalizedDeviceId || normalizedDeviceId === "local" || this.deviceId !== "local") return;
+		const previousDeviceId = this.deviceId;
+		const fallbackActorId = `local:${previousDeviceId}`;
+		const hasActorsTable = tableExists(this.db, "actors");
+		const fallbackActor = hasActorsTable
+			? (this.db
+					.prepare(
+						`SELECT display_name FROM actors WHERE actor_id = ?
+						 AND (? = 1 OR (is_local = 1 AND status = 'active'))`,
+					)
+					.get(fallbackActorId, this.actorIdUsesDeviceFallback ? 1 : 0) as
+					| { display_name: string }
+					| undefined)
+			: undefined;
+		if (!this.actorIdUsesDeviceFallback && !fallbackActor) {
+			this.deviceId = normalizedDeviceId;
+			return;
+		}
+
+		const nextActorId = this.actorIdUsesDeviceFallback
+			? `local:${normalizedDeviceId}`
+			: this.actorId;
+		const fallbackDisplayName = cleanStr(fallbackActor?.display_name);
+		const nextActorDisplayName =
+			this.actorIdUsesDeviceFallback &&
+			fallbackDisplayName &&
+			fallbackDisplayName !== fallbackActorId
+				? fallbackDisplayName
+				: this.actorDisplayName === fallbackActorId
+					? nextActorId
+					: this.actorDisplayName;
+		const now = nowIso();
+		this.db.transaction(() => {
+			if (fallbackActor) {
+				this.db
+					.prepare(
+						`INSERT INTO actors(
+						 actor_id, display_name, is_local, status, merged_into_actor_id, created_at, updated_at
+						 ) VALUES (?, ?, 1, 'active', NULL, ?, ?)
+						 ON CONFLICT(actor_id) DO UPDATE SET
+						 display_name = excluded.display_name, is_local = 1, status = 'active',
+						 merged_into_actor_id = NULL, updated_at = excluded.updated_at`,
+					)
+					.run(nextActorId, nextActorDisplayName, now, now);
+			}
+			this.db
+				.prepare(
+					// Canonicalize only rows that still carry both fallback ownership signals.
+					// origin_device_id and metadata clock_device_id remain historical provenance;
+					// personal workspace identity follows the canonical actor when applicable.
+					`UPDATE memory_items
+					 SET actor_id = ?,
+					     workspace_id = CASE WHEN workspace_id = ? THEN ? ELSE workspace_id END
+					 WHERE actor_id = ?
+					   AND (origin_device_id IS NULL OR TRIM(origin_device_id) = '' OR origin_device_id = ?)`,
+				)
+				.run(
+					nextActorId,
+					`personal:${fallbackActorId}`,
+					`personal:${nextActorId}`,
+					fallbackActorId,
+					previousDeviceId,
+				);
+			if (!fallbackActor) return;
+			this.db
+				.prepare(
+					`UPDATE actors SET is_local = 0, status = 'merged', merged_into_actor_id = ?, updated_at = ?
+					 WHERE actor_id = ?`,
+				)
+				.run(nextActorId, now, fallbackActorId);
+		})();
+		// Publish the new in-memory identity only after every persistence mutation commits.
+		this.deviceId = normalizedDeviceId;
+		if (this.actorIdUsesDeviceFallback) {
+			this.actorId = nextActorId;
+			this.actorDisplayName = nextActorDisplayName;
+		}
+	}
+
 	private findExistingDuplicateMemory(
 		sessionId: number,
 		kind: string,
 		title: string,
 		dedupKey: string | null,
+		scopeId: string,
 		provenance: {
 			visibility: string;
 			workspace_id: string;
@@ -281,16 +423,24 @@ export class MemoryStore {
 		const sameSessionRows = this.db
 			.prepare(
 				`SELECT id, title
-				 FROM memory_items
-				 WHERE active = 1
+					 FROM memory_items
+					 WHERE active = 1
 				   AND session_id = ?
 				   AND kind = ?
 				   AND visibility = ?
 				   AND workspace_id = ?
+				   AND (scope_id = ? OR scope_id IS NULL OR TRIM(scope_id) = '')
 				   AND (dedup_key = ? OR dedup_key IS NULL)
 				 ORDER BY created_at DESC, id DESC`,
 			)
-			.all(sessionId, kind, provenance.visibility, provenance.workspace_id, dedupKey) as Array<{
+			.all(
+				sessionId,
+				kind,
+				provenance.visibility,
+				provenance.workspace_id,
+				scopeId,
+				dedupKey,
+			) as Array<{
 			id: number;
 			title: string;
 		}>;
@@ -310,12 +460,13 @@ export class MemoryStore {
 		const crossSessionRows = this.db
 			.prepare(
 				`SELECT id, title
-				 FROM memory_items
-				 WHERE active = 1
+					 FROM memory_items
+					 WHERE active = 1
 				   AND session_id != ?
 				   AND kind = ?
 				   AND visibility = ?
 				   AND workspace_id = ?
+				   AND scope_id = ?
 				   AND created_at >= ?
 				   AND (dedup_key = ? OR dedup_key IS NULL)
 				 ORDER BY confidence DESC, created_at DESC, id DESC`,
@@ -325,6 +476,7 @@ export class MemoryStore {
 				kind,
 				provenance.visibility,
 				provenance.workspace_id,
+				scopeId,
 				since,
 				dedupKey,
 			) as Array<{
@@ -384,6 +536,33 @@ export class MemoryStore {
 		await Promise.allSettled([...this.pendingVectorWrites]);
 	}
 
+	/**
+	 * Build the ownership/scope-visibility filter context for SQL filter
+	 * builders. Snapshots claimed same-actor peers (and their legacy-sync actor
+	 * ids) once so `ownership_scope=mine/theirs` SQL matches
+	 * {@link buildOwnershipPredicate}. Shared by core read paths and viewer
+	 * routes to keep a single source of truth for "is this mine?".
+	 */
+	ownershipFilterContext(): OwnershipFilterContext {
+		const claimedDeviceIds = this.sameActorPeerIds();
+		return {
+			actorId: this.actorId,
+			deviceId: this.deviceId,
+			claimedDeviceIds,
+			legacyActorIds: claimedDeviceIds.map((peerId) => `legacy-sync:${peerId}`),
+			enforceScopeVisibility: true,
+			// Resolve the visible scope set once per request so the SQL filter can
+			// use the index-eligible `scope_id IN (...)` fast path instead of the
+			// per-row EXISTS predicate. Fronts get()/recent()/recentByKinds() and
+			// every viewer-server route.
+			visibleScopeIds: resolveVisibleScopeIds(this.db, this.deviceId),
+		};
+	}
+
+	private scopeVisibleFilterContext(): OwnershipFilterContext {
+		return this.ownershipFilterContext();
+	}
+
 	// get
 
 	/**
@@ -391,11 +570,14 @@ export class MemoryStore {
 	 * Returns null if not found (does not filter by active status).
 	 */
 	get(memoryId: number): MemoryItemResponse | null {
-		const row = this.d
-			.select()
-			.from(schema.memoryItems)
-			.where(eq(schema.memoryItems.id, memoryId))
-			.get() as MemoryItem | undefined;
+		const filterResult = buildFilterClausesWithContext(null, this.scopeVisibleFilterContext());
+		const whereSql = buildWhereSql(
+			["memory_items.id = ?", ...filterResult.clauses],
+			[memoryId, ...filterResult.params],
+		);
+		const row = this.d.get<MemoryItem>(
+			sql`SELECT memory_items.* FROM memory_items WHERE ${whereSql}`,
+		);
 		if (!row) return null;
 		return parseMetadata(row);
 	}
@@ -551,9 +733,32 @@ export class MemoryStore {
 	): number {
 		const validKind = validateMemoryKind(kind);
 		const now = nowIso();
-		const tagsText = tags ? [...new Set(tags)].sort().join(" ") : "";
-		const metaPayload = { ...(metadata ?? {}) };
-		const dedupKey = buildMemoryDedupKey(title);
+
+		// Scan for secrets BEFORE any further processing. The redacted forms are
+		// what get deduped, embedded, and persisted; the originals never reach
+		// disk. There is no override flag — see secret-scanner.ts.
+		const scanner = this.scanner;
+		const titleScan = scanner.scan(title);
+		const bodyScan = scanner.scan(bodyText);
+		const safeTitle = titleScan.redacted;
+		const safeBody = bodyScan.redacted;
+
+		// Tags are written verbatim into tags_text and mirrored into the FTS
+		// index. Scan each one so a malformed caller can't use a tag as a
+		// scanner bypass.
+		const tagDetections: ScanDetection[] = [];
+		const safeTags = tags
+			? tags.map((t) => {
+					const r = scanner.scan(t);
+					tagDetections.push(...r.detections);
+					return r.redacted;
+				})
+			: undefined;
+		const tagsText = safeTags ? [...new Set(safeTags)].sort().join(" ") : "";
+
+		const metaScan = scanner.redactValue(metadata ?? {});
+		const metaPayload = { ...(metaScan.value as Record<string, unknown>) };
+		const dedupKey = buildMemoryDedupKey(safeTitle);
 
 		metaPayload.clock_device_id ??= this.deviceId;
 		const importKey = (metaPayload.import_key as string) || randomUUID();
@@ -575,17 +780,31 @@ export class MemoryStore {
 
 		// Resolve provenance fields
 		const provenance = this.resolveProvenance(metaPayload);
+		const scopeId = resolveSessionScopeId(this.db, {
+			sessionId,
+			workspaceId: provenance.workspace_id,
+		});
+
+		// Denormalize the session's project name onto memory_items so that
+		// cross-device sync (which does not replicate sessions) can still
+		// surface this memory under its real project identity on peers.
+		const sessionProject = (this.d
+			.select({ project: schema.sessions.project })
+			.from(schema.sessions)
+			.where(eq(schema.sessions.id, sessionId))
+			.get()?.project ?? null) as string | null;
 
 		const existingHit = this.findExistingDuplicateMemory(
 			sessionId,
 			validKind,
-			title,
+			safeTitle,
 			dedupKey,
+			scopeId,
 			provenance,
 			now,
 		);
 		if (existingHit != null) {
-			this.logDedupHit(existingHit, validKind, title);
+			this.logDedupHit(existingHit, validKind, safeTitle);
 			return existingHit.id;
 		}
 
@@ -600,9 +819,9 @@ export class MemoryStore {
 					.values({
 						session_id: sessionId,
 						kind: validKind,
-						title,
+						title: safeTitle,
 						subtitle,
-						body_text: bodyText,
+						body_text: safeBody,
 						confidence,
 						tags_text: tagsText,
 						active: 1,
@@ -628,6 +847,8 @@ export class MemoryStore {
 						rev: 1,
 						dedup_key: dedupKey,
 						import_key: importKey,
+						scope_id: scopeId,
+						project: sessionProject,
 					})
 					.returning({ id: schema.memoryItems.id })
 					.all();
@@ -651,21 +872,45 @@ export class MemoryStore {
 			const existingSameSessionHit = this.findExistingDuplicateMemory(
 				sessionId,
 				validKind,
-				title,
+				safeTitle,
 				dedupKey,
+				scopeId,
 				provenance,
 				now,
 			);
 			if (existingSameSessionHit != null) {
-				this.logDedupHit(existingSameSessionHit, validKind, title);
+				this.logDedupHit(existingSameSessionHit, validKind, safeTitle);
 				return existingSameSessionHit.id;
 			}
 			throw error;
 		}
 
-		this.enqueueVectorWrite(memoryId, title, bodyText);
+		this.enqueueVectorWrite(memoryId, safeTitle, safeBody);
+
+		const detections = mergeDetections(
+			titleScan.detections,
+			bodyScan.detections,
+			metaScan.detections,
+		);
+		if (detections.length > 0) {
+			this.logSecretRedactions(memoryId, validKind, detections);
+		}
 
 		return memoryId;
+	}
+
+	/**
+	 * Log secret-redaction events for observability. Records the kind and
+	 * count only — never the matched value. Gated on CODEMEM_DEBUG so normal
+	 * use stays quiet, but the call site always runs so test coverage and
+	 * future structured-logging hooks have a single chokepoint to grow into.
+	 */
+	private logSecretRedactions(memoryId: number, kind: string, detections: ScanDetection[]): void {
+		if (process.env[CODEMEM_DEBUG_ENV] !== "1") return;
+		const summary = detections.map((d) => `${d.kind}=${d.count}`).join(",");
+		process.stderr.write(
+			`[codemem] secret_scanner redacted memory_id=${memoryId} kind=${kind} detections=${summary}\n`,
+		);
 	}
 
 	// provenance resolution
@@ -750,30 +995,47 @@ export class MemoryStore {
 	 * 3. actor_id in legacy sync actor ids → owned
 	 */
 	memoryOwnedBySelf(item: MemoryItem | MemoryResult | Record<string, unknown>): boolean {
-		const rec = item as Record<string, unknown>;
-		// Check top-level columns first (MemoryItem / DB row),
-		// then metadata dict (MemoryResult from search populates provenance there).
-		// For raw DB rows, metadata_json is a string — parse it so legacy rows
-		// whose actor_id/origin_device_id live inside metadata_json still pass
-		// ownership checks.
-		let meta = (rec.metadata ?? {}) as Record<string, unknown>;
-		if (!rec.metadata && typeof rec.metadata_json === "string") {
-			meta = fromJson(rec.metadata_json);
-		}
+		// Always re-reads sync_peers via sameActorPeerIds(). This method
+		// authorizes mutating APIs (forgetMemory / setMemoryVisibility /
+		// reassignMemoryScope etc.) so it must reflect peer claim changes
+		// the moment they land — no caching here. Callers that legitimately
+		// loop over many memories (search ranking, widening filters) should
+		// snapshot once via buildOwnershipPredicate() and reuse the closure.
+		return this.buildOwnershipPredicate()(item);
+	}
 
-		const actorId = cleanStr(rec.actor_id) ?? cleanStr(meta.actor_id);
-		if (actorId === this.actorId) return true;
-
-		const deviceId = cleanStr(rec.origin_device_id) ?? cleanStr(meta.origin_device_id);
-		if (deviceId === this.deviceId) return true;
-
-		const claimedPeers = new Set(this.sameActorPeerIds());
-		if (deviceId && claimedPeers.has(deviceId)) return true;
-
-		const legacyActorIds = new Set(this.claimedSameActorLegacyActorIds());
-		if (actorId && legacyActorIds.has(actorId)) return true;
-
-		return false;
+	/**
+	 * Snapshot the current ownership state into a fast inline predicate.
+	 *
+	 * Used to amortize the sync_peers SELECTs across hot loops in the
+	 * search ranker. The closure captures the actor + device + claimed-peer
+	 * sets at construction time and returns synchronous boolean checks
+	 * without touching sqlite. Because the snapshot is frozen, callers
+	 * should rebuild the predicate once per request — never share one
+	 * across requests where peer claims could change in between.
+	 */
+	buildOwnershipPredicate(): (
+		item: MemoryItem | MemoryResult | Record<string, unknown>,
+	) => boolean {
+		const peerIds = this.sameActorPeerIds();
+		const claimedDeviceIds = new Set(peerIds);
+		const legacyActorIds = new Set(peerIds.map((peerId) => `legacy-sync:${peerId}`));
+		const ownerActorId = this.actorId;
+		const ownerDeviceId = this.deviceId;
+		return (item) => {
+			const rec = item as Record<string, unknown>;
+			let meta = (rec.metadata ?? {}) as Record<string, unknown>;
+			if (!rec.metadata && typeof rec.metadata_json === "string") {
+				meta = fromJson(rec.metadata_json);
+			}
+			const actorId = cleanStr(rec.actor_id) ?? cleanStr(meta.actor_id);
+			if (actorId === ownerActorId) return true;
+			const deviceId = cleanStr(rec.origin_device_id) ?? cleanStr(meta.origin_device_id);
+			if (deviceId === ownerDeviceId) return true;
+			if (deviceId && claimedDeviceIds.has(deviceId)) return true;
+			if (actorId && legacyActorIds.has(actorId)) return true;
+			return false;
+		};
 	}
 
 	// forget
@@ -835,7 +1097,7 @@ export class MemoryStore {
 	 */
 	recent(limit = 10, filters?: MemoryFilters | null, offset = 0): MemoryItemResponse[] {
 		const baseClauses = ["memory_items.active = 1"];
-		const filterResult = buildFilterClauses(filters);
+		const filterResult = buildFilterClausesWithContext(filters, this.scopeVisibleFilterContext());
 		const allClauses = [...baseClauses, ...filterResult.clauses];
 		const whereSql = buildWhereSql(allClauses, filterResult.params);
 
@@ -848,7 +1110,7 @@ export class MemoryStore {
 		const rows = this.d.all<MemoryItem>(
 			sql`SELECT memory_items.* FROM ${fromSql}
 				WHERE ${whereSql}
-				ORDER BY created_at DESC
+				ORDER BY created_at DESC, id DESC
 				LIMIT ${limit} OFFSET ${Math.max(offset, 0)}`,
 		);
 
@@ -871,7 +1133,7 @@ export class MemoryStore {
 
 		const kindPlaceholders = kindsList.map(() => "?").join(", ");
 		const baseClauses = ["memory_items.active = 1", `memory_items.kind IN (${kindPlaceholders})`];
-		const filterResult = buildFilterClauses(filters);
+		const filterResult = buildFilterClausesWithContext(filters, this.scopeVisibleFilterContext());
 		const allClauses = [...baseClauses, ...filterResult.clauses];
 		const params = [...kindsList, ...filterResult.params];
 		const whereSql = buildWhereSql(allClauses, params);
@@ -883,11 +1145,68 @@ export class MemoryStore {
 		const rows = this.d.all<MemoryItem>(
 			sql`SELECT memory_items.* FROM ${fromSql}
 				WHERE ${whereSql}
-				ORDER BY created_at DESC
+				ORDER BY created_at DESC, id DESC
 				LIMIT ${limit} OFFSET ${Math.max(offset, 0)}`,
 		);
 
 		return rows.map((row) => parseMetadata(row));
+	}
+
+	// usageAggregate
+
+	/**
+	 * Neutral, unfiltered token/event aggregate over usage_events, grouped by
+	 * event kind. This is the shared SQL aggregate used by both stats() and the
+	 * viewer /api/usage route so neither has to scan the (potentially large)
+	 * usage_events table into JS to sum it. The COALESCE on tokens_saved matches
+	 * the historical stats() semantics (treat NULL saved as 0). When
+	 * projectFilter is a non-empty string, rows are restricted to the given
+	 * project via the sessions join; otherwise every row is aggregated.
+	 * Callers sort the returned rows as needed.
+	 */
+	usageAggregate(projectFilter?: string | null): Array<{
+		event: string;
+		count: number;
+		tokens_read: number;
+		tokens_written: number;
+		tokens_saved: number;
+	}> {
+		// Two near-identical GROUP BYs kept deliberately separate: the global
+		// variant avoids a needless sessions join, and the projections (incl.
+		// the tokens_saved double-COALESCE) must stay byte-identical in both.
+		const hasProject = typeof projectFilter === "string" && projectFilter.length > 0;
+		const rows = hasProject
+			? (this.db
+					.prepare(
+						`SELECT usage_events.event AS event,
+							COUNT(*) AS count,
+							COALESCE(SUM(usage_events.tokens_read), 0) AS tokens_read,
+							COALESCE(SUM(usage_events.tokens_written), 0) AS tokens_written,
+							COALESCE(SUM(COALESCE(usage_events.tokens_saved, 0)), 0) AS tokens_saved
+						 FROM usage_events
+						 JOIN sessions ON sessions.id = usage_events.session_id
+						 WHERE sessions.project = ?
+						 GROUP BY usage_events.event`,
+					)
+					.all(projectFilter) as Record<string, unknown>[])
+			: (this.db
+					.prepare(
+						`SELECT event AS event,
+							COUNT(*) AS count,
+							COALESCE(SUM(tokens_read), 0) AS tokens_read,
+							COALESCE(SUM(tokens_written), 0) AS tokens_written,
+							COALESCE(SUM(COALESCE(tokens_saved, 0)), 0) AS tokens_saved
+						 FROM usage_events
+						 GROUP BY event`,
+					)
+					.all() as Record<string, unknown>[]);
+		return rows.map((row) => ({
+			event: String(row.event),
+			count: Number(row.count ?? 0),
+			tokens_read: Number(row.tokens_read ?? 0),
+			tokens_written: Number(row.tokens_written ?? 0),
+			tokens_saved: Number(row.tokens_saved ?? 0),
+		}));
 	}
 
 	// stats
@@ -899,22 +1218,44 @@ export class MemoryStore {
 		// biome-ignore lint/suspicious/noExplicitAny: Drizzle table union type is unwieldy
 		const countRows = (tbl: any) =>
 			this.d.select({ c: sql<number>`COUNT(*)` }).from(tbl).get()?.c ?? 0;
+		const visibleFilter = buildFilterClausesWithContext(null, this.scopeVisibleFilterContext());
+		const countVisibleMemoryRows = (extraClauses: string[] = []): number => {
+			const clauses = [...extraClauses, ...visibleFilter.clauses];
+			const row = this.db
+				.prepare(`SELECT COUNT(*) AS c FROM memory_items WHERE ${clauses.join(" AND ")}`)
+				.get(...visibleFilter.params) as { c: number | null } | undefined;
+			return row?.c ?? 0;
+		};
+		const countVisibleMemorySessions = (): number => {
+			const clauses = ["memory_items.active = 1", ...visibleFilter.clauses];
+			const row = this.db
+				.prepare(
+					`SELECT COUNT(DISTINCT memory_items.session_id) AS c
+					 FROM memory_items
+					 WHERE ${clauses.join(" AND ")}`,
+				)
+				.get(...visibleFilter.params) as { c: number | null } | undefined;
+			return row?.c ?? 0;
+		};
 
-		const totalMemories = countRows(schema.memoryItems);
-		const activeMemories =
-			this.d
-				.select({ c: sql<number>`COUNT(*)` })
-				.from(schema.memoryItems)
-				.where(eq(schema.memoryItems.active, 1))
-				.get()?.c ?? 0;
-		const sessions = countRows(schema.sessions);
+		const totalMemories = countVisibleMemoryRows();
+		const activeMemories = countVisibleMemoryRows(["memory_items.active = 1"]);
+		const sessions = countVisibleMemorySessions();
 		const artifacts = countRows(schema.artifacts);
 		const rawEvents = countRows(schema.rawEvents);
 
 		let vectorCount = 0;
 		if (!isEmbeddingDisabled() && tableExists(this.db, "memory_vectors")) {
 			try {
-				const row = this.d.get<{ c: number | null }>(sql`SELECT COUNT(*) AS c FROM memory_vectors`);
+				const clauses = ["memory_items.active = 1", ...visibleFilter.clauses];
+				const row = this.db
+					.prepare(
+						`SELECT COUNT(*) AS c
+						 FROM memory_vectors
+						 JOIN memory_items ON memory_items.id = memory_vectors.memory_id
+						 WHERE ${clauses.join(" AND ")}`,
+					)
+					.get(...visibleFilter.params) as { c: number | null } | undefined;
 				vectorCount = row?.c ?? 0;
 			} catch {
 				vectorCount = 0;
@@ -922,12 +1263,10 @@ export class MemoryStore {
 		}
 		const vectorCoverage = activeMemories > 0 ? Math.min(1, vectorCount / activeMemories) : 0;
 
-		const tagsFilled =
-			this.d
-				.select({ c: sql<number>`COUNT(*)` })
-				.from(schema.memoryItems)
-				.where(and(eq(schema.memoryItems.active, 1), sql`TRIM(tags_text) != ''`))
-				.get()?.c ?? 0;
+		const tagsFilled = countVisibleMemoryRows([
+			"memory_items.active = 1",
+			"TRIM(memory_items.tags_text) != ''",
+		]);
 		const tagsCoverage = activeMemories > 0 ? Math.min(1, tagsFilled / activeMemories) : 0;
 
 		let sizeBytes = 0;
@@ -937,27 +1276,12 @@ export class MemoryStore {
 			// File may not exist yet or be inaccessible
 		}
 
-		// Usage stats
-		const usageRows = this.d
-			.select({
-				event: schema.usageEvents.event,
-				count: sql<number>`COUNT(*)`,
-				tokens_read: sql<number | null>`SUM(tokens_read)`,
-				tokens_written: sql<number | null>`SUM(tokens_written)`,
-				tokens_saved: sql<number | null>`SUM(COALESCE(tokens_saved, 0))`,
-			})
-			.from(schema.usageEvents)
-			.groupBy(schema.usageEvents.event)
-			.orderBy(desc(sql`COUNT(*)`))
-			.all();
-
-		const usageEvents = usageRows.map((r) => ({
-			event: r.event,
-			count: r.count,
-			tokens_read: r.tokens_read ?? 0,
-			tokens_written: r.tokens_written ?? 0,
-			tokens_saved: r.tokens_saved ?? 0,
-		}));
+		// Usage stats. Sort by count DESC to preserve the historical
+		// ORDER BY COUNT(*) DESC ordering of this block, with event name as a
+		// stable tiebreaker so equal-count rows have a deterministic order.
+		const usageEvents = this.usageAggregate().sort(
+			(a, b) => b.count - a.count || a.event.localeCompare(b.event),
+		);
 
 		const totalEvents = usageEvents.reduce((s, e) => s + e.count, 0);
 		const totalTokensRead = usageEvents.reduce((s, e) => s + e.tokens_read, 0);
@@ -1063,14 +1387,124 @@ export class MemoryStore {
 						opType: "upsert",
 						deviceId: this.deviceId,
 					});
-				} catch {
-					// Non-fatal
+				} catch (err) {
+					// Non-fatal for the visibility write itself, but surface
+					// the failure: peers won't learn about this change until
+					// the next reconciliation pass, and a silent swallow
+					// hides whatever broke the replication path.
+					console.warn(
+						`[codemem] updateMemoryVisibility: replication-op emit failed for memory ${memoryId}: ${err instanceof Error ? err.message : String(err)}`,
+					);
 				}
 
 				const updated = this.get(memoryId);
 				if (!updated) {
 					throw new Error("memory not found after update");
 				}
+				return updated;
+			})
+			.immediate();
+	}
+
+	// reassignMemoryScope
+
+	/**
+	 * Move an active, locally owned memory to another Sharing domain.
+	 *
+	 * Scope assignment is effectively immutable once a memory may have replicated,
+	 * so this is not a bare `scope_id` update. The transaction emits an old-scope
+	 * delete/tombstone op followed by a new-scope upsert op with a newer Lamport
+	 * revision. Old-scope recipients learn to stop syncing the memory, while
+	 * already-copied data on those devices may still remain outside this store.
+	 */
+	reassignMemoryScope(memoryId: number, newScopeId: string): MemoryItemResponse {
+		const cleanedScopeId = newScopeId.trim();
+		if (!cleanedScopeId) throw new Error("scope_id must be a non-empty string");
+
+		return this.db
+			.transaction(() => {
+				const row = this.d
+					.select()
+					.from(schema.memoryItems)
+					.where(and(eq(schema.memoryItems.id, memoryId), eq(schema.memoryItems.active, 1)))
+					.get() as MemoryItem | undefined;
+				if (!row) throw new Error("memory not found");
+				if (!this.memoryOwnedBySelf(row)) throw new Error("memory not owned by this device");
+
+				const targetScope = this.d
+					.select({ scope_id: schema.replicationScopes.scope_id })
+					.from(schema.replicationScopes)
+					.where(
+						and(
+							eq(schema.replicationScopes.scope_id, cleanedScopeId),
+							eq(schema.replicationScopes.status, "active"),
+						),
+					)
+					.get();
+				if (!targetScope) throw new Error(`scope not found or inactive: ${cleanedScopeId}`);
+
+				const oldScopeId = ensureMemoryScopeId(this.db, memoryId);
+				if (!oldScopeId) throw new Error("memory scope could not be resolved");
+				if (oldScopeId === cleanedScopeId) {
+					const current = this.get(memoryId);
+					if (!current) throw new Error("memory not found after scope check");
+					return current;
+				}
+
+				// Block shared-memory scope moves while sync requires attention.
+				this.assertSharedMutationAllowed(row.visibility);
+
+				const now = nowIso();
+				const reassignmentOpPrefix = `~scope-reassign:${randomUUID()}`;
+				const oldRev = row.rev ?? 0;
+				const tombstoneRev = oldRev + 1;
+				const upsertRev = oldRev + 2;
+				const meta = fromJson(row.metadata_json);
+				meta.clock_device_id = this.deviceId;
+				meta.last_scope_reassignment = {
+					old_scope_id: oldScopeId,
+					new_scope_id: cleanedScopeId,
+					reassigned_at: now,
+					warning:
+						"Already-copied data may remain on devices that previously received the old scope.",
+				};
+
+				this.d
+					.update(schema.memoryItems)
+					.set({
+						scope_id: cleanedScopeId,
+						updated_at: now,
+						metadata_json: toJson(meta),
+						rev: upsertRev,
+					})
+					.where(eq(schema.memoryItems.id, memoryId))
+					.run();
+
+				recordReplicationOp(this.db, {
+					memoryId,
+					opType: "delete",
+					deviceId: this.deviceId,
+					scopeId: oldScopeId,
+					clockRev: tombstoneRev,
+					clockUpdatedAt: now,
+					clockDeviceId: this.deviceId,
+					createdAt: now,
+					opId: `${reassignmentOpPrefix}:0-delete`,
+				});
+				recordReplicationOp(this.db, {
+					memoryId,
+					opType: "upsert",
+					deviceId: this.deviceId,
+					scopeId: cleanedScopeId,
+					clockRev: upsertRev,
+					clockUpdatedAt: now,
+					clockDeviceId: this.deviceId,
+					createdAt: now,
+					opId: `${reassignmentOpPrefix}:1-upsert`,
+				});
+
+				const updated = this.get(memoryId);
+				if (!updated) throw new Error("memory not found after scope reassignment");
 				return updated;
 			})
 			.immediate();
@@ -1212,6 +1646,24 @@ export class MemoryStore {
 		return buildMemoryPackTrace(this, context, limit, tokenBudget ?? null, filters);
 	}
 
+	buildMemoryPackWithTrace(
+		context: string,
+		limit?: number,
+		tokenBudget?: number | null,
+		filters?: MemoryFilters,
+		renderOptions?: PackRenderOptions,
+	): PackArtifacts {
+		return buildMemoryPackWithTrace(
+			this,
+			context,
+			limit,
+			tokenBudget ?? null,
+			filters,
+			undefined,
+			renderOptions,
+		);
+	}
+
 	/**
 	 * Build a memory pack with semantic candidate merging.
 	 *
@@ -1227,6 +1679,23 @@ export class MemoryStore {
 		renderOptions?: PackRenderOptions,
 	): Promise<PackResponse> {
 		return buildMemoryPackAsync(this, context, limit, tokenBudget ?? null, filters, renderOptions);
+	}
+
+	async buildMemoryPackWithTraceAsync(
+		context: string,
+		limit?: number,
+		tokenBudget?: number | null,
+		filters?: MemoryFilters,
+		renderOptions?: PackRenderOptions,
+	): Promise<PackArtifacts> {
+		return buildMemoryPackWithTraceAsync(
+			this,
+			context,
+			limit,
+			tokenBudget ?? null,
+			filters,
+			renderOptions,
+		);
 	}
 
 	async buildMemoryPackTraceAsync(
@@ -1400,6 +1869,66 @@ export class MemoryStore {
 	}
 
 	/**
+	 * Report raw_events storage usage and how many rows fall before an age cutoff.
+	 *
+	 * Age-based only (mirrors planReplicationOpsAgePrune / estimateReplicationOps
+	 * style): counts total rows, estimates the on-disk bytes for the raw_events
+	 * table and its indexes, and counts rows with ts_wall_ms older than the
+	 * cutoff implied by maxAgeMs. Used by the prune-raw-events dry-run report.
+	 */
+	rawEventsRetentionStatus(maxAgeMs: number): {
+		total_rows: number;
+		estimated_bytes: number;
+		candidate_rows: number;
+		cutoff_ts_wall_ms: number | null;
+	} {
+		const totalRow = this.d.select({ total: sql<number>`COUNT(*)` }).from(schema.rawEvents).get();
+		const totalRows = Number(totalRow?.total ?? 0);
+
+		let candidateRows = 0;
+		let cutoffTsWallMs: number | null = null;
+		if (maxAgeMs > 0) {
+			cutoffTsWallMs = Date.now() - maxAgeMs;
+			const candidateRow = this.d
+				.select({ total: sql<number>`COUNT(*)` })
+				.from(schema.rawEvents)
+				.where(
+					and(
+						isNotNull(schema.rawEvents.ts_wall_ms),
+						lt(schema.rawEvents.ts_wall_ms, cutoffTsWallMs),
+					),
+				)
+				.get();
+			candidateRows = Number(candidateRow?.total ?? 0);
+		}
+
+		return {
+			total_rows: totalRows,
+			estimated_bytes: this.estimateRawEventsBytes(),
+			candidate_rows: candidateRows,
+			cutoff_ts_wall_ms: cutoffTsWallMs,
+		};
+	}
+
+	private estimateRawEventsBytes(): number {
+		try {
+			const row = this.db
+				.prepare(
+					`SELECT COALESCE(SUM(pgsize), 0) AS total_bytes
+					 FROM dbstat
+					 WHERE name = 'raw_events'
+					    OR name LIKE 'idx_raw_events_%'
+					    OR name LIKE 'sqlite_autoindex_raw_events_%'`,
+				)
+				.get() as { total_bytes?: number | string | null } | undefined;
+			const total = Number(row?.total_bytes ?? 0);
+			return Number.isFinite(total) && total >= 0 ? total : 0;
+		} catch {
+			return 0;
+		}
+	}
+
+	/**
 	 * Mark stuck flush batches (started/running/pending/claimed) as failed.
 	 * Port of mark_stuck_raw_event_batches_as_error().
 	 */
@@ -1454,6 +1983,7 @@ export class MemoryStore {
 				project: schema.rawEventSessions.project,
 				started_at: schema.rawEventSessions.started_at,
 				last_seen_ts_wall_ms: schema.rawEventSessions.last_seen_ts_wall_ms,
+				last_received_event_seq: schema.rawEventSessions.last_received_event_seq,
 				last_flushed_event_seq: schema.rawEventSessions.last_flushed_event_seq,
 			})
 			.from(schema.rawEventSessions)
@@ -1465,6 +1995,7 @@ export class MemoryStore {
 			project: row.project,
 			started_at: row.started_at,
 			last_seen_ts_wall_ms: row.last_seen_ts_wall_ms,
+			last_received_event_seq: row.last_received_event_seq,
 			last_flushed_event_seq: row.last_flushed_event_seq,
 		};
 	}
@@ -1494,6 +2025,7 @@ export class MemoryStore {
 		source = "opencode",
 		afterEventSeq = -1,
 		limit?: number | null,
+		throughEventSeq?: number | null,
 	): Record<string, unknown>[] {
 		const [s, sid] = this.normalizeStreamIdentity(source, opencodeSessionId);
 		const baseQuery = this.d
@@ -1511,6 +2043,7 @@ export class MemoryStore {
 					eq(schema.rawEvents.source, s),
 					eq(schema.rawEvents.stream_id, sid),
 					gt(schema.rawEvents.event_seq, afterEventSeq),
+					throughEventSeq == null ? undefined : lte(schema.rawEvents.event_seq, throughEventSeq),
 				),
 			)
 			.orderBy(schema.rawEvents.event_seq);
@@ -2168,19 +2701,127 @@ export class MemoryStore {
 	}
 
 	sameActorPeerIds(): string[] {
-		if (!tableExists(this.db, "sync_peers")) return [];
-		const rows = this.d
-			.select({ peer_device_id: schema.syncPeers.peer_device_id })
-			.from(schema.syncPeers)
-			.where(
-				or(
-					eq(schema.syncPeers.claimed_local_actor, 1),
-					eq(schema.syncPeers.actor_id, this.actorId),
-				),
-			)
-			.orderBy(schema.syncPeers.peer_device_id)
-			.all();
-		return rows.map((row) => String(row.peer_device_id ?? "").trim()).filter(Boolean);
+		const deviceIds = new Set<string>();
+		const boundDeviceIds = new Set<string>();
+		const locallyBoundDeviceIds = new Set<string>();
+		const hasIdentityBindings =
+			tableExists(this.db, "identity_devices") &&
+			["device_id", "identity_id", "status", "provenance"].every((column) =>
+				columnExists(this.db, "identity_devices", column),
+			);
+		if (tableExists(this.db, "identity_devices") && !hasIdentityBindings) {
+			// A partial binding schema cannot safely distinguish authoritative evidence.
+			return [];
+		}
+		if (hasIdentityBindings) {
+			const bindings = this.db
+				.prepare("SELECT device_id, identity_id, status, provenance FROM identity_devices")
+				.all() as Array<{
+				device_id: string;
+				identity_id: string;
+				status: string;
+				provenance: string;
+			}>;
+			const hasActorIdentityState =
+				bindings.length > 0 &&
+				tableExists(this.db, "actors") &&
+				["actor_id", "status", "merged_into_actor_id"].every((column) =>
+					columnExists(this.db, "actors", column),
+				);
+			const localActor = hasActorIdentityState
+				? (this.db
+						.prepare("SELECT status, merged_into_actor_id FROM actors WHERE actor_id = ?")
+						.get(this.actorId) as
+						| { status: string; merged_into_actor_id: string | null }
+						| undefined)
+				: undefined;
+			const localActorIsActive =
+				localActor?.status === "active" && !localActor.merged_into_actor_id;
+			for (const binding of bindings) {
+				const deviceId = String(binding.device_id ?? "").trim();
+				if (!deviceId) continue;
+				boundDeviceIds.add(deviceId);
+				if (
+					localActorIsActive &&
+					String(binding.identity_id ?? "").trim() === this.actorId &&
+					binding.status === "active" &&
+					SAME_PERSON_BINDING_PROVENANCE.has(binding.provenance)
+				) {
+					deviceIds.add(deviceId);
+					locallyBoundDeviceIds.add(deviceId);
+				}
+			}
+		}
+		if (tableExists(this.db, "sync_peers")) {
+			const hasAliasEvidence = ["peer_device_id", "public_key", "pinned_fingerprint"].every(
+				(column) => columnExists(this.db, "sync_peers", column),
+			);
+			if (boundDeviceIds.size > 0 && !hasAliasEvidence) return [...deviceIds].sort();
+			if (boundDeviceIds.size > 0 && hasAliasEvidence) {
+				const peerEvidence = this.db
+					.prepare("SELECT peer_device_id, public_key, pinned_fingerprint FROM sync_peers")
+					.all() as Array<{
+					peer_device_id: string;
+					public_key: string | null;
+					pinned_fingerprint: string | null;
+				}>;
+				const validatedFingerprint = (row: (typeof peerEvidence)[number]): string | null => {
+					const publicKey = String(row.public_key ?? "").trim();
+					const pinned = String(row.pinned_fingerprint ?? "").trim();
+					if (!publicKey) return pinned || null;
+					const derived = fingerprintPublicKey(publicKey);
+					return pinned && pinned !== derived ? null : pinned || derived;
+				};
+				const provenFingerprint = (row: (typeof peerEvidence)[number]): string | null =>
+					String(row.public_key ?? "").trim() ? validatedFingerprint(row) : null;
+				const boundFingerprints = new Set<string>();
+				const locallyBoundFingerprints = new Set<string>();
+				const conflictingBoundFingerprints = new Set<string>();
+				for (const row of peerEvidence) {
+					const deviceId = String(row.peer_device_id ?? "").trim();
+					const fingerprint = validatedFingerprint(row);
+					if (!deviceId || !fingerprint || !boundDeviceIds.has(deviceId)) continue;
+					boundFingerprints.add(fingerprint);
+					if (locallyBoundDeviceIds.has(deviceId)) {
+						if (provenFingerprint(row)) locallyBoundFingerprints.add(fingerprint);
+					} else {
+						conflictingBoundFingerprints.add(fingerprint);
+					}
+				}
+				for (const fingerprint of conflictingBoundFingerprints) {
+					locallyBoundFingerprints.delete(fingerprint);
+				}
+				for (const row of peerEvidence) {
+					const deviceId = String(row.peer_device_id ?? "").trim();
+					const fingerprint = validatedFingerprint(row);
+					if (!deviceId || !fingerprint || !boundFingerprints.has(fingerprint)) continue;
+					const hasAuthoritativeBinding = boundDeviceIds.has(deviceId);
+					boundDeviceIds.add(deviceId);
+					if (
+						!hasAuthoritativeBinding &&
+						locallyBoundFingerprints.has(fingerprint) &&
+						provenFingerprint(row)
+					) {
+						deviceIds.add(deviceId);
+					}
+				}
+			}
+			const legacyRows = this.d
+				.select({ peer_device_id: schema.syncPeers.peer_device_id })
+				.from(schema.syncPeers)
+				.where(
+					or(
+						eq(schema.syncPeers.claimed_local_actor, 1),
+						eq(schema.syncPeers.actor_id, this.actorId),
+					),
+				)
+				.all();
+			for (const row of legacyRows) {
+				const deviceId = String(row.peer_device_id ?? "").trim();
+				if (deviceId && !boundDeviceIds.has(deviceId)) deviceIds.add(deviceId);
+			}
+		}
+		return [...deviceIds].sort();
 	}
 
 	claimedSameActorLegacyActorIds(): string[] {

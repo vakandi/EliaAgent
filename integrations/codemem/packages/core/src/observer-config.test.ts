@@ -272,6 +272,20 @@ describe("getProviderApiKey", () => {
 });
 
 describe("getCodememEnvOverrides", () => {
+	it("includes shared observer reasoning env overrides when set", () => {
+		process.env.CODEMEM_OBSERVER_REASONING_EFFORT = "medium";
+		process.env.CODEMEM_OBSERVER_REASONING_SUMMARY = "auto";
+		try {
+			expect(getCodememEnvOverrides()).toMatchObject({
+				observer_reasoning_effort: "CODEMEM_OBSERVER_REASONING_EFFORT",
+				observer_reasoning_summary: "CODEMEM_OBSERVER_REASONING_SUMMARY",
+			});
+		} finally {
+			delete process.env.CODEMEM_OBSERVER_REASONING_EFFORT;
+			delete process.env.CODEMEM_OBSERVER_REASONING_SUMMARY;
+		}
+	});
+
 	it("includes sync retention env overrides when set", () => {
 		process.env.CODEMEM_SYNC_RETENTION_ENABLED = "1";
 		process.env.CODEMEM_SYNC_RETENTION_MAX_AGE_DAYS = "14";
@@ -286,6 +300,20 @@ describe("getCodememEnvOverrides", () => {
 			delete process.env.CODEMEM_SYNC_RETENTION_ENABLED;
 			delete process.env.CODEMEM_SYNC_RETENTION_MAX_AGE_DAYS;
 			delete process.env.CODEMEM_SYNC_RETENTION_MAX_SIZE_MB;
+		}
+	});
+
+	it("includes raw-events retention env overrides when set", () => {
+		process.env.CODEMEM_RAW_EVENTS_RETENTION_ENABLED = "1";
+		process.env.CODEMEM_RAW_EVENTS_RETENTION_MAX_AGE_DAYS = "45";
+		try {
+			expect(getCodememEnvOverrides()).toMatchObject({
+				raw_events_retention_enabled: "CODEMEM_RAW_EVENTS_RETENTION_ENABLED",
+				raw_events_retention_max_age_days: "CODEMEM_RAW_EVENTS_RETENTION_MAX_AGE_DAYS",
+			});
+		} finally {
+			delete process.env.CODEMEM_RAW_EVENTS_RETENTION_ENABLED;
+			delete process.env.CODEMEM_RAW_EVENTS_RETENTION_MAX_AGE_DAYS;
 		}
 	});
 });

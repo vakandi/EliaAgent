@@ -8,10 +8,16 @@ import { deviceNeedsFriendlyName, resolveFriendlyDeviceName } from "./device-nam
 import { cleanText } from "./internal";
 import { derivePeerTrustSummary, derivePeerUiStatus } from "./peer-status";
 import { deriveDuplicatePeople } from "./people-derivations";
+import { deriveTeamSyncPrimaryStatus } from "./primary-status";
 import type {
 	ActorLike,
+	CoordinatorSetupBlocker,
 	DiscoveredDeviceLike,
 	PeerLike,
+	ProjectShareOperationLike,
+	RecipientPolicyReconciliationLike,
+	TeamSyncDaemonState,
+	TeamSyncPresenceState,
 	UiSyncAttentionItem,
 	UiSyncViewModel,
 } from "./types";
@@ -79,6 +85,40 @@ function createNamingItem(device: {
 	};
 }
 
+export function deriveCoordinatorSetupBlocker(
+	coordinator:
+		| {
+				configured?: boolean;
+				coordinator_url?: string | null;
+				groups?: unknown[];
+				sync_enabled?: boolean;
+		  }
+		| null
+		| undefined,
+): CoordinatorSetupBlocker | null {
+	const coordinatorUrl = cleanText(coordinator?.coordinator_url);
+	const groups = Array.isArray(coordinator?.groups) ? coordinator.groups : [];
+	if (!coordinatorUrl) {
+		return {
+			reason: "coordinator_url_missing",
+			message: "Configure a coordinator URL before pairing team devices.",
+		};
+	}
+	if (!groups.some((group) => cleanText(group))) {
+		return {
+			reason: "coordinator_groups_empty",
+			message: "Join or configure a team before pairing team devices.",
+		};
+	}
+	if (coordinator?.sync_enabled === false) {
+		return {
+			reason: "sync_disabled",
+			message: "Enable sync before pairing team devices.",
+		};
+	}
+	return null;
+}
+
 function mergeDevices(
 	peers: PeerLike[],
 	discoveredDevices: DiscoveredDeviceLike[],
@@ -118,7 +158,21 @@ function mergeDevices(
 export function deriveSyncViewModel(input: {
 	actors?: ActorLike[];
 	peers?: PeerLike[];
-	coordinator?: { discovered_devices?: DiscoveredDeviceLike[] };
+	coordinator?: {
+		configured?: boolean;
+		sync_enabled?: boolean;
+		presence_status?: TeamSyncPresenceState;
+		groups?: unknown[];
+		discovered_devices?: DiscoveredDeviceLike[];
+	};
+	status?: {
+		enabled?: boolean;
+		daemon_state?: TeamSyncDaemonState;
+		daemon_running?: boolean;
+	} | null;
+	shareOperations?: ProjectShareOperationLike[];
+	shareOperationsLoadError?: boolean;
+	reconciliation?: RecipientPolicyReconciliationLike | null;
 	duplicatePersonDecisions?: Record<string, string>;
 }): UiSyncViewModel {
 	const actors = Array.isArray(input.actors) ? input.actors : [];
@@ -256,6 +310,14 @@ export function deriveSyncViewModel(input: {
 	});
 
 	return {
+		primaryStatus: deriveTeamSyncPrimaryStatus({
+			status: input.status,
+			coordinator: input.coordinator,
+			peers,
+			shareOperations: input.shareOperations,
+			shareOperationsLoadError: input.shareOperationsLoadError,
+			reconciliation: input.reconciliation,
+		}),
 		summary: {
 			connectedDeviceCount: peers.filter((peer) => derivePeerUiStatus(peer) === "connected").length,
 			seenOnTeamCount: discoveredDevices.length,

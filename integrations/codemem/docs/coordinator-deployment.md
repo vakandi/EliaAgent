@@ -1,13 +1,21 @@
 # Deploying the coordinator
 
-The built-in TypeScript coordinator is the canonical deployment target for team sync. This guide covers how to run it
-natively, in a container, and how to expose it to teammates outside your local network.
+The built-in TypeScript coordinator is the canonical **operator deployment** target for cross-network discovery. Normal teammate sharing is **Projects → Sharing → Devices → Health**; the coordinator, Teams, Spaces, grants, and direct-peer state are Advanced compatibility and operations mechanics.
 
 The coordinator HTTP service is Hono-based, but the canonical deployment path today is still the built-in
-`codemem sync coordinator serve` runtime on Node/Linux with a local SQLite database. If your end goal is Cloudflare,
-validate this Linux/Node flow first, then use the dedicated Worker runbook in `docs/cloudflare-coordinator-deployment.md`.
+`codemem coordinator serve` runtime on Node/Linux with a local SQLite database. If your end goal is Cloudflare,
+validate this Linux/Node flow first, then use the dedicated Worker runbook in [Cloudflare coordinator deployment](cloudflare-coordinator-deployment.md).
 
-If you want the fastest clean validation path, use `docs/coordinator-e2e-runbook.md` alongside this guide.
+If you want the fastest clean validation path, use [the coordinator E2E runbook](coordinator-e2e-runbook.md) alongside this guide.
+
+## What the coordinator does (and does not do)
+
+- It enrolls devices in a coordinator group and advertises fresh peer addresses.
+- It does **not** grant a Project, create a direct peer relationship, or relay memory payloads.
+- **Sharing** manages Project recipients, while authoritative Team policy determines which member devices are eligible. **Devices** shows registered devices and direct Project access without inferring Team access from membership; **Health** distinguishes waiting from needs-attention recovery.
+- Removing Project access stops future delivery but cannot erase a copy already delivered to a device.
+
+Use the controls below only when you operate a coordinator, diagnose compatibility, or maintain an existing integration. Internal identifiers, fingerprints, addresses, scopes/grants, filters, epochs, and cursors belong in this operator surface—not the normal sharing workflow.
 
 ## Quick start (native)
 
@@ -16,13 +24,13 @@ If you want the fastest clean validation path, use `docs/coordinator-e2e-runbook
 npm install -g codemem
 
 # Create a coordinator group
-codemem sync coordinator group-create my-team --db-path ~/.codemem/coordinator.sqlite
+codemem coordinator group-create my-team --db-path ~/.codemem/coordinator.sqlite
 
 # Set an admin secret (required for creating invites via the API)
 set -x CODEMEM_SYNC_COORDINATOR_ADMIN_SECRET (openssl rand -base64 32)
 
 # Start the coordinator
-codemem sync coordinator serve --db-path ~/.codemem/coordinator.sqlite --host 0.0.0.0 --port 7347
+codemem coordinator serve --db-path ~/.codemem/coordinator.sqlite --coordinator-host 0.0.0.0 --coordinator-port 7347
 ```
 
 The coordinator is now listening on port 7347. Devices on the same network can connect using this machine's IP address.
@@ -35,58 +43,58 @@ coordinator rejects admin operations (invite creation, join request review) with
 ### Coordinator server
 
 ```fish
-codemem sync coordinator serve [OPTIONS]
+codemem coordinator serve [OPTIONS]
 ```
 
 | Option      | Default       | Description                            |
 |-------------|---------------|----------------------------------------|
 | `--db-path` | `~/.codemem/coordinator.sqlite` | Path to coordinator SQLite database    |
-| `--host`    | `127.0.0.1`   | Bind address (`0.0.0.0` for all interfaces) |
-| `--port`    | `7347`        | Listen port                            |
+| `--coordinator-host` | `127.0.0.1`   | Bind address (`0.0.0.0` for all interfaces) |
+| `--coordinator-port` | `7347`        | Listen port                            |
 
-### Team management
+### Team management (Advanced/operator)
 
 ```fish
 # Create a group
-codemem sync coordinator group-create <group-id> --db-path <path>
+codemem coordinator group-create <group-id> --db-path <path>
 
 # List groups
-codemem sync coordinator list-groups --db-path <path>
+codemem coordinator list-groups --db-path <path>
 
 # Enroll a device directly (admin)
-codemem sync coordinator enroll-device <group-id> <device-id> \
+codemem coordinator enroll-device <group-id> <device-id> \
   --fingerprint <fingerprint> --public-key-file <path> --db-path <path>
 
 # List enrolled devices
-codemem sync coordinator list-devices <group-id> --db-path <path>
+codemem coordinator list-devices <group-id> --db-path <path>
 
 # Rename, disable, or remove a device
-codemem sync coordinator rename-device <group-id> <device-id> --name "work-laptop" --db-path <path>
-codemem sync coordinator disable-device <group-id> <device-id> --db-path <path>
-codemem sync coordinator remove-device <group-id> <device-id> --db-path <path>
+codemem coordinator rename-device <group-id> <device-id> --name "work-laptop" --db-path <path>
+codemem coordinator disable-device <group-id> <device-id> --db-path <path>
+codemem coordinator remove-device <group-id> <device-id> --db-path <path>
 
 # Invite / join-request commands
-codemem sync coordinator create-invite <group-id> --db-path <path>
-codemem sync coordinator list-join-requests <group-id> --db-path <path>
-codemem sync coordinator approve-join-request <request-id> --db-path <path>
-codemem sync coordinator deny-join-request <request-id> --db-path <path>
+codemem coordinator create-invite <group-id> --db-path <path>
+codemem coordinator list-join-requests <group-id> --db-path <path>
+codemem coordinator approve-join-request <request-id> --db-path <path>
+codemem coordinator deny-join-request <request-id> --db-path <path>
 ```
 
 ### Invite and join flow
 
 ```fish
 # Create an invite (admin)
-codemem sync coordinator create-invite <group-id> --db-path <path>
+codemem coordinator create-invite <group-id> --db-path <path>
 
 # Import an invite (teammate)
-codemem sync coordinator import-invite <encoded-invite>
+codemem coordinator import-invite <encoded-invite>
 
 # List pending join requests (admin)
-codemem sync coordinator list-join-requests <group-id> --db-path <path>
+codemem coordinator list-join-requests <group-id> --db-path <path>
 
 # Approve or deny (admin)
-codemem sync coordinator approve-join-request <request-id> --db-path <path>
-codemem sync coordinator deny-join-request <request-id> --db-path <path>
+codemem coordinator approve-join-request <request-id> --db-path <path>
+codemem coordinator deny-join-request <request-id> --db-path <path>
 ```
 
 ## Container deployment
@@ -102,9 +110,9 @@ VOLUME /data
 
 EXPOSE 7347
 
-ENTRYPOINT ["codemem", "sync", "coordinator", "serve", \
+ENTRYPOINT ["codemem", "coordinator", "serve", \
   "--db-path", "/data/coordinator.sqlite", \
-  "--host", "0.0.0.0", "--port", "7347"]
+  "--coordinator-host", "0.0.0.0", "--coordinator-port", "7347"]
 ```
 
 Build and run:
@@ -117,7 +125,7 @@ docker run -d --name coordinator -p 7347:7347 -v coordinator-data:/data codemem-
 Initialize the group from the host:
 
 ```fish
-docker exec coordinator codemem sync coordinator group-create my-team --db-path /data/coordinator.sqlite
+docker exec coordinator codemem coordinator group-create my-team --db-path /data/coordinator.sqlite
 ```
 
 ## Exposing the coordinator
@@ -130,7 +138,7 @@ Tailscale Funnel exposes a local port to the internet via your Tailscale network
 
 ```fish
 # Start the coordinator
-codemem sync coordinator serve --db-path ~/.codemem/coordinator.sqlite --host 0.0.0.0 --port 7347
+codemem coordinator serve --db-path ~/.codemem/coordinator.sqlite --coordinator-host 0.0.0.0 --coordinator-port 7347
 
 # In another terminal, expose via Funnel
 tailscale funnel 7347
@@ -146,7 +154,7 @@ itself.
 
 ```fish
 # Start the coordinator
-codemem sync coordinator serve --db-path ~/.codemem/coordinator.sqlite --host 127.0.0.1 --port 7347
+codemem coordinator serve --db-path ~/.codemem/coordinator.sqlite --coordinator-host 127.0.0.1 --coordinator-port 7347
 
 # Start the tunnel
 cloudflared tunnel --url http://localhost:7347
@@ -155,7 +163,7 @@ cloudflared tunnel --url http://localhost:7347
 Use the generated `*.trycloudflare.com` URL for quick testing, or configure a named tunnel with a custom domain for
 production use.
 
-## Client configuration
+## Client configuration (Advanced/operator)
 
 Once the coordinator is reachable, teammates configure their codemem client:
 
@@ -194,17 +202,16 @@ Or through the viewer UI: Settings → Device Sync → Coordinator URL / Group.
 **Note:** Teammates who join via an invite link don't need to configure anything manually — the invite import
 auto-configures `sync_coordinator_url` and `sync_coordinator_group`.
 
-Joining the coordinator team enrolls the device for coordinator-backed discovery, but it does not automatically create a
-local sync peer relationship. Direct sync still depends on explicit `sync_peers` state.
+Joining the coordinator Team enrolls the device for coordinator-backed discovery, but it does not automatically create a local `sync_peers` relationship or Project grant. Direct sync still depends on explicit `sync_peers` state.
 
-## Onboarding teammates
+## Onboarding teammates (Advanced/operator)
 
 ### Admin-driven enrollment
 
 The admin can enroll a teammate's device directly from the local coordinator machine:
 
 ```fish
-codemem sync coordinator enroll-device my-team <device-id> \
+codemem coordinator enroll-device my-team <device-id> \
   --fingerprint <fingerprint> --public-key-file <path> \
   --db-path ~/.codemem/coordinator.sqlite
 ```
@@ -214,21 +221,26 @@ codemem sync coordinator enroll-device my-team <device-id> \
 The admin creates an invite and shares it:
 
 ```fish
-codemem sync coordinator create-invite my-team --db-path ~/.codemem/coordinator.sqlite
+codemem coordinator create-invite my-team --db-path ~/.codemem/coordinator.sqlite
 ```
 
 This outputs an encoded invite string. Share it with the teammate, who imports it:
 
 ```fish
-codemem sync coordinator import-invite <encoded-invite>
+codemem coordinator import-invite <encoded-invite>
 ```
 
-Or paste the invite in the viewer UI under Team sync → Join team.
+Or paste the invite in the viewer UI under **Advanced → Team sync → Join team**.
+
+For an exact-Project invitation, use `--recipient-name "Your name"` or
+`--device-name "Your device"` to replace legacy configured names that look like internal
+identifiers. Team-member and add-device recipient invitations must be accepted in the viewer
+because codemem must show and confirm their reviewed access details before joining.
 
 If the invite policy is `approval_required`, the teammate's join request will appear in the admin's pending queue. The
 admin approves it from the CLI or the viewer UI.
 
-## Data model
+## Data model (operator terms)
 
 The coordinator stores:
 
@@ -243,10 +255,10 @@ peer-to-peer sync remains the data path.
 
 ## Troubleshooting
 
-**Coordinator not reachable**: verify the `--host` binding. Use `0.0.0.0` to listen on all interfaces. Check firewall
+**Coordinator not reachable**: verify the `--coordinator-host` binding. Use `0.0.0.0` to listen on all interfaces. Check firewall
 rules and that the tunnel/funnel is active.
 
-**Device not enrolled**: run `codemem sync coordinator list-devices <group> --db-path <path>` to confirm enrollment.
+**Device not enrolled**: run `codemem coordinator list-devices <group> --db-path <path>` to confirm enrollment.
 Use the invite flow for self-service enrollment.
 
 **Presence not refreshing**: check that the client's `sync_coordinator_url` matches the coordinator's reachable address

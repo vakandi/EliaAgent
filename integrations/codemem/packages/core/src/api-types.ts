@@ -11,6 +11,8 @@
  * Import existing store/entity types where shapes match.
  */
 
+import type { HookTranscriptOutcome } from "./hook-transcript.js";
+import type { SyncCapability, SyncFeature } from "./sync-capability.js";
 import type {
 	Actor,
 	MemoryItemResponse,
@@ -101,9 +103,13 @@ export interface ApiUsageResponse {
 
 /** Extended memory item with session + ownership fields attached by the viewer. */
 export interface ApiMemoryItem extends MemoryItemResponse {
-	project?: string;
+	project: string | null;
 	cwd?: string;
 	owned_by_self?: boolean;
+	/** Presentation-only actor label resolved from trusted local identity data. */
+	resolved_actor_display_name?: string;
+	/** Presentation-only device label resolved from trusted local identity data. */
+	resolved_device_display_name?: string;
 }
 
 /**
@@ -365,6 +371,10 @@ export interface ApiRawEventsStatusResponse {
 	items: ApiRawEventBacklogItem[];
 	totals: ApiRawEventBacklogTotals;
 	ingest: ApiRawEventIngestInfo;
+	transcript_diagnostics: {
+		scope: "legacy_compatibility_routes";
+		counts: Record<"claude" | "codex", Record<HookTranscriptOutcome, number>>;
+	};
 }
 
 /**
@@ -372,6 +382,7 @@ export interface ApiRawEventsStatusResponse {
  */
 export interface ApiRawEventsPostResponse {
 	inserted: number;
+	skipped: number;
 	received: number;
 }
 
@@ -381,7 +392,12 @@ export interface ApiRawEventsPostResponse {
 export interface ApiClaudeHooksPostResponse {
 	inserted: number;
 	skipped: number;
+	skip_reason?: "transcript_unavailable" | "unsupported_hook";
+	skip_detail?: Exclude<HookTranscriptOutcome, "ok">;
 }
+
+/** POST /api/codex-hooks — response. */
+export type ApiCodexHooksPostResponse = ApiClaudeHooksPostResponse;
 
 // ---------------------------------------------------------------------------
 // Sync — sync.py
@@ -406,6 +422,14 @@ export interface ApiPeerStatus {
 	last_ping_at: string | null;
 }
 
+/** Diagnostic for legacy same-actor private sync migration. */
+export interface ApiClaimedLocalActorScopeStatus {
+	scope_id: string | null;
+	authorized: boolean;
+	state: string;
+	action_required: boolean;
+}
+
 /** Peer item in sync status/peers responses. */
 export interface ApiSyncPeerItem {
 	peer_device_id: string;
@@ -416,8 +440,11 @@ export interface ApiSyncPeerItem {
 	last_seen_at: string | null;
 	last_sync_at: string | null;
 	last_error: string | null;
+	runtime_version: string | null;
+	runtime_version_observed_at: string | null;
 	has_error: boolean;
 	claimed_local_actor: boolean;
+	claimed_local_actor_scope: ApiClaimedLocalActorScopeStatus | null;
 	actor_id: string | null;
 	actor_display_name: string | null;
 	project_scope: ApiProjectScope;
@@ -434,6 +461,9 @@ export interface ApiSyncAttemptItem {
 	finished_at: string | null;
 	ops_in: number;
 	ops_out: number;
+	local_sync_capability: SyncCapability | null;
+	peer_sync_capability: SyncCapability | null;
+	negotiated_sync_capability: SyncCapability | null;
 }
 
 /** Enriched sync attempt — embedded in /api/sync/status with extra fields. */
@@ -478,6 +508,7 @@ export interface ApiCoordinatorDiscoveredDevice {
 export interface ApiCoordinatorStatus {
 	enabled: boolean;
 	configured: boolean;
+	sync_enabled?: boolean;
 	coordinator_url?: string | null;
 	groups?: string[];
 	group_id?: string | null;
@@ -762,6 +793,40 @@ export interface ApiCreateInviteResponse {
 	mode?: "local" | "remote";
 }
 
+export interface ApiProjectInviteRequest {
+	teammate_name: string;
+	project_ids: string[];
+}
+
+export interface ApiProjectInvitePreviewProject {
+	project_id: string;
+	display_name: string;
+	existing_memory_count: number;
+}
+
+export interface ApiProjectInvitePreviewResponse {
+	operation_id: string;
+	teammate: {
+		display_name: string;
+		match: "existing" | "pending";
+		person_id?: string;
+	};
+	projects: ApiProjectInvitePreviewProject[];
+	existing_memory_count: number;
+	future_memories_shared: true;
+	history_policy: "existing_and_future";
+	reviewed_project_set_digest: string;
+}
+
+export interface ApiCreateProjectInviteRequest extends ApiProjectInviteRequest {
+	reviewed_project_set_digest: string;
+}
+
+export interface ApiCreateProjectInviteResponse extends ApiProjectInvitePreviewResponse {
+	ok: true;
+	invite: { link: string; encoded: string; expires_at: string };
+}
+
 /** POST /api/sync/invites/import — request. */
 export interface ApiImportInviteRequest {
 	invite: string;
@@ -805,20 +870,34 @@ export interface ApiSyncNowResponse {
 export interface ApiSyncOpsRequestQuery {
 	since: string | null;
 	limit: number;
+	scope_id?: string | null;
 	generation: number;
 	snapshot_id: string;
 	baseline_cursor: string | null;
 }
 
 export interface ApiSyncResetBoundary {
+	/** Null means the peer used the legacy unscoped compatibility request shape. */
+	scope_id: string | null;
 	generation: number;
 	snapshot_id: string;
 	baseline_cursor: string | null;
 	retained_floor_cursor: string | null;
 }
 
+export interface ApiSyncProtocolStatusResponse {
+	device_id: string;
+	protocol_version: string;
+	fingerprint: string;
+	runtime_version?: string;
+	sync_reset: ApiSyncResetBoundary;
+	sync_capability: SyncCapability;
+	sync_features: SyncFeature[];
+}
+
 export interface ApiSyncOpsIncrementalResponse extends ApiSyncResetBoundary {
 	reset_required: false;
+	sync_capability: SyncCapability;
 	ops: ReplicationOp[];
 	next_cursor: string | null;
 	skipped: number;
@@ -827,7 +906,15 @@ export interface ApiSyncOpsIncrementalResponse extends ApiSyncResetBoundary {
 export interface ApiSyncOpsResetRequiredResponse extends ApiSyncResetBoundary {
 	error: "reset_required";
 	reset_required: true;
-	reason: "stale_cursor" | "generation_mismatch" | "boundary_mismatch";
+	sync_capability: SyncCapability;
+	reason:
+		| "stale_cursor"
+		| "generation_mismatch"
+		| "boundary_mismatch"
+		| "missing_scope"
+		| "scope_inactive"
+		| "stale_epoch"
+		| "unsupported_scope";
 }
 
 export type ApiSyncOpsResponse = ApiSyncOpsIncrementalResponse | ApiSyncOpsResetRequiredResponse;
@@ -835,12 +922,14 @@ export type ApiSyncOpsResponse = ApiSyncOpsIncrementalResponse | ApiSyncOpsReset
 export interface ApiSyncMemorySnapshotPageRequestQuery {
 	limit: number;
 	page_token: string | null;
+	scope_id?: string | null;
 	generation: number;
 	snapshot_id: string;
 	baseline_cursor: string | null;
 }
 
 export interface ApiSyncMemorySnapshotPageResponse extends ApiSyncResetBoundary {
+	sync_capability: SyncCapability;
 	items: SyncMemorySnapshotItem[];
 	next_page_token: string | null;
 	has_more: boolean;

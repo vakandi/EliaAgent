@@ -13,22 +13,53 @@ export {
 } from "./view-model/coordinator-approval";
 export { deviceNeedsFriendlyName, resolveFriendlyDeviceName } from "./view-model/device-names";
 export {
+	derivePeerAuthorizedDomainsView,
 	derivePeerDirection,
+	derivePeerGrantRoleMismatchView,
+	derivePeerProjectNarrowingView,
+	derivePeerScopeRejectionsView,
+	derivePeerScopeSyncView,
 	derivePeerTrustSummary,
 	derivePeerUiStatus,
+	type PeerAuthorizedDomainsView,
+	type PeerAuthorizedDomainViewItem,
+	type PeerGrantRoleMismatchView,
+	type PeerProjectNarrowingView,
+	type PeerScopeRejectionsView,
+	type PeerScopeSyncView,
+	type PeerScopeSyncViewItem,
 } from "./view-model/peer-status";
 export {
 	deriveDuplicatePeople,
 	deriveVisiblePeopleActors,
 } from "./view-model/people-derivations";
-export { deriveSyncViewModel } from "./view-model/sync-view-model";
+export { deriveTeamSyncPrimaryStatus } from "./view-model/primary-status";
+export {
+	deriveCoordinatorSetupBlocker,
+	deriveSyncViewModel,
+} from "./view-model/sync-view-model";
 export {
 	type ActorLike,
+	type CoordinatorSetupBlocker,
+	type CoordinatorSetupBlockerReason,
 	type DiscoveredDeviceLike,
+	type PeerAuthorizedScopeLike,
+	type PeerClaimedLocalActorScopeLike,
 	type PeerDirection,
 	type PeerLike,
+	type PeerPerScopeSyncLike,
+	type PeerProjectScopeLike,
 	type PeerRecentOps,
+	type PeerScopeRejectionReason,
+	type PeerScopeRejectionsSummary,
+	type ProjectShareOperationLike,
+	type RecipientPolicyReconciliationLike,
 	SYNC_TERMINOLOGY,
+	type TeamSyncDaemonState,
+	type TeamSyncPresenceState,
+	type TeamSyncProjectOperationActionKind,
+	type TeamSyncProjectOperationState,
+	type TeamSyncReconciliationState,
 	type UiCoordinatorApprovalState,
 	type UiCoordinatorApprovalSummary,
 	type UiDuplicatePersonCandidate,
@@ -38,6 +69,8 @@ export {
 	type UiSyncRunResponse,
 	type UiSyncStatus,
 	type UiSyncViewModel,
+	type UiTeamSyncPrimaryState,
+	type UiTeamSyncPrimaryStatus,
 	type UiTrustState,
 	type VisiblePeopleResult,
 } from "./view-model/types";

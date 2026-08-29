@@ -5,6 +5,8 @@
  * data structures in codemem/store/types.py.
  */
 
+import type { SyncCapability } from "./sync-capability.js";
+
 // ---------------------------------------------------------------------------
 // Core entities
 // ---------------------------------------------------------------------------
@@ -58,6 +60,8 @@ export interface MemoryItem {
 	// Soft delete + replication
 	deleted_at: string | null;
 	rev: number;
+	scope_id: string | null;
+	project: string | null;
 }
 
 export interface Artifact {
@@ -106,6 +110,12 @@ export type PackTraceCandidate = {
 	reasons: string[];
 	disposition: PackTraceDisposition;
 	section: PackTraceSection | null;
+	/**
+	 * In-place artifact marker for this row, if capture-time routing recorded one
+	 * (`session_summary` | `derived_fact` | `telemetry` | `unknown`). Diagnostic
+	 * only: it does NOT affect ranking and no row is materialized from it.
+	 */
+	artifact_class: "session_summary" | "derived_fact" | "telemetry" | "unknown";
 	inferred_role: "recap" | "durable" | "ephemeral" | "general";
 	role_reason: string;
 };
@@ -302,6 +312,47 @@ export interface ReplicationOp {
 	clock_device_id: string;
 	device_id: string;
 	created_at: string;
+	scope_id: string | null;
+}
+
+export interface ReplicationScope {
+	scope_id: string;
+	label: string;
+	kind: string;
+	authority_type: string;
+	coordinator_id: string | null;
+	group_id: string | null;
+	manifest_issuer_device_id: string | null;
+	membership_epoch: number;
+	manifest_hash: string | null;
+	status: string;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface ProjectScopeMapping {
+	id: number;
+	workspace_identity: string | null;
+	project_pattern: string;
+	scope_id: string;
+	priority: number;
+	source: string;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface ScopeMembership {
+	scope_id: string;
+	device_id: string;
+	role: string;
+	status: string;
+	membership_epoch: number;
+	coordinator_id: string | null;
+	group_id: string | null;
+	manifest_issuer_device_id: string | null;
+	manifest_hash: string | null;
+	signed_manifest_json: string | null;
+	updated_at: string;
 }
 
 export interface ReplicationClock {
@@ -364,6 +415,7 @@ export interface SyncResetState {
 }
 
 export interface SyncResetBoundary {
+	scope_id?: string | null;
 	generation: number;
 	snapshot_id: string;
 	baseline_cursor: string | null;
@@ -372,7 +424,15 @@ export interface SyncResetBoundary {
 
 export interface SyncResetRequired extends SyncResetBoundary {
 	reset_required: true;
-	reason: "stale_cursor" | "generation_mismatch" | "boundary_mismatch" | "initial_bootstrap";
+	reason:
+		| "stale_cursor"
+		| "generation_mismatch"
+		| "boundary_mismatch"
+		| "initial_bootstrap"
+		| "missing_scope"
+		| "scope_inactive"
+		| "stale_epoch"
+		| "unsupported_scope";
 }
 
 export interface SyncDirtyLocalState {
@@ -413,6 +473,9 @@ export interface SyncAttempt {
 	ops_in: number;
 	ops_out: number;
 	error: string | null;
+	local_sync_capability: SyncCapability | null;
+	peer_sync_capability: SyncCapability | null;
+	negotiated_sync_capability: SyncCapability | null;
 }
 
 export interface Actor {
@@ -634,6 +697,10 @@ export interface MemoryFilters {
 	working_set_paths?: string[];
 	/** Project scope — matches sessions.project. Triggers session JOIN. */
 	project?: string;
+	/** Replication scope / Sharing domain filters. These narrow authorization; they never widen it. */
+	scope_id?: string | string[];
+	include_scope_ids?: string[];
+	exclude_scope_ids?: string[];
 	visibility?: string | string[];
 	include_visibility?: string[];
 	exclude_visibility?: string[];
@@ -673,4 +740,11 @@ export interface PackRenderOptions {
 	 * Ignored when compact is false. Default: 3.
 	 */
 	compactDetailCount?: number;
+	/**
+	 * Controls near-related pack compression. Default: "compact".
+	 * - "off": never compress related items
+	 * - "compact": compress related items only in compact rendering mode
+	 * - "ids": compress related items in all modes and render related IDs as a retrieval hint
+	 */
+	compressionMode?: "off" | "compact" | "ids";
 }

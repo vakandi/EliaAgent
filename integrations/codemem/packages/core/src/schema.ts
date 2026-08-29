@@ -30,6 +30,82 @@ export const sessions = sqliteTable("sessions", {
 export type Session = typeof sessions.$inferSelect;
 export type NewSession = typeof sessions.$inferInsert;
 
+export const replicationScopes = sqliteTable(
+	"replication_scopes",
+	{
+		scope_id: text("scope_id").primaryKey(),
+		label: text("label").notNull(),
+		kind: text("kind").notNull().default("user"),
+		authority_type: text("authority_type").notNull().default("local"),
+		coordinator_id: text("coordinator_id"),
+		group_id: text("group_id"),
+		manifest_issuer_device_id: text("manifest_issuer_device_id"),
+		membership_epoch: integer("membership_epoch").notNull().default(0),
+		manifest_hash: text("manifest_hash"),
+		status: text("status").notNull().default("active"),
+		created_at: text("created_at").notNull(),
+		updated_at: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_replication_scopes_status").on(table.status),
+		index("idx_replication_scopes_authority_group").on(table.coordinator_id, table.group_id),
+	],
+);
+
+export type ReplicationScope = typeof replicationScopes.$inferSelect;
+export type NewReplicationScope = typeof replicationScopes.$inferInsert;
+
+export const projectScopeMappings = sqliteTable(
+	"project_scope_mappings",
+	{
+		id: integer("id").primaryKey(),
+		workspace_identity: text("workspace_identity"),
+		project_pattern: text("project_pattern").notNull(),
+		scope_id: text("scope_id").notNull(),
+		priority: integer("priority").notNull().default(0),
+		source: text("source").notNull().default("user"),
+		created_at: text("created_at").notNull(),
+		updated_at: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_project_scope_mappings_workspace_priority").on(
+			table.workspace_identity,
+			table.priority,
+		),
+		index("idx_project_scope_mappings_pattern_priority").on(table.project_pattern, table.priority),
+		index("idx_project_scope_mappings_scope").on(table.scope_id),
+	],
+);
+
+export type ProjectScopeMapping = typeof projectScopeMappings.$inferSelect;
+export type NewProjectScopeMapping = typeof projectScopeMappings.$inferInsert;
+
+export const scopeMemberships = sqliteTable(
+	"scope_memberships",
+	{
+		scope_id: text("scope_id").notNull(),
+		device_id: text("device_id").notNull(),
+		role: text("role").notNull().default("member"),
+		status: text("status").notNull().default("active"),
+		membership_epoch: integer("membership_epoch").notNull().default(0),
+		coordinator_id: text("coordinator_id"),
+		group_id: text("group_id"),
+		manifest_issuer_device_id: text("manifest_issuer_device_id"),
+		manifest_hash: text("manifest_hash"),
+		signed_manifest_json: text("signed_manifest_json"),
+		updated_at: text("updated_at").notNull(),
+	},
+	(table) => [
+		primaryKey({ columns: [table.scope_id, table.device_id] }),
+		index("idx_scope_memberships_device_status").on(table.device_id, table.status),
+		index("idx_scope_memberships_scope_status").on(table.scope_id, table.status),
+		index("idx_scope_memberships_authority_group").on(table.coordinator_id, table.group_id),
+	],
+);
+
+export type ScopeMembership = typeof scopeMemberships.$inferSelect;
+export type NewScopeMembership = typeof scopeMemberships.$inferInsert;
+
 export const artifacts = sqliteTable(
 	"artifacts",
 	{
@@ -86,10 +162,27 @@ export const memoryItems = sqliteTable(
 		rev: integer("rev").default(0),
 		dedup_key: text("dedup_key"),
 		import_key: text("import_key"),
+		scope_id: text("scope_id"),
+		// Denormalized project name. Carries the originating session's project
+		// across sync boundaries so cross-device memories surface under their
+		// real project identity instead of an inferred placeholder. Backfilled
+		// from sessions.project for legacy rows during migration. May be null
+		// when the originating session had no project.
+		project: text("project"),
 	},
 	(table) => [
 		index("idx_memory_items_active_created").on(table.active, table.created_at),
+		index("idx_memory_items_origin_device_active").on(table.origin_device_id, table.active),
 		index("idx_memory_items_session").on(table.session_id),
+		index("idx_memory_items_project").on(table.project),
+		index("idx_memory_items_scope_visibility_created").on(
+			table.scope_id,
+			table.visibility,
+			table.created_at,
+		),
+		index("idx_memory_items_scope_backfill_pending")
+			.on(table.id)
+			.where(sql`scope_id IS NULL OR scope_id = ''`),
 		index("idx_memory_items_dedup_key_active_created").on(
 			table.dedup_key,
 			table.active,
@@ -161,6 +254,210 @@ export const usageEvents = sqliteTable(
 
 export type UsageEvent = typeof usageEvents.$inferSelect;
 export type NewUsageEvent = typeof usageEvents.$inferInsert;
+
+export const retrievalAttempts = sqliteTable(
+	"retrieval_attempts",
+	{
+		attempt_id: text("attempt_id").primaryKey(),
+		contract_version: integer("contract_version").notNull(),
+		surface: text("surface").notNull(),
+		trigger: text("trigger").notNull(),
+		started_at: text("started_at").notNull(),
+		completed_at: text("completed_at"),
+		retrieval_status: text("retrieval_status").notNull(),
+		delivery_status: text("delivery_status").notNull(),
+		candidate_count: integer("candidate_count").notNull(),
+		selected_count: integer("selected_count").notNull(),
+		persisted_candidate_count: integer("persisted_candidate_count").notNull(),
+		recorder_version: text("recorder_version").notNull(),
+		session_id: integer("session_id").references(() => sessions.id, { onDelete: "cascade" }),
+		source: text("source"),
+		stream_id: text("stream_id"),
+		source_session_id: text("source_session_id"),
+		prompt_number: integer("prompt_number"),
+		request_id: text("request_id"),
+		raw_event_start_seq: integer("raw_event_start_seq"),
+		raw_event_end_seq: integer("raw_event_end_seq"),
+		experiment_id: text("experiment_id"),
+		experiment_cell_id: text("experiment_cell_id"),
+		evaluation_checkout_id: text("evaluation_checkout_id"),
+		evaluation_fixture_id: text("evaluation_fixture_id"),
+		evaluation_seed: integer("evaluation_seed"),
+		latency_ms: integer("latency_ms"),
+		project: text("project"),
+		scope_id: text("scope_id"),
+		mode: text("mode"),
+		limit_requested: integer("limit_requested"),
+		token_budget: integer("token_budget"),
+		output_tokens: integer("output_tokens"),
+		working_set_file_count: integer("working_set_file_count"),
+		working_set_files_json: text("working_set_files_json"),
+		query_hash_sha256: text("query_hash_sha256"),
+		query_char_count: integer("query_char_count"),
+		query_token_estimate: integer("query_token_estimate"),
+		filter_summary_json: text("filter_summary_json"),
+		failure_code: text("failure_code"),
+		failure_stage: text("failure_stage"),
+		trace_version: integer("trace_version"),
+		retention_until: text("retention_until"),
+		retention_pinned: integer("retention_pinned").notNull().default(0),
+		retention_finalized_at: text("retention_finalized_at"),
+	},
+	(table) => [
+		index("idx_retrieval_attempts_session_started").on(table.session_id, table.started_at),
+		index("idx_retrieval_attempts_source_stream_started").on(
+			table.source,
+			table.stream_id,
+			table.started_at,
+		),
+		index("idx_retrieval_attempts_retention").on(table.retention_pinned, table.retention_until),
+		index("idx_retrieval_attempts_started").on(table.started_at, table.attempt_id),
+		index("idx_retrieval_attempts_surface_started").on(table.surface, table.started_at),
+		uniqueIndex("idx_retrieval_attempts_request_identity")
+			.on(table.source, table.surface, table.request_id)
+			.where(sql`request_id IS NOT NULL`),
+		index("idx_retrieval_attempts_experiment_cell").on(
+			table.experiment_id,
+			table.experiment_cell_id,
+		),
+	],
+);
+
+export type RetrievalAttempt = typeof retrievalAttempts.$inferSelect;
+export type NewRetrievalAttempt = typeof retrievalAttempts.$inferInsert;
+
+export const retrievalExposures = sqliteTable(
+	"retrieval_exposures",
+	{
+		exposure_id: integer("exposure_id").primaryKey({ autoIncrement: true }),
+		attempt_id: text("attempt_id")
+			.notNull()
+			.references(() => retrievalAttempts.attempt_id, { onDelete: "cascade" }),
+		memory_id: integer("memory_id").references(() => memoryItems.id, { onDelete: "set null" }),
+		memory_import_key: text("memory_import_key"),
+		origin_device_id: text("origin_device_id"),
+		rank: integer("rank").notNull(),
+		disposition: text("disposition").notNull(),
+		section: text("section"),
+		handoff_status: text("handoff_status").notNull(),
+		memory_rev: integer("memory_rev"),
+		memory_updated_at: text("memory_updated_at"),
+		memory_scope_id: text("memory_scope_id"),
+		memory_kind: text("memory_kind"),
+		memory_active: integer("memory_active"),
+		memory_deleted_at: text("memory_deleted_at"),
+		score_summary_json: text("score_summary_json"),
+		reason_codes_json: text("reason_codes_json"),
+	},
+	(table) => [
+		uniqueIndex("idx_retrieval_exposures_attempt_rank").on(table.attempt_id, table.rank),
+		index("idx_retrieval_exposures_memory").on(table.memory_id),
+	],
+);
+
+export type RetrievalExposure = typeof retrievalExposures.$inferSelect;
+export type NewRetrievalExposure = typeof retrievalExposures.$inferInsert;
+
+export const outcomeEvidence = sqliteTable(
+	"outcome_evidence",
+	{
+		evidence_id: text("evidence_id").primaryKey(),
+		contract_version: integer("contract_version").notNull(),
+		dimension: text("dimension").notNull(),
+		evidence_type: text("evidence_type").notNull(),
+		source_class: text("source_class").notNull(),
+		observed_at: text("observed_at").notNull(),
+		producer: text("producer").notNull(),
+		producer_version: text("producer_version").notNull(),
+		status: text("status").notNull(),
+		value_type: text("value_type"),
+		value_integer: integer("value_integer"),
+		value_real: real("value_real"),
+		value_unit: text("value_unit"),
+		session_id: integer("session_id").references(() => sessions.id, { onDelete: "cascade" }),
+		source: text("source"),
+		stream_id: text("stream_id"),
+		source_session_id: text("source_session_id"),
+		prompt_number: integer("prompt_number"),
+		raw_event_start_seq: integer("raw_event_start_seq"),
+		raw_event_end_seq: integer("raw_event_end_seq"),
+		experiment_id: text("experiment_id"),
+		experiment_cell_id: text("experiment_cell_id"),
+		window_start_at: text("window_start_at"),
+		window_end_at: text("window_end_at"),
+		references_json: text("references_json"),
+		retention_until: text("retention_until"),
+		retention_pinned: integer("retention_pinned").notNull().default(0),
+		retention_finalized_at: text("retention_finalized_at"),
+	},
+	(table) => [
+		index("idx_outcome_evidence_observed_id").on(table.observed_at, table.evidence_id),
+		index("idx_outcome_evidence_session_observed").on(table.session_id, table.observed_at),
+		index("idx_outcome_evidence_source_stream_observed").on(
+			table.source,
+			table.stream_id,
+			table.observed_at,
+		),
+		index("idx_outcome_evidence_type_observed").on(table.evidence_type, table.observed_at),
+		index("idx_outcome_evidence_retention").on(table.retention_pinned, table.retention_until),
+	],
+);
+
+export type OutcomeEvidence = typeof outcomeEvidence.$inferSelect;
+export type NewOutcomeEvidence = typeof outcomeEvidence.$inferInsert;
+
+export const attributionAssessments = sqliteTable(
+	"attribution_assessments",
+	{
+		assessment_id: text("assessment_id").primaryKey(),
+		contract_version: integer("contract_version").notNull(),
+		subject_type: text("subject_type").notNull(),
+		attempt_id: text("attempt_id")
+			.notNull()
+			.references(() => retrievalAttempts.attempt_id, { onDelete: "cascade" }),
+		exposure_id: integer("exposure_id").references(() => retrievalExposures.exposure_id, {
+			onDelete: "cascade",
+		}),
+		dimension: text("dimension").notNull(),
+		impact_label: text("impact_label").notNull(),
+		basis: text("basis").notNull(),
+		confidence_level: text("confidence_level").notNull(),
+		method: text("method").notNull(),
+		method_version: text("method_version").notNull(),
+		created_at: text("created_at").notNull(),
+		claim_type: text("claim_type").notNull().default("observational"),
+	},
+	(table) => [
+		index("idx_attribution_assessments_attempt_created").on(table.attempt_id, table.created_at),
+		index("idx_attribution_assessments_label_created").on(table.impact_label, table.created_at),
+		index("idx_attribution_assessments_exposure").on(table.exposure_id),
+	],
+);
+
+export type AttributionAssessment = typeof attributionAssessments.$inferSelect;
+export type NewAttributionAssessment = typeof attributionAssessments.$inferInsert;
+
+export const attributionAssessmentEvidence = sqliteTable(
+	"attribution_assessment_evidence",
+	{
+		assessment_id: text("assessment_id")
+			.notNull()
+			.references(() => attributionAssessments.assessment_id, { onDelete: "cascade" }),
+		evidence_id: text("evidence_id")
+			.notNull()
+			.references(() => outcomeEvidence.evidence_id, { onDelete: "cascade" }),
+	},
+	(table) => [
+		primaryKey({ columns: [table.assessment_id, table.evidence_id] }),
+		index("idx_attribution_assessment_evidence_evidence").on(
+			table.evidence_id,
+			table.assessment_id,
+		),
+	],
+);
+
+export type AttributionAssessmentEvidence = typeof attributionAssessmentEvidence.$inferSelect;
+export type NewAttributionAssessmentEvidence = typeof attributionAssessmentEvidence.$inferInsert;
 
 export const maintenanceJobs = sqliteTable(
 	"maintenance_jobs",
@@ -368,10 +665,12 @@ export const replicationOps = sqliteTable(
 		clock_device_id: text("clock_device_id").notNull(),
 		device_id: text("device_id").notNull(),
 		created_at: text("created_at").notNull(),
+		scope_id: text("scope_id"),
 	},
 	(table) => [
 		index("idx_replication_ops_created").on(table.created_at, table.op_id),
 		index("idx_replication_ops_entity").on(table.entity_type, table.entity_id),
+		index("idx_replication_ops_scope_created").on(table.scope_id, table.created_at, table.op_id),
 	],
 );
 
@@ -388,6 +687,24 @@ export const replicationCursors = sqliteTable("replication_cursors", {
 export type ReplicationCursor = typeof replicationCursors.$inferSelect;
 export type NewReplicationCursor = typeof replicationCursors.$inferInsert;
 
+export const replicationCursorsV2 = sqliteTable(
+	"replication_cursors_v2",
+	{
+		peer_device_id: text("peer_device_id").notNull(),
+		scope_id: text("scope_id").notNull(),
+		last_applied_cursor: text("last_applied_cursor"),
+		last_acked_cursor: text("last_acked_cursor"),
+		updated_at: text("updated_at").notNull(),
+	},
+	(table) => [
+		primaryKey({ columns: [table.peer_device_id, table.scope_id] }),
+		index("idx_replication_cursors_v2_scope").on(table.scope_id),
+	],
+);
+
+export type ReplicationCursorV2 = typeof replicationCursorsV2.$inferSelect;
+export type NewReplicationCursorV2 = typeof replicationCursorsV2.$inferInsert;
+
 export const syncPeers = sqliteTable("sync_peers", {
 	peer_device_id: text("peer_device_id").primaryKey(),
 	name: text("name"),
@@ -402,12 +719,27 @@ export const syncPeers = sqliteTable("sync_peers", {
 	last_seen_at: text("last_seen_at"),
 	last_sync_at: text("last_sync_at"),
 	last_error: text("last_error"),
+	runtime_version: text("runtime_version"),
+	runtime_version_observed_at: text("runtime_version_observed_at"),
+	highest_observed_direct_signature_version: integer("highest_observed_direct_signature_version"),
 	discovered_via_coordinator_id: text("discovered_via_coordinator_id"),
 	discovered_via_group_id: text("discovered_via_group_id"),
+	trust_provenance: text("trust_provenance"),
+	pending_bootstrap_grant_id: text("pending_bootstrap_grant_id"),
 });
 
 export type SyncPeer = typeof syncPeers.$inferSelect;
 export type NewSyncPeer = typeof syncPeers.$inferInsert;
+
+export const syncPeerSignatureState = sqliteTable("sync_peer_signature_state", {
+	peer_device_id: text("peer_device_id").primaryKey(),
+	highest_observed_direct_signature_version: integer(
+		"highest_observed_direct_signature_version",
+	).notNull(),
+});
+
+export type SyncPeerSignatureState = typeof syncPeerSignatureState.$inferSelect;
+export type NewSyncPeerSignatureState = typeof syncPeerSignatureState.$inferInsert;
 
 export const syncNonces = sqliteTable("sync_nonces", {
 	nonce: text("nonce").primaryKey(),
@@ -439,12 +771,36 @@ export const syncAttempts = sqliteTable(
 		ops_in: integer("ops_in").notNull(),
 		ops_out: integer("ops_out").notNull(),
 		error: text("error"),
+		local_sync_capability: text("local_sync_capability"),
+		peer_sync_capability: text("peer_sync_capability"),
+		negotiated_sync_capability: text("negotiated_sync_capability"),
 	},
 	(table) => [index("idx_sync_attempts_peer_started").on(table.peer_device_id, table.started_at)],
 );
 
 export type SyncAttempt = typeof syncAttempts.$inferSelect;
 export type NewSyncAttempt = typeof syncAttempts.$inferInsert;
+
+export const syncScopeRejections = sqliteTable(
+	"sync_scope_rejections",
+	{
+		id: integer("id").primaryKey({ autoIncrement: true }),
+		peer_device_id: text("peer_device_id"),
+		op_id: text("op_id").notNull(),
+		entity_type: text("entity_type").notNull(),
+		entity_id: text("entity_id").notNull(),
+		scope_id: text("scope_id"),
+		reason: text("reason").notNull(),
+		created_at: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_sync_scope_rejections_peer_created").on(table.peer_device_id, table.created_at),
+		index("idx_sync_scope_rejections_scope_created").on(table.scope_id, table.created_at),
+	],
+);
+
+export type SyncScopeRejection = typeof syncScopeRejections.$inferSelect;
+export type NewSyncScopeRejection = typeof syncScopeRejections.$inferInsert;
 
 export const syncDaemonState = sqliteTable("sync_daemon_state", {
 	id: integer("id").primaryKey(),
@@ -470,6 +826,18 @@ export const syncResetState = sqliteTable("sync_reset_state", {
 export type SyncResetState = typeof syncResetState.$inferSelect;
 export type NewSyncResetState = typeof syncResetState.$inferInsert;
 
+export const syncResetStateV2 = sqliteTable("sync_reset_state_v2", {
+	scope_id: text("scope_id").primaryKey(),
+	generation: integer("generation").notNull(),
+	snapshot_id: text("snapshot_id").notNull(),
+	baseline_cursor: text("baseline_cursor"),
+	retained_floor_cursor: text("retained_floor_cursor"),
+	updated_at: text("updated_at").notNull(),
+});
+
+export type SyncResetStateV2 = typeof syncResetStateV2.$inferSelect;
+export type NewSyncResetStateV2 = typeof syncResetStateV2.$inferInsert;
+
 export const syncRetentionState = sqliteTable("sync_retention_state", {
 	id: integer("id").primaryKey(),
 	last_run_at: text("last_run_at"),
@@ -484,6 +852,21 @@ export const syncRetentionState = sqliteTable("sync_retention_state", {
 
 export type SyncRetentionState = typeof syncRetentionState.$inferSelect;
 export type NewSyncRetentionState = typeof syncRetentionState.$inferInsert;
+
+export const syncRetentionStateV2 = sqliteTable("sync_retention_state_v2", {
+	scope_id: text("scope_id").primaryKey(),
+	last_run_at: text("last_run_at"),
+	last_duration_ms: integer("last_duration_ms"),
+	last_deleted_ops: integer("last_deleted_ops").notNull().default(0),
+	last_estimated_bytes_before: integer("last_estimated_bytes_before"),
+	last_estimated_bytes_after: integer("last_estimated_bytes_after"),
+	retained_floor_cursor: text("retained_floor_cursor"),
+	last_error: text("last_error"),
+	last_error_at: text("last_error_at"),
+});
+
+export type SyncRetentionStateV2 = typeof syncRetentionStateV2.$inferSelect;
+export type NewSyncRetentionStateV2 = typeof syncRetentionStateV2.$inferInsert;
 
 export const rawEventIngestSamples = sqliteTable("raw_event_ingest_samples", {
 	id: integer("id").primaryKey({ autoIncrement: true }),
@@ -518,6 +901,10 @@ export const coordinatorGroupPreferences = sqliteTable(
 		projects_include_json: text("projects_include_json"),
 		projects_exclude_json: text("projects_exclude_json"),
 		auto_seed_scope: integer("auto_seed_scope").notNull().default(1),
+		default_space_scope_id: text("default_space_scope_id"),
+		auto_grant_default_space_on_join: integer("auto_grant_default_space_on_join")
+			.notNull()
+			.default(0),
 		updated_at: text("updated_at").notNull(),
 	},
 	(table) => ({
@@ -548,13 +935,498 @@ export const actors = sqliteTable(
 export type Actor = typeof actors.$inferSelect;
 export type NewActor = typeof actors.$inferInsert;
 
+export const recipientPolicyReviewResolutions = sqliteTable(
+	"recipient_policy_review_resolutions",
+	{
+		review_item_id: text("review_item_id").notNull(),
+		source_fingerprint: text("source_fingerprint").notNull(),
+		decision: text("decision").notNull(),
+		decision_input_json: text("decision_input_json").notNull(),
+		preview_json: text("preview_json").notNull(),
+		decided_by_identity_id: text("decided_by_identity_id").notNull(),
+		decided_by_device_id: text("decided_by_device_id").notNull(),
+		resolved_at: text("resolved_at").notNull(),
+	},
+	(table) => [primaryKey({ columns: [table.review_item_id, table.source_fingerprint] })],
+);
+
+export type RecipientPolicyReviewResolution = typeof recipientPolicyReviewResolutions.$inferSelect;
+export type NewRecipientPolicyReviewResolution =
+	typeof recipientPolicyReviewResolutions.$inferInsert;
+
+export const coordinatorEnrollmentReconciliationIssues = sqliteTable(
+	"coordinator_enrollment_reconciliation_issues",
+	{
+		coordinator_id: text("coordinator_id").notNull(),
+		group_id: text("group_id").notNull(),
+		kind: text("kind").notNull(),
+		reference_id: text("reference_id").notNull(),
+		code: text("code").notNull(),
+		status: text("status").notNull().default("open"),
+		first_seen_at: text("first_seen_at").notNull(),
+		last_seen_at: text("last_seen_at").notNull(),
+		resolved_at: text("resolved_at"),
+		occurrence_count: integer("occurrence_count").notNull().default(1),
+		updated_at: text("updated_at").notNull(),
+	},
+	(table) => [
+		primaryKey({
+			columns: [table.coordinator_id, table.group_id, table.kind, table.reference_id, table.code],
+		}),
+		index("idx_coordinator_enrollment_issues_boundary_status").on(
+			table.coordinator_id,
+			table.group_id,
+			table.status,
+		),
+		index("idx_coordinator_enrollment_issues_status_recent").on(
+			table.status,
+			table.last_seen_at,
+			table.resolved_at,
+		),
+	],
+);
+
+export type CoordinatorEnrollmentReconciliationIssue =
+	typeof coordinatorEnrollmentReconciliationIssues.$inferSelect;
+export type NewCoordinatorEnrollmentReconciliationIssue =
+	typeof coordinatorEnrollmentReconciliationIssues.$inferInsert;
+
+export const policyTeams = sqliteTable("policy_teams", {
+	team_id: text("team_id").primaryKey(),
+	display_name: text("display_name").notNull(),
+	status: text("status").notNull(),
+	device_eligibility_mode: text("device_eligibility_mode").notNull().default("person_all_devices"),
+	provenance: text("provenance").notNull(),
+	revision: text("revision").notNull(),
+	migration_state: text("migration_state").notNull(),
+	source_fingerprint: text("source_fingerprint"),
+	idempotency_key: text("idempotency_key").notNull().unique(),
+	created_at: text("created_at").notNull(),
+	updated_at: text("updated_at").notNull(),
+});
+
+export type PolicyTeam = typeof policyTeams.$inferSelect;
+export type NewPolicyTeam = typeof policyTeams.$inferInsert;
+
+export const policyTeamMemberships = sqliteTable(
+	"policy_team_memberships",
+	{
+		team_id: text("team_id").notNull(),
+		identity_id: text("identity_id").notNull(),
+		role: text("role").notNull(),
+		status: text("status").notNull(),
+		provenance: text("provenance").notNull(),
+		revision: text("revision").notNull(),
+		migration_state: text("migration_state").notNull(),
+		source_fingerprint: text("source_fingerprint"),
+		idempotency_key: text("idempotency_key").notNull().unique(),
+		created_at: text("created_at").notNull(),
+		updated_at: text("updated_at").notNull(),
+	},
+	(table) => ({
+		pk: primaryKey({ columns: [table.team_id, table.identity_id] }),
+		identityStatusIdx: index("idx_policy_team_memberships_identity_status").on(
+			table.identity_id,
+			table.status,
+		),
+	}),
+);
+
+export type PolicyTeamMembership = typeof policyTeamMemberships.$inferSelect;
+export type NewPolicyTeamMembership = typeof policyTeamMemberships.$inferInsert;
+
+export const policyTeamDeviceDecisions = sqliteTable(
+	"policy_team_device_decisions",
+	{
+		team_id: text("team_id")
+			.notNull()
+			.references(() => policyTeams.team_id, { onDelete: "cascade" }),
+		device_id: text("device_id").notNull(),
+		decision: text("decision").notNull(),
+		assignment_version: integer("assignment_version").notNull().default(0),
+		provenance: text("provenance").notNull(),
+		revision: text("revision").notNull(),
+		created_at: text("created_at").notNull(),
+		updated_at: text("updated_at").notNull(),
+	},
+	(table) => [
+		primaryKey({ columns: [table.team_id, table.device_id] }),
+		index("idx_policy_team_device_decisions_device").on(table.device_id),
+	],
+);
+
+export type PolicyTeamDeviceDecisionRow = typeof policyTeamDeviceDecisions.$inferSelect;
+export type NewPolicyTeamDeviceDecisionRow = typeof policyTeamDeviceDecisions.$inferInsert;
+
+export const identityDevices = sqliteTable(
+	"identity_devices",
+	{
+		device_id: text("device_id").primaryKey(),
+		identity_id: text("identity_id").notNull(),
+		display_name: text("display_name").notNull(),
+		status: text("status").notNull(),
+		provenance: text("provenance").notNull(),
+		revision: text("revision").notNull(),
+		migration_state: text("migration_state").notNull(),
+		assignment_version: integer("assignment_version").notNull().default(0),
+		source_fingerprint: text("source_fingerprint"),
+		idempotency_key: text("idempotency_key").notNull().unique(),
+		created_at: text("created_at").notNull(),
+		updated_at: text("updated_at").notNull(),
+	},
+	(table) => ({
+		identityStatusIdx: index("idx_identity_devices_identity_status").on(
+			table.identity_id,
+			table.status,
+		),
+	}),
+);
+
+export type IdentityDevice = typeof identityDevices.$inferSelect;
+export type NewIdentityDevice = typeof identityDevices.$inferInsert;
+
+export const deviceIdentityBindingCommits = sqliteTable("device_identity_binding_commits", {
+	commit_digest: text("commit_digest").primaryKey(),
+	reviewed_inventory_digest: text("reviewed_inventory_digest").notNull(),
+	request_json: text("request_json").notNull(),
+	outcomes_json: text("outcomes_json").notNull(),
+	write_count: integer("write_count").notNull(),
+	decided_by_identity_id: text("decided_by_identity_id").notNull(),
+	decided_by_device_id: text("decided_by_device_id").notNull(),
+	created_at: text("created_at").notNull(),
+});
+
+export const deviceIdentityBindingAudit = sqliteTable(
+	"device_identity_binding_audit",
+	{
+		event_id: text("event_id").primaryKey(),
+		commit_digest: text("commit_digest")
+			.notNull()
+			.references(() => deviceIdentityBindingCommits.commit_digest),
+		device_id: text("device_id").notNull(),
+		previous_identity_id: text("previous_identity_id"),
+		target_identity_id: text("target_identity_id").notNull(),
+		action: text("action").notNull(),
+		previous_assignment_version: integer("previous_assignment_version"),
+		resulting_assignment_version: integer("resulting_assignment_version").notNull(),
+		decided_by_identity_id: text("decided_by_identity_id").notNull(),
+		decided_by_device_id: text("decided_by_device_id").notNull(),
+		created_at: text("created_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_device_identity_binding_audit_commit_device").on(
+			table.commit_digest,
+			table.device_id,
+		),
+		index("idx_device_identity_binding_audit_device_created").on(
+			table.device_id,
+			table.created_at,
+			table.event_id,
+		),
+	],
+);
+
+export const projectRecipients = sqliteTable(
+	"project_recipients",
+	{
+		canonical_project_identity: text("canonical_project_identity").notNull(),
+		recipient_kind: text("recipient_kind").notNull(),
+		recipient_id: text("recipient_id").notNull(),
+		status: text("status").notNull(),
+		provenance: text("provenance").notNull(),
+		policy_revision: text("policy_revision").notNull(),
+		migration_state: text("migration_state").notNull(),
+		source_fingerprint: text("source_fingerprint"),
+		idempotency_key: text("idempotency_key").notNull().unique(),
+		created_at: text("created_at").notNull(),
+		updated_at: text("updated_at").notNull(),
+	},
+	(table) => ({
+		pk: primaryKey({
+			columns: [table.canonical_project_identity, table.recipient_kind, table.recipient_id],
+		}),
+		projectStatusIdx: index("idx_project_recipients_project_status").on(
+			table.canonical_project_identity,
+			table.status,
+		),
+		recipientStatusIdx: index("idx_project_recipients_recipient_status").on(
+			table.recipient_kind,
+			table.recipient_id,
+			table.status,
+		),
+	}),
+);
+
+export type ProjectRecipient = typeof projectRecipients.$inferSelect;
+export type NewProjectRecipient = typeof projectRecipients.$inferInsert;
+
+export const legacyTeamSetupDrafts = sqliteTable(
+	"legacy_team_setup_drafts",
+	{
+		attempt_id: text("attempt_id").primaryKey(),
+		candidate_id: text("candidate_id").notNull(),
+		coordinator_id: text("coordinator_id").notNull(),
+		group_id: text("group_id").notNull(),
+		state: text("state").notNull().default("needs_setup"),
+		display_name: text("display_name").notNull(),
+		roster_fingerprint: text("roster_fingerprint").notNull(),
+		projection_fingerprint: text("projection_fingerprint").notNull(),
+		finish_digest: text("finish_digest"),
+		safe_error_code: text("safe_error_code"),
+		completed_team_id: text("completed_team_id"),
+		created_at: text("created_at").notNull(),
+		updated_at: text("updated_at").notNull(),
+		completed_at: text("completed_at"),
+		superseded_at: text("superseded_at"),
+	},
+	(table) => [
+		index("idx_legacy_team_setup_drafts_candidate_state").on(
+			table.candidate_id,
+			table.state,
+			table.created_at,
+		),
+		index("idx_legacy_team_setup_drafts_state_updated").on(table.state, table.updated_at),
+		index("idx_legacy_team_setup_drafts_finish_digest").on(table.finish_digest),
+	],
+);
+
+export type LegacyTeamSetupDraft = typeof legacyTeamSetupDrafts.$inferSelect;
+export type NewLegacyTeamSetupDraft = typeof legacyTeamSetupDrafts.$inferInsert;
+
+export const legacyTeamSetupCompletions = sqliteTable(
+	"legacy_team_setup_completions",
+	{
+		attempt_id: text("attempt_id").notNull(),
+		finish_digest: text("finish_digest").notNull(),
+		candidate_ref: text("candidate_ref").notNull(),
+		confirmed_access_delta_digest: text("confirmed_access_delta_digest").notNull(),
+		completed_team_id: text("completed_team_id").notNull(),
+		response_json: text("response_json").notNull(),
+		completed_at: text("completed_at").notNull(),
+		created_at: text("created_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_legacy_team_setup_completions_attempt_finish").on(
+			table.attempt_id,
+			table.finish_digest,
+		),
+		index("idx_legacy_team_setup_completions_exact_replay").on(
+			table.candidate_ref,
+			table.attempt_id,
+			table.finish_digest,
+			table.confirmed_access_delta_digest,
+		),
+	],
+);
+
+export type LegacyTeamSetupCompletion = typeof legacyTeamSetupCompletions.$inferSelect;
+export type NewLegacyTeamSetupCompletion = typeof legacyTeamSetupCompletions.$inferInsert;
+
+export const legacyTeamSetupDraftDevices = sqliteTable(
+	"legacy_team_setup_draft_devices",
+	{
+		attempt_id: text("attempt_id")
+			.notNull()
+			.references(() => legacyTeamSetupDrafts.attempt_id, { onDelete: "cascade" }),
+		device_id: text("device_id").notNull(),
+		device_ref: text("device_ref").notNull(),
+		key_fingerprint: text("key_fingerprint").notNull(),
+		display_name: text("display_name").notNull(),
+		enabled: integer("enabled", { mode: "boolean" }).notNull(),
+		existing_identity_id: text("existing_identity_id"),
+		existing_assignment_version: integer("existing_assignment_version"),
+		verified_evidence_kind: text("verified_evidence_kind"),
+		decision: text("decision").notNull().default("unresolved"),
+		target_identity_id: text("target_identity_id"),
+		expected_assignment_kind: text("expected_assignment_kind"),
+		expected_assignment_version: integer("expected_assignment_version"),
+		updated_at: text("updated_at").notNull(),
+	},
+	(table) => [
+		primaryKey({ columns: [table.attempt_id, table.device_id] }),
+		uniqueIndex("idx_legacy_team_setup_devices_attempt_ref").on(table.attempt_id, table.device_ref),
+		index("idx_legacy_team_setup_devices_attempt_decision").on(table.attempt_id, table.decision),
+	],
+);
+
+export type LegacyTeamSetupDraftDevice = typeof legacyTeamSetupDraftDevices.$inferSelect;
+export type NewLegacyTeamSetupDraftDevice = typeof legacyTeamSetupDraftDevices.$inferInsert;
+
+export const legacyTeamSetupDraftProjects = sqliteTable(
+	"legacy_team_setup_draft_projects",
+	{
+		attempt_id: text("attempt_id")
+			.notNull()
+			.references(() => legacyTeamSetupDrafts.attempt_id, { onDelete: "cascade" }),
+		project_ref: text("project_ref").notNull(),
+		source_project_identity: text("source_project_identity").notNull(),
+		display_name: text("display_name").notNull(),
+		source_fingerprint: text("source_fingerprint").notNull(),
+		resolution_kind: text("resolution_kind").notNull().default("unresolved"),
+		resolved_project_identity: text("resolved_project_identity"),
+		updated_at: text("updated_at").notNull(),
+	},
+	(table) => [
+		primaryKey({ columns: [table.attempt_id, table.project_ref] }),
+		index("idx_legacy_team_setup_projects_attempt_resolution").on(
+			table.attempt_id,
+			table.resolution_kind,
+		),
+	],
+);
+
+export type LegacyTeamSetupDraftProject = typeof legacyTeamSetupDraftProjects.$inferSelect;
+export type NewLegacyTeamSetupDraftProject = typeof legacyTeamSetupDraftProjects.$inferInsert;
+
+export const recipientManagedProjectProjections = sqliteTable(
+	"recipient_managed_project_projections",
+	{
+		canonical_project_identity: text("canonical_project_identity").notNull(),
+		display_name: text("display_name").notNull(),
+		managed_scope_id: text("managed_scope_id").notNull(),
+		coordinator_id: text("coordinator_id").notNull(),
+		group_id: text("group_id").notNull(),
+		recipient_identity_id: text("recipient_identity_id").notNull(),
+		accepting_device_id: text("accepting_device_id").notNull(),
+		source_operation_id: text("source_operation_id").notNull(),
+		reviewed_project_set_digest: text("reviewed_project_set_digest").notNull(),
+		status: text("status").notNull().default("active"),
+		accepted_at: text("accepted_at").notNull(),
+		revoked_at: text("revoked_at"),
+		created_at: text("created_at").notNull(),
+		updated_at: text("updated_at").notNull(),
+	},
+	(table) => [
+		primaryKey({
+			columns: [table.source_operation_id, table.canonical_project_identity],
+		}),
+		index("idx_recipient_managed_projects_identity_status").on(
+			table.recipient_identity_id,
+			table.status,
+		),
+		index("idx_recipient_managed_projects_scope_authority").on(
+			table.managed_scope_id,
+			table.coordinator_id,
+			table.group_id,
+			table.status,
+		),
+	],
+);
+
+export type RecipientManagedProjectProjection =
+	typeof recipientManagedProjectProjections.$inferSelect;
+export type NewRecipientManagedProjectProjection =
+	typeof recipientManagedProjectProjections.$inferInsert;
+
+export const recipientPolicyAuthorityStates = sqliteTable("recipient_policy_authority_states", {
+	canonical_project_identity: text("canonical_project_identity").primaryKey(),
+	authority_state: text("authority_state").notNull().default("legacy"),
+	generation: integer("generation").notNull().default(0),
+	desired_devices_digest: text("desired_devices_digest"),
+	current_devices_digest: text("current_devices_digest"),
+	stable_parity_evidence_digest: text("stable_parity_evidence_digest"),
+	stable_parity_passed_at: text("stable_parity_passed_at"),
+	fresh_snapshot_fingerprint: text("fresh_snapshot_fingerprint"),
+	fresh_snapshot_observed_at: text("fresh_snapshot_observed_at"),
+	safe_error_code: text("safe_error_code"),
+	state_changed_at: text("state_changed_at").notNull(),
+	last_error_at: text("last_error_at"),
+	attempt_count: integer("attempt_count").notNull().default(0),
+	last_attempt_at: text("last_attempt_at"),
+	last_completed_at: text("last_completed_at"),
+	lease_owner: text("lease_owner"),
+	lease_acquired_at: text("lease_acquired_at"),
+	lease_expires_at: text("lease_expires_at"),
+	created_at: text("created_at").notNull(),
+	updated_at: text("updated_at").notNull(),
+});
+
+export type RecipientPolicyAuthorityStateRow = typeof recipientPolicyAuthorityStates.$inferSelect;
+export type NewRecipientPolicyAuthorityStateRow =
+	typeof recipientPolicyAuthorityStates.$inferInsert;
+
+export const recipientPolicyReconciliationSteps = sqliteTable(
+	"recipient_policy_reconciliation_steps",
+	{
+		canonical_project_identity: text("canonical_project_identity").notNull(),
+		generation: integer("generation").notNull(),
+		step_key: text("step_key").notNull(),
+		effect_id: text("effect_id").notNull(),
+		payload_digest: text("payload_digest").notNull(),
+		status: text("status").notNull().default("pending"),
+		attempt_count: integer("attempt_count").notNull().default(0),
+		started_at: text("started_at"),
+		completed_at: text("completed_at"),
+		last_attempt_at: text("last_attempt_at"),
+		safe_error_code: text("safe_error_code"),
+		error_at: text("error_at"),
+		lease_owner: text("lease_owner"),
+		lease_acquired_at: text("lease_acquired_at"),
+		lease_expires_at: text("lease_expires_at"),
+		created_at: text("created_at").notNull(),
+		updated_at: text("updated_at").notNull(),
+	},
+	(table) => [
+		primaryKey({
+			columns: [table.canonical_project_identity, table.generation, table.step_key],
+		}),
+		uniqueIndex("idx_recipient_policy_reconciliation_steps_effect").on(table.effect_id),
+		index("idx_recipient_policy_reconciliation_steps_status").on(
+			table.canonical_project_identity,
+			table.status,
+		),
+		index("idx_recipient_policy_reconciliation_steps_pending_refresh")
+			.on(table.canonical_project_identity, table.generation, table.step_key)
+			.where(
+				sql`${table.status} IN ('pending', 'running', 'failed') AND ${table.step_key} GLOB 'refresh-after-revocations-v2:*'`,
+			),
+	],
+);
+
+export type RecipientPolicyReconciliationStep =
+	typeof recipientPolicyReconciliationSteps.$inferSelect;
+export type NewRecipientPolicyReconciliationStep =
+	typeof recipientPolicyReconciliationSteps.$inferInsert;
+
+export const recipientPolicyDenyOverlays = sqliteTable(
+	"recipient_policy_deny_overlays",
+	{
+		canonical_project_identity: text("canonical_project_identity").notNull(),
+		scope_id: text("scope_id").notNull(),
+		device_id: text("device_id").notNull(),
+		generation: integer("generation").notNull(),
+		reason_code: text("reason_code").notNull(),
+		created_at: text("created_at").notNull(),
+		updated_at: text("updated_at").notNull(),
+	},
+	(table) => [
+		primaryKey({
+			columns: [table.canonical_project_identity, table.scope_id, table.device_id],
+		}),
+		index("idx_recipient_policy_deny_overlays_scope_device").on(table.scope_id, table.device_id),
+	],
+);
+
+export type RecipientPolicyDenyOverlay = typeof recipientPolicyDenyOverlays.$inferSelect;
+export type NewRecipientPolicyDenyOverlay = typeof recipientPolicyDenyOverlays.$inferInsert;
+
 export const schema = {
+	deviceIdentityBindingCommits,
+	deviceIdentityBindingAudit,
 	sessions,
+	replicationScopes,
+	projectScopeMappings,
+	scopeMemberships,
 	artifacts,
 	memoryItems,
 	memoryFileRefs,
 	memoryConceptRefs,
 	usageEvents,
+	retrievalAttempts,
+	retrievalExposures,
+	outcomeEvidence,
+	attributionAssessments,
+	attributionAssessmentEvidence,
 	rawEvents,
 	rawEventSessions,
 	opencodeSessions,
@@ -563,14 +1435,33 @@ export const schema = {
 	sessionSummaries,
 	replicationOps,
 	replicationCursors,
+	replicationCursorsV2,
 	syncPeers,
 	syncNonces,
 	syncDevice,
 	syncAttempts,
+	syncScopeRejections,
 	syncDaemonState,
 	syncResetState,
+	syncResetStateV2,
+	syncRetentionStateV2,
 	rawEventIngestSamples,
 	rawEventIngestStats,
 	coordinatorGroupPreferences,
 	actors,
+	recipientPolicyReviewResolutions,
+	coordinatorEnrollmentReconciliationIssues,
+	policyTeams,
+	policyTeamMemberships,
+	policyTeamDeviceDecisions,
+	identityDevices,
+	projectRecipients,
+	legacyTeamSetupDrafts,
+	legacyTeamSetupCompletions,
+	legacyTeamSetupDraftDevices,
+	legacyTeamSetupDraftProjects,
+	recipientManagedProjectProjections,
+	recipientPolicyAuthorityStates,
+	recipientPolicyReconciliationSteps,
+	recipientPolicyDenyOverlays,
 };

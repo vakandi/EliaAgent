@@ -17,11 +17,12 @@ import {
 	connect,
 	ensureSchemaBootstrapped,
 	flushRawEvents,
+	ingestRawEvents,
 	loadSqliteVec,
 	MemoryStore,
 	ObserverClient,
 	resolveDbPath,
-	stripPrivateObj,
+	TRUSTED_HOOK_MAPPER_OPTIONS,
 } from "@codemem/core";
 import { Command } from "commander";
 import { helpStyle } from "../help-style.js";
@@ -36,8 +37,9 @@ import {
 	spoolPayload,
 	withClaudeHookIngestLock,
 } from "./claude-hook-ingest-spool.js";
-import { logHookFailure } from "./claude-hook-plugin-log.js";
+import { logHookEvent } from "./claude-hook-plugin-log.js";
 import { trackHookSessionState } from "./claude-hook-session-state.js";
+import { isViewerTargetConflict, rawEventTarget } from "./raw-event-target.js";
 
 type IngestVia = "http" | "direct" | "spool" | "spool_lock_busy";
 
@@ -53,6 +55,13 @@ type IngestDeps = {
 	directIngest?: typeof directEnqueue;
 	resolveDb?: typeof resolveDbPath;
 	boundaryFlush?: (payload: Record<string, unknown>, dbPath: string) => Promise<void> | void;
+};
+
+type HttpIngestResult = {
+	ok: boolean;
+	inserted: number;
+	skipped: number;
+	targetMismatch?: boolean;
 };
 
 function emitStructuredError(errorCode: string, message: string): void {
@@ -80,7 +89,7 @@ async function tryHttpIngest(
 	payload: Record<string, unknown>,
 	host: string,
 	port: number,
-): Promise<{ ok: boolean; inserted: number; skipped: number }> {
+): Promise<HttpIngestResult> {
 	const url = `http://${host}:${port}/api/claude-hooks`;
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), 5000);
@@ -91,22 +100,30 @@ async function tryHttpIngest(
 			body: JSON.stringify(payload),
 			signal: controller.signal,
 		});
-		if (!res.ok) return { ok: false, inserted: 0, skipped: 0 };
+		if (!res.ok) {
+			const body = await res.json().catch(() => null);
+			return {
+				ok: false,
+				inserted: 0,
+				skipped: 0,
+				targetMismatch: isViewerTargetConflict(res.status, body),
+			};
+		}
 
 		let body: unknown;
 		try {
 			body = await res.json();
 		} catch {
-			logHookFailure("codemem claude-hook-ingest HTTP accepted with invalid response body");
+			logHookEvent("codemem claude-hook-ingest HTTP accepted with invalid response body");
 			return { ok: false, inserted: 0, skipped: 0 };
 		}
 		if (body == null || typeof body !== "object" || Array.isArray(body)) {
-			logHookFailure("codemem claude-hook-ingest HTTP accepted with invalid response type");
+			logHookEvent("codemem claude-hook-ingest HTTP accepted with invalid response type");
 			return { ok: false, inserted: 0, skipped: 0 };
 		}
 		const obj = body as Record<string, unknown>;
 		if (typeof obj.inserted !== "number" || typeof obj.skipped !== "number") {
-			logHookFailure("codemem claude-hook-ingest HTTP accepted with unexpected response body");
+			logHookEvent("codemem claude-hook-ingest HTTP accepted with unexpected response body");
 			return { ok: false, inserted: 0, skipped: 0 };
 		}
 		return { ok: true, inserted: obj.inserted, skipped: obj.skipped };
@@ -122,7 +139,7 @@ export function directEnqueue(
 	payload: Record<string, unknown>,
 	dbPath: string,
 ): { inserted: number; skipped: number } {
-	const envelope = buildRawEventEnvelopeFromHook(payload);
+	const envelope = buildRawEventEnvelopeFromHook(payload, TRUSTED_HOOK_MAPPER_OPTIONS);
 	if (!envelope) return { inserted: 0, skipped: 1 };
 
 	const db = connect(dbPath);
@@ -137,67 +154,8 @@ export function directEnqueue(
 		// hooks can race its startup (claude-hook-ingest is a separate CLI
 		// process) so we can't rely on that ordering.
 		ensureSchemaBootstrapped(db);
-		const strippedPayload = stripPrivateObj(envelope.payload) as Record<string, unknown>;
-		const existing = db
-			.prepare(
-				"SELECT 1 FROM raw_events WHERE source = ? AND stream_id = ? AND event_id = ? LIMIT 1",
-			)
-			.get(envelope.source, envelope.session_stream_id, envelope.event_id);
-		if (existing) return { inserted: 0, skipped: 0 };
-
-		db.prepare(
-			`INSERT INTO raw_events(
-				source, stream_id, opencode_session_id, event_id, event_seq,
-				event_type, ts_wall_ms, payload_json, created_at
-			) VALUES (?, ?, ?, ?, (
-				SELECT COALESCE(MAX(event_seq), 0) + 1
-				FROM raw_events WHERE source = ? AND stream_id = ?
-			), ?, ?, ?, datetime('now'))`,
-		).run(
-			envelope.source,
-			envelope.session_stream_id,
-			envelope.opencode_session_id,
-			envelope.event_id,
-			envelope.source,
-			envelope.session_stream_id,
-			"claude.hook",
-			envelope.ts_wall_ms,
-			JSON.stringify(strippedPayload),
-		);
-
-		// Query actual max event_seq for this stream to keep session metadata in sync
-		const maxSeqRow = db
-			.prepare(
-				"SELECT COALESCE(MAX(event_seq), 0) AS max_seq FROM raw_events WHERE source = ? AND stream_id = ?",
-			)
-			.get(envelope.source, envelope.session_stream_id) as { max_seq: number };
-		const currentMaxSeq = maxSeqRow.max_seq;
-
-		// Upsert session metadata with accurate sequence tracking
-		db.prepare(
-			`INSERT INTO raw_event_sessions(
-				source, stream_id, opencode_session_id, cwd, project, started_at,
-				last_seen_ts_wall_ms, last_received_event_seq, last_flushed_event_seq, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, -1, datetime('now'))
-			ON CONFLICT(source, stream_id) DO UPDATE SET
-				cwd = COALESCE(excluded.cwd, cwd),
-				project = COALESCE(excluded.project, project),
-				started_at = COALESCE(excluded.started_at, started_at),
-				last_seen_ts_wall_ms = MAX(COALESCE(excluded.last_seen_ts_wall_ms, 0), COALESCE(last_seen_ts_wall_ms, 0)),
-				last_received_event_seq = MAX(excluded.last_received_event_seq, last_received_event_seq),
-				updated_at = datetime('now')`,
-		).run(
-			envelope.source,
-			envelope.session_stream_id,
-			envelope.opencode_session_id,
-			envelope.cwd,
-			envelope.project,
-			envelope.started_at,
-			envelope.ts_wall_ms,
-			currentMaxSeq,
-		);
-
-		return { inserted: 1, skipped: 0 };
+		const result = ingestRawEvents({ db }, envelope);
+		return { inserted: result.inserted, skipped: result.skipped };
 	} finally {
 		db.close();
 	}
@@ -219,14 +177,14 @@ async function flushBoundaryRawEvents(
 	payload: Record<string, unknown>,
 	dbPath: string,
 ): Promise<void> {
-	const envelope = buildRawEventEnvelopeFromHook(payload);
+	const envelope = buildRawEventEnvelopeFromHook(payload, TRUSTED_HOOK_MAPPER_OPTIONS);
 	if (!envelope) return;
 
 	let observer: ObserverClient;
 	try {
 		observer = new ObserverClient();
 	} catch (err) {
-		logHookFailure(
+		logHookEvent(
 			`codemem claude-hook-ingest boundary flush observer init failed: ${err instanceof Error ? err.message : String(err)}`,
 		);
 		return;
@@ -236,7 +194,7 @@ async function flushBoundaryRawEvents(
 	try {
 		store = new MemoryStore(dbPath);
 	} catch (err) {
-		logHookFailure(
+		logHookEvent(
 			`codemem claude-hook-ingest boundary flush store init failed: ${err instanceof Error ? err.message : String(err)}`,
 		);
 		return;
@@ -256,7 +214,7 @@ async function flushBoundaryRawEvents(
 			},
 		);
 	} catch (err) {
-		logHookFailure(
+		logHookEvent(
 			`codemem claude-hook-ingest boundary flush raw events failed: ${err instanceof Error ? err.message : String(err)}`,
 		);
 	} finally {
@@ -297,6 +255,10 @@ export async function ingestClaudeHookPayload(
 		if (cachedDbPath === null) cachedDbPath = resolveDb(resolveDbOpt(opts));
 		return cachedDbPath;
 	};
+	const httpPayload = (queued: Record<string, unknown>): Record<string, unknown> => ({
+		...queued,
+		...rawEventTarget(getDbPath()),
+	});
 
 	const tryDirectFallback = (
 		queued: Record<string, unknown>,
@@ -304,7 +266,7 @@ export async function ingestClaudeHookPayload(
 		try {
 			return { ok: true, result: directIngest(queued, getDbPath()) };
 		} catch (err) {
-			logHookFailure(
+			logHookEvent(
 				`codemem claude-hook-ingest direct fallback failed: ${err instanceof Error ? err.message : String(err)}`,
 			);
 			return { ok: false };
@@ -321,14 +283,14 @@ export async function ingestClaudeHookPayload(
 		try {
 			directIngest(payload, getDbPath());
 		} catch (err) {
-			logHookFailure(
+			logHookEvent(
 				`codemem claude-hook-ingest boundary flush direct write failed: ${err instanceof Error ? err.message : String(err)}`,
 			);
 		}
 		try {
 			await boundaryFlush(payload, getDbPath());
 		} catch (err) {
-			logHookFailure(
+			logHookEvent(
 				`codemem claude-hook-ingest boundary flush failed: ${err instanceof Error ? err.message : String(err)}`,
 			);
 		}
@@ -347,7 +309,7 @@ export async function ingestClaudeHookPayload(
 			await withClaudeHookIngestLock(async () => {
 				recoverStaleTmpSpool(lockTtlSeconds());
 				await drainSpool(async (queuedPayload) => {
-					const queuedHttp = await httpIngest(queuedPayload, opts.host, port);
+					const queuedHttp = await httpIngest(httpPayload(queuedPayload), opts.host, port);
 					if (queuedHttp.ok) return true;
 					return tryDirectFallback(queuedPayload).ok;
 				});
@@ -357,17 +319,20 @@ export async function ingestClaudeHookPayload(
 				// Another invocation is already draining; nothing to do.
 				return;
 			}
-			logHookFailure(
+			logHookEvent(
 				`codemem claude-hook-ingest backlog drain failed: ${err instanceof Error ? err.message : String(err)}`,
 			);
 		}
 	};
 
 	// 1. Unlocked HTTP attempt — fast path when the viewer is up.
-	const httpResult = await httpIngest(payload, opts.host, port);
+	const httpResult = await httpIngest(httpPayload(payload), opts.host, port);
 	if (httpResult.ok) {
-		await flushOnBoundaryIfRequested();
+		// Drain any spooled backlog before the boundary flush so the
+		// flush pass sees every queued payload of the session, not just
+		// this event.
 		await drainBacklogIfPresent();
+		await flushOnBoundaryIfRequested();
 		return { inserted: httpResult.inserted, skipped: httpResult.skipped, via: "http" };
 	}
 
@@ -378,14 +343,16 @@ export async function ingestClaudeHookPayload(
 			recoverStaleTmpSpool(lockTtlSeconds());
 
 			await drainSpool(async (queuedPayload) => {
-				const queuedHttp = await httpIngest(queuedPayload, opts.host, port);
+				if (httpResult.targetMismatch) return tryDirectFallback(queuedPayload).ok;
+				const queuedHttp = await httpIngest(httpPayload(queuedPayload), opts.host, port);
 				if (queuedHttp.ok) return true;
-				const direct = tryDirectFallback(queuedPayload);
-				return direct.ok;
+				return tryDirectFallback(queuedPayload).ok;
 			});
 
-			const secondHttp = await httpIngest(payload, opts.host, port);
-			if (secondHttp.ok) {
+			const secondHttp = httpResult.targetMismatch
+				? null
+				: await httpIngest(httpPayload(payload), opts.host, port);
+			if (secondHttp?.ok) {
 				await flushOnBoundaryIfRequested();
 				return {
 					inserted: secondHttp.inserted,
@@ -404,13 +371,13 @@ export async function ingestClaudeHookPayload(
 				return { inserted: 0, skipped: 0, via: "spool" as const };
 			}
 
-			logHookFailure("codemem claude-hook-ingest failed: fallback and spool failed");
+			logHookEvent("codemem claude-hook-ingest failed: fallback and spool failed");
 			throw new Error("claude-hook-ingest: fallback and spool both failed");
 		});
 	} catch (err) {
 		if (!(err instanceof LockBusyError)) throw err;
 
-		logHookFailure("codemem claude-hook-ingest lock busy; trying unlocked fallback");
+		logHookEvent("codemem claude-hook-ingest lock busy; trying unlocked fallback");
 		const direct = tryDirectFallback(payload);
 		if (direct.ok) {
 			return { ...direct.result, via: "direct" };
@@ -418,7 +385,7 @@ export async function ingestClaudeHookPayload(
 		if (spoolPayload(payload)) {
 			return { inserted: 0, skipped: 0, via: "spool_lock_busy" };
 		}
-		logHookFailure("codemem claude-hook-ingest failed: unlocked fallback and spool failed");
+		logHookEvent("codemem claude-hook-ingest failed: unlocked fallback and spool failed");
 		throw err;
 	}
 }

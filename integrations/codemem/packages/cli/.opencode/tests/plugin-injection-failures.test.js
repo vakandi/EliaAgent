@@ -42,6 +42,78 @@ describe("parsePackMetrics", () => {
   });
 });
 
+describe("Viewer prompt transport failure classification", () => {
+  test.each([
+    ["pack profile", false, "fallback", true],
+    ["pack", true, "terminal", false],
+  ])(
+    "classifies invalid_request for %s with compatibleProfile=%s as %s",
+    (operation, compatibleProfile, disposition, retryable) => {
+      // Arrange
+      const body = {
+        error: { code: "invalid_request" },
+      };
+
+      // Act
+      const classification = __testUtils.classifyViewerHttpFailure({
+        operation,
+        status: 400,
+        body,
+        compatibleProfile,
+      });
+
+      // Assert
+      expect(classification).toMatchObject({ disposition, retryable });
+    },
+  );
+
+  test("fails closed on contract 409 only after a compatible profile", () => {
+    const body = {
+      error: {
+        code: "viewer_contract_unsupported",
+        message: "viewer request contract is incompatible",
+      },
+    };
+
+    expect(__testUtils.classifyViewerHttpFailure({
+      operation: "pack profile",
+      status: 409,
+      body,
+      compatibleProfile: false,
+    })).toMatchObject({ disposition: "fallback", retryable: true });
+    expect(__testUtils.classifyViewerHttpFailure({
+      operation: "pack",
+      status: 409,
+      body,
+      compatibleProfile: true,
+    })).toMatchObject({ disposition: "terminal", retryable: false });
+  });
+
+  test.each([
+    [401, { error: { code: "unauthorized" } }],
+    [403, { error: { code: "policy_denied" } }],
+    [400, { error: { code: "invalid_request", message: "context required" } }],
+  ])("treats status %s as terminal", (status, body) => {
+    expect(__testUtils.classifyViewerHttpFailure({
+      operation: "pack",
+      status,
+      body,
+      compatibleProfile: true,
+    })).toMatchObject({ disposition: "terminal", retryable: false });
+  });
+
+  test.each([
+    ["database", { error: { code: "viewer_db_mismatch" } }],
+    ["runtime identity", { error: { code: "viewer_identity_mismatch" } }],
+  ])("classifies a %s mismatch as one-shot local fallback", (_label, body) => {
+    expect(__testUtils.classifyViewerHttpFailure({
+      operation: "pack profile",
+      status: 409,
+      body,
+    })).toMatchObject({ disposition: "local_fallback", retryable: true });
+  });
+});
+
 describe("applyInjectedContextToOutput — failure behavior", () => {
   test("returns false when buildInjectedContext simulates spawn failure (empty string)", async () => {
     const output = { system: ["pre-existing"] };
@@ -51,7 +123,6 @@ describe("applyInjectedContextToOutput — failure behavior", () => {
       injectEnabled: true,
       input: { sessionID: "sess-fail-spawn" },
       output,
-      injectedSessions: new Map(),
       injectionToastShown: new Set(),
       showToast: vi.fn(),
       resolveInjectQuery: () => "q",
@@ -75,7 +146,6 @@ describe("applyInjectedContextToOutput — failure behavior", () => {
       injectEnabled: true,
       input: { sessionID: "sess-toast-fail" },
       output,
-      injectedSessions: new Map(),
       injectionToastShown: new Set(),
       showToast,
       resolveInjectQuery: () => "q",
@@ -98,7 +168,6 @@ describe("applyInjectedContextToOutput — failure behavior", () => {
         injectEnabled: true,
         input: { sessionID: "sess-cli-crash" },
         output,
-        injectedSessions: new Map(),
         injectionToastShown: new Set(),
         showToast: vi.fn(),
         resolveInjectQuery: () => "q",

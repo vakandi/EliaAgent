@@ -1,6 +1,7 @@
 import { appendFile, mkdir } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, posix, resolve, win32 } from "node:path";
+import { homedir } from "node:os";
 import { createHash } from "node:crypto";
 import { spawn as nodeSpawn, execSync } from "node:child_process";
 import { tool } from "@opencode-ai/plugin";
@@ -15,17 +16,295 @@ import {
 
 const TRUTHY_VALUES = ["1", "true", "yes"];
 const DISABLED_VALUES = ["0", "false", "off"];
-const PINNED_BACKEND_VERSION = "0.29.1";
+const PINNED_BACKEND_VERSION = "0.43.1";
 const COMPAT_CHECK_DELAY_MS = 1500;
 const COMPAT_CHECK_CACHE_TTL_MS = 5 * 60 * 1000;
+const MAX_UPDATE_STATUS_BYTES = 16 * 1024;
+const MAX_UPDATE_ACTION_CHARS = 1000;
+const MAX_UPDATE_VERSION_CHARS = 128;
+const STABLE_RELEASE_VERSION =
+  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+const CODEMEM_CONTEXT_PART_ID_PREFIX = "codemem-context-";
+const MAX_MESSAGE_INJECTION_CACHE_SESSIONS = 20;
+const MAX_MESSAGE_INJECTION_CACHE_MESSAGES = 100;
+const COMPACTION_INJECTION_SKIP_TTL_MS = 30 * 1000;
+const MAX_WORKING_SET_PATH_CHARS = 400;
+const VIEWER_HEALTH_CHECK_INTERVAL_MS = 60_000;
+const VIEWER_HEALTH_TIMEOUT_MS = 5_000;
+const VIEWER_HEALTH_RESTART_THRESHOLD = 3;
+const VIEWER_HEALTH_RESTART_COOLDOWN_MS = 5 * 60_000;
+const RAW_EVENTS_STATUS_TIMEOUT_MS = 5_000;
 
 let compatCheckCache = null;
+const notifiedReleaseVersions = new Set();
+
+// Release an unread response body without surfacing cancellation failures.
+const discardResponseBody = (response) => {
+  try {
+    const cancelled = response?.body?.cancel?.();
+    if (cancelled && typeof cancelled.catch === "function") {
+      cancelled.catch(() => {});
+    }
+  } catch {
+    // Best effort — a locked or already-errored stream is fine to abandon.
+  }
+};
+
+// Bounded ingest-availability preflight: a hung viewer socket must not stall
+// raw-event delivery indefinitely. Failures fall into the existing stream
+// backoff + CLI enqueue fallback path.
+const fetchRawEventsStatus = (url, fetchFn = fetch) =>
+  fetchFn(url, {
+    method: "GET",
+    signal: AbortSignal.timeout(RAW_EVENTS_STATUS_TIMEOUT_MS),
+  });
 
 const normalizeEnvValue = (value) => (value || "").toLowerCase();
 const envHasValue = (value, truthyValues) =>
   truthyValues.includes(normalizeEnvValue(value));
 const envNotDisabled = (value) =>
   !DISABLED_VALUES.includes(normalizeEnvValue(value));
+
+const createViewerHealthMonitor = ({
+  viewerHealthUrl,
+  legacyStatusUrl,
+  isActive,
+  restartViewer,
+  logLine,
+  fetchFn = fetch,
+  now = Date.now,
+  setIntervalFn = setInterval,
+  clearIntervalFn = clearInterval,
+  timeoutSignal = (timeoutMs) => AbortSignal.timeout(timeoutMs),
+}) => {
+  let timer = null;
+  let consecutiveFailures = 0;
+  let lastRestartAttempt = 0;
+
+  const boundedFetch = (url) => fetchFn(url, {
+    method: "GET",
+    signal: timeoutSignal(VIEWER_HEALTH_TIMEOUT_MS),
+  });
+
+  const probe = async () => {
+    let response;
+    try {
+      response = await boundedFetch(viewerHealthUrl);
+    } catch (error) {
+      return { live: false, detail: `error: ${String(error).slice(0, 200)}` };
+    }
+
+    if (response.status === 404) {
+      discardResponseBody(response);
+      try {
+        // Old-viewer compatibility: released viewers serving this route
+        // always include the `ingest` availability object, so require that
+        // identifying evidence rather than trusting any 2xx from an
+        // arbitrary local service.
+        const fallbackResponse = await boundedFetch(legacyStatusUrl);
+        if (!fallbackResponse.ok) {
+          discardResponseBody(fallbackResponse);
+          return { live: false, detail: `fallback status=${fallbackResponse.status}` };
+        }
+        const fallbackPayload = await fallbackResponse.json();
+        const looksLikeViewer =
+          fallbackPayload &&
+          typeof fallbackPayload === "object" &&
+          fallbackPayload.ingest &&
+          typeof fallbackPayload.ingest === "object";
+        return looksLikeViewer
+          ? { live: true }
+          : { live: false, detail: "fallback unexpected payload" };
+      } catch (error) {
+        return { live: false, detail: `fallback error: ${String(error).slice(0, 200)}` };
+      }
+    }
+
+    if (!response.ok) {
+      // Release the unread body so a persistently failing viewer does not
+      // pin connections across the 60s monitor interval.
+      discardResponseBody(response);
+      return { live: false, detail: `status=${response.status}` };
+    }
+
+    let payload;
+    try {
+      payload = await response.json();
+    } catch (error) {
+      return { live: false, detail: `invalid JSON: ${String(error).slice(0, 200)}` };
+    }
+    if (!payload || typeof payload !== "object" || payload.service !== "codemem-viewer") {
+      return { live: false, detail: "unexpected service" };
+    }
+    return { live: true };
+  };
+
+  const check = async () => {
+    if (!isActive()) return;
+    const result = await probe();
+    if (result.live) {
+      if (consecutiveFailures > 0) {
+        await logLine(`viewer.health recovered after ${consecutiveFailures} failure(s)`);
+      }
+      consecutiveFailures = 0;
+      return;
+    }
+
+    consecutiveFailures += 1;
+    await logLine(
+      `viewer.health check failed (${result.detail}, consecutive=${consecutiveFailures})`
+    );
+    if (
+      consecutiveFailures < VIEWER_HEALTH_RESTART_THRESHOLD ||
+      now() - lastRestartAttempt < VIEWER_HEALTH_RESTART_COOLDOWN_MS
+    ) {
+      return;
+    }
+
+    // Re-check after the awaited probe: a stop requested while the probe was
+    // in flight must not be undone by a restart.
+    if (!isActive()) return;
+
+    lastRestartAttempt = now();
+    await logLine(`viewer.health restarting viewer after ${consecutiveFailures} consecutive failures`);
+    try {
+      const restartResult = await restartViewer();
+      const restarted = restartResult?.exitCode === 0;
+      await logLine(
+        `viewer.health restart ${restarted ? "succeeded" : "failed"} (exit=${restartResult?.exitCode ?? "unknown"})`
+      );
+      if (restarted) consecutiveFailures = 0;
+    } catch (error) {
+      await logLine(`viewer.health restart error: ${String(error).slice(0, 200)}`);
+    }
+  };
+
+  const start = () => {
+    if (timer) return;
+    consecutiveFailures = 0;
+    timer = setIntervalFn(() => {
+      check().catch(() => {});
+    }, VIEWER_HEALTH_CHECK_INTERVAL_MS);
+    if (timer?.unref) timer.unref();
+  };
+
+  const stop = () => {
+    if (timer) {
+      clearIntervalFn(timer);
+      timer = null;
+    }
+    consecutiveFailures = 0;
+  };
+
+  return {
+    check,
+    start,
+    stop,
+    state: () => ({
+      consecutiveFailures,
+      lastRestartAttempt,
+      running: timer !== null,
+    }),
+  };
+};
+
+const resolveInjectSurface = (value) => {
+  const normalized = String(value || "message").trim().toLowerCase();
+  if (normalized === "system") {
+    return "system";
+  }
+  return "message";
+};
+
+const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value || {}, key);
+
+const deterministicUuid = (namespace, components) => {
+  const hex = createHash("sha256")
+    .update(JSON.stringify([namespace, ...components.map((value) => String(value ?? ""))]))
+    .digest("hex");
+  const bytes = Buffer.from(hex.slice(0, 32), "hex");
+  bytes[6] = (bytes[6] & 0x0f) | 0x50;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const value = bytes.toString("hex");
+  return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20)}`;
+};
+
+const promptPackIdentity = ({
+  source = "opencode",
+  sessionID = "unknown",
+  requestKey,
+  surface,
+  promptNumber = 0,
+  queryHash,
+}) => {
+  const components = [source, sessionID, requestKey, surface, promptNumber, queryHash];
+  return {
+    attemptId: deterministicUuid("codemem.prompt-pack.attempt.v1", components),
+    requestId: deterministicUuid("codemem.prompt-pack.request.v1", components),
+  };
+};
+
+const hashPromptPackQuery = (query) =>
+  createHash("sha256").update(String(query || "")).digest("hex");
+
+const redactPackCommand = (runner, runnerArgs, packArgs) => {
+  const safePackArgs = [...packArgs];
+  if (safePackArgs[0] === "pack" && safePackArgs.length > 1) {
+    safePackArgs[1] = "[query-redacted]";
+  }
+  for (let index = 0; index < safePackArgs.length - 1; index += 1) {
+    if (safePackArgs[index] === "--working-set-file") {
+      safePackArgs[index + 1] = "[path-redacted]";
+    }
+  }
+  return [runner, ...runnerArgs, ...safePackArgs].join(" ");
+};
+
+const rejectsInternalLedgerFlag = (result) => {
+  if (!result || result.exitCode === 0) return false;
+  const diagnostics = `${result.stderr || ""}\n${result.stdout || ""}`;
+  return diagnostics.includes("--internal-ledger")
+    && /(?:unknown|unsupported|unrecognized|invalid)\s+(?:option|argument)/i.test(diagnostics);
+};
+
+const parseFallbackStructuredError = (stdout) => {
+  const lines = String(stdout || "").trim().split(/\r?\n/).reverse();
+  for (const line of lines) {
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed && typeof parsed === "object") {
+        return {
+          code: typeof parsed.error === "string" ? parsed.error : "",
+          message: typeof parsed.message === "string" ? parsed.message : "",
+        };
+      }
+    } catch {
+      // Continue past non-JSON CLI output.
+    }
+  }
+  return { code: "", message: "" };
+};
+
+const classifyFallbackCommandResult = (result) => {
+  const structured = parseFallbackStructuredError(result?.stdout);
+  const diagnostic = [structured.code, structured.message, result?.stderr, result?.stdout]
+    .filter(Boolean)
+    .join("\n");
+  if (/SQLITE_(?:BUSY|LOCKED)|database(?: table)? (?:is )?(?:busy|locked)/i.test(diagnostic)) {
+    return { retryable: true, cause: "SQLite database is locked" };
+  }
+  if (result?.exitCode == null && /(?:timeout|timed out|ETIMEDOUT)/i.test(diagnostic)) {
+    return { retryable: true, cause: "enqueue-raw-event command timeout" };
+  }
+  if (structured.code === "validation_error" || /invalid raw event|session id required/i.test(diagnostic)) {
+    return { retryable: false, cause: "enqueue-raw-event validation failed" };
+  }
+  if (/unknown command ['\"]?enqueue-raw-event|command not found|\bENOENT\b/i.test(diagnostic)) {
+    return { retryable: false, cause: "enqueue-raw-event command unavailable" };
+  }
+  const exitCode = result?.exitCode ?? "unknown";
+  return { retryable: false, cause: `enqueue-raw-event failed (${exitCode})` };
+};
 
 const DEFAULT_LOG_PATH = (homeDir, cwd) => `${homeDir || cwd}/.codemem/plugin.log`;
 
@@ -71,6 +350,40 @@ const writeCompatCheckCache = (cacheKey, value) => {
 
 const clearCompatCheckCache = () => {
   compatCheckCache = null;
+};
+
+const isStableReleaseVersion = (value) => {
+  if (typeof value !== "string" || value.length > MAX_UPDATE_VERSION_CHARS) return false;
+  const match = STABLE_RELEASE_VERSION.exec(value);
+  return Boolean(match && match.slice(1, 4).map(Number).every(Number.isSafeInteger));
+};
+
+const parseReleaseNotification = (result) => {
+  if (result?.exitCode !== 0) return null;
+  const stdout = String(result?.stdout || "").trim();
+  if (!stdout || Buffer.byteLength(stdout, "utf8") > MAX_UPDATE_STATUS_BYTES) return null;
+  try {
+    const status = JSON.parse(stdout);
+    if (!status || typeof status !== "object" || Array.isArray(status)) return null;
+    if (status.update_available !== true) return null;
+    if (!isStableReleaseVersion(status.latest_version)) {
+      return null;
+    }
+    if (
+      typeof status.recommended_action !== "string"
+      || !status.recommended_action.trim()
+      || status.recommended_action.length > MAX_UPDATE_ACTION_CHARS
+    ) {
+      return null;
+    }
+    return {
+      latestVersion: status.latest_version,
+      recommendedAction: status.recommended_action.trim(),
+      autoUpdateEligible: status.auto_update_eligible === true,
+    };
+  } catch {
+    return null;
+  }
 };
 
 const createLogLine = (logPath) => async (line) => {
@@ -147,16 +460,82 @@ const extractApplyPatchPaths = (patchText) => {
   return paths;
 };
 
+const windowsPathFlavor = (value, doubleSlashIsUnc = true) =>
+  /^[A-Za-z]:[\\/]/.test(value)
+  || /^\\\\/.test(value)
+  || (doubleSlashIsUnc && /^\/\/[^/]+[\\/][^/]+/.test(value));
+
+const hasTraversalSegment = (value) =>
+  value.replaceAll("\\", "/").split("/").includes("..");
+
+const normalizeWorkingSetPath = (value, repositoryRoot) => {
+  if (typeof value !== "string" || typeof repositoryRoot !== "string") return null;
+  const candidate = value.trim();
+  if (
+    !candidate
+    || candidate.length > MAX_WORKING_SET_PATH_CHARS
+    || hasTraversalSegment(candidate)
+  ) {
+    return null;
+  }
+
+  const root = repositoryRoot.trim();
+  const candidateIsAbsolute = posix.isAbsolute(candidate) || win32.isAbsolute(candidate);
+  if (candidateIsAbsolute) {
+    if (!root || hasTraversalSegment(root)) return null;
+    const rootUsesWindows = windowsPathFlavor(root);
+    const candidateUsesWindows = windowsPathFlavor(candidate, rootUsesWindows);
+    if (candidateUsesWindows !== rootUsesWindows) return null;
+    const pathApi = candidateUsesWindows ? win32 : posix;
+    if (!pathApi.isAbsolute(root) || !pathApi.isAbsolute(candidate)) return null;
+    const relative = pathApi.relative(pathApi.normalize(root), pathApi.normalize(candidate));
+    if (
+      !relative
+      || relative === ".."
+      || relative.startsWith(`..${pathApi.sep}`)
+      || pathApi.isAbsolute(relative)
+    ) {
+      return null;
+    }
+    const normalized = relative.replaceAll("\\", "/");
+    return normalized.length <= MAX_WORKING_SET_PATH_CHARS ? normalized : null;
+  }
+
+  if (/^[A-Za-z]:/.test(candidate)) return null;
+  const normalized = posix.normalize(candidate.replaceAll("\\", "/")).replace(/^\.\//, "");
+  if (
+    !normalized
+    || normalized === "."
+    || normalized === ".."
+    || normalized.startsWith("../")
+    || posix.isAbsolute(normalized)
+    || normalized.length > MAX_WORKING_SET_PATH_CHARS
+  ) {
+    return null;
+  }
+  return normalized;
+};
+
+const addWorkingSetPath = (paths, value, repositoryRoot) => {
+  const normalized = normalizeWorkingSetPath(value, repositoryRoot);
+  if (!normalized) return null;
+  const duplicate = windowsPathFlavor(repositoryRoot)
+    ? Array.from(paths).some((existing) => existing.toLowerCase() === normalized.toLowerCase())
+    : paths.has(normalized);
+  if (!duplicate) paths.add(normalized);
+  return normalized;
+};
+
 const appendWorkingSetFileArgs = (args, workingSetFiles) => {
   if (!Array.isArray(workingSetFiles) || workingSetFiles.length === 0) {
     return args;
   }
   for (const file of workingSetFiles) {
     const normalized = String(file || "").trim();
-    if (!normalized) {
+    if (!normalized || normalized.length > MAX_WORKING_SET_PATH_CHARS) {
       continue;
     }
-    args.push("--working-set-file", normalized.slice(0, 400));
+    args.push("--working-set-file", normalized);
   }
   return args;
 };
@@ -198,14 +577,14 @@ const buildInjectQuery = ({ firstPrompt, lastPromptText, projectName, filesModif
   return query.length > 500 ? query.slice(0, 500) : query;
 };
 
-const buildPackArgs = ({ query, filesModified, injectLimit, injectTokenBudget, agentScope }) => {
+const buildPackArgs = ({ query, filesModified, injectLimit, injectTokenBudget, internalLedger = false }) => {
   const workingSetFiles = Array.from(filesModified || [])
     .slice(-8)
     .map((value) => String(value || "").trim())
     .filter(Boolean);
   const args = ["pack", query, "--json"];
-  if (agentScope && String(agentScope).trim()) {
-    args.push("--project", String(agentScope).trim());
+  if (internalLedger) {
+    args.push("--internal-ledger");
   }
   if (injectLimit !== null && Number.isFinite(injectLimit) && injectLimit > 0) {
     args.push("--limit", String(injectLimit));
@@ -244,54 +623,703 @@ const parsePackMetrics = (stdout) => {
   }
 };
 
+const buildViewerIdentityTarget = (env = process.env, cwd = process.cwd()) => {
+  const normalizeIdentityPath = (value) => {
+    const trimmed = String(value || "").trim();
+    if (!trimmed) return null;
+    const expanded = trimmed.startsWith("~/")
+      ? join(env.HOME?.trim() || homedir(), trimmed.slice(2))
+      : trimmed;
+    return resolve(cwd, expanded);
+  };
+  return {
+    device_id: env.CODEMEM_DEVICE_ID?.trim() || null,
+    actor_id_present: Object.hasOwn(env, "CODEMEM_ACTOR_ID"),
+    actor_id: env.CODEMEM_ACTOR_ID?.trim() || null,
+    config_path: normalizeIdentityPath(env.CODEMEM_CONFIG),
+    runtime_root: normalizeIdentityPath(env.CODEMEM_RUNTIME_ROOT),
+    workspace_id: env.CODEMEM_WORKSPACE_ID?.trim() || null,
+    home_dir: normalizeIdentityPath(env.HOME || homedir()),
+    pack_compression: env.CODEMEM_PACK_COMPRESSION?.trim() || null,
+    embedding_disabled: ["1", "true", "yes"].includes(
+      String(env.CODEMEM_EMBEDDING_DISABLED || "").toLowerCase(),
+    ),
+    embedding_model: env.CODEMEM_EMBEDDING_MODEL || "Xenova/bge-small-en-v1.5",
+  };
+};
+
+const parsePackOutput = (result) => {
+  const succeeded = result?.exitCode === 0;
+  let payload = null;
+  if (succeeded) {
+    try {
+      payload = JSON.parse(result.stdout);
+    } catch {
+      payload = null;
+    }
+  }
+  const ledgerConflict = payload?.ledger_outcome?.ok === false
+    && payload.ledger_outcome.errorCode === "retrieval_ledger_write_failed"
+    && payload.ledger_outcome.reason === "idempotency_conflict";
+  const metrics = succeeded ? payload?.metrics || null : null;
+  const itemCount = Number.isFinite(Number(metrics?.total_items))
+    ? Number(metrics.total_items)
+    : null;
+  const candidatePackText = succeeded && itemCount !== 0
+    ? String(payload?.pack_text || "").trim()
+    : "";
+  return {
+    conflictPackText: ledgerConflict ? candidatePackText : "",
+    ledgerConflict,
+    metrics,
+    itemCount,
+    // The real builder renders section headings even when it selected no
+    // memories. Treat the structured count as authoritative so headings alone
+    // are never handed to the model as retrieved context.
+    packText: !ledgerConflict ? candidatePackText : "",
+  };
+};
+
+const isRecord = (value) => value != null && typeof value === "object" && !Array.isArray(value);
+
+const isValidPackHttpPayload = (payload) => {
+  if (!isRecord(payload) || typeof payload.pack_text !== "string" || !isRecord(payload.metrics)) {
+    return false;
+  }
+  const itemCount = payload.metrics.total_items;
+  if (!Number.isInteger(itemCount) || itemCount < 0) {
+    return false;
+  }
+  if (
+    payload.ledger_artifact_fingerprint != null
+    && !/^[0-9a-f]{64}$/i.test(payload.ledger_artifact_fingerprint)
+  ) {
+    return false;
+  }
+  if (payload.ledger_outcome != null) {
+    return isRecord(payload.ledger_outcome)
+      && payload.ledger_outcome.ok === false
+      && payload.ledger_outcome.errorCode === "retrieval_ledger_write_failed"
+      && payload.ledger_outcome.reason === "idempotency_conflict";
+  }
+  return true;
+};
+
+const isValidLedgerHttpPayload = (payload) => isRecord(payload) && payload.ok === true;
+
+const isValidLedgerFailureHttpPayload = (payload) =>
+  isRecord(payload)
+  && payload.ok === false
+  && (
+    payload.errorCode === "retrieval_ledger_write_failed"
+    || payload.errorCode === "retrieval_ledger_delivery_write_failed"
+  )
+  && typeof payload.reason === "string";
+
+const isViewerDbMismatchPayload = (payload) =>
+  isRecord(payload)
+  && isRecord(payload.error)
+  && payload.error.code === "viewer_db_mismatch";
+
+const isViewerIdentityMismatchPayload = (payload) =>
+  isRecord(payload)
+  && isRecord(payload.error)
+  && payload.error.code === "viewer_identity_mismatch";
+
+const isViewerContractUnsupportedPayload = (payload) =>
+  isRecord(payload)
+  && isRecord(payload.error)
+  && payload.error.code === "viewer_contract_unsupported";
+
+const isViewerInvalidRequestPayload = (payload) =>
+  isRecord(payload)
+  && isRecord(payload.error)
+  && payload.error.code === "invalid_request";
+
+// Dependency-free port of @codemem/core prompt-transport semantics. Keep the
+// range and classifier parity pinned by the plugin injection tests.
+const PROMPT_TRANSPORT_PROTOCOL_RANGE = Object.freeze({
+  minSupportedProtocolVersion: 1,
+  protocolVersion: 1,
+});
+
+const normalizePromptTransportProtocolRange = (
+  protocolVersion,
+  minSupportedProtocolVersion = undefined,
+) => {
+  if (!Number.isSafeInteger(protocolVersion) || protocolVersion < 1) return null;
+  const minimum = minSupportedProtocolVersion === undefined
+    ? protocolVersion
+    : minSupportedProtocolVersion;
+  if (!Number.isSafeInteger(minimum) || minimum < 1 || minimum > protocolVersion) return null;
+  return { minSupportedProtocolVersion: minimum, protocolVersion };
+};
+
+const arePromptTransportProtocolRangesCompatible = (left, right) =>
+  left.minSupportedProtocolVersion <= right.protocolVersion
+  && right.minSupportedProtocolVersion <= left.protocolVersion;
+
+const classifyPromptTransportFailure = ({ kind, compatibleProfile = false }) => {
+  if (kind === "database_mismatch" || kind === "runtime_identity_mismatch") {
+    return "local_fallback";
+  }
+  if (kind === "invalid_request") {
+    return compatibleProfile ? "terminal" : "fallback";
+  }
+  if (kind === "policy_failure" || kind === "authorization_failure") {
+    return "terminal";
+  }
+  if (kind === "viewer_contract_unsupported") {
+    return compatibleProfile ? "terminal" : "fallback";
+  }
+  return "fallback";
+};
+
+const isViewerPolicyOrAuthFailurePayload = (payload) => {
+  const code = isRecord(payload) && isRecord(payload.error)
+    ? payload.error.code
+    : isRecord(payload)
+    ? payload.error
+    : null;
+  return typeof code === "string" && [
+    "authorization_failed",
+    "forbidden",
+    "policy_denied",
+    "policy_disabled",
+    "unauthorized",
+  ].includes(code);
+};
+
+const viewerFailureClassification = (cause, disposition) => ({
+  cause,
+  disposition,
+  retryable: disposition !== "terminal",
+});
+
+const classifyViewerHttpFailure = ({
+  operation,
+  status = null,
+  error = null,
+  malformed = false,
+  body = null,
+  compatibleProfile = false,
+}) => {
+  if (malformed) {
+    return viewerFailureClassification(
+      `${operation} returned malformed success`,
+      classifyPromptTransportFailure({ kind: "malformed_response" }),
+    );
+  }
+  if (isViewerDbMismatchPayload(body)) {
+    return viewerFailureClassification(
+      `${operation} viewer database mismatch`,
+      classifyPromptTransportFailure({ kind: "database_mismatch" }),
+    );
+  }
+  if (isViewerIdentityMismatchPayload(body)) {
+    return viewerFailureClassification(
+      `${operation} viewer runtime identity mismatch`,
+      classifyPromptTransportFailure({ kind: "runtime_identity_mismatch" }),
+    );
+  }
+  if (isViewerContractUnsupportedPayload(body)) {
+    return viewerFailureClassification(
+      `${operation} viewer contract unsupported`,
+      classifyPromptTransportFailure({
+        kind: "viewer_contract_unsupported",
+        compatibleProfile,
+      }),
+    );
+  }
+  if (operation === "prompt-pack-ledger" && isValidLedgerFailureHttpPayload(body)) {
+    return viewerFailureClassification(`${operation} request rejected (${status})`, "terminal");
+  }
+  if (status === 401 || status === 403 || isViewerPolicyOrAuthFailurePayload(body)) {
+    return viewerFailureClassification(
+      `${operation} policy or authorization failure (${status})`,
+      classifyPromptTransportFailure({
+        kind: status === 401 || status === 403 ? "authorization_failure" : "policy_failure",
+      }),
+    );
+  }
+  if (isViewerInvalidRequestPayload(body)) {
+    return viewerFailureClassification(
+      `${operation} request rejected (${status})`,
+      classifyPromptTransportFailure({ kind: "invalid_request", compatibleProfile }),
+    );
+  }
+  if (status === 404 || status === 405) {
+    return viewerFailureClassification(`${operation} endpoint unavailable (${status})`, "fallback");
+  }
+  if (Number.isInteger(status) && status >= 500) {
+    return viewerFailureClassification(`${operation} server failure (${status})`, "fallback");
+  }
+  if (Number.isInteger(status)) {
+    return viewerFailureClassification(`${operation} unexpected response (${status})`, "fallback");
+  }
+  const diagnostic = [
+    error?.name,
+    error?.code,
+    error?.cause?.code,
+    error?.message,
+    error,
+  ].filter(Boolean).join(" ");
+  const timedOut = /AbortError|TimeoutError|timeout|timed out|ETIMEDOUT/i.test(diagnostic);
+  return viewerFailureClassification(
+    timedOut ? `${operation} request timeout` : `${operation} connection failed`,
+    "fallback",
+  );
+};
+
+const buildPackHttpBody = ({
+  query,
+  filesModified,
+  injectLimit,
+  injectTokenBudget,
+  projectName,
+  cwd,
+  dbPath,
+  identityTarget,
+  attempt,
+}) => ({
+  context: query,
+  limit: injectLimit !== null && Number.isFinite(injectLimit) && injectLimit > 0
+    ? Math.trunc(injectLimit)
+    : 10,
+  token_budget:
+    injectTokenBudget !== null
+    && Number.isFinite(injectTokenBudget)
+    && injectTokenBudget > 0
+      ? Math.trunc(injectTokenBudget)
+      : null,
+  ...(projectName ? { project: projectName } : {}),
+  ...(cwd ? { cwd } : {}),
+  db_path: dbPath,
+  identity_target: identityTarget,
+  working_set_files: Array.from(filesModified || [])
+    .slice(-8)
+    .map((value) => String(value || "").trim())
+    .filter((value) => value && value.length <= MAX_WORKING_SET_PATH_CHARS),
+  attempt,
+});
+
+const canonicalJson = (value) => {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+};
+
+const promptPackArtifactFingerprint = (stdout, packText) => {
+  try {
+    const payload = JSON.parse(stdout);
+    if (/^[0-9a-f]{64}$/i.test(payload?.ledger_artifact_fingerprint || "")) {
+      return payload.ledger_artifact_fingerprint.toLowerCase();
+    }
+    return createHash("sha256").update(canonicalJson(payload)).digest("hex");
+  } catch {
+    return createHash("sha256").update(packText).digest("hex");
+  }
+};
+
 const applyInjectedContextToOutput = async ({
   injectEnabled,
   input,
   output,
-  injectedSessions,
   injectionToastShown,
   showToast,
   resolveInjectQuery,
   buildInjectedContext,
+  confirmDelivery,
+  recordSkipped,
 }) => {
   if (!injectEnabled) {
+    recordSkipped?.("injection_disabled", input?.sessionID || null);
     return false;
   }
 
+  // The previous incarnation cached by sessionID-only, so a follow-up
+  // turn whose query happened to match the cache key (e.g. because
+  // lastPromptText hadn't yet been captured by the time
+  // experimental.chat.system.transform fired) would silently re-serve
+  // the first turn's pack. Recompute on every call instead — the chat
+  // path tolerates the transport round trip, and correctness beats the
+  // O(1) hit when the cache key isn't tied to the prompt that produced
+  // the pack.
   const query = resolveInjectQuery();
-  const cached = injectedSessions.get(input.sessionID);
-  const queryMatchesCache = cached?.query === query;
-  let contextText = queryMatchesCache ? cached?.text || "" : "";
+  const sessionID = input?.sessionID || null;
+  const injected = await buildInjectedContext(query, {
+    sessionID,
+    requestKey: `system:${sessionID || "unknown"}`,
+    surface: "system",
+  });
+  if (!injected?.text) {
+    return false;
+  }
 
-  if (!contextText || cached?.query !== query) {
-    const injected = await buildInjectedContext(query);
-    if (injected?.text) {
-      injectedSessions.set(input.sessionID, {
-        query,
-        text: injected.text,
-        metrics: injected.metrics || null,
+  if (!injectionToastShown.has(input.sessionID) && showToast) {
+    injectionToastShown.add(input.sessionID);
+    try {
+      await showToast(buildInjectionToastMessage(injected.metrics));
+    } catch {
+      // best-effort only
+    }
+  }
+
+  try {
+    if (!Array.isArray(output.system)) {
+      output.system = [];
+    }
+    output.system.push(injected.text);
+  } catch (error) {
+    if (injected.attemptId) {
+      confirmDelivery?.(injected.attemptId, "failed");
+    }
+    throw error;
+  }
+  if (injected.attemptId) {
+    confirmDelivery?.(injected.attemptId);
+  }
+  return true;
+};
+
+const isUserMessageEntry = (entry) => entry?.info?.role === "user";
+
+const resolveEntryMessageId = (entry) => {
+  const id = entry?.info?.id || entry?.parts?.find((part) => part?.messageID)?.messageID;
+  return id ? String(id) : null;
+};
+
+const fallbackEntryMessageId = (entry, index = 0) => {
+  const id = resolveEntryMessageId(entry);
+  if (id) return id;
+  const text = extractMessageText(entry);
+  if (text) {
+    return `message-${createHash("sha256").update(text).digest("hex").slice(0, 16)}`;
+  }
+  return `message-${index}`;
+};
+
+const resolveEntrySessionID = (entry) => {
+  const id = entry?.info?.sessionID || entry?.parts?.find((part) => part?.sessionID)?.sessionID;
+  return id ? String(id) : null;
+};
+
+const isCodememContextPart = (part) =>
+  part?.type === "text" && String(part?.id || "").startsWith(CODEMEM_CONTEXT_PART_ID_PREFIX);
+
+const extractMessageText = (entry) => {
+  if (!Array.isArray(entry?.parts)) {
+    return "";
+  }
+  return entry.parts
+    .filter((part) => part?.type === "text" && !isCodememContextPart(part))
+    .map((part) => String(part?.text || "").trim())
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+};
+
+const findFirstUserMessage = (messages) => {
+  for (let index = 0; index < messages.length; index += 1) {
+    const entry = messages[index];
+    if (isUserMessageEntry(entry)) {
+      return { entry, index };
+    }
+  }
+  return null;
+};
+
+const findLatestUserMessage = (messages) => {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const entry = messages[index];
+    if (isUserMessageEntry(entry)) {
+      return { entry, index };
+    }
+  }
+  return null;
+};
+
+const markCompactionInjectionSkip = (compactionInjectionSkips, sessionID, now = Date.now()) => {
+  if (!compactionInjectionSkips || !sessionID) return;
+  compactionInjectionSkips.set(String(sessionID), now + COMPACTION_INJECTION_SKIP_TTL_MS);
+};
+
+const consumeCompactionInjectionSkip = (compactionInjectionSkips, sessionID, now = Date.now()) => {
+  if (!compactionInjectionSkips || !sessionID) return false;
+  const key = String(sessionID);
+  const expiresAt = compactionInjectionSkips.get(key);
+  if (!expiresAt) return false;
+  compactionInjectionSkips.delete(key);
+  return now <= expiresAt;
+};
+
+// OpenCode does not guarantee that synthetic message parts survive into the
+// next transform call. Cache each message's injected block by message ID and
+// re-append the exact same bytes on later turns: older prompts stay stable for
+// provider prefix caching while only the newest user message triggers a fresh
+// pack build. The replay cache only activates when OpenCode provides both a
+// session ID and a real message ID; unidentified messages still receive current
+// turn context, but are not cached because positional fallbacks can drift across
+// turns or sessions. Do not "simplify" this into recomputing previous turns.
+const getSessionMessageInjectionCache = (messageInjectionCache, sessionID) => {
+  if (!sessionID) {
+    return null;
+  }
+  const cacheKey = sessionID;
+  let sessionCache = messageInjectionCache.get(cacheKey);
+  if (sessionCache) {
+    // Refresh recency so the bounded cache behaves like a small LRU.
+    messageInjectionCache.delete(cacheKey);
+  } else {
+    sessionCache = new Map();
+  }
+  messageInjectionCache.set(cacheKey, sessionCache);
+  while (messageInjectionCache.size > MAX_MESSAGE_INJECTION_CACHE_SESSIONS) {
+    const oldestKey = messageInjectionCache.keys().next().value;
+    if (!oldestKey) break;
+    messageInjectionCache.delete(oldestKey);
+  }
+  return sessionCache;
+};
+
+const trimSessionMessageInjectionCache = (sessionCache) => {
+  if (!sessionCache) return;
+  while (sessionCache.size > MAX_MESSAGE_INJECTION_CACHE_MESSAGES) {
+    const oldestKey = sessionCache.keys().next().value;
+    if (!oldestKey) break;
+    sessionCache.delete(oldestKey);
+  }
+};
+
+const normalizeInjectedMessageParts = (messages, sessionCache) => {
+  for (let index = 0; index < messages.length; index += 1) {
+    const entry = messages[index];
+    if (!isUserMessageEntry(entry) || !Array.isArray(entry.parts)) {
+      continue;
+    }
+
+    const messageId = resolveEntryMessageId(entry);
+    const retainedParts = [];
+    let existingText = null;
+    for (const part of entry.parts) {
+      if (isCodememContextPart(part)) {
+        const text = String(part?.text || "");
+        if (text.trim()) {
+          existingText = text;
+        }
+      } else {
+        retainedParts.push(part);
+      }
+    }
+    if (existingText && sessionCache && messageId && !sessionCache.has(messageId)) {
+      sessionCache.set(messageId, { text: existingText, attemptId: null, reconstructed: true });
+      trimSessionMessageInjectionCache(sessionCache);
+    }
+    if (retainedParts.length !== entry.parts.length) {
+      entry.parts.splice(0, entry.parts.length, ...retainedParts);
+    }
+  }
+};
+
+const buildInjectedContextPart = (entry, index, text, options = {}) => {
+  const messageId = options.messageId || fallbackEntryMessageId(entry, index);
+  const sessionID = options.sessionID || resolveEntrySessionID(entry) || "unknown";
+  return {
+    id: `${CODEMEM_CONTEXT_PART_ID_PREFIX}${messageId}`,
+    sessionID,
+    messageID: messageId,
+    type: "text",
+    text,
+    synthetic: true,
+  };
+};
+
+const appendCachedInjectedContextParts = async (
+  messages,
+  sessionCache,
+  sessionID = null,
+  options = {},
+) => {
+  let appended = 0;
+  for (let index = 0; index < messages.length; index += 1) {
+    const entry = messages[index];
+    if (!isUserMessageEntry(entry) || !Array.isArray(entry.parts)) {
+      continue;
+    }
+    const messageId = resolveEntryMessageId(entry);
+    if (!messageId) {
+      continue;
+    }
+    const cached = sessionCache.get(messageId);
+    const text = typeof cached === "string" ? cached : cached?.text;
+    if (!text) {
+      continue;
+    }
+    let attemptId = cached?.attemptId || null;
+    let cacheReuseReady = null;
+    if (
+      messageId === options.latestMessageId
+      && !options.latestWasBuilt
+      && attemptId
+      && options.recordCacheReuse
+    ) {
+      const reuse = options.recordCacheReuse(cached, {
+        messageId,
+        sessionID,
       });
-      contextText = injected.text;
+      attemptId = typeof reuse === "string" ? reuse : reuse?.attemptId || null;
+      cacheReuseReady = typeof reuse === "object" ? reuse?.ready : null;
+    }
+    try {
+      entry.parts.push(buildInjectedContextPart(entry, index, text, { messageId, sessionID }));
+    } catch (error) {
+      if (messageId === options.latestMessageId && attemptId && options.confirmDelivery) {
+        if (cacheReuseReady) {
+          void Promise.resolve(cacheReuseReady)
+            .then(() => options.confirmDelivery(attemptId, "failed"))
+            .catch(() => {});
+        } else {
+          options.confirmDelivery(attemptId, "failed");
+        }
+      }
+      throw error;
+    }
+    if (messageId === options.latestMessageId && attemptId && options.confirmDelivery) {
+      if (cacheReuseReady) {
+        void Promise.resolve(cacheReuseReady)
+          .then(() => options.confirmDelivery(attemptId))
+          .catch(() => {});
+      } else {
+        options.confirmDelivery(attemptId);
+      }
+    }
+    appended += 1;
+  }
+  return appended;
+};
 
-      if (!injectionToastShown.has(input.sessionID) && showToast) {
-        injectionToastShown.add(input.sessionID);
+const applyInjectedContextToMessages = async ({
+  injectEnabled,
+  input,
+  output,
+  injectionToastShown,
+  showToast,
+  resolveInjectQuery,
+  buildInjectedContext,
+  messageInjectionCache,
+  compactionInjectionSkips,
+  confirmDelivery,
+  recordCacheReuse,
+  recordSkipped,
+}) => {
+  const hasMessages = Array.isArray(output?.messages);
+  const latestUser = hasMessages ? findLatestUserMessage(output.messages) : null;
+  const sessionID = latestUser
+    ? resolveEntrySessionID(latestUser.entry) || input?.sessionID || null
+    : input?.sessionID || null;
+  if (!injectEnabled) {
+    recordSkipped?.("injection_disabled", sessionID);
+    return false;
+  }
+  if (!hasMessages) {
+    return false;
+  }
+
+  if (consumeCompactionInjectionSkip(compactionInjectionSkips, sessionID)) {
+    normalizeInjectedMessageParts(output.messages, null);
+    recordSkipped?.("compaction_skipped", sessionID);
+    return false;
+  }
+
+  if (!latestUser) {
+    return false;
+  }
+
+  const sessionCache = getSessionMessageInjectionCache(messageInjectionCache, sessionID);
+  normalizeInjectedMessageParts(output.messages, sessionCache);
+
+  const latestMessageId = resolveEntryMessageId(latestUser.entry);
+  const canReplay = Boolean(sessionCache && latestMessageId);
+  const latestCached = canReplay ? sessionCache.get(latestMessageId) : null;
+  const latestWasCached = Boolean(latestCached) && latestCached?.reconstructed !== true;
+  let latestWasBuilt = false;
+  if (!latestWasCached) {
+    const firstUser = findFirstUserMessage(output.messages);
+    const query = resolveInjectQuery({
+      firstPrompt: firstUser ? extractMessageText(firstUser.entry) : null,
+      lastPromptText: extractMessageText(latestUser.entry),
+    });
+    const injected = await buildInjectedContext(query, {
+      sessionID,
+      requestKey: latestMessageId || fallbackEntryMessageId(latestUser.entry, latestUser.index),
+      surface: "message",
+    });
+    if (injected?.text) {
+      latestWasBuilt = true;
+      if (canReplay) {
+        sessionCache.set(latestMessageId, {
+          text: injected.text,
+          attemptId: injected.attemptId || null,
+          requestId: injected.requestId || null,
+          queryHash: injected.queryHash || null,
+          promptNumber: injected.promptNumber || 0,
+          reuseCount: 0,
+        });
+        trimSessionMessageInjectionCache(sessionCache);
+      } else if (Array.isArray(latestUser.entry.parts)) {
+        try {
+          latestUser.entry.parts.push(
+            buildInjectedContextPart(latestUser.entry, latestUser.index, injected.text, {
+              messageId: latestMessageId || undefined,
+              sessionID: sessionID || undefined,
+            })
+          );
+        } catch (error) {
+          if (injected.attemptId) {
+            confirmDelivery?.(injected.attemptId, "failed");
+          }
+          throw error;
+        }
+        if (injected.attemptId) {
+          confirmDelivery?.(injected.attemptId);
+        }
+      }
+
+      const toastKey = sessionID || latestMessageId || "unknown";
+      if (!injectionToastShown.has(toastKey) && showToast) {
+        injectionToastShown.add(toastKey);
         try {
           await showToast(buildInjectionToastMessage(injected.metrics));
         } catch {
           // best-effort only
         }
       }
+    } else if (canReplay && latestCached?.reconstructed === true) {
+      sessionCache.delete(latestMessageId);
     }
   }
 
-  if (!contextText) {
-    return false;
+  if (!canReplay) {
+    return Boolean(
+      Array.isArray(latestUser.entry.parts)
+      && latestUser.entry.parts.some(isCodememContextPart)
+    );
   }
-  if (!Array.isArray(output.system)) {
-    output.system = [];
-  }
-  output.system.push(contextText);
-  return true;
+
+  const appended = await appendCachedInjectedContextParts(output.messages, sessionCache, sessionID, {
+    latestMessageId,
+    latestWasBuilt,
+    confirmDelivery,
+    recordCacheReuse,
+  });
+  return appended > 0;
 };
 
 const mapOpencodeEventTypeToAdapterType = (eventType) => {
@@ -599,7 +1627,7 @@ const parsePositiveInt = (value, fallback) => {
 };
 
 export const buildInjectionToastMessage = (metrics) => {
-  const items = asFiniteNonNegativeInt(metrics?.items);
+  const items = asFiniteNonNegativeInt(metrics?.items) ?? asFiniteNonNegativeInt(metrics?.total_items);
   const packTokens = asFiniteNonNegativeInt(metrics?.pack_tokens);
   const avoided = asFiniteNonNegativeInt(metrics?.avoided_work_tokens);
   const avoidedUnknown = asNonNegativeCount(metrics?.avoided_work_unknown_items);
@@ -632,8 +1660,30 @@ const detectRunner = ({ cwd, envRunner }) => {
   }
   // Prefer the TS codemem if installed globally, fall back to npx
   try {
-    const versionOutput = execSync("codemem --version", { encoding: "utf-8", timeout: 3000 }).trim();
-    if (versionOutput === PINNED_BACKEND_VERSION || versionOutput.startsWith("0.2")) {
+    const versionOutput = execSync("codemem --version", {
+      encoding: "utf-8",
+      timeout: 3000,
+      // Suppress shell "not found" noise when codemem is not on PATH; the
+      // catch below falls back to npx. Without this, stderr leaks to the
+      // terminal on every OpenCode startup for npx-only installs.
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    // Accept any global codemem at or above the pinned backend version, so a
+    // newer global install is used instead of silently downgrading to
+    // `npx codemem@<pin>` (the old check only matched the exact pin or the
+    // long-obsolete 0.2x series).
+    // Accept a global codemem only when it is the EXACT pinned version, or a
+    // clean (non-prerelease) release at least as new as the pin. isVersionAtLeast
+    // ignores prerelease suffixes, so without this a prerelease like
+    // "0.36.1-alpha.0" would wrongly compare >= the "0.36.1" release even though
+    // SemVer orders it below. Requiring an exact match for prereleases also
+    // handles a prerelease PIN correctly (the release script can set one): only
+    // the identical prerelease is trusted, never an older/different one.
+    const isPrerelease = versionOutput.includes("-");
+    const matchesOrCleanNewer =
+      versionOutput === PINNED_BACKEND_VERSION ||
+      (!isPrerelease && isVersionAtLeast(versionOutput, PINNED_BACKEND_VERSION));
+    if (matchesOrCleanNewer) {
       return "codemem";
     }
   } catch {
@@ -672,12 +1722,11 @@ const buildRunnerArgs = ({ runner, runnerFrom, runnerFromExplicit }) => {
   return runnerFromExplicit ? [runnerFrom] : [];
 };
 
-export const OpencodeMemPlugin = async ({
+export const CodememPlugin = async ({
   project,
   client,
   directory,
   worktree,
-  serverUrl,
 }) => {
   const events = [];
   const maxEvents = parsePositiveInt(process.env.CODEMEM_PLUGIN_MAX_EVENTS, 200);
@@ -732,11 +1781,25 @@ export const OpencodeMemPlugin = async ({
   const viewerHost = process.env.CODEMEM_VIEWER_HOST || "127.0.0.1";
   const viewerPort = process.env.CODEMEM_VIEWER_PORT || "38888";
   const viewerDbPath = process.env.CODEMEM_DB || "";
-  const viewerConfigPath = process.env.CODEMEM_CONFIG || "";
-  const commandTimeout = Number.parseInt(
-    process.env.CODEMEM_PLUGIN_CMD_TIMEOUT || "20000",
-    10
+  const expandedViewerDbPath = viewerDbPath.startsWith("~/")
+    ? join(process.env.HOME?.trim() || homedir(), viewerDbPath.slice(2))
+    : viewerDbPath;
+  const promptPackDbPath = resolve(
+    cwd,
+    expandedViewerDbPath || join(homedir(), ".codemem", "mem.sqlite"),
   );
+  const promptPackIdentityTarget = buildViewerIdentityTarget(process.env, cwd);
+  const viewerConfigPath = process.env.CODEMEM_CONFIG || "";
+  // A malformed value (e.g. "abc", "", "-1") falls back to the 20s default
+  // instead of NaN, which would silently disable the timeout. An explicit "0"
+  // is preserved as the intentional opt-out (disable the timeout, e.g. for slow
+  // first-run npx installs/backend updates) — the `commandTimeout > 0` guard at
+  // the call site skips installing the timer when it is 0.
+  const rawCommandTimeout = String(process.env.CODEMEM_PLUGIN_CMD_TIMEOUT ?? "").trim();
+  const commandTimeout =
+    rawCommandTimeout === "0" ? 0 : parsePositiveInt(rawCommandTimeout, 20000);
+  const promptPackHttpTimeout =
+    parsePositiveInt(process.env.CODEMEM_INJECT_HTTP_MAX_TIME_S || "2", 2) * 1000;
   const backendUpdatePolicy = parseBackendUpdatePolicy(
     process.env.CODEMEM_BACKEND_UPDATE_POLICY || "notify"
   );
@@ -748,17 +1811,26 @@ export const OpencodeMemPlugin = async ({
   const injectEnabled = envNotDisabled(
     process.env.CODEMEM_INJECT_CONTEXT || "1"
   );
+  const injectSurface = resolveInjectSurface(process.env.CODEMEM_INJECT_SURFACE);
   // Only use env overrides if explicitly set; otherwise CLI uses config defaults
   const injectLimitEnv = process.env.CODEMEM_INJECT_LIMIT;
   const injectLimit = injectLimitEnv ? parseNumber(injectLimitEnv, null) : null;
   const injectTokenBudgetEnv = process.env.CODEMEM_INJECT_TOKEN_BUDGET;
   const injectTokenBudget = injectTokenBudgetEnv ? parseNumber(injectTokenBudgetEnv, null) : null;
-  const injectedSessions = new Map();
   const injectionToastShown = new Set();
+  const messageInjectionCache = new Map();
+  const compactionInjectionSkips = new Map();
+  const disabledInjectionRecorded = new Set();
+  const attemptStartedAt = new Map();
+  const promptPackRetryCounts = new Map();
+  const successfulPromptPackArtifacts = new Map();
   let sessionStartedAt = null;
   let activeSessionID = null;
   let viewerStarted = false;
+  let viewerStartInFlight = false;
+  let compatibilityAutoUpdateAttempted = false;
   let promptCounter = 0;
+  let skippedAttemptCounter = 0;
   let lastPromptText = null;
   let lastAssistantText = null;
   const assistantUsageCaptured = new Set();
@@ -771,8 +1843,15 @@ export const OpencodeMemPlugin = async ({
   const rawEventsEnabled = envNotDisabled(
     process.env.CODEMEM_RAW_EVENTS || "1"
   );
-  const rawEventsUrl = `http://${viewerHost}:${viewerPort}/api/raw-events`;
-  const rawEventsStatusUrl = `http://${viewerHost}:${viewerPort}/api/raw-events/status?limit=1`;
+  const viewerUrlHost = viewerHost.includes(":") && !viewerHost.startsWith("[")
+    ? `[${viewerHost}]`
+    : viewerHost;
+  const rawEventsUrl = `http://${viewerUrlHost}:${viewerPort}/api/raw-events`;
+  const rawEventsStatusUrl = `http://${viewerUrlHost}:${viewerPort}/api/raw-events/status?limit=1`;
+  const packUrl = `http://${viewerUrlHost}:${viewerPort}/api/pack`;
+  const promptPackProfileUrl = `http://${viewerUrlHost}:${viewerPort}/api/prompt-pack-profile`;
+  const promptPackLedgerUrl = `http://${viewerUrlHost}:${viewerPort}/api/prompt-pack-ledger`;
+  const viewerHealthUrl = `http://${viewerUrlHost}:${viewerPort}/api/health`;
   const rawEventsBackoffMs = parseNumber(
     process.env.CODEMEM_RAW_EVENTS_BACKOFF_MS || "10000",
     10000
@@ -790,14 +1869,8 @@ export const OpencodeMemPlugin = async ({
   let fallbackFailureNoted = false;
   let lastStatusCheckAt = 0;
   let lastStatusAvailable = true;
+  let promptPackTransportUnavailableUntil = 0;
 
-  // Viewer health-check state
-  const HEALTH_CHECK_INTERVAL_MS = 60_000;
-  const HEALTH_CONSECUTIVE_FAILURES_BEFORE_RESTART = 3;
-  const HEALTH_RESTART_COOLDOWN_MS = 5 * 60_000;
-  let healthCheckTimer = null;
-  let healthConsecutiveFailures = 0;
-  let healthLastRestartAttempt = 0;
   const nextEventId = () => {
     if (typeof crypto !== "undefined" && crypto.randomUUID) {
       return crypto.randomUUID();
@@ -806,13 +1879,24 @@ export const OpencodeMemPlugin = async ({
   };
 
   const queueRawEventViaCli = async (body) => {
-    const result = await runCli(["enqueue-raw-event"], {
+    const runFallback = () => runCli(["enqueue-raw-event"], {
       stdinText: JSON.stringify(body),
     });
+    let result = await runFallback();
+    let classification = classifyFallbackCommandResult(result);
+    let attemptedRetry = false;
+    if (result?.exitCode !== 0 && classification.retryable) {
+      attemptedRetry = true;
+      result = await runFallback();
+      classification = classifyFallbackCommandResult(result);
+    }
     if (result?.exitCode !== 0) {
-      throw new Error(
-        `enqueue-raw-event failed (${result?.exitCode ?? "unknown"})`
+      const retryExhausted = attemptedRetry && classification.retryable;
+      const error = new Error(
+        retryExhausted ? `${classification.cause} after retry` : classification.cause
       );
+      error.retryable = classification.retryable && !attemptedRetry;
+      throw error;
     }
     return true;
   };
@@ -852,7 +1936,7 @@ export const OpencodeMemPlugin = async ({
       type,
       payload,
       cwd,
-      project: resolveAgentScope() || resolveProjectName(project, cwd),
+      project: resolveProjectName(project, cwd),
       startedAt: sessionStartedAt,
       nowMs: now,
       nowMono:
@@ -871,6 +1955,9 @@ export const OpencodeMemPlugin = async ({
         }
         return true;
       } catch (fallbackErr) {
+        if (payload && typeof payload === "object") {
+          payload._raw_fallback_terminal = fallbackErr?.retryable !== true;
+        }
         await logLine(
           `raw_events.fallback.error sessionID=${sessionID} type=${type} err=${String(
             fallbackErr
@@ -909,8 +1996,10 @@ export const OpencodeMemPlugin = async ({
     }
     try {
       if (now - lastStatusCheckAt >= Math.max(1000, rawEventsStatusCheckMs)) {
-        const statusResp = await fetch(rawEventsStatusUrl, { method: "GET" });
+        const statusResp = await fetchRawEventsStatus(rawEventsStatusUrl);
         if (!statusResp.ok) {
+          // Release the unread body before bailing into the backoff path.
+          discardResponseBody(statusResp);
           throw new Error(`raw-events status failed (${statusResp.status})`);
         }
         const statusJson = await statusResp.json();
@@ -924,10 +2013,27 @@ export const OpencodeMemPlugin = async ({
       const postResp = await fetch(rawEventsUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify({
+          ...body,
+          db_path: promptPackDbPath,
+          identity_target: promptPackIdentityTarget,
+        }),
       });
       if (!postResp.ok) {
-        throw new Error(`raw-events post failed (${postResp.status})`);
+        let responseBody = null;
+        if (postResp.status === 409) {
+          try {
+            responseBody = await postResp.json();
+          } catch {
+            // Generic failure handling below remains the safe fallback.
+          }
+        }
+        const targetMismatch = isViewerDbMismatchPayload(responseBody)
+          || isViewerIdentityMismatchPayload(responseBody)
+          || isViewerContractUnsupportedPayload(responseBody);
+        const postError = new Error(`raw-events post failed (${postResp.status})`);
+        postError.viewerTargetMismatch = targetMismatch;
+        throw postError;
       }
       streamUnavailableUntil = 0;
       streamErrorNoted = false;
@@ -950,6 +2056,7 @@ export const OpencodeMemPlugin = async ({
             type,
             viewerHost,
             viewerPort,
+            viewerTargetMismatch: err?.viewerTargetMismatch === true,
             error: String(err),
           },
         });
@@ -962,6 +2069,9 @@ export const OpencodeMemPlugin = async ({
         await queueRawEventViaCli(body);
         fallbackOk = true;
       } catch (fallbackErr) {
+        if (payload && typeof payload === "object") {
+          payload._raw_fallback_terminal = fallbackErr?.retryable !== true;
+        }
         await logLine(
           `raw_events.fallback.error sessionID=${sessionID} type=${type} err=${String(
             fallbackErr
@@ -1007,6 +2117,7 @@ export const OpencodeMemPlugin = async ({
 
       if (!streamErrorNoted) {
         streamErrorNoted = true;
+        fallbackFailureNoted = true;
         try {
           await client.app.log({
             service: "codemem",
@@ -1045,6 +2156,20 @@ export const OpencodeMemPlugin = async ({
     return event?.properties?.sessionID || null;
   };
 
+  const extractHookSessionID = (input) => {
+    if (!input || typeof input !== "object") {
+      return null;
+    }
+    return (
+      input.sessionID ||
+      input.sessionId ||
+      input.session?.id ||
+      input.session?.sessionID ||
+      input.properties?.sessionID ||
+      null
+    );
+  };
+
   // Session context tracking for comprehensive memories
   const sessionContext = {
     firstPrompt: null,
@@ -1053,7 +2178,6 @@ export const OpencodeMemPlugin = async ({
     startTime: null,
     filesModified: new Set(),
     filesRead: new Set(),
-    currentAgent: null,
   };
 
   const resetSessionContext = () => {
@@ -1063,7 +2187,6 @@ export const OpencodeMemPlugin = async ({
     sessionContext.startTime = null;
     sessionContext.filesModified = new Set();
     sessionContext.filesRead = new Set();
-    sessionContext.currentAgent = null;
   };
 
   // Check if we should force flush immediately (threshold-based)
@@ -1249,12 +2372,28 @@ export const OpencodeMemPlugin = async ({
     return { usage, id: info.id };
   };
 
-  const startViewer = () => {
-    if (!viewerEnabled || !viewerAutoStart || viewerStarted) {
+  const startViewer = async () => {
+    if (!viewerEnabled || !viewerAutoStart || viewerStarted || viewerStartInFlight) {
       if (viewerStarted) logLine("viewer already started, skipping auto-start").catch(() => {});
       return;
     }
-    viewerStarted = true;
+    viewerStartInFlight = true;
+    let existingViewer = false;
+    try {
+      const existing = await fetch(viewerHealthUrl, {
+        method: "GET",
+        redirect: "manual",
+        signal: AbortSignal.timeout(1_000),
+      });
+      existingViewer = existing.ok;
+    } catch {
+      // No live viewer responded; proceed with the plugin-owned start.
+    }
+    if (existingViewer) {
+      viewerStartInFlight = false;
+      logLine("viewer already running, skipping plugin-owned auto-start").catch(() => {});
+      return;
+    }
     const viewerArgs = buildViewerCliArgs("start");
     const cmd = [runner, ...runnerArgs, ...viewerArgs];
     logLine(`auto-starting viewer: ${cmd.join(" ")}`).catch(() => {});
@@ -1265,18 +2404,24 @@ export const OpencodeMemPlugin = async ({
         detached: true,
         stdio: "ignore",
       });
+      child.once("spawn", () => {
+        viewerStarted = true;
+        viewerStartInFlight = false;
+        startHealthCheck();
+      });
       child.on("error", (err) => {
+        viewerStartInFlight = false;
         logLine(`viewer spawn error: ${err.message}`).catch(() => {});
       });
       child.unref();
     } catch (err) {
+      viewerStartInFlight = false;
       logLine(`viewer spawn failed: ${err}`).catch(() => {});
     }
-    startHealthCheck();
   };
 
   const runCommand = async (cmd, options = {}) => {
-    const { stdinText = null } = options;
+    const { stdinText = null, timeoutMs = commandTimeout } = options;
     const [command, ...args] = cmd;
     return new Promise((resolve) => {
       const proc = nodeSpawn(command, args, {
@@ -1286,8 +2431,18 @@ export const OpencodeMemPlugin = async ({
       });
       let stdout = "";
       let stderr = "";
-      proc.stdout.on("data", (chunk) => { stdout += chunk; });
-      proc.stderr.on("data", (chunk) => { stderr += chunk; });
+      // Guard stdio access: a hard spawn failure (ENOENT) can hand back null
+      // streams, and a synchronous null-deref here would reject the promise
+      // that callers await for a resolved { exitCode, stdout, stderr }.
+      if (proc.stdout) proc.stdout.on("data", (chunk) => { stdout += chunk; });
+      if (proc.stderr) proc.stderr.on("data", (chunk) => { stderr += chunk; });
+      // Absorb async stream errors (e.g. EPIPE when the child exits mid-write,
+      // or a spawn failure surfacing on a pipe). Without these handlers an
+      // unhandled stream "error" event would crash the host process. The
+      // child-level proc.once("error") below still resolves the promise.
+      for (const stream of [proc.stdin, proc.stdout, proc.stderr]) {
+        if (stream && typeof stream.on === "function") stream.on("error", () => {});
+      }
       if (typeof stdinText === "string") {
         try {
           proc.stdin.write(stdinText);
@@ -1305,25 +2460,287 @@ export const OpencodeMemPlugin = async ({
         return;
       }
       let timer = null;
-      if (Number.isFinite(commandTimeout) && commandTimeout > 0) {
+      let killTimer = null;
+      let timedOut = false;
+      let settled = false;
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        if (killTimer) clearTimeout(killTimer);
+        resolve(result);
+      };
+      if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
         timer = setTimeout(() => {
-          try { proc.kill(); } catch { /* ignore */ }
-          resolve({ exitCode: null, stdout, stderr: "timeout" });
-        }, commandTimeout);
+          timedOut = true;
+          try { proc.kill("SIGTERM"); } catch { /* ignore */ }
+          killTimer = setTimeout(() => {
+            try { proc.kill("SIGKILL"); } catch { /* ignore */ }
+          }, 5_000);
+          if (killTimer.unref) killTimer.unref();
+        }, timeoutMs);
       }
       proc.once("exit", (exitCode) => {
-        if (timer) clearTimeout(timer);
-        resolve({ exitCode, stdout, stderr });
+        finish({ exitCode: timedOut ? null : exitCode, stdout, stderr: timedOut ? "timeout" : stderr });
       });
       proc.once("error", (err) => {
-        if (timer) clearTimeout(timer);
-        resolve({ exitCode: 1, stdout: "", stderr: String(err) });
+        finish({ exitCode: 1, stdout: "", stderr: String(err) });
       });
     });
   };
 
   const runCli = async (args, options = {}) =>
     runCommand([runner, ...runnerArgs, ...args], options);
+
+  const postViewerJson = async ({ url, operation, payload, validate }) => {
+    if (!viewerEnabled) {
+      return {
+        ok: false,
+        classification: viewerFailureClassification(
+          `${operation} viewer transport disabled`,
+          "fallback",
+        ),
+      };
+    }
+    if (Date.now() < promptPackTransportUnavailableUntil) {
+      return {
+        ok: false,
+        classification: viewerFailureClassification(
+          `${operation} viewer transport in backoff`,
+          "fallback",
+        ),
+      };
+    }
+
+    let response;
+    try {
+      const profileResponse = await fetch(promptPackProfileUrl, {
+        method: "GET",
+        redirect: "manual",
+        signal: AbortSignal.timeout(promptPackHttpTimeout),
+      });
+      let profileBody;
+      try {
+        profileBody = await profileResponse.json();
+      } catch {
+        profileBody = null;
+      }
+      if (!profileResponse.ok) {
+        const classification = classifyViewerHttpFailure({
+          operation: `${operation} profile`,
+          status: profileResponse.status,
+          body: profileBody,
+        });
+        if (classification.retryable) {
+          promptPackTransportUnavailableUntil = Date.now() + Math.max(1000, rawEventsBackoffMs);
+        }
+        return { ok: false, classification };
+      }
+      const viewerProtocolRange = isRecord(profileBody)
+        ? normalizePromptTransportProtocolRange(
+            profileBody.protocol_version,
+            profileBody.min_supported_protocol_version,
+          )
+        : null;
+      let profileFailure = null;
+      if (!isRecord(profileBody) || profileBody.service !== "codemem-viewer") {
+        profileFailure = viewerFailureClassification(
+          `${operation} viewer profile malformed`,
+          classifyPromptTransportFailure({ kind: "profile_malformed" }),
+        );
+      } else if (!viewerProtocolRange) {
+        profileFailure = viewerFailureClassification(
+          `${operation} viewer protocol range malformed`,
+          classifyPromptTransportFailure({ kind: "profile_malformed" }),
+        );
+      } else if (!arePromptTransportProtocolRangesCompatible(
+        PROMPT_TRANSPORT_PROTOCOL_RANGE,
+        viewerProtocolRange,
+      )) {
+        profileFailure = viewerFailureClassification(
+          `${operation} viewer protocol range unsupported`,
+          classifyPromptTransportFailure({ kind: "protocol_range_mismatch" }),
+        );
+      } else if (profileBody.db_path !== promptPackDbPath) {
+        profileFailure = viewerFailureClassification(
+          `${operation} viewer database mismatch`,
+          classifyPromptTransportFailure({ kind: "database_mismatch" }),
+        );
+      } else if (
+        canonicalJson(profileBody.identity_target) !== canonicalJson(promptPackIdentityTarget)
+      ) {
+        profileFailure = viewerFailureClassification(
+          `${operation} viewer runtime identity mismatch`,
+          classifyPromptTransportFailure({ kind: "runtime_identity_mismatch" }),
+        );
+      }
+      if (profileFailure) {
+        promptPackTransportUnavailableUntil = Date.now() + Math.max(1000, rawEventsBackoffMs);
+        return {
+          ok: false,
+          classification: profileFailure,
+        };
+      }
+      response = await fetch(url, {
+        method: "POST",
+        redirect: "manual",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(promptPackHttpTimeout),
+      });
+    } catch (error) {
+      const classification = classifyViewerHttpFailure({ operation, error });
+      promptPackTransportUnavailableUntil =
+        Date.now() + Math.max(1000, rawEventsBackoffMs);
+      return { ok: false, classification };
+    }
+
+    let body;
+    try {
+      body = await response.json();
+    } catch {
+      body = null;
+    }
+    if (!response.ok) {
+      const classification = classifyViewerHttpFailure({
+        operation,
+        status: response.status,
+        body,
+        compatibleProfile: true,
+      });
+      if (classification.retryable) {
+        promptPackTransportUnavailableUntil =
+          Date.now() + Math.max(1000, rawEventsBackoffMs);
+      }
+      return { ok: false, classification };
+    }
+
+    if (!validate(body)) {
+      const classification = classifyViewerHttpFailure({ operation, malformed: true });
+      promptPackTransportUnavailableUntil =
+        Date.now() + Math.max(1000, rawEventsBackoffMs);
+      return { ok: false, classification };
+    }
+
+    promptPackTransportUnavailableUntil = 0;
+    return { ok: true, body };
+  };
+
+  const attemptMetadata = (identity, sessionID = null, promptNumber = promptCounter) => ({
+    attempt_id: identity.attemptId,
+    started_at: (() => {
+      const existing = attemptStartedAt.get(identity.attemptId);
+      if (existing) return existing;
+      const created = new Date().toISOString();
+      attemptStartedAt.set(identity.attemptId, created);
+      while (attemptStartedAt.size > 2000) {
+        const oldest = attemptStartedAt.keys().next().value;
+        if (!oldest) break;
+        attemptStartedAt.delete(oldest);
+      }
+      return created;
+    })(),
+    source: "opencode",
+    ...(sessionID ? { stream_id: String(sessionID), source_session_id: String(sessionID) } : {}),
+    ...(promptNumber > 0 ? { prompt_number: promptNumber } : {}),
+    request_id: identity.requestId,
+  });
+
+  const runPromptPackLedger = async (payload) => {
+    const viewerPayload = {
+      ...payload,
+      db_path: promptPackDbPath,
+      identity_target: promptPackIdentityTarget,
+    };
+    const httpResult = await postViewerJson({
+      url: promptPackLedgerUrl,
+      operation: "prompt-pack-ledger",
+      payload: viewerPayload,
+      validate: isValidLedgerHttpPayload,
+    });
+    if (httpResult.ok) {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify(httpResult.body),
+        stderr: "",
+        transport: "viewer",
+      };
+    }
+
+    const { cause, retryable } = httpResult.classification;
+    await logLine(
+      `inject.ledger.http_error cause=${JSON.stringify(redactLog(cause, 200))} retryable=${retryable}`
+    );
+    if (!retryable) {
+      return { exitCode: 1, stdout: "", stderr: cause, transport: "viewer" };
+    }
+
+    try {
+      const result = await runCli(["prompt-pack-ledger"], {
+        stdinText: JSON.stringify(payload),
+      });
+      return { ...result, transport: "cli" };
+    } catch {
+      return null;
+    }
+  };
+
+  const skippedIdentity = (failureCode, sessionID, surface, eventKey) =>
+    promptPackIdentity({
+      sessionID: sessionID || "unknown",
+      requestKey: `${failureCode}:${eventKey}`,
+      surface,
+      promptNumber: promptCounter,
+      queryHash: hashPromptPackQuery(""),
+    });
+
+  const recordSkippedPromptPack = (failureCode, sessionID = null, surface = injectSurface) => {
+    const sessionKey = String(sessionID || "unknown");
+    const memoKey = `${surface}:${sessionKey}`;
+    if (failureCode === "injection_disabled" && disabledInjectionRecorded.has(memoKey)) {
+      return null;
+    }
+    if (failureCode === "injection_disabled") disabledInjectionRecorded.add(memoKey);
+    const identity = skippedIdentity(
+      failureCode,
+      sessionID,
+      surface,
+      failureCode === "injection_disabled" ? "once" : `event-${++skippedAttemptCounter}`,
+    );
+    void runPromptPackLedger({
+      action: "record",
+      ...attemptMetadata(identity, sessionID),
+      retrieval_status: "skipped",
+      failure_code: failureCode,
+      failure_stage: "policy",
+    });
+    return identity.attemptId;
+  };
+
+  const recordCachedPromptPack = (cached, { messageId, sessionID } = {}) => {
+    cached.reuseCount = (cached.reuseCount || 0) + 1;
+    const identity = promptPackIdentity({
+      sessionID: sessionID || "unknown",
+      requestKey: `${messageId || "unknown"}:cache:${cached.reuseCount}`,
+      surface: "message",
+      promptNumber: cached.promptNumber || promptCounter,
+      queryHash: cached.queryHash || hashPromptPackQuery(""),
+    });
+    const ready = runPromptPackLedger({
+      action: "cache_reuse",
+      ...attemptMetadata(identity, sessionID, cached.promptNumber || promptCounter),
+      original_attempt_id: cached.attemptId,
+    });
+    return { attemptId: identity.attemptId, ready };
+  };
+
+  const confirmPromptPackDelivery = (attemptId, deliveryStatus = "handed_off") => {
+    void runPromptPackLedger({
+      action: "delivery",
+      attempt_id: attemptId,
+      delivery_status: deliveryStatus,
+    });
+  };
 
   const showToast = async (message, variant = "warning") => {
     if (backendUpdatePolicy === "off") {
@@ -1348,7 +2765,7 @@ export const OpencodeMemPlugin = async ({
     if (!viewerEnabled || !viewerAutoStart || !viewerStarted) {
       return { attempted: false, ok: false };
     }
-    const restartResult = await runCli(buildViewerCliArgs("restart"));
+    const restartResult = await runCli(buildViewerCliArgs("restart"), { timeoutMs: 60_000 });
     if (restartResult?.exitCode === 0) {
       await logLine("compat.auto_update_viewer_restart ok");
       return { attempted: true, ok: true };
@@ -1428,12 +2845,14 @@ export const OpencodeMemPlugin = async ({
       `compat.version_mismatch current=${currentVersion} required=${minVersion} mode=${guidance.mode} note=${redactLog(guidance.note)}`
     );
 
-    const autoPlan = resolveAutoUpdatePlan({ runner, runnerFrom });
     if (backendUpdatePolicy === "auto") {
-      if (autoPlan.allowed && Array.isArray(autoPlan.command) && autoPlan.command.length > 0) {
-        const commandText = autoPlan.commandText || autoPlan.command.join(" ");
-        await logLine(`compat.auto_update_start cmd=${redactLog(commandText)}`);
-        const updateResult = await runCommand(autoPlan.command);
+      compatibilityAutoUpdateAttempted = true;
+      await logLine("compat.auto_update_start cmd=codemem update install --json");
+      const updateResult = await runCli(
+        ["update", "install", "--json"],
+        { timeoutMs: 420_000 }
+      );
+      if (updateResult?.exitCode === 0) {
         await logLine(
           `compat.auto_update_result exit=${updateResult?.exitCode ?? "unknown"} stderr=${redactLog(
             (updateResult?.stderr || "").trim()
@@ -1443,8 +2862,7 @@ export const OpencodeMemPlugin = async ({
         const refreshedResult = await runCli(["version"]);
         const refreshedVersion = (refreshedResult?.stdout || "").trim();
         if (
-          updateResult?.exitCode === 0
-          && refreshedResult?.exitCode === 0
+          refreshedResult?.exitCode === 0
           && isVersionAtLeast(refreshedVersion, minVersion)
         ) {
           writeCompatCheckCache(cacheKey, refreshedVersion);
@@ -1464,19 +2882,31 @@ export const OpencodeMemPlugin = async ({
           }
           return;
         }
-
+        await logLine(
+          `compat.auto_update_verification_failed current=${redactLog(refreshedVersion || "unknown")} required=${redactLog(minVersion)}`
+        );
         await showToast(
-          `${message}. Auto-update did not resolve it. Suggested action: ${guidance.action}`,
+          `${message}. Auto-update completed, but the active CLI failed verification. Suggested action: ${guidance.action}`,
           "warning"
         );
         return;
       }
-
+      let installError = null;
+      try {
+        installError = JSON.parse((updateResult?.stdout || "").trim())?.error || null;
+      } catch {
+        // Non-JSON output is treated as an installation failure.
+      }
+      const failureReason = installError === "update_install_locked"
+        ? "another update is already running"
+        : installError === "update_install_refused"
+          ? "not eligible"
+          : "installation failed";
       await logLine(
-        `compat.auto_update_skipped reason=${autoPlan.reason || "not-eligible"}`
+        `compat.auto_update_skipped reason=${installError || "update_install_failed"} exit=${updateResult?.exitCode ?? "unknown"} stderr=${redactLog((updateResult?.stderr || "").trim())}`
       );
       await showToast(
-        `${message}. Auto-update skipped (${autoPlan.reason || "not eligible"}). Suggested action: ${guidance.action}`,
+        `${message}. Auto-update skipped (${failureReason}). Suggested action: ${guidance.action}`,
         "warning"
       );
       return;
@@ -1485,46 +2915,81 @@ export const OpencodeMemPlugin = async ({
     await showToast(`${message}. Suggested action: ${guidance.action}`, "warning");
   };
 
-  const resolveInjectQuery = () =>
-    buildInjectQuery({
-      firstPrompt: sessionContext.firstPrompt,
-      lastPromptText,
+  const checkForReleaseUpdate = async () => {
+    if (backendUpdatePolicy === "off") return;
+    const notification = parseReleaseNotification(
+      await runCli(["update", "check", "--json"])
+    );
+    if (
+      !notification
+      || notifiedReleaseVersions.has(notification.latestVersion)
+    ) {
+      return;
+    }
+    notifiedReleaseVersions.add(notification.latestVersion);
+    if (
+      backendUpdatePolicy === "auto"
+      && notification.autoUpdateEligible
+      && !compatibilityAutoUpdateAttempted
+    ) {
+      const autoPlan = resolveAutoUpdatePlan({ runner, runnerFrom, runnerFromExplicit });
+      if (autoPlan.allowed) {
+        const installation = await runCli(
+          ["update", "install", "--json"],
+          { timeoutMs: 420_000 }
+        );
+        if (installation?.exitCode === 0) {
+          const viewerRestart = await restartViewerAfterAutoUpdate();
+          await showToast(`Updated codemem to ${notification.latestVersion}.`, "success");
+          if (viewerRestart.attempted && !viewerRestart.ok) {
+            await showToast(
+              "Backend updated, but viewer restart failed. Run `codemem serve restart`.",
+              "warning"
+            );
+          }
+          return;
+        }
+        await logLine(
+          `release.auto_update_failed exit=${installation?.exitCode ?? "unknown"} stderr=${redactLog(
+            (installation?.stderr || "").trim()
+          )}`
+        );
+      }
+    }
+    await showToast(
+      `codemem ${notification.latestVersion} is available. ${notification.recommendedAction}`,
+      "warning"
+    );
+  };
+
+  const resolveInjectQuery = (overrides = {}) => {
+    const firstPrompt = hasOwn(overrides, "firstPrompt")
+      ? overrides.firstPrompt
+      : sessionContext.firstPrompt;
+    const resolvedLastPromptText = hasOwn(overrides, "lastPromptText")
+      ? overrides.lastPromptText
+      : lastPromptText;
+    return buildInjectQuery({
+      firstPrompt,
+      lastPromptText: resolvedLastPromptText,
       projectName: resolveProjectName(project, cwd),
       filesModified: sessionContext.filesModified,
     });
-
-  /** Use the agent name as-is from OpenCode config/events — no hardcoded map. */
-  const normalizeOpenCodeAgentLabel = (raw) => {
-    if (!raw) return "";
-    return String(raw)
-      .replace(/[\u200B-\u200D\uFEFF]/g, "")
-      .trim()
-      .toLowerCase();
   };
 
-  const resolveAgentScope = () => {
-    const base = resolveProjectName(project, cwd);
-    const agentId = normalizeOpenCodeAgentLabel(sessionContext.currentAgent);
-    if (!agentId) return base || null;
-    return base ? `${base}/${agentId}` : agentId;
-  };
-
-  const buildMemRecentCliArgs = (limitStr) => {
-    const args = ["recent", "--limit", limitStr];
-    const scopedProject = resolveAgentScope();
-    if (scopedProject) {
-      args.push("--project", scopedProject);
-    }
-    return args;
-  };
-
-  const describeInjectQuery = (query) => {
+  const describeInjectQuery = (query, overrides = {}) => {
     const safeQuery = redactLog((query || "").trim(), 240);
     const projectName = resolveProjectName(project, cwd) || "";
+    const firstPrompt = hasOwn(overrides, "firstPrompt")
+      ? overrides.firstPrompt
+      : sessionContext.firstPrompt;
+    const resolvedLastPromptText = hasOwn(overrides, "lastPromptText")
+      ? overrides.lastPromptText
+      : lastPromptText;
     return {
       safeQuery,
-      firstPromptLen: sessionContext.firstPrompt?.trim()?.length || 0,
-      lastPromptLen: lastPromptText?.trim()?.length || 0,
+      firstPromptLen: firstPrompt?.trim()?.length || 0,
+      lastPromptLen: resolvedLastPromptText?.trim()?.length || 0,
       projectName,
       filesModifiedCount: sessionContext.filesModified.size,
     };
@@ -1536,29 +3001,339 @@ export const OpencodeMemPlugin = async ({
     return masked.length > limit ? `${masked.slice(0, limit)}…` : masked;
   };
 
-  const buildInjectedContext = async (query) => {
-    const packArgs = buildPackArgs({
-      query,
-      filesModified: sessionContext.filesModified,
-      injectLimit,
-      injectTokenBudget,
-      agentScope: resolveAgentScope(),
+  const advancePromptPackRetryIdentity = (attemptKey) => {
+    promptPackRetryCounts.set(
+      attemptKey,
+      (promptPackRetryCounts.get(attemptKey) || 0) + 1
+    );
+    while (promptPackRetryCounts.size > 2000) {
+      const oldest = promptPackRetryCounts.keys().next().value;
+      if (!oldest) break;
+      promptPackRetryCounts.delete(oldest);
+    }
+  };
+
+  const rememberSuccessfulPromptPackArtifact = (
+    attemptKey,
+    retryCount,
+    fingerprint
+  ) => {
+    successfulPromptPackArtifacts.delete(attemptKey);
+    successfulPromptPackArtifacts.set(attemptKey, {
+      retryCount,
+      fingerprint,
     });
-    const result = await runCli(packArgs);
+    while (successfulPromptPackArtifacts.size > 2000) {
+      const oldest = successfulPromptPackArtifacts.keys().next().value;
+      if (!oldest) break;
+      successfulPromptPackArtifacts.delete(oldest);
+    }
+  };
+
+  const buildInjectedContext = async (query, context = {}) => {
+    const queryHash = hashPromptPackQuery(query);
+    const sessionID = context.sessionID || activeSessionID || "unknown";
+    const surface = context.surface || injectSurface;
+    const requestKey = context.requestKey || "unknown";
+    const attemptKey = JSON.stringify([
+      sessionID,
+      requestKey,
+      surface,
+      promptCounter,
+      queryHash,
+    ]);
+    let retryCount = promptPackRetryCounts.get(attemptKey) || 0;
+    const resolveIdentity = () => promptPackIdentity({
+      sessionID,
+      requestKey: retryCount > 0
+        ? `${requestKey}:empty-retry:${retryCount}`
+        : requestKey,
+      surface,
+      promptNumber: promptCounter,
+      queryHash,
+    });
+    let identity = resolveIdentity();
+    let metadata = attemptMetadata(
+      identity,
+      context.sessionID || activeSessionID || null,
+    );
+    const runPack = async () => {
+      let packArgs = buildPackArgs({
+        query,
+        filesModified: sessionContext.filesModified,
+        injectLimit,
+        injectTokenBudget,
+        internalLedger: true,
+      });
+      const httpResult = await postViewerJson({
+        url: packUrl,
+        operation: "pack",
+        payload: buildPackHttpBody({
+          query,
+          filesModified: sessionContext.filesModified,
+          injectLimit,
+          injectTokenBudget,
+          projectName: normalizeProjectLabel(process.env.CODEMEM_PROJECT),
+          cwd,
+          dbPath: promptPackDbPath,
+          identityTarget: promptPackIdentityTarget,
+          attempt: metadata,
+        }),
+        validate: isValidPackHttpPayload,
+      });
+      if (httpResult.ok) {
+        return {
+          packArgs,
+          result: {
+            exitCode: 0,
+            stdout: JSON.stringify(httpResult.body),
+            stderr: "",
+            transport: "viewer",
+          },
+        };
+      }
+
+      const { cause, retryable } = httpResult.classification;
+      await logLine(
+        `inject.pack.http_error cause=${JSON.stringify(redactLog(cause, 200))} retryable=${retryable}`
+      );
+      if (!retryable) {
+        return {
+          packArgs,
+          result: { exitCode: 1, stdout: "", stderr: cause, transport: "viewer" },
+        };
+      }
+
+      let result = await runCli(packArgs, { stdinText: JSON.stringify(metadata) });
+      if (rejectsInternalLedgerFlag(result)) {
+        packArgs = packArgs.filter((arg) => arg !== "--internal-ledger");
+        result = await runCli(packArgs);
+      }
+      return { packArgs, result: { ...result, transport: "cli" } };
+    };
+    let { packArgs, result } = await runPack();
+    let { packText, conflictPackText, metrics, itemCount, ledgerConflict } = parsePackOutput(result);
+    let artifactFingerprint = packText
+      ? promptPackArtifactFingerprint(result.stdout, packText)
+      : "";
+    let injectedIdentity = identity;
+    let repairFallbackUsed = false;
+    if (ledgerConflict) {
+      // A restarted plugin has no artifact cache to predict this conflict. The
+      // ledger marker is authoritative: never attribute delivery to the stale
+      // identity, and retry once with a fresh deterministic identity.
+      await log("warn", "codemem prompt-pack ledger conflict; retrying with fresh identity", {
+        sessionID,
+        surface,
+      });
+      const fallback = conflictPackText
+        ? {
+            packArgs,
+            result,
+            packText: conflictPackText,
+            metrics,
+            itemCount,
+            artifactFingerprint: promptPackArtifactFingerprint(result.stdout, conflictPackText),
+            ledgerConflict,
+          }
+        : null;
+      advancePromptPackRetryIdentity(attemptKey);
+      retryCount = promptPackRetryCounts.get(attemptKey) || 0;
+      identity = resolveIdentity();
+      metadata = attemptMetadata(
+        identity,
+        context.sessionID || activeSessionID || null,
+      );
+      ({ packArgs, result } = await runPack());
+      // Repair-conflict bytes are never preferred over the original preserved pack.
+      ({ packText, metrics, itemCount, ledgerConflict } = parsePackOutput(result));
+      artifactFingerprint = packText
+        ? promptPackArtifactFingerprint(result.stdout, packText)
+        : "";
+      const repairFailed = ledgerConflict
+        || !result
+        || result.exitCode !== 0
+        || (!packText && itemCount !== 0);
+      if (fallback && repairFailed) {
+        if (ledgerConflict) {
+          await log("warn", "codemem prompt-pack fresh identity also conflicted", {
+            sessionID,
+            surface,
+          });
+        } else {
+          const malformedSuccess = result?.exitCode === 0;
+          const exitCode = result?.exitCode ?? "unknown";
+          const stderr = redactLog(result?.stderr ? result.stderr.trim() : "");
+          const cmd = redactPackCommand(runner, runnerArgs, packArgs);
+          await logLine(
+            `inject.pack.identity_repair_failed reason=${malformedSuccess ? "malformed_success" : "command_failed"} exit=${exitCode} cmd=${cmd}` +
+              `${stderr ? ` stderr=${stderr}` : ""}`
+          );
+          await log("warn", "codemem prompt-pack identity repair failed", {
+            reason: malformedSuccess ? "malformed_success" : "command_failed",
+            exitCode,
+          });
+          void runPromptPackLedger({
+            action: "record",
+            ...metadata,
+            retrieval_status: "failed",
+            failure_code: malformedSuccess
+              ? "pack_identity_repair_failed"
+              : "pack_command_failed",
+            failure_stage: malformedSuccess ? "decode" : "transport",
+          });
+        }
+        advancePromptPackRetryIdentity(attemptKey);
+        retryCount = promptPackRetryCounts.get(attemptKey) || 0;
+        ({
+          packArgs,
+          result,
+          packText,
+          metrics,
+          itemCount,
+          artifactFingerprint,
+          ledgerConflict,
+        } = fallback);
+        // Neither persisted identity represents fallback delivery: the first
+        // conflicted and the fresh repair failed. Keep the bytes fail-open but
+        // leave delivery and replay attribution empty.
+        injectedIdentity = null;
+        repairFallbackUsed = true;
+      } else {
+        injectedIdentity = identity;
+      }
+    }
+    if (packText) {
+      const previous = successfulPromptPackArtifacts.get(attemptKey);
+      if (
+        previous?.retryCount === retryCount
+        && previous.fingerprint !== artifactFingerprint
+      ) {
+        // The in-memory fingerprint detected a changed artifact before handoff.
+        // Defensively rebuild once with a fresh identity; older CLIs do not
+        // expose the persisted conflict marker used by the restart path above.
+        // Keep the usable changed bytes as a fail-open fallback: diagnostics
+        // identity repair must never suppress context injection.
+        const fallback = {
+          packArgs,
+          result,
+          packText,
+          metrics,
+          itemCount,
+          artifactFingerprint,
+          ledgerConflict,
+        };
+        advancePromptPackRetryIdentity(attemptKey);
+        retryCount = promptPackRetryCounts.get(attemptKey) || 0;
+        identity = resolveIdentity();
+        metadata = attemptMetadata(
+          identity,
+          context.sessionID || activeSessionID || null,
+        );
+        ({ packArgs, result } = await runPack());
+        ({ packText, metrics, itemCount, ledgerConflict } = parsePackOutput(result));
+        artifactFingerprint = packText
+          ? promptPackArtifactFingerprint(result.stdout, packText)
+          : "";
+
+        if (ledgerConflict) {
+          // The repair identity is also persisted with different artifacts.
+          // Preserve the marker for the fail-closed return below; never use the
+          // stale changed bytes as the transport-failure fallback.
+          injectedIdentity = identity;
+        } else if (result?.exitCode === 0 && itemCount === 0) {
+          // A fresh identity can legitimately resolve to no results if the
+          // underlying memory set changed between rebuilds. The CLI already
+          // recorded that terminal outcome; do not misclassify it as a decode
+          // failure or fall back to stale non-empty context.
+          injectedIdentity = identity;
+        } else if (!result || result.exitCode !== 0 || !packText) {
+          const malformedSuccess = result?.exitCode === 0;
+          const exitCode = result?.exitCode ?? "unknown";
+          const stderr = redactLog(result?.stderr ? result.stderr.trim() : "");
+          const cmd = redactPackCommand(runner, runnerArgs, packArgs);
+          await logLine(
+            `inject.pack.identity_repair_failed reason=${malformedSuccess ? "malformed_success" : "command_failed"} exit=${exitCode} cmd=${cmd}` +
+              `${stderr ? ` stderr=${stderr}` : ""}`
+          );
+          await log("warn", "codemem prompt-pack identity repair failed", {
+            reason: malformedSuccess ? "malformed_success" : "command_failed",
+            exitCode,
+          });
+          void runPromptPackLedger({
+            action: "record",
+            ...metadata,
+            retrieval_status: "failed",
+            failure_code: malformedSuccess
+              ? "pack_identity_repair_failed"
+              : "pack_command_failed",
+            failure_stage: malformedSuccess ? "decode" : "transport",
+          });
+          advancePromptPackRetryIdentity(attemptKey);
+
+          ({
+            packArgs,
+            result,
+            packText,
+            metrics,
+            itemCount,
+            artifactFingerprint,
+            ledgerConflict,
+          } = fallback);
+          // The stale attempt does not represent these changed bytes, and the
+          // fresh repair attempt failed. Inject without delivery attribution
+          // rather than falsely marking either ledger attempt handed off.
+          injectedIdentity = null;
+          repairFallbackUsed = true;
+        } else {
+          injectedIdentity = identity;
+        }
+      }
+    }
     if (!result || result.exitCode !== 0) {
       const exitCode = result?.exitCode ?? "unknown";
       const stderr = redactLog(result?.stderr ? result.stderr.trim() : "");
       const stdout = redactLog(result?.stdout ? result.stdout.trim() : "");
-      const cmd = [runner, ...runnerArgs, ...packArgs].join(" ");
+      const cmd = redactPackCommand(runner, runnerArgs, packArgs);
       await logLine(
         `inject.pack.error ${exitCode} cmd=${cmd}` +
           `${stderr ? ` stderr=${stderr}` : ""}` +
           `${stdout ? ` stdout=${stdout}` : ""}`
       );
-      return "";
+      void runPromptPackLedger({
+        action: "record",
+        ...metadata,
+        retrieval_status: "failed",
+        failure_code: "pack_command_failed",
+        failure_stage: "transport",
+      });
+      advancePromptPackRetryIdentity(attemptKey);
+      return {
+        text: "",
+        attemptId: identity.attemptId,
+        requestId: identity.requestId,
+        queryHash,
+        promptNumber: promptCounter,
+      };
     }
-    const packText = parsePackText(result.stdout);
+    if (ledgerConflict && !repairFallbackUsed) {
+      await log("warn", "codemem prompt-pack fresh identity also conflicted", {
+        sessionID,
+        surface,
+      });
+      advancePromptPackRetryIdentity(attemptKey);
+      return {
+        text: "",
+        attemptId: identity.attemptId,
+        requestId: identity.requestId,
+        queryHash,
+        promptNumber: promptCounter,
+      };
+    }
     if (!packText) {
+      if (itemCount === 0) {
+        advancePromptPackRetryIdentity(attemptKey);
+      }
       if (debug) {
         const { safeQuery, firstPromptLen, lastPromptLen, projectName, filesModifiedCount } =
           describeInjectQuery(query);
@@ -1566,27 +3341,46 @@ export const OpencodeMemPlugin = async ({
           `inject.pack.empty query_len=${query ? query.length : 0} query=${JSON.stringify(safeQuery)} first_prompt_len=${firstPromptLen} last_prompt_len=${lastPromptLen} project=${JSON.stringify(projectName)} files_modified=${filesModifiedCount} stdout=${JSON.stringify(redactLog((result.stdout || "").trim(), 240))}`
         );
       }
-      return "";
+      return {
+        text: "",
+        attemptId: identity.attemptId,
+        requestId: identity.requestId,
+        queryHash,
+        promptNumber: promptCounter,
+      };
     }
-    const metrics = parsePackMetrics(result.stdout);
-    if (debug) {
-      const itemCount = Number.isFinite(Number(metrics?.items))
-        ? Number(metrics.items)
-        : 0;
-      const packTokens = Number.isFinite(Number(metrics?.pack_tokens))
-        ? Number(metrics.pack_tokens)
-        : 0;
-      await logLine(
-        `inject.pack.ok query_len=${query ? query.length : 0} items=${itemCount} pack_tokens=${packTokens}`
+    // The pack JSON exposes the item count as `total_items`; `metrics.items`
+    // does not exist on that payload, so reading it would always log 0.
+    const packTokens = Number.isFinite(Number(metrics?.pack_tokens))
+      ? Number(metrics.pack_tokens)
+      : 0;
+    await logLine(
+      `inject.pack.ok source=opencode items=${itemCount ?? 0} pack_tokens=${packTokens} query_len=${query ? query.length : 0}`
+    );
+    if (!repairFallbackUsed) {
+      rememberSuccessfulPromptPackArtifact(
+        attemptKey,
+        retryCount,
+        artifactFingerprint || promptPackArtifactFingerprint(result.stdout, packText)
       );
     }
     if (metrics) {
       return {
         text: `[codemem context]\n${packText}`,
         metrics,
+        attemptId: injectedIdentity?.attemptId || null,
+        requestId: injectedIdentity?.requestId || null,
+        queryHash,
+        promptNumber: promptCounter,
       };
     }
-    return { text: `[codemem context]\n${packText}` };
+    return {
+      text: `[codemem context]\n${packText}`,
+      attemptId: injectedIdentity?.attemptId || null,
+      requestId: injectedIdentity?.requestId || null,
+      queryHash,
+      promptNumber: promptCounter,
+    };
   };
 
   const stopViewer = async () => {
@@ -1599,62 +3393,15 @@ export const OpencodeMemPlugin = async ({
     await runCli(buildViewerCliArgs("stop"));
   };
 
-  const checkViewerHealth = async () => {
-    if (!viewerStarted || !viewerEnabled) return;
-    try {
-      const resp = await fetch(rawEventsStatusUrl, {
-        method: "GET",
-        signal: AbortSignal.timeout(5000),
-      });
-      if (resp.ok) {
-        if (healthConsecutiveFailures > 0) {
-          await logLine(`viewer.health recovered after ${healthConsecutiveFailures} failure(s)`);
-        }
-        healthConsecutiveFailures = 0;
-        return;
-      }
-      healthConsecutiveFailures++;
-      await logLine(`viewer.health check failed (status=${resp.status}, consecutive=${healthConsecutiveFailures})`);
-    } catch (err) {
-      healthConsecutiveFailures++;
-      await logLine(`viewer.health check error (consecutive=${healthConsecutiveFailures}): ${String(err).slice(0, 200)}`);
-    }
-
-    if (
-      healthConsecutiveFailures >= HEALTH_CONSECUTIVE_FAILURES_BEFORE_RESTART &&
-      Date.now() - healthLastRestartAttempt >= HEALTH_RESTART_COOLDOWN_MS
-    ) {
-      healthLastRestartAttempt = Date.now();
-      await logLine(`viewer.health restarting viewer after ${healthConsecutiveFailures} consecutive failures`);
-      try {
-        const result = await runCli(buildViewerCliArgs("restart"));
-        const ok = result?.exitCode === 0;
-        await logLine(`viewer.health restart ${ok ? "succeeded" : "failed"} (exit=${result?.exitCode ?? "unknown"})`);
-        if (ok) {
-          healthConsecutiveFailures = 0;
-        }
-      } catch (restartErr) {
-        await logLine(`viewer.health restart error: ${String(restartErr).slice(0, 200)}`);
-      }
-    }
-  };
-
-  const startHealthCheck = () => {
-    if (healthCheckTimer) return;
-    healthConsecutiveFailures = 0;
-    healthCheckTimer = setInterval(() => {
-      checkViewerHealth().catch(() => {});
-    }, HEALTH_CHECK_INTERVAL_MS);
-    if (healthCheckTimer.unref) healthCheckTimer.unref();
-  };
-
-  const stopHealthCheck = () => {
-    if (healthCheckTimer) {
-      clearInterval(healthCheckTimer);
-      healthCheckTimer = null;
-    }
-    healthConsecutiveFailures = 0;
-  };
+  const viewerHealthMonitor = createViewerHealthMonitor({
+    viewerHealthUrl,
+    legacyStatusUrl: rawEventsStatusUrl,
+    isActive: () => viewerStarted && viewerEnabled,
+    restartViewer: () => runCli(buildViewerCliArgs("restart")),
+    logLine,
+  });
+  const startHealthCheck = viewerHealthMonitor.start;
+  const stopHealthCheck = viewerHealthMonitor.stop;
 
   // Get version info (commit hash) for debugging
   let version = "unknown";
@@ -1663,6 +3410,9 @@ export const OpencodeMemPlugin = async ({
       cwd: runnerFrom,
       timeout: 500,
       encoding: "utf-8",
+      // Suppress "fatal: not a git repository" when the working directory is
+      // not a git repo. The catch below leaves version as "unknown".
+      stdio: ["ignore", "pipe", "ignore"],
     }).trim();
   } catch (err) {
     // Ignore - version will remain 'unknown'
@@ -1670,15 +3420,26 @@ export const OpencodeMemPlugin = async ({
 
   await log("info", "codemem plugin initialized", { cwd, version });
   await logLine(`plugin initialized cwd=${cwd} version=${version}`);
-  startViewer();
-  const compatCheckTimer = setTimeout(() => {
-    void verifyCliCompatibility().catch(async (err) => {
-      await logLine(
-        `compat.version_check_error message=${String(err?.message || err || "unknown")}`
-      );
-    });
+  void startViewer();
+  const updateCheckTimer = setTimeout(() => {
+    void (async () => {
+      try {
+        await verifyCliCompatibility();
+      } catch (err) {
+        await logLine(
+          `compat.version_check_error message=${String(err?.message || err || "unknown")}`
+        );
+      }
+      try {
+        await checkForReleaseUpdate();
+      } catch (err) {
+        await logLine(
+          `release.update_check_error message=${String(err?.message || err || "unknown")}`
+        );
+      }
+    })();
   }, COMPAT_CHECK_DELAY_MS);
-  if (compatCheckTimer.unref) compatCheckTimer.unref();
+  if (updateCheckTimer.unref) updateCheckTimer.unref();
 
   const truncate = (value) => {
     if (value === undefined || value === null) {
@@ -1773,8 +3534,16 @@ export const OpencodeMemPlugin = async ({
     }
 
     const failed = [];
+    let droppedCount = 0;
     for (const queuedEvent of batch) {
       if (queuedEvent && typeof queuedEvent === "object" && queuedEvent._raw_enqueued) {
+        continue;
+      }
+      if (queuedEvent && typeof queuedEvent === "object" && queuedEvent._raw_fallback_terminal) {
+        droppedCount += 1;
+        await logLine(
+          `flush.drop terminal_fallback event_id=${queuedEvent?._raw_event_id || "unknown"}`
+        );
         continue;
       }
       const queuedSessionID =
@@ -1787,6 +3556,13 @@ export const OpencodeMemPlugin = async ({
         payload: queuedEvent,
       });
       if (!ok) {
+        if (queuedEvent?._raw_fallback_terminal) {
+          droppedCount += 1;
+          await logLine(
+            `flush.drop terminal_fallback event_id=${queuedEvent?._raw_event_id || "unknown"}`
+          );
+          continue;
+        }
         const currentRetry =
           typeof queuedEvent?._raw_retry_count === "number" && Number.isFinite(queuedEvent._raw_retry_count)
             ? queuedEvent._raw_retry_count
@@ -1811,319 +3587,97 @@ export const OpencodeMemPlugin = async ({
     await logLine(
       `flush.stream_only finalize count=${batch.length} tools=${sessionContext.toolCount} prompts=${sessionContext.promptCount} duration=${Math.round(durationMs / 1000)}s`
     );
-    await logLine(`flush.ok count=${batch.length}`);
+    await logLine(`flush.ok count=${batch.length - droppedCount} dropped=${droppedCount}`);
     sessionStartedAt = null;
     resetSessionContext();
   };
 
-  // -------------------------------------------------------------------------
-  // Plugin-observer loop — polls viewer for pending batches, calls LLM via
-  // OpenCode SDK, posts result back. Runs every 30s in background.
-  // -------------------------------------------------------------------------
-  const OBSERVER_POLL_MS = 30_000;
-  let observerLoopActive = false;
-  // Track observer-only OpenCode sessions so they don't interfere with viewer lifecycle.
-  const observerSessions = new Set();
-
-  // Use Node.js http.request directly to bypass HTTP_PROXY for localhost calls
-  const { request: httpRequest } = await import("node:http");
-  await logLine(`observer.proxy HTTP_PROXY=${process.env.HTTP_PROXY || "none"} NO_PROXY=${process.env.NO_PROXY || "none"} serverUrl=${serverUrl || "none"}`);
-  const localFetch = (url, opts = {}) => new Promise((resolve, reject) => {
-    // Temporarily clear proxy env vars so http.request goes direct
-    const savedVars = {
-      HTTP_PROXY: process.env.HTTP_PROXY,
-      HTTPS_PROXY: process.env.HTTPS_PROXY,
-      http_proxy: process.env.http_proxy,
-      https_proxy: process.env.https_proxy,
-    };
-    delete process.env.HTTP_PROXY;
-    delete process.env.HTTPS_PROXY;
-    delete process.env.http_proxy;
-    delete process.env.https_proxy;
-
-    const parsed = new URL(url);
-    const body = opts.body ? String(opts.body) : null;
-    const method = opts.method || "GET";
-    const defaultTimeout =
-      typeof opts.timeoutMs === "number"
-        ? opts.timeoutMs
-        : method === "POST"
-          ? 30_000
-          : 10_000;
-    const reqOpts = {
-      hostname: parsed.hostname,
-      port: parsed.port || 80,
-      path: parsed.pathname + parsed.search,
-      method,
-      headers: { ...(opts.headers || {}), ...(body ? { "Content-Length": Buffer.byteLength(body) } : {}) },
-      timeout: defaultTimeout,
-    };
-    const req = httpRequest(reqOpts, (res) => {
-      // Restore proxy vars
-      for (const [k, v] of Object.entries(savedVars)) {
-        if (v !== undefined) process.env[k] = v; else delete process.env[k];
-      }
-      let data = "";
-      res.on("data", (chunk) => { data += chunk; });
-      res.on("end", () => {
-        resolve({
-          ok: res.statusCode >= 200 && res.statusCode < 300,
-          status: res.statusCode,
-          json: () => Promise.resolve(JSON.parse(data)),
-          text: () => Promise.resolve(data),
-        });
-      });
-    });
-    req.on("error", (err) => {
-      for (const [k, v] of Object.entries(savedVars)) {
-        if (v !== undefined) process.env[k] = v; else delete process.env[k];
-      }
-      reject(err);
-    });
-    if (opts.signal) opts.signal.addEventListener("abort", () => req.destroy(new Error("aborted")));
-    if (body) req.write(body);
-    req.end();
-  });
-
-  const runObserverLoop = async () => {
-    if (observerLoopActive) return;
-    observerLoopActive = true;
-    try {
-      const pendingUrl = `http://${viewerHost}:${viewerPort}/api/plugin-observer/pending`;
-      const resultUrl = `http://${viewerHost}:${viewerPort}/api/plugin-observer/result`;
-
-      const resp = await localFetch(pendingUrl, { signal: AbortSignal.timeout(5000) });
-      if (resp.status === 204) {
-        await logLine(`observer.poll.empty`);
-        return;
-      }
-      if (!resp.ok) {
-        await logLine(`observer.poll.error status=${resp.status}`);
-        return;
-      }
-
-      const batch = await resp.json();
-      const { batch_id, session_id, source, start_seq, end_seq, system, user } = batch;
-      await logLine(`observer.batch batch_id=${batch_id} session=${session_id} seqs=${start_seq}-${end_seq}`);
-
-      // Prefer the OpenCode plugin SDK client when available (no port guessing, no proxy issues).
-      // Fall back to local HTTP calls when SDK isn't present.
-      const sdkSession = client?.session;
-      const canUseSdk =
-        sdkSession &&
-        typeof sdkSession.create === "function" &&
-        (typeof sdkSession.promptAsync === "function" || typeof sdkSession.prompt === "function") &&
-        typeof sdkSession.messages === "function";
-
-      // Use localFetch to call OpenCode API directly via serverUrl (bypasses proxy)
-      const opencodeBase = serverUrl
-        ? `http://127.0.0.1:${serverUrl.port || "4096"}`
-        : "http://127.0.0.1:4096";
-
-      let observerSessionId = null;
-      if (canUseSdk) {
-        try {
-          const createBody = {
-            title: "codemem-observer",
-            permission: [
-              { permission: "tool", pattern: "*", action: "deny" },
-              { permission: "write", pattern: "*", action: "deny" },
-            ],
-          };
-          // SDK signature differs across versions; try common shapes.
-          let created = null;
-          try { created = await sdkSession.create({ body: createBody }); } catch {}
-          if (!created) created = await sdkSession.create(createBody);
-          observerSessionId = created?.data?.id ?? created?.id ?? null;
-        } catch (e) {
-          await logLine(`observer.session.create.sdk_failed ${String(e).slice(0, 200)}`);
-          observerSessionId = null;
-        }
-      }
-      if (!observerSessionId) {
-        // Fallback: create session over local HTTP
-        const sessionResp = await localFetch(`${opencodeBase}/session`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            title: "codemem-observer",
-            permission: [
-              { permission: "tool", pattern: "*", action: "deny" },
-              { permission: "write", pattern: "*", action: "deny" },
-            ],
-          }),
-        });
-        if (!sessionResp.ok) {
-          await logLine(`observer.session.create.failed status=${sessionResp.status}`);
-          return;
-        }
-        const sessionData = await sessionResp.json();
-        observerSessionId = sessionData?.id ?? null;
-      }
-      await logLine(`observer.session.created id=${observerSessionId}`);
-
-      if (!observerSessionId) {
-        await logLine(`observer.session.create.no_id`);
-        return;
-      }
-      observerSessions.add(observerSessionId);
-
-      // Send via prompt_async (returns immediately; blocking /message hits socket timeout)
-      const fullPrompt = `${system}\n\n${user}`;
-      const observerModelID =
-        String(process.env.CODEMEM_OBSERVER_MODEL || "").trim() || "big-pickle";
-      const observerProviderID =
-        String(process.env.CODEMEM_OBSERVER_PROVIDER || "").trim() || "opencode";
-      await logLine(
-        `observer.prompt_async.sending len=${fullPrompt.length} model=${observerProviderID}/${observerModelID} session=${observerSessionId} sdk=${canUseSdk}`
-      );
-
-      let promptAccepted = false;
-      if (canUseSdk && typeof sdkSession.promptAsync === "function") {
-        try {
-          const promptBody = {
-            model: { providerID: observerProviderID, modelID: observerModelID },
-            parts: [{ type: "text", text: fullPrompt }],
-          };
-          // Try common shapes for SDK promptAsync
-          let ok = false;
-          try {
-            await sdkSession.promptAsync({ path: { id: observerSessionId }, body: promptBody });
-            ok = true;
-          } catch {}
-          if (!ok) {
-            await sdkSession.promptAsync({ id: observerSessionId, body: promptBody });
-          }
-          promptAccepted = true;
-        } catch (e) {
-          await logLine(`observer.prompt_async.sdk_failed ${String(e).slice(0, 200)}`);
-        }
-      }
-      if (!promptAccepted) {
-        const promptResp = await localFetch(
-          `${opencodeBase}/session/${observerSessionId}/prompt_async`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              model: { providerID: observerProviderID, modelID: observerModelID },
-              parts: [{ type: "text", text: fullPrompt }],
-            }),
-            timeoutMs: 30_000,
-          }
-        );
-        if (!promptResp.ok) {
-          const errBody = await promptResp.text().catch(() => "");
-          await logLine(
-            `observer.prompt_async.failed status=${promptResp.status} body=${errBody.slice(0, 200)}`
-          );
-          localFetch(`${opencodeBase}/session/${observerSessionId}`, { method: "DELETE" }).catch(() => {});
-          return;
-        }
-      }
-      await logLine(`observer.prompt_async.accepted polling...`);
-
-      // Poll for the assistant response (max 300s)
-      const deadline = Date.now() + 300_000;
-      let llmOutput = null;
-      let lastAssistantText = null;
-      let pollCount = 0;
-      while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 2000));
-        pollCount++;
-        let msgs = null;
-        if (canUseSdk) {
-          try {
-            let sdkMsgs = null;
-            try { sdkMsgs = await sdkSession.messages({ path: { id: observerSessionId } }); } catch {}
-            if (!sdkMsgs) sdkMsgs = await sdkSession.messages({ id: observerSessionId });
-            msgs = sdkMsgs?.data ?? sdkMsgs ?? null;
-          } catch (e) {
-            await logLine(`observer.poll.sdk_failed ${String(e).slice(0, 200)}`);
-          }
-        }
-        if (!msgs) {
-          const msgsResp = await localFetch(`${opencodeBase}/session/${observerSessionId}/message`, {
-            timeoutMs: 60_000,
-          });
-          if (!msgsResp.ok) {
-            await logLine(`observer.poll.msgs.failed status=${msgsResp.status} poll=${pollCount}`);
-            continue;
-          }
-          msgs = await msgsResp.json();
-        }
-        if (!Array.isArray(msgs)) continue;
-        if (pollCount % 5 === 0) await logLine(`observer.poll.tick poll=${pollCount} msgs=${msgs.length}`);
-        for (let i = msgs.length - 1; i >= 0; i--) {
-          const msg = msgs[i];
-          if (msg?.info?.role !== "assistant") continue;
-          const text = (msg.parts || [])
-            .filter((p) => p.type === "text" && p.text)
-            .map((p) => p.text)
-            .join("\n")
-            .trim();
-          if (!text) continue;
-          lastAssistantText = text;
-          // OpenCode server versions differ: some set info.finished=true, others use info.finish and/or info.time.completed.
-          const isFinished = Boolean(
-            msg?.info?.finished ||
-            msg?.info?.finish ||
-            (msg?.info?.time && msg.info.time.completed)
-          );
-          if (isFinished) { llmOutput = text; break; }
-        }
-        if (llmOutput) break;
-      }
-      if (!llmOutput && lastAssistantText) {
-        await logLine(`observer.poll.fallback using last assistant text len=${lastAssistantText.length}`);
-        llmOutput = lastAssistantText;
-      }
-      if (!llmOutput) await logLine(`observer.poll.timeout after ${pollCount} polls`);
-
-      // Clean up session
-      localFetch(`${opencodeBase}/session/${observerSessionId}`, { method: "DELETE" })
-        .catch(() => {})
-        .finally(() => {
-          observerSessions.delete(observerSessionId);
-        });
-
-      if (!llmOutput) {
-        await logLine(`observer.llm.empty batch_id=${batch_id}`);
-        return;
-      }
-      await logLine(`observer.llm.ok batch_id=${batch_id} len=${llmOutput.length}`);
-
-      // Post result back to viewer
-      const postResp = await localFetch(resultUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ batch_id, session_id, source, start_seq, end_seq, llm_output: llmOutput }),
-      });
-
-      if (!postResp.ok) {
-        const errText = await postResp.text().catch(() => "");
-        await logLine(`observer.result.error status=${postResp.status} body=${errText.slice(0, 200)}`);
-      } else {
-        await logLine(`observer.result.ok batch_id=${batch_id}`);
-      }
-    } catch (err) {
-      await logLine(`observer.loop.error ${String(err).slice(0, 200)}`);
-      try {
-        await client.app.log({ body: { service: "codemem-observer", level: "error", message: `observer loop error: ${String(err).slice(0, 200)}` } });
-      } catch {}
-    } finally {
-      observerLoopActive = false;
-    }
-  };
-
-  // Start the observer loop after a short delay (let viewer start first)
-  setTimeout(() => {
-    runObserverLoop();
-    setInterval(runObserverLoop, OBSERVER_POLL_MS);
-  }, 10_000);
-
   return {
+    "experimental.session.compacting": async (input) => {
+      const sessionID = extractHookSessionID(input) || activeSessionID;
+      markCompactionInjectionSkip(compactionInjectionSkips, sessionID);
+      if (debug) {
+        await logLine(
+          `inject.compaction_skip_marked sessionID=${sessionID || "unknown"}`
+        );
+      }
+    },
+    "experimental.chat.messages.transform": async (input, output) => {
+      if (injectSurface === "system") {
+        return;
+      }
+      const latestUser = Array.isArray(output?.messages)
+        ? findLatestUserMessage(output.messages)
+        : null;
+      const sessionID = latestUser ? resolveEntrySessionID(latestUser.entry) : input?.sessionID;
+      const latestPromptText = latestUser ? extractMessageText(latestUser.entry) : "";
+      if (debug) {
+        const query = resolveInjectQuery({ lastPromptText: latestPromptText });
+        const { safeQuery, firstPromptLen, lastPromptLen, projectName, filesModifiedCount } =
+          describeInjectQuery(query, { lastPromptText: latestPromptText });
+        await logLine(
+          `inject.messages_transform sessionID=${sessionID || "unknown"} query_len=${
+            query ? query.length : 0
+          } inject_enabled=${injectEnabled} tui_toast=${Boolean(client.tui?.showToast)} query=${JSON.stringify(safeQuery)} first_prompt_len=${firstPromptLen} last_prompt_len=${lastPromptLen} project=${JSON.stringify(projectName)} files_modified=${filesModifiedCount}`
+        );
+      }
+
+      let applied = false;
+      try {
+        applied = await applyInjectedContextToMessages({
+          injectEnabled,
+          input,
+          output,
+          injectionToastShown,
+          showToast: client.tui?.showToast
+            ? async (message) => {
+              await client.tui.showToast({
+                body: {
+                  message,
+                  variant: "info",
+                },
+              });
+            }
+            : null,
+          resolveInjectQuery,
+          buildInjectedContext,
+          messageInjectionCache,
+          compactionInjectionSkips,
+          confirmDelivery: confirmPromptPackDelivery,
+          recordCacheReuse: recordCachedPromptPack,
+          recordSkipped: recordSkippedPromptPack,
+        });
+      } catch (err) {
+        await logLine(
+          `inject.messages_transform.error sessionID=${sessionID || "unknown"} message=${JSON.stringify(err instanceof Error ? err.message : String(err))}`
+        );
+      }
+      if (debug) {
+        const partsCount = Array.isArray(output?.messages)
+          ? output.messages.reduce(
+            (count, entry) => count + (Array.isArray(entry?.parts) ? entry.parts.length : 0),
+            0
+          )
+          : 0;
+        await logLine(
+          `inject.messages_transform.result sessionID=${sessionID || "unknown"} applied=${Boolean(applied)} messages=${Array.isArray(output?.messages) ? output.messages.length : 0} parts=${partsCount}`
+        );
+      }
+    },
     "experimental.chat.system.transform": async (input, output) => {
+      if (injectSurface !== "system") {
+        return;
+      }
+      const hookSessionID = input?.sessionID || activeSessionID;
+      if (consumeCompactionInjectionSkip(compactionInjectionSkips, hookSessionID)) {
+        recordSkippedPromptPack("compaction_skipped", hookSessionID, "system");
+        if (debug) {
+          await logLine(
+            `inject.transform.skip_compaction sessionID=${hookSessionID || "unknown"}`
+          );
+        }
+        return;
+      }
       const query = resolveInjectQuery();
       if (debug) {
         const { safeQuery, firstPromptLen, lastPromptLen, projectName, filesModifiedCount } =
@@ -2134,25 +3688,37 @@ export const OpencodeMemPlugin = async ({
           } inject_enabled=${injectEnabled} tui_toast=${Boolean(client.tui?.showToast)} query=${JSON.stringify(safeQuery)} first_prompt_len=${firstPromptLen} last_prompt_len=${lastPromptLen} project=${JSON.stringify(projectName)} files_modified=${filesModifiedCount}`
         );
       }
-      const applied = await applyInjectedContextToOutput({
-        injectEnabled,
-        input,
-        output,
-        injectedSessions,
-        injectionToastShown,
-        showToast: client.tui?.showToast
-          ? async (message) => {
-            await client.tui.showToast({
-              body: {
-                message,
-                variant: "info",
-              },
-            });
-          }
-          : null,
-        resolveInjectQuery,
-        buildInjectedContext,
-      });
+      // Without the old per-session cache, every transform call rebuilds the
+      // pack. Swallow rejections here so a single failed build (viewer failure,
+      // CLI fallback crash, sqlite lock, or network blip)
+      // can't take down the chat path.
+      let applied = false;
+      try {
+        applied = await applyInjectedContextToOutput({
+          injectEnabled,
+          input,
+          output,
+          injectionToastShown,
+          showToast: client.tui?.showToast
+            ? async (message) => {
+              await client.tui.showToast({
+                body: {
+                  message,
+                  variant: "info",
+                },
+              });
+            }
+            : null,
+          resolveInjectQuery,
+          buildInjectedContext,
+          confirmDelivery: confirmPromptPackDelivery,
+          recordSkipped: recordSkippedPromptPack,
+        });
+      } catch (err) {
+        await logLine(
+          `inject.transform.error sessionID=${input.sessionID} message=${JSON.stringify(err instanceof Error ? err.message : String(err))}`
+        );
+      }
       if (debug) {
         await logLine(
           `inject.transform.result sessionID=${input.sessionID} applied=${Boolean(applied)} system_entries=${Array.isArray(output.system) ? output.system.length : 0}`
@@ -2228,16 +3794,6 @@ export const OpencodeMemPlugin = async ({
           "message.part.updated",
         ].includes(eventType)
       ) {
-        // Capture agent from user messages
-        const msgInfo = event?.properties?.info;
-        if (msgInfo && msgInfo.role === "user" && msgInfo.agent && String(msgInfo.agent).trim()) {
-          const detectedAgent = String(msgInfo.agent).trim();
-          if (sessionContext.currentAgent !== detectedAgent) {
-            sessionContext.currentAgent = detectedAgent;
-            await logLine(`agent.detected agent=${detectedAgent}`);
-          }
-        }
-
         const promptText = extractPromptText(event);
         if (promptText) {
           // Update activity tracking
@@ -2334,42 +3890,30 @@ export const OpencodeMemPlugin = async ({
         await flushEvents();
       }
 
-      if (eventType === "session.next.agent.switched") {
-        const nextAgent =
-          event?.properties?.agent ||
-          event?.properties?.nextAgent ||
-          event?.properties?.info?.agent ||
-          null;
-        if (nextAgent && String(nextAgent).trim()) {
-          sessionContext.currentAgent = String(nextAgent).trim();
-          await logLine(`agent.detected agent=${sessionContext.currentAgent}`);
-        }
-      }
-
       if (eventType === "session.created") {
-        // Ignore observer-only sessions created by the background plugin-observer loop.
-        // They must not reset the active session context nor control viewer lifecycle.
-        if (observerSessions && observerSessions.has(sessionID)) {
-          return;
-        }
         if (events.length) {
           await flushEvents();
         }
         activeSessionID = sessionID || null;
         sessionStartedAt = new Date().toISOString();
         promptCounter = 0;
+        skippedAttemptCounter = 0;
+        disabledInjectionRecorded.delete("message:unknown");
+        disabledInjectionRecorded.delete("system:unknown");
         lastPromptText = null;
         lastAssistantText = null;
         resetSessionContext();
         startViewer();
       }
       if (eventType === "session.deleted") {
-        // Ignore observer-only sessions; otherwise each observer cleanup would stop the viewer mid-ingest.
-        if (observerSessions && observerSessions.has(sessionID)) {
-          observerSessions.delete(sessionID);
-          return;
-        }
         activeSessionID = null;
+        if (sessionID) {
+          injectionToastShown.delete(sessionID);
+          messageInjectionCache.delete(sessionID);
+          compactionInjectionSkips.delete(sessionID);
+          disabledInjectionRecorded.delete(`message:${sessionID}`);
+          disabledInjectionRecorded.delete(`system:${sessionID}`);
+        }
         await stopViewer();
       }
     },
@@ -2388,15 +3932,15 @@ export const OpencodeMemPlugin = async ({
       if (filePath) {
         const lowerTool = toolName.toLowerCase();
         if (lowerTool === "edit" || lowerTool === "write") {
-          sessionContext.filesModified.add(filePath);
+          addWorkingSetPath(sessionContext.filesModified, filePath, cwd);
         } else if (lowerTool === "read") {
-          sessionContext.filesRead.add(filePath);
+          addWorkingSetPath(sessionContext.filesRead, filePath, cwd);
         }
       }
       if (toolName.toLowerCase() === "apply_patch") {
         const patchPaths = extractApplyPatchPaths(args.patchText);
         for (const path of patchPaths) {
-          sessionContext.filesModified.add(path);
+          addWorkingSetPath(sessionContext.filesModified, path, cwd);
         }
       }
 
@@ -2417,35 +3961,36 @@ export const OpencodeMemPlugin = async ({
       }
     },
     tool: {
-      // ── Per-agent tools (default) ──────────────────────────────────
-
-      "mem-stats": tool({
-        description:
-          "Show codemem stats for this agent/project (stats itself is DB-level, appended with scope info). Use mem-all-stats for raw global stats.",
+      "mem-status": tool({
+        description: "Show codemem stats and recent entries",
         args: {},
         async execute() {
-          const scope = resolveAgentScope();
           const stats = await runCli(["stats"]);
-          const lines = [];
-          if (stats.exitCode === 0) {
-            lines.push(stats.stdout.trim() || "No stats yet.");
-          } else {
-            lines.push(`Failed to fetch stats: ${stats.stderr || stats.exitCode}`);
+          const recent = await runCli(["recent", "--limit", "5"]);
+          const lines = [
+            `viewer: http://${viewerUrlHost}:${viewerPort}`,
+            `log: ${logPath || "disabled"}`,
+          ];
+          if (stats.exitCode === 0 && stats.stdout.trim()) {
+            lines.push("", "stats:", stats.stdout.trim());
           }
-          lines.push(`\nscope: ${scope || "(no agent — whole DB)"}`);
+          if (recent.exitCode === 0 && recent.stdout.trim()) {
+            lines.push("", "recent:", recent.stdout.trim());
+          }
           return lines.join("\n");
         },
       }),
 
       "mem-recent": tool({
-        description:
-          "Show recent codemem entries for the current agent/project. Use mem-all-recent for all.",
+        description: "Show recent codemem entries",
         args: {
           limit: tool.schema.number().optional(),
         },
         async execute({ limit }) {
-          const safeLimit = Number.isFinite(limit) ? String(limit) : "5";
-          const recent = await runCli(buildMemRecentCliArgs(safeLimit));
+          // Number.isFinite accepts floats and negatives; coerce to a positive
+          // integer (default 5) before forwarding to the CLI.
+          const safeLimit = String(parsePositiveInt(limit, 5));
+          const recent = await runCli(["recent", "--limit", safeLimit]);
           if (recent.exitCode === 0) {
             return recent.stdout.trim() || "No recent memories.";
           }
@@ -2453,69 +3998,8 @@ export const OpencodeMemPlugin = async ({
         },
       }),
 
-      "mem-status": tool({
-        description:
-          "Show stats (global DB) + recent entries scoped to the current agent/project.",
-        args: {},
-        async execute() {
-          const scope = resolveAgentScope();
-          const [statsResult, recentResult] = await Promise.all([
-            runCli(["stats"]),
-            runCli(buildMemRecentCliArgs("5")),
-          ]);
-          const lines = [
-            `viewer: http://${viewerHost}:${viewerPort}`,
-            `log: ${logPath || "disabled"}`,
-            `scope: ${scope || "(no agent — whole DB)"}`,
-          ];
-          if (statsResult.exitCode === 0 && statsResult.stdout.trim()) {
-            lines.push("", "stats (global DB):", statsResult.stdout.trim());
-          }
-          if (recentResult.exitCode === 0 && recentResult.stdout.trim()) {
-            lines.push("", "recent (scoped):", recentResult.stdout.trim());
-          }
-          return lines.join("\n");
-        },
-      }),
-
-      "mem-specificagent-stats": tool({
-        description:
-          "Alias for mem-stats — stats + scope info for current agent/project.",
-        args: {},
-        async execute() {
-          const scope = resolveAgentScope();
-          const stats = await runCli(["stats"]);
-          const lines = [];
-          if (stats.exitCode === 0) {
-            lines.push(stats.stdout.trim() || "No stats yet.");
-          } else {
-            lines.push(`Failed to fetch stats: ${stats.stderr || stats.exitCode}`);
-          }
-          lines.push(`\nscope: ${scope || "(no agent — whole DB)"}`);
-          return lines.join("\n");
-        },
-      }),
-
-      "mem-specificagent-recent": tool({
-        description:
-          "Alias for mem-recent — recent entries scoped to the current agent/project.",
-        args: {
-          limit: tool.schema.number().optional(),
-        },
-        async execute({ limit }) {
-          const safeLimit = Number.isFinite(limit) ? String(limit) : "5";
-          const recent = await runCli(buildMemRecentCliArgs(safeLimit));
-          if (recent.exitCode === 0) {
-            return recent.stdout.trim() || "No recent memories.";
-          }
-          return `Failed to fetch recent: ${recent.stderr || recent.exitCode}`;
-        },
-      }),
-
-      // ── Global / cross-agent tools ─────────────────────────────────
-
-      "mem-all-stats": tool({
-        description: "Show codemem stats for the entire database (all agents).",
+      "mem-stats": tool({
+        description: "Show codemem stats",
         args: {},
         async execute() {
           const stats = await runCli(["stats"]);
@@ -2525,62 +4009,52 @@ export const OpencodeMemPlugin = async ({
           return `Failed to fetch stats: ${stats.stderr || stats.exitCode}`;
         },
       }),
-
-      "mem-all-recent": tool({
-        description: "Show recent codemem entries for all agents/projects.",
-        args: {
-          limit: tool.schema.number().optional(),
-        },
-        async execute({ limit }) {
-          const safeLimit = Number.isFinite(limit) ? String(limit) : "5";
-          const recent = await runCli(["recent", "--limit", safeLimit]);
-          if (recent.exitCode === 0) {
-            return recent.stdout.trim() || "No recent memories.";
-          }
-          return `Failed to fetch recent: ${recent.stderr || recent.exitCode}`;
-        },
-      }),
-
-      "mem-all-status": tool({
-        description: "Show stats + recent entries for the entire database (all agents).",
-        args: {},
-        async execute() {
-          const [statsResult, recentResult] = await Promise.all([
-            runCli(["stats"]),
-            runCli(["recent", "--limit", "5"]),
-          ]);
-          const lines = [
-            `viewer: http://${viewerHost}:${viewerPort}`,
-            `log: ${logPath || "disabled"}`,
-            "scope: ALL agents (global database)",
-          ];
-          if (statsResult.exitCode === 0 && statsResult.stdout.trim()) {
-            lines.push("", "stats (global):", statsResult.stdout.trim());
-          }
-          if (recentResult.exitCode === 0 && recentResult.stdout.trim()) {
-            lines.push("", "recent (global):", recentResult.stdout.trim());
-          }
-          return lines.join("\n");
-        },
-      }),
     },
   };
 };
 
-export default OpencodeMemPlugin;
+export default CodememPlugin;
+
+/**
+ * @deprecated Use CodememPlugin.
+ * Keep this reference-identical: OpenCode deduplicates plugin exports by identity.
+ */
+export const OpencodeMemPlugin = CodememPlugin;
 export const __testUtils = {
   PINNED_BACKEND_VERSION,
+  fetchRawEventsStatus,
   inferProjectFromCwd,
   normalizeProjectLabel,
   resolveProjectName,
   buildInjectQuery,
   buildPackArgs,
+  deterministicUuid,
+  promptPackIdentity,
+  hashPromptPackQuery,
+  redactPackCommand,
+  rejectsInternalLedgerFlag,
+  classifyFallbackCommandResult,
+  PROMPT_TRANSPORT_PROTOCOL_RANGE,
+  normalizePromptTransportProtocolRange,
+  arePromptTransportProtocolRangesCompatible,
+  classifyPromptTransportFailure,
+  classifyViewerHttpFailure,
+  isValidPackHttpPayload,
+  isValidLedgerHttpPayload,
+  buildPackHttpBody,
   parsePackText,
   parsePackMetrics,
+  buildViewerIdentityTarget,
+  resolveInjectSurface,
   applyInjectedContextToOutput,
+  applyInjectedContextToMessages,
+  extractMessageText,
+  isCodememContextPart,
   buildRunnerArgs,
   appendWorkingSetFileArgs,
   extractApplyPatchPaths,
+  normalizeWorkingSetPath,
+  addWorkingSetPath,
   mapOpencodeEventTypeToAdapterType,
   buildOpencodeAdapterPayload,
   buildOpencodeAdapterEvent,
@@ -2589,4 +4063,5 @@ export const __testUtils = {
   buildRawEventEnvelope,
   trimEventQueue,
   parsePositiveInt,
+  createViewerHealthMonitor,
 };

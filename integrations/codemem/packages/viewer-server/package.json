@@ -1,6 +1,6 @@
 {
 	"name": "@codemem/server",
-	"version": "0.29.1",
+	"version": "0.43.1",
 	"type": "module",
 	"types": "./dist/index.d.ts",
 	"exports": {
@@ -28,9 +28,9 @@
 	},
 	"devDependencies": {
 		"@types/better-sqlite3": "catalog:",
-		"@types/node": "^22.15.21",
-		"better-sqlite3": "^12.8.0",
-		"sqlite-vec": "0.1.7-alpha.2",
+		"@types/node": "^24.12.4",
+		"better-sqlite3": "12.8.0",
+		"sqlite-vec": "0.1.9",
 		"typescript": "catalog:",
 		"vite": "catalog:",
 		"vitest": "catalog:"

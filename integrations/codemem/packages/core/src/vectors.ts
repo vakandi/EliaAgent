@@ -19,15 +19,44 @@ import {
 	resolveEmbeddingModel,
 	serializeFloat32,
 } from "./embeddings.js";
+import { buildFilterClausesWithContext, type OwnershipFilterContext } from "./filters.js";
 import { getMaintenanceJob } from "./maintenance-jobs.js";
 import { projectClause } from "./project.js";
 import type { ReplicationVectorWork } from "./sync-replication.js";
+import type { MemoryFilters } from "./types.js";
 
 const VECTOR_MODEL_MIGRATION_JOB = "vector_model_migration";
 
 type VectorModelCount = { model: string; rows: number };
 
 type MemoryTextRow = { id: number; title: string | null; body_text: string | null };
+
+// Deliberately omits `enforceScopeVisibility` so semantic callers can never
+// disable the local read boundary — scopeVisibleFilterContext() always forces
+// it on below. Field list otherwise mirrors OwnershipFilterContext.
+export type SemanticSearchScopeContext = Omit<OwnershipFilterContext, "enforceScopeVisibility">;
+
+function scopeVisibleFilterContext(context: SemanticSearchScopeContext): OwnershipFilterContext {
+	return {
+		actorId: context?.actorId ?? "",
+		deviceId: context?.deviceId ?? "",
+		claimedDeviceIds: context?.claimedDeviceIds ?? [],
+		legacyActorIds: context?.legacyActorIds ?? [],
+		enforceScopeVisibility: true,
+		// Forward the pre-resolved visible scope set so the KNN candidate filter
+		// gets the index-eligible `scope_id IN (...)` fast path. Callers reach
+		// semanticSearch via ownershipFilterContext(store) (search.ts / store.ts),
+		// which already resolves this set; when absent the filter falls back to the
+		// equivalent EXISTS predicate. This function has no db handle of its own.
+		visibleScopeIds: context?.visibleScopeIds,
+	};
+}
+
+function clampSemanticLimit(limit: number): number {
+	if (limit === Number.POSITIVE_INFINITY) return 200;
+	if (!Number.isFinite(limit)) return 1;
+	return Math.min(Math.max(1, Math.trunc(limit)), 200);
+}
 
 function listVectorModelCounts(db: Database): VectorModelCount[] {
 	if (!tableExists(db, "memory_vectors")) {
@@ -211,33 +240,65 @@ function countEmbeddableActiveMemories(db: Database): number {
 	return Number(row?.c ?? 0);
 }
 
+/**
+ * `memory_vectors` is a sqlite-vec virtual table. Querying it requires the
+ * `vec0` module to be loaded into the active connection — a different
+ * concern from the table merely existing in the schema. On platforms where
+ * sqlite-vec failed to load (e.g. Linux ARM64 without the matching
+ * platform package), the table can persist from a previous run while the
+ * module is gone, so a JOIN crashes with `SQLITE_ERROR: no such module:
+ * vec0`. Diagnostic counters must treat that case as "0 indexed", same as
+ * the explicit `CODEMEM_EMBEDDING_DISABLED` path, instead of throwing.
+ */
+function isVecModuleMissingError(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	const message = error.message ?? "";
+	return /no such module:\s*vec0/i.test(message);
+}
+
 function countIndexedActiveMemories(db: Database, model: string): number {
-	if (!tableExists(db, "memory_vectors")) return 0;
-	const rows = db
-		.prepare(
-			`SELECT id, title, body_text
-			 FROM memory_items
-			 WHERE active = 1
-			   AND TRIM(COALESCE(title, '') || COALESCE(body_text, '')) != ''
-			 ORDER BY id ASC`,
-		)
-		.all() as MemoryTextRow[];
-	return rows.filter((row) => memoryHasCompleteVectorCoverage(db, row, model)).length;
+	if (isEmbeddingDisabled() || !tableExists(db, "memory_vectors")) return 0;
+	let rows: MemoryTextRow[];
+	try {
+		rows = db
+			.prepare(
+				`SELECT id, title, body_text
+				 FROM memory_items
+				 WHERE active = 1
+				   AND TRIM(COALESCE(title, '') || COALESCE(body_text, '')) != ''
+				 ORDER BY id ASC`,
+			)
+			.all() as MemoryTextRow[];
+	} catch (error) {
+		if (isVecModuleMissingError(error)) return 0;
+		throw error;
+	}
+	try {
+		return rows.filter((row) => memoryHasCompleteVectorCoverage(db, row, model)).length;
+	} catch (error) {
+		if (isVecModuleMissingError(error)) return 0;
+		throw error;
+	}
 }
 
 function countIndexedActiveMemoriesFast(db: Database, model: string): number {
-	if (!tableExists(db, "memory_vectors")) return 0;
-	const row = db
-		.prepare(
-			`SELECT COUNT(DISTINCT mi.id) AS c
-			 FROM memory_items mi
-			 JOIN memory_vectors mv ON mv.memory_id = mi.id
-			 WHERE mi.active = 1
-			   AND mv.model = ?
-			   AND TRIM(COALESCE(mi.title, '') || COALESCE(mi.body_text, '')) != ''`,
-		)
-		.get(model) as { c?: number } | undefined;
-	return Number(row?.c ?? 0);
+	if (isEmbeddingDisabled() || !tableExists(db, "memory_vectors")) return 0;
+	try {
+		const row = db
+			.prepare(
+				`SELECT COUNT(DISTINCT mi.id) AS c
+				 FROM memory_items mi
+				 JOIN memory_vectors mv ON mv.memory_id = mi.id
+				 WHERE mi.active = 1
+				   AND mv.model = ?
+				   AND TRIM(COALESCE(mi.title, '') || COALESCE(mi.body_text, '')) != ''`,
+			)
+			.get(model) as { c?: number } | undefined;
+		return Number(row?.c ?? 0);
+	} catch (error) {
+		if (isVecModuleMissingError(error)) return 0;
+		throw error;
+	}
 }
 
 function resolvePendingMemoryCount(
@@ -630,7 +691,7 @@ export interface SemanticSearchResult {
 }
 
 /**
- * Search for memories by vector similarity (KNN via sqlite-vec MATCH).
+ * Search for memories by vector similarity using exact sqlite-vec distance.
  * Returns an empty array when embeddings are disabled or unavailable.
  *
  * Matches Python's `_semantic_search()` in store/search.py.
@@ -638,12 +699,16 @@ export interface SemanticSearchResult {
 export async function semanticSearch(
 	db: Database,
 	query: string,
-	limit = 10,
-	filters?: { project?: string | null } | null,
+	limit: number,
+	filters: MemoryFilters | null,
+	context: SemanticSearchScopeContext,
 ): Promise<SemanticSearchResult[]> {
 	if (query.trim().length < 3) return [];
 	const searchModel = resolveSemanticSearchModel(db, resolveEmbeddingModel());
 	if (!searchModel) return [];
+	if (!context?.deviceId?.trim()) {
+		throw new Error("semantic_search_scope_context_required");
+	}
 
 	const embeddings = await embedTexts([query]);
 	if (embeddings.length === 0) return [];
@@ -651,50 +716,64 @@ export async function semanticSearch(
 	const firstEmbedding = embeddings[0];
 	if (!firstEmbedding) return [];
 	const queryEmbedding = serializeFloat32(firstEmbedding);
-	const params: unknown[] = [queryEmbedding, limit, searchModel];
+	const effectiveLimit = clampSemanticLimit(limit);
 	const whereClauses: string[] = ["memory_items.active = 1"];
-	let joinSessions = false;
-
-	if (filters?.project) {
-		const pc = projectClause(filters.project);
-		if (pc.clause) {
-			whereClauses.push(pc.clause);
-			params.push(...pc.params);
-			joinSessions = true;
-		}
-	}
+	const filterResult = buildFilterClausesWithContext(filters, scopeVisibleFilterContext(context));
+	whereClauses.push(...filterResult.clauses);
 
 	const where = whereClauses.join(" AND ");
-	const joinClause = joinSessions ? "JOIN sessions ON sessions.id = memory_items.session_id" : "";
+	const joinClause = filterResult.joinSessions
+		? "JOIN sessions ON sessions.id = memory_items.session_id"
+		: "";
 
+	// Scope predicates must apply before vector ranking. sqlite-vec's MATCH/k
+	// query ranks inside the virtual table before joined memory_items filters can
+	// reliably constrain the candidate set, so use an exact distance scan over the
+	// already-authorized memory rows instead of widening post-KNN candidates.
 	const sql = `
-		SELECT memory_items.*, memory_vectors.distance
-		FROM memory_vectors
-		JOIN memory_items ON memory_items.id = memory_vectors.memory_id
-		${joinClause}
-		WHERE memory_vectors.embedding MATCH ?
-		  AND k = ?
-		  AND memory_vectors.model = ?
-		  AND ${where}
-		ORDER BY memory_vectors.distance ASC
+		WITH scoped_vectors AS (
+			SELECT
+				memory_vectors.memory_id,
+				MIN(vec_distance_l2(memory_vectors.embedding, ?)) AS distance
+			FROM memory_vectors
+			JOIN memory_items ON memory_items.id = memory_vectors.memory_id
+			${joinClause}
+			WHERE memory_vectors.model = ?
+			  AND ${where}
+			GROUP BY memory_vectors.memory_id
+			ORDER BY distance ASC
+			LIMIT ?
+		)
+		SELECT memory_items.*, scoped_vectors.distance
+		FROM scoped_vectors
+		JOIN memory_items ON memory_items.id = scoped_vectors.memory_id
+		ORDER BY scoped_vectors.distance ASC
 	`;
 
-	const rows = db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+	const statement = db.prepare(sql);
+	const rows = statement.all(
+		queryEmbedding,
+		searchModel,
+		...filterResult.params,
+		effectiveLimit,
+	) as Array<Record<string, unknown>>;
 
-	return rows.map((row) => ({
-		id: Number(row.id),
-		kind: String(row.kind ?? "observation"),
-		title: String(row.title ?? ""),
-		body_text: String(row.body_text ?? ""),
-		confidence: Number(row.confidence ?? 0),
-		tags_text: String(row.tags_text ?? ""),
-		metadata_json: row.metadata_json == null ? null : String(row.metadata_json),
-		created_at: String(row.created_at ?? ""),
-		updated_at: String(row.updated_at ?? ""),
-		session_id: Number(row.session_id),
-		score: 1.0 / (1.0 + Number(row.distance ?? 0)),
-		distance: Number(row.distance ?? 0),
-		narrative: row.narrative == null ? null : String(row.narrative),
-		facts: row.facts == null ? null : String(row.facts),
-	}));
+	return rows
+		.map((row) => ({
+			id: Number(row.id),
+			kind: String(row.kind ?? "observation"),
+			title: String(row.title ?? ""),
+			body_text: String(row.body_text ?? ""),
+			confidence: Number(row.confidence ?? 0),
+			tags_text: String(row.tags_text ?? ""),
+			metadata_json: row.metadata_json == null ? null : String(row.metadata_json),
+			created_at: String(row.created_at ?? ""),
+			updated_at: String(row.updated_at ?? ""),
+			session_id: Number(row.session_id),
+			score: 1.0 / (1.0 + Number(row.distance ?? 0)),
+			distance: Number(row.distance ?? 0),
+			narrative: row.narrative == null ? null : String(row.narrative),
+			facts: row.facts == null ? null : String(row.facts),
+		}))
+		.slice(0, effectiveLimit);
 }

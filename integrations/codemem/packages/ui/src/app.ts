@@ -5,28 +5,49 @@
  * Orchestrates tab routing, polling, and delegates rendering to tab modules.
  */
 
-/* global marked, lucide */
+/* global lucide */
 
 declare const __CODEMEM_GIT_COMMIT__: string;
 
+import { createRecipientPolicySharingLoader } from "./app-sharing";
 import { mountToastHost } from "./components/primitives/toast";
 import * as api from "./lib/api";
+import type { ProjectScopeInventoryProject } from "./lib/api/sync";
+import { coordinatorEnrollmentOpenIssueCount } from "./lib/coordinator-enrollment-attention";
 import { $, $button, $select } from "./lib/dom";
+import { handlePrimaryActionKeyboard } from "./lib/keyboard";
 import {
+	type AdvancedSection,
 	ALL_TAB_IDS,
 	getVisibleTabs,
 	initState,
+	parseAdvancedSectionFromHash,
 	parseTabFromHash,
 	resolveAccessibleTab,
 	setActiveTab,
+	setAdvancedSection,
 	state,
 	type TabId,
 } from "./lib/state";
 import { getTheme, initThemeToggle, setTheme } from "./lib/theme";
 
 import { initCoordinatorAdminTab, loadCoordinatorAdminData } from "./tabs/coordinator-admin";
+import {
+	beginStandaloneCoordinatorAdminStatusRefresh,
+	refreshCoordinatorAdminStatusForGeneration,
+} from "./tabs/coordinator-admin/data/status-refresh";
+import {
+	type DeviceAvailabilityInput,
+	type DevicePeerRuntimeMetadataInput,
+	type DevicesNavigationTarget,
+	type DevicesProjectInput,
+	mountDevices,
+} from "./tabs/devices";
 import { initFeedTab, loadFeedData, updateFeedView } from "./tabs/feed";
 import { initHealthTab, loadHealthData } from "./tabs/health";
+import { mountLegacyTeamSetupDialog, openLegacyTeamSetup } from "./tabs/legacy-team-setup-dialog";
+import { initProjectsTab, loadProjectsData } from "./tabs/projects";
+import { toRecipientPolicyManagementProjects } from "./tabs/recipient-policy-projects";
 import { initSettings, isSettingsOpen, loadConfigData } from "./tabs/settings";
 import {
 	initSyncTab,
@@ -34,6 +55,8 @@ import {
 	loadPairingData,
 	loadSyncData,
 } from "./tabs/sync";
+import { applySyncSubView } from "./tabs/sync/sync-view-controller";
+import { derivePeerUiStatus } from "./tabs/sync/view-model/peer-status";
 
 function setRuntimeLabel(version: string, commit: string | null) {
 	const el = $("runtimeLabel");
@@ -58,9 +81,155 @@ async function loadRuntimeLabel() {
 type RefreshState = "idle" | "refreshing" | "paused" | "error";
 let lastAnnouncedRefreshState: RefreshState | null = null;
 const RECONNECT_POLL_MS = 1500;
+const LEGACY_UPGRADE_NOTICE_DISMISSED_KEY = "codemem-legacy-upgrade-notice-dismissed";
 
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let reconnecting = false;
+let legacyUpgradeNoticeShown = false;
+let legacyUpgradeNoticePreviousFocus: HTMLElement | null = null;
+
+type LegacyUpgradeReviewSummary = {
+	groupCount: number;
+	memoryCount: number;
+};
+
+function readNonNegativeCount(value: unknown, fallback = 0): number {
+	const count = Number(value);
+	return Number.isFinite(count) ? Math.max(0, count) : fallback;
+}
+
+function readLegacyUpgradeReviewSummary(payload: unknown): LegacyUpgradeReviewSummary | null {
+	if (!payload || typeof payload !== "object") return null;
+	const review = (payload as { legacy_shared_review?: unknown }).legacy_shared_review ?? payload;
+	if (!review || typeof review !== "object") return null;
+	const raw = review as {
+		groups?: unknown;
+		has_data?: unknown;
+		memory_count?: unknown;
+		total_group_count?: unknown;
+	};
+	if (raw.has_data !== true) return null;
+	const groups = Array.isArray(raw.groups) ? raw.groups : [];
+	const groupCount = readNonNegativeCount(raw.total_group_count, groups.length);
+	const memoryCount = readNonNegativeCount(raw.memory_count);
+	if (groupCount <= 0 || memoryCount <= 0) return null;
+	return { groupCount, memoryCount };
+}
+
+function isLegacyUpgradeNoticeDismissed(): boolean {
+	try {
+		return localStorage.getItem(LEGACY_UPGRADE_NOTICE_DISMISSED_KEY) === "1";
+	} catch {
+		return false;
+	}
+}
+
+function dismissLegacyUpgradeNoticeIfRequested() {
+	const checkbox = document.getElementById("legacyUpgradeDontShow") as HTMLInputElement | null;
+	if (!checkbox?.checked) return;
+	try {
+		localStorage.setItem(LEGACY_UPGRADE_NOTICE_DISMISSED_KEY, "1");
+	} catch {}
+}
+
+function legacyUpgradeFocusableElements(): HTMLElement[] {
+	const modal = $("legacyUpgradeModal");
+	if (!modal || modal.hidden) return [];
+	return Array.from(
+		modal.querySelectorAll<HTMLElement>(
+			'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+		),
+	).filter((element) => !element.hidden && element.offsetParent !== null);
+}
+
+function focusLegacyUpgradeModal() {
+	const focusable = legacyUpgradeFocusableElements();
+	const primary = $("legacyUpgradeReviewGroups") as HTMLElement | null;
+	(primary && focusable.includes(primary) ? primary : focusable[0])?.focus();
+}
+
+function handleLegacyUpgradeModalKeydown(event: KeyboardEvent) {
+	const modal = $("legacyUpgradeModal");
+	if (!modal || modal.hidden) return;
+	if (event.key === "Escape") {
+		event.preventDefault();
+		dismissLegacyUpgradeNoticeIfRequested();
+		setLegacyUpgradeNotice(false);
+		return;
+	}
+	if (event.key === "Enter") {
+		const primary = $("legacyUpgradeReviewGroups") as HTMLButtonElement | null;
+		handlePrimaryActionKeyboard(event, {
+			onSubmit: () => primary?.click(),
+			disabled: !primary || primary.disabled,
+		});
+		return;
+	}
+	if (event.key !== "Tab") return;
+	const focusable = legacyUpgradeFocusableElements();
+	if (focusable.length === 0) return;
+	const first = focusable[0];
+	const last = focusable[focusable.length - 1];
+	if (event.shiftKey && document.activeElement === first) {
+		event.preventDefault();
+		last.focus();
+		return;
+	}
+	if (!event.shiftKey && document.activeElement === last) {
+		event.preventDefault();
+		first.focus();
+	}
+}
+
+function setLegacyUpgradeBackgroundInert(inert: boolean) {
+	for (const element of document.querySelectorAll<HTMLElement>(
+		"header, .tab-bar, .tab-panel, #toastRoot, #viewerReconnectOverlay, #settingsDialogMount",
+	)) {
+		if (element.id === "viewerReconnectOverlay" && element.hidden) continue;
+		element.inert = inert;
+		if (inert) element.setAttribute("aria-hidden", "true");
+		else element.removeAttribute("aria-hidden");
+	}
+}
+
+function setLegacyUpgradeNotice(open: boolean, summary?: LegacyUpgradeReviewSummary) {
+	const overlay = $("legacyUpgradeModalBackdrop");
+	const modal = $("legacyUpgradeModal");
+	const summaryEl = $("legacyUpgradeSummary");
+	if (!overlay || !modal || !summaryEl) return;
+	if (summary) {
+		summaryEl.textContent = `${summary.groupCount.toLocaleString()} older ${summary.groupCount === 1 ? "project needs" : "projects need"} a Sharing domain. They contain ${summary.memoryCount.toLocaleString()} older shared memories total; you will review the projects, not individual memories.`;
+	}
+	overlay.hidden = !open;
+	modal.hidden = !open;
+	if (open) {
+		legacyUpgradeNoticePreviousFocus = document.activeElement as HTMLElement | null;
+		document.addEventListener("keydown", handleLegacyUpgradeModalKeydown);
+		focusLegacyUpgradeModal();
+		setLegacyUpgradeBackgroundInert(true);
+		return;
+	}
+	setLegacyUpgradeBackgroundInert(false);
+	document.removeEventListener("keydown", handleLegacyUpgradeModalKeydown);
+	if (legacyUpgradeNoticePreviousFocus && document.contains(legacyUpgradeNoticePreviousFocus)) {
+		legacyUpgradeNoticePreviousFocus.focus();
+	}
+	legacyUpgradeNoticePreviousFocus = null;
+}
+
+function maybeShowLegacyUpgradeNotice(summary: LegacyUpgradeReviewSummary | null) {
+	if (!summary || legacyUpgradeNoticeShown || isLegacyUpgradeNoticeDismissed()) return;
+	legacyUpgradeNoticeShown = true;
+	setLegacyUpgradeNotice(true, summary);
+}
+
+async function checkLegacyUpgradeNotice() {
+	if (legacyUpgradeNoticeShown || isLegacyUpgradeNoticeDismissed()) return;
+	try {
+		const payload = await api.loadSyncStatus(false, "", { includeJoinRequests: false });
+		maybeShowLegacyUpgradeNotice(readLegacyUpgradeReviewSummary(payload));
+	} catch {}
+}
 
 function setReconnectOverlay(open: boolean, detail?: string) {
 	const overlay = $("viewerReconnectOverlay");
@@ -187,6 +356,12 @@ function stopPolling() {
 
 function startPolling() {
 	if (state.refreshTimer) return;
+	// Polling drives health/config updates and disconnect detection in
+	// doRefresh(), so it must run regardless of which tab is active. The
+	// Projects tab's draft-preservation lives inside loadProjectsData()
+	// itself: it short-circuits when a Space select is focused
+	// (isProjectSpaceSelectActive) and persists drafts across re-renders
+	// via the draftClusterDomainSelections / draftDomainSelections maps.
 	state.refreshTimer = setInterval(() => refresh(), 5000);
 }
 
@@ -202,6 +377,24 @@ document.addEventListener("visibilitychange", () => {
 
 /* ── Tab routing ─────────────────────────────────────────── */
 
+function renderAdvancedSection() {
+	const isSync = state.advancedSection === "sync";
+	const syncContent = $("advancedSyncContent");
+	const teamsContent = $("advancedTeamsContent");
+	if (syncContent) syncContent.hidden = !isSync;
+	if (teamsContent) teamsContent.hidden = isSync;
+	const syncButton = $("advancedSyncButton");
+	const teamsButton = $("advancedTeamsButton");
+	syncButton?.setAttribute("aria-pressed", String(isSync));
+	teamsButton?.setAttribute("aria-pressed", String(!isSync));
+	queueMicrotask(() => {
+		const hash = window.location.hash.replace(/^#/, "");
+		applySyncSubView(
+			hash === "sync/diagnostics" || hash === "advanced/sync/diagnostics" ? "diagnostics" : "main",
+		);
+	});
+}
+
 function renderTabs(activeTab: TabId) {
 	const visibleTabs = new Set(getVisibleTabs(state.lastCoordinatorAdminStatus));
 	ALL_TAB_IDS.forEach((id) => {
@@ -213,13 +406,25 @@ function renderTabs(activeTab: TabId) {
 		const btn = $(`tabBtn-${id}`);
 		if (!btn) return;
 		btn.hidden = !visibleTabs.has(id);
-		btn.classList.toggle("active", id === activeTab && visibleTabs.has(id));
+		const active = id === activeTab && visibleTabs.has(id);
+		btn.classList.toggle("active", active);
+		if (active) btn.setAttribute("aria-current", "page");
+		else btn.removeAttribute("aria-current");
 	});
+	renderAdvancedSection();
 }
 
-function switchTab(tab: TabId) {
+function switchTab(
+	tab: TabId,
+	options: { canonicalHash?: boolean; advancedSection?: AdvancedSection } = {},
+) {
 	const nextTab = resolveAccessibleTab(tab, state.lastCoordinatorAdminStatus);
-	setActiveTab(nextTab);
+	if (nextTab === "advanced") {
+		setAdvancedSection(
+			options.advancedSection ?? parseAdvancedSectionFromHash() ?? state.advancedSection,
+		);
+	}
+	setActiveTab(nextTab, options.canonicalHash ? { canonicalHash: true } : {});
 	renderTabs(nextTab);
 
 	// Refresh data for active tab
@@ -229,7 +434,24 @@ function switchTab(tab: TabId) {
 function initTabs() {
 	ALL_TAB_IDS.forEach((id) => {
 		const btn = $(`tabBtn-${id}`);
-		btn?.addEventListener("click", () => switchTab(id));
+		btn?.addEventListener("click", () =>
+			switchTab(
+				id,
+				id === "advanced"
+					? { canonicalHash: true, advancedSection: "sync" }
+					: { canonicalHash: true },
+			),
+		);
+	});
+	$("advancedSyncButton")?.addEventListener("click", () => setAdvancedSection("sync", true));
+	$("advancedTeamsButton")?.addEventListener("click", () => {
+		setAdvancedSection("teams", true);
+		renderAdvancedSection();
+		queueMicrotask(() => document.getElementById("coordinatorAdminLegacyNoticeTitle")?.focus());
+	});
+	$("coordinatorAdminOpenSharing")?.addEventListener("click", () => {
+		switchTab("sharing", { canonicalHash: true });
+		queueMicrotask(() => document.getElementById("tabBtn-sharing")?.focus());
 	});
 
 	// Listen for hash changes (back/forward navigation). Hashes may include a
@@ -237,8 +459,12 @@ function initTabs() {
 	// helper so nested segments still resolve to their parent tab.
 	window.addEventListener("hashchange", () => {
 		const top = parseTabFromHash();
-		if (top && top !== state.activeTab) {
-			switchTab(top);
+		if (top) {
+			const advancedSection = parseAdvancedSectionFromHash();
+			switchTab(top, advancedSection ? { advancedSection } : {});
+			if (top === "advanced" && advancedSection === "teams") {
+				queueMicrotask(() => document.getElementById("coordinatorAdminLegacyNoticeTitle")?.focus());
+			}
 		}
 	});
 
@@ -272,6 +498,195 @@ async function loadProjects() {
 	} catch {}
 }
 
+function reviewDevicesFromSharing(deviceId?: string) {
+	state.pendingDeviceIdentityFocus = deviceId?.trim() || null;
+	switchTab("devices", { canonicalHash: true });
+}
+
+const loadRecipientPolicySharingData = createRecipientPolicySharingLoader(
+	{},
+	{
+		onOpenTeamSetup: openLegacyTeamSetup,
+		onReviewDevices: reviewDevicesFromSharing,
+	},
+);
+const emptyRecipientPolicyIntent: api.RecipientPolicyIntentGraphV1 = {
+	version: 1,
+	identities: [],
+	teams: [],
+	teamMemberships: [],
+	identityDevices: [],
+	projectRecipients: [],
+};
+let devicesLoadRevision = 0;
+let latestDevicesLoad: Promise<boolean> | null = null;
+let lastDevicesData: {
+	projects: DevicesProjectInput[];
+	intent: api.RecipientPolicyIntentGraphV1;
+	reconciliation: api.RecipientPolicyReconciliationStatusV1;
+	availability: DeviceAvailabilityInput[];
+	peerRuntimeMetadata: DevicePeerRuntimeMetadataInput[];
+	inventory: api.DeviceIdentityInventoryV1 | undefined;
+	inventoryUnavailable: boolean;
+	coordinatorEnrollmentIssueCount: number;
+} | null = null;
+
+async function loadRecipientPolicyProjects(): Promise<DevicesProjectInput[]> {
+	const projects: ProjectScopeInventoryProject[] = [];
+	let offset = 0;
+	while (true) {
+		const page = await api.loadProjectScopeInventory({ limit: 250, offset });
+		projects.push(...page.projects);
+		if (!page.has_more) break;
+		offset += page.limit;
+	}
+	return toRecipientPolicyManagementProjects(projects);
+}
+
+function deriveDeviceAvailability(): DeviceAvailabilityInput[] {
+	const availability = new Map<string, DeviceAvailabilityInput["state"]>();
+	const rank = { unknown: 0, offline: 1, available: 2 } as const;
+	const record = (deviceId: string, next: DeviceAvailabilityInput["state"]) => {
+		if (!deviceId || rank[next] <= rank[availability.get(deviceId) ?? "unknown"]) return;
+		availability.set(deviceId, next);
+	};
+	for (const device of state.lastSyncCoordinator?.discovered_devices ?? []) {
+		record(String(device.device_id ?? "").trim(), device.stale ? "offline" : "available");
+	}
+	for (const peer of state.lastSyncPeers) {
+		const deviceId = String(peer.peer_device_id ?? "").trim();
+		const syncState = derivePeerUiStatus(peer);
+		record(
+			deviceId,
+			syncState === "connected" || syncState === "available"
+				? "available"
+				: syncState === "offline"
+					? "offline"
+					: "unknown",
+		);
+	}
+	return [...availability].map(([deviceId, state]) => ({ deviceId, state }));
+}
+
+function deriveDevicePeerRuntimeMetadata(): DevicePeerRuntimeMetadataInput[] {
+	return state.lastSyncPeers.flatMap((peer) => {
+		const deviceId = String(peer.peer_device_id ?? "").trim();
+		if (!deviceId) return [];
+		return [
+			{
+				deviceId,
+				runtimeVersion: peer.runtime_version ?? null,
+				runtimeVersionObservedAt: peer.runtime_version_observed_at ?? null,
+			},
+		];
+	});
+}
+
+function navigateFromDevices(target: DevicesNavigationTarget) {
+	if (target === "advanced_sync") {
+		switchTab("advanced", { advancedSection: "sync" });
+		queueMicrotask(() => document.getElementById("tabBtn-advanced")?.focus());
+		return;
+	}
+	switchTab(target, { canonicalHash: true });
+	queueMicrotask(() => document.getElementById(`tabBtn-${target}`)?.focus());
+}
+
+function loadDevicesData(): Promise<boolean> {
+	const mount = document.getElementById("devicesMount");
+	if (!mount) return Promise.resolve(true);
+	const revision = ++devicesLoadRevision;
+	const operation = runLoadDevicesData(mount, revision);
+	latestDevicesLoad = operation;
+	return operation;
+}
+
+async function runLoadDevicesData(mount: HTMLElement, revision: number): Promise<boolean> {
+	if (!lastDevicesData) {
+		mountDevices(mount, emptyRecipientPolicyIntent, { version: 1, items: [] }, [], [], {
+			loading: true,
+		});
+	}
+	try {
+		const [projects, intent, reconciliation, inventoryResult] = await Promise.all([
+			loadRecipientPolicyProjects(),
+			api.loadRecipientPolicyIntent(),
+			api.loadRecipientPolicyReconciliationStatus(),
+			api
+				.loadDeviceIdentityInventory()
+				.then((inventory) => ({ inventory, unavailable: false }))
+				.catch(() => ({ inventory: lastDevicesData?.inventory, unavailable: true })),
+			loadSyncData(),
+		]);
+		if (revision !== devicesLoadRevision) return latestDevicesLoad ?? false;
+		const availability = deriveDeviceAvailability();
+		const peerRuntimeMetadata = deriveDevicePeerRuntimeMetadata();
+		const coordinatorEnrollmentIssueCount = coordinatorEnrollmentOpenIssueCount(
+			state.lastSyncStatus,
+		);
+		if (!inventoryResult.unavailable && inventoryResult.inventory) {
+			state.lastDeviceIdentityInventory = inventoryResult.inventory;
+		}
+		state.deviceIdentityInventoryLoadError = inventoryResult.unavailable;
+		mountDevices(mount, intent, reconciliation, projects, availability, {
+			inventory: inventoryResult.inventory,
+			inventoryUnavailable: inventoryResult.unavailable,
+			coordinatorEnrollmentIssueCount,
+			onCommitted: async () => {
+				const [devicesRefreshed, sharingRefreshed] = await Promise.all([
+					loadDevicesData(),
+					loadRecipientPolicySharingData(),
+				]);
+				return devicesRefreshed && sharingRefreshed;
+			},
+			onNavigate: navigateFromDevices,
+			peerRuntimeMetadata,
+		});
+		lastDevicesData = {
+			projects,
+			intent,
+			reconciliation,
+			availability,
+			peerRuntimeMetadata,
+			inventory: inventoryResult.inventory,
+			inventoryUnavailable: inventoryResult.unavailable,
+			coordinatorEnrollmentIssueCount,
+		};
+		return true;
+	} catch {
+		if (revision !== devicesLoadRevision) return latestDevicesLoad ?? false;
+		if (lastDevicesData) {
+			mountDevices(
+				mount,
+				lastDevicesData.intent,
+				lastDevicesData.reconciliation,
+				lastDevicesData.projects,
+				lastDevicesData.availability,
+				{
+					coordinatorEnrollmentIssueCount: lastDevicesData.coordinatorEnrollmentIssueCount,
+					inventory: lastDevicesData.inventory,
+					inventoryUnavailable: lastDevicesData.inventoryUnavailable,
+					onCommitted: async () => {
+						const [devicesRefreshed, sharingRefreshed] = await Promise.all([
+							loadDevicesData(),
+							loadRecipientPolicySharingData(),
+						]);
+						return devicesRefreshed && sharingRefreshed;
+					},
+					onNavigate: navigateFromDevices,
+					peerRuntimeMetadata: lastDevicesData.peerRuntimeMetadata,
+					refreshError: true,
+				},
+			);
+		} else {
+			mountDevices(mount, emptyRecipientPolicyIntent, { version: 1, items: [] }, [], [], {
+				loadError: true,
+			});
+		}
+		return false;
+	}
+}
+
 $select("projectFilter")?.addEventListener("change", () => {
 	state.currentProject = $select("projectFilter")?.value || "";
 	updateFeedView(true);
@@ -300,52 +715,41 @@ async function doRefresh() {
 	try {
 		setRefreshStatus("refreshing");
 
-		let refreshTab = state.activeTab;
-		if (refreshTab === "coordinator-admin") {
-			try {
-				const status = await api.loadCoordinatorAdminStatus();
-				state.lastCoordinatorAdminStatus =
-					status && typeof status === "object"
-						? (status as typeof state.lastCoordinatorAdminStatus)
-						: null;
-			} catch {
-				state.lastCoordinatorAdminStatus = null;
-			}
-			refreshTab = state.activeTab;
-			refreshTab = resolveAccessibleTab(refreshTab, state.lastCoordinatorAdminStatus);
-			if (refreshTab !== state.activeTab) {
-				setActiveTab(refreshTab);
-				renderTabs(refreshTab);
-			}
-		}
+		const refreshTab = state.activeTab;
 
 		// Always load health data (for the header health dot) and config
 		const promises: Promise<unknown>[] = [loadHealthData(), loadConfigData()];
+		let devicesRefreshSucceeded = true;
 		if (refreshTab === "feed") {
-			promises.push(
-				api
-					.loadCoordinatorAdminStatus()
-					.then((status) => {
-						state.lastCoordinatorAdminStatus =
-							status && typeof status === "object"
-								? (status as typeof state.lastCoordinatorAdminStatus)
-								: null;
-					})
-					.catch(() => {
-						state.lastCoordinatorAdminStatus = null;
-					}),
-			);
+			const coordinatorGeneration = beginStandaloneCoordinatorAdminStatusRefresh();
+			promises.push(refreshCoordinatorAdminStatusForGeneration(coordinatorGeneration));
 		}
 
 		// Load tab-specific data
 		if (refreshTab === "feed") {
 			promises.push(loadFeedData());
 		}
-		// Sync data is needed by both Sync tab and Health tab (health cards derive sync state)
-		if (refreshTab === "sync" || refreshTab === "health") {
+		if (refreshTab === "projects") {
+			promises.push(loadProjectsData());
+		}
+		if (refreshTab === "sharing") {
+			promises.push(loadRecipientPolicySharingData());
+		}
+		if (refreshTab === "devices") {
+			promises.push(
+				loadDevicesData().then((succeeded) => {
+					devicesRefreshSucceeded = succeeded;
+				}),
+			);
+		}
+		// Sync data is needed by Advanced Sync and Health (health cards derive sync state).
+		if (
+			(refreshTab === "advanced" && state.advancedSection === "sync") ||
+			refreshTab === "health"
+		) {
 			promises.push(loadSyncData());
 		}
-		if (refreshTab === "coordinator-admin") {
+		if (refreshTab === "advanced" && state.advancedSection === "teams") {
 			promises.push(loadCoordinatorAdminData());
 		}
 
@@ -355,12 +759,13 @@ async function doRefresh() {
 		}
 
 		await Promise.all(promises);
+		maybeShowLegacyUpgradeNotice(readLegacyUpgradeReviewSummary(state.lastSyncLegacySharedReview));
 		const nextTab = resolveAccessibleTab(state.activeTab, state.lastCoordinatorAdminStatus);
 		if (nextTab !== state.activeTab) {
 			setActiveTab(nextTab);
 		}
 		renderTabs(state.activeTab);
-		setRefreshStatus("idle");
+		setRefreshStatus(devicesRefreshSucceeded ? "idle" : "error");
 	} catch {
 		const ready = await isViewerReady();
 		if (!ready) {
@@ -384,6 +789,24 @@ initState();
 // Toast host — mount first so early notices (from tab init etc.) land.
 const toastRoot = document.getElementById("toastRoot");
 if (toastRoot) mountToastHost(toastRoot);
+const legacyTeamSetupRoot = document.getElementById("legacyTeamSetupMount");
+if (legacyTeamSetupRoot) {
+	mountLegacyTeamSetupDialog(legacyTeamSetupRoot, {
+		onCompleted: async () => {
+			let sharingUpdated: boolean;
+			let projectsUpdated: boolean;
+			const refreshOptions = { requireTeamSetupSummary: true };
+			if (state.activeTab === "sharing") {
+				projectsUpdated = await loadProjectsData(refreshOptions);
+				sharingUpdated = await loadRecipientPolicySharingData(refreshOptions);
+			} else {
+				sharingUpdated = await loadRecipientPolicySharingData(refreshOptions);
+				projectsUpdated = await loadProjectsData(refreshOptions);
+			}
+			if (!sharingUpdated || !projectsUpdated) throw new Error("team_setup_refresh_failed");
+		},
+	});
+}
 
 // Theme
 initThemeToggle($button("themeToggle"));
@@ -395,6 +818,7 @@ initTabs();
 // Tab modules
 initFeedTab();
 initHealthTab();
+initProjectsTab(() => refresh(), { onOpenTeamSetup: openLegacyTeamSetup });
 initSyncTab(() => refresh());
 initCoordinatorAdminTab();
 initSettings(stopPolling, startPolling, () => refresh());
@@ -426,8 +850,32 @@ $("viewerReconnectRetry")?.addEventListener("click", async () => {
 	if (!reconnecting) setReconnectOverlay(false);
 });
 
+$("legacyUpgradeReviewGroups")?.addEventListener("click", () => {
+	dismissLegacyUpgradeNoticeIfRequested();
+	setLegacyUpgradeNotice(false);
+	window.location.hash = "sync";
+	setTimeout(
+		() => document.getElementById("syncSharingReview")?.scrollIntoView({ block: "start" }),
+		120,
+	);
+});
+
+$("legacyUpgradeReviewProjects")?.addEventListener("click", () => {
+	dismissLegacyUpgradeNoticeIfRequested();
+	setLegacyUpgradeNotice(false);
+	window.location.hash = "projects";
+});
+
+$("legacyUpgradeNotNow")?.addEventListener("click", () => {
+	dismissLegacyUpgradeNoticeIfRequested();
+	setLegacyUpgradeNotice(false);
+});
+
 // Version label
 loadRuntimeLabel();
+
+// Upgrade notice
+checkLegacyUpgradeNotice();
 
 // Start
 refresh();

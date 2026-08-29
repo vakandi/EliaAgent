@@ -34,7 +34,17 @@ export interface SyncRunItem {
 	address?: string;
 	opsIn: number;
 	opsOut: number;
+	opsSkipped?: number;
+	skipped_out?: SyncSkippedOutDetail | null;
 	addressErrors: Array<{ address: string; error: string }>;
+}
+
+export interface SyncSkippedOutDetail {
+	reason?: "scope_filter" | "visibility_filter" | "project_filter" | string;
+	skipped_count?: number;
+	project?: string | null;
+	scope_id?: string | null;
+	visibility?: string | null;
 }
 
 export interface SyncRunResponse {
@@ -43,6 +53,20 @@ export interface SyncRunResponse {
 
 export interface RuntimeInfo {
 	version: string;
+}
+
+/** Browser-side mirror of the additive /api/update-status wire contract. */
+export interface UpdateStatus {
+	current_version: string;
+	latest_version: string | null;
+	update_available: boolean;
+	first_seen_at: string | null;
+	checked_at: string | null;
+	stale: boolean;
+	install_kind: "npm-global" | "npx" | "docker" | "repo-dev" | "pinned" | "unknown";
+	auto_update_eligible: boolean;
+	recommended_action: string;
+	error: string | null;
 }
 
 export interface PackTraceCandidate {

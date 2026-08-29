@@ -1,17 +1,47 @@
 import { Fragment, h } from "preact";
 import { useState } from "preact/hooks";
-import { setFeedScopeFilter, setFeedTypeFilter, setAgentFilter, state } from "../../../lib/state";
+import { setFeedScopeFilter, setFeedTypeFilter, state } from "../../../lib/state";
 import { feedMetaText } from "../data/meta";
 import type { FeedItem, FeedViewOps } from "../types";
 import { ContextInspectorPanel } from "./ContextInspectorPanel";
 import { FeedList } from "./FeedList";
 import { FeedToggle } from "./FeedToggle";
 
+export function FeedStatus({ text }: { text: string }) {
+	return h(
+		"div",
+		{ "aria-live": "polite", className: "section-meta", id: "feedMeta", role: "status" },
+		text,
+	);
+}
+
+export function FeedSearchInput({
+	query,
+	onQuery,
+}: {
+	query: string;
+	onQuery: (query: string) => void;
+}) {
+	return h("input", {
+		"aria-label": "Search memories",
+		className: "feed-search",
+		id: "feedSearch",
+		onInput: (event) => {
+			onQuery(String((event.currentTarget as HTMLInputElement).value || ""));
+		},
+		placeholder: "Search title, body, tags…",
+		type: "search",
+		value: query,
+	});
+}
+
 export function FeedTabView({
+	errorText,
 	items,
 	loadingText,
 	ops,
 }: {
+	errorText?: string;
 	items: FeedItem[];
 	loadingText?: string;
 	ops: FeedViewOps;
@@ -23,32 +53,20 @@ export function FeedTabView({
 		h(
 			"div",
 			{ className: "feed-controls" },
-			h(
-				"div",
-				{ className: "section-meta", id: "feedMeta" },
-				loadingText || feedMetaText(items.length, ops.hasMorePages()),
-			),
+			h(FeedStatus, {
+				text: loadingText || feedMetaText(items.length, ops.hasMorePages()),
+			}),
 			h(
 				"div",
 				{ className: "feed-controls-right" },
-				h("input", {
-					className: "feed-search",
-					id: "feedSearch",
-					onInput: (event) => {
-						state.feedQuery = String((event.currentTarget as HTMLInputElement).value || "");
-						ops.updateFeedView();
-					},
-					placeholder: "Search title, body, tags…",
-					value: state.feedQuery,
-				}),
+				h(FeedSearchInput, { query: state.feedQuery, onQuery: ops.updateFeedQuery }),
 				h(FeedToggle, {
 					active: state.feedScopeFilter,
 					id: "feedScopeToggle",
 					onSelect: (value) => {
 						if (value === state.feedScopeFilter) return;
 						setFeedScopeFilter(value);
-						ops.updateFeedView(true);
-						void ops.loadFeedData();
+						void ops.loadFeedData().catch(() => undefined);
 					},
 					options: [
 						{ value: "all", label: "All" },
@@ -70,27 +88,6 @@ export function FeedTabView({
 						{ value: "summaries", label: "Summaries" },
 					],
 				}),
-				h(FeedToggle, {
-					active: state.agentFilter,
-					id: "agentFilterToggle",
-					onSelect: (value) => {
-						if (value === state.agentFilter) return;
-						setAgentFilter(value);
-						ops.updateFeedView(true);
-						void ops.loadFeedData();
-					},
-					options: [
-						{ value: "all", label: "All Agents" },
-						{ value: "elia", label: "Elia" },
-						{ value: "gilfoyle", label: "Gilfoyle" },
-						{ value: "setbon", label: "Setbon" },
-						{ value: "bene2luxe", label: "Bene2Luxe" },
-						{ value: "cobou-agency", label: "CoBou" },
-						{ value: "zovaboost", label: "ZovaBoost" },
-						{ value: "cobou-promoter", label: "CoBou Promo" },
-						{ value: "bene2luxe-promoter", label: "B2L Promo" },
-					],
-				}),
 				h(
 					"button",
 					{
@@ -105,6 +102,31 @@ export function FeedTabView({
 			),
 		),
 		h(ContextInspectorPanel, { open: inspectorOpen }),
-		h("div", { className: "feed-list", id: "feedList" }, h(FeedList, { items, loadingText, ops })),
+		h(
+			"div",
+			{ className: "feed-list", id: "feedList" },
+			h(
+				Fragment,
+				null,
+				errorText
+					? h(
+							"div",
+							{ className: "small feed-empty-state", role: "alert" },
+							h("strong", null, errorText),
+							h("div", null, "Check the viewer connection, then retry the Feed."),
+							h(
+								"button",
+								{
+									className: "settings-button",
+									onClick: () => void ops.loadFeedData().catch(() => undefined),
+									type: "button",
+								},
+								"Retry",
+							),
+						)
+					: null,
+				!errorText || items.length > 0 ? h(FeedList, { items, loadingText, ops }) : null,
+			),
+		),
 	);
 }

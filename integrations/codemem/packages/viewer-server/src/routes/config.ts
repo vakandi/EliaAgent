@@ -5,18 +5,14 @@
  * codemem/viewer_routes/config.py, scoped to the TS runtime's current needs.
  */
 
-import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import {
 	CODEMEM_CONFIG_ENV_OVERRIDES,
+	coerceObserverCommand,
 	getCodememConfigPath,
 	getCodememEnvOverrides,
 	listObserverProviderOptions,
 	type RawEventSweeper,
 	readCodememConfigFile,
-	stripJsonComments,
-	stripTrailingCommas,
 	writeCodememConfigFile,
 } from "@codemem/core";
 import { Hono } from "hono";
@@ -25,11 +21,12 @@ type ConfigData = Record<string, unknown>;
 
 const REDACTED_VALUE = "[redacted]";
 
-const RUNTIMES = new Set(["api_http", "claude_sidecar", "opencode_plugin"]);
+const RUNTIMES = new Set(["api_http", "claude_sidecar", "codex_sidecar"]);
 const AUTH_SOURCES = new Set(["auto", "env", "file", "command", "none"]);
 const HOT_RELOAD_KEYS = new Set(["raw_events_sweeper_interval_s"]);
 const PROTECTED_WRITE_KEYS = new Set<string>([
 	"claude_command",
+	"codex_command",
 	"observer_base_url",
 	"observer_auth_file",
 	"observer_auth_command",
@@ -45,12 +42,15 @@ const SECRET_CONFIG_KEYS = new Set<string>([
 const REMOVED_CONFIG_KEYS = new Set<string>(["observer_rich_openai_use_responses"]);
 const ALLOWED_KEYS = [
 	"claude_command",
+	"codex_command",
 	"observer_base_url",
 	"observer_provider",
 	"observer_model",
 	"observer_tier_routing_enabled",
 	"observer_simple_model",
 	"observer_simple_temperature",
+	"observer_reasoning_effort",
+	"observer_reasoning_summary",
 	"observer_rich_model",
 	"observer_rich_temperature",
 	"observer_rich_reasoning_effort",
@@ -83,6 +83,7 @@ const ALLOWED_KEYS = [
 
 const DEFAULTS: ConfigData = {
 	claude_command: ["claude"],
+	codex_command: ["codex"],
 	observer_runtime: "api_http",
 	observer_auth_source: "auto",
 	observer_tier_routing_enabled: false,
@@ -114,30 +115,6 @@ function loadProviderOptions(): string[] {
 	return listObserverProviderOptions();
 }
 
-function getConfigPath(): string {
-	const envPath = process.env.CODEMEM_CONFIG;
-	if (envPath) return envPath.replace(/^~/, homedir());
-	const configDir = join(homedir(), ".config", "codemem");
-	const candidates = [join(configDir, "config.json"), join(configDir, "config.jsonc")];
-	return candidates.find((p) => existsSync(p)) ?? join(configDir, "config.json");
-}
-
-function readConfigFile(configPath: string): ConfigData {
-	if (!existsSync(configPath)) return {};
-	try {
-		let text = readFileSync(configPath, "utf-8").trim();
-		if (!text) return {};
-		try {
-			return JSON.parse(text) as ConfigData;
-		} catch {
-			text = stripTrailingCommas(stripJsonComments(text));
-			return JSON.parse(text) as ConfigData;
-		}
-	} catch {
-		return {};
-	}
-}
-
 function withoutRemovedConfigKeys(configData: ConfigData): ConfigData {
 	const next = { ...configData };
 	for (const key of REMOVED_CONFIG_KEYS) {
@@ -148,11 +125,19 @@ function withoutRemovedConfigKeys(configData: ConfigData): ConfigData {
 
 function getEffectiveConfig(configData: ConfigData): ConfigData {
 	const effective: ConfigData = { ...DEFAULTS, ...configData };
+	for (const key of ["claude_command", "codex_command"] as const) {
+		effective[key] = coerceObserverCommand(effective[key]) ?? DEFAULTS[key];
+	}
 	for (const [key, envVar] of Object.entries(CODEMEM_CONFIG_ENV_OVERRIDES) as Array<
 		[string, string]
 	>) {
 		const val = process.env[envVar];
-		if (val != null && val !== "") effective[key] = val;
+		if (val == null || val === "") continue;
+		if (key === "claude_command" || key === "codex_command") {
+			effective[key] = coerceObserverCommand(val) ?? effective[key];
+		} else {
+			effective[key] = val;
+		}
 	}
 	return effective;
 }
@@ -283,7 +268,7 @@ function validateAndApplyUpdate(
 		if (typeof value !== "string") return "observer_runtime must be string";
 		const runtime = value.trim().toLowerCase();
 		if (!RUNTIMES.has(runtime)) {
-			return "observer_runtime must be one of: api_http, claude_sidecar, opencode_plugin";
+			return "observer_runtime must be one of: api_http, claude_sidecar, codex_sidecar";
 		}
 		configData[key] = runtime;
 		return null;
@@ -297,7 +282,7 @@ function validateAndApplyUpdate(
 		configData[key] = source;
 		return null;
 	}
-	if (key === "claude_command" || key === "observer_auth_command") {
+	if (key === "claude_command" || key === "codex_command" || key === "observer_auth_command") {
 		const argv = asExecutableArgv(value);
 		if (argv == null) return `${key} must be string array`;
 		if (argv.length > 0) configData[key] = argv;
@@ -325,6 +310,8 @@ function validateAndApplyUpdate(
 		key === "observer_base_url" ||
 		key === "observer_model" ||
 		key === "observer_simple_model" ||
+		key === "observer_reasoning_effort" ||
+		key === "observer_reasoning_summary" ||
 		key === "observer_rich_model" ||
 		key === "observer_rich_reasoning_effort" ||
 		key === "observer_rich_reasoning_summary" ||
@@ -375,8 +362,12 @@ export function configRoutes(opts: ConfigRouteOptions = {}) {
 	const app = new Hono();
 
 	app.get("/api/config", (c) => {
-		const configPath = getConfigPath();
-		const configData = withoutRemovedConfigKeys(readConfigFile(configPath));
+		// Resolve via the core resolver so GET reflects the same file POST
+		// writes — including workspace-scoped overrides honored through
+		// CODEMEM_RUNTIME_ROOT / CODEMEM_WORKSPACE_ID, which the legacy local
+		// getConfigPath() ignored.
+		const configPath = getCodememConfigPath();
+		const configData = withoutRemovedConfigKeys(readCodememConfigFile());
 		const effective = getEffectiveConfig(configData);
 		return c.json({
 			path: configPath,
@@ -446,7 +437,7 @@ export function configRoutes(opts: ConfigRouteOptions = {}) {
 		const afterEffective = getEffectiveConfig(nextConfig);
 		const savedChangedKeys = ALLOWED_KEYS.filter((key) => beforeConfig[key] !== nextConfig[key]);
 		const effectiveChangedKeys = ALLOWED_KEYS.filter(
-			(key) => beforeEffective[key] !== afterEffective[key],
+			(key) => !configValuesEqual(beforeEffective[key], afterEffective[key]),
 		);
 		const envOverrides = getCodememEnvOverrides();
 		const ignoredByEnvKeys = savedChangedKeys.filter(

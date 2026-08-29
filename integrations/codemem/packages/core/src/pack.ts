@@ -14,15 +14,16 @@
  * tracking, discovery-token work estimation.
  */
 
-import type { Database } from "./db.js";
+import { type Database, fromJson } from "./db.js";
 import { buildFilterClausesWithContext } from "./filters.js";
-import { inferMemoryRole } from "./memory-quality.js";
+import { inferMemoryRole, readArtifactClass } from "./memory-quality.js";
 import { projectBasename } from "./project.js";
 import { sanitizeSearchQuery } from "./query-sanitizer.js";
 import { memoryLooksRecapLike, queryPrefersRecap } from "./recap-policy.js";
 import { findByFile } from "./ref-queries.js";
+import { MAX_RETRIEVAL_DIAGNOSTIC_EXPOSURES } from "./retrieval-ledger.js";
 import type { StoreHandle } from "./search.js";
-import { rerankResults, scoreResult, search, timeline } from "./search.js";
+import { ownershipFilterContext, rerankResults, scoreResult, search, timeline } from "./search.js";
 import {
 	canonicalMemoryKind,
 	getSummaryMetadata,
@@ -68,7 +69,10 @@ const TASK_HINT_QUERY =
 
 const RECALL_HINT_QUERY = "session summary recap remember last time previous work";
 
-const TRACE_CANDIDATE_LIMIT = 20;
+const PACK_BASELINE_BATCH_SIZE = 25;
+const MAX_PACK_BASELINE_SCAN_ROWS = 250;
+const MAX_SEMANTIC_REVALIDATION_IDS = 200;
+const TRACE_CANDIDATE_LIMIT = Math.min(20, MAX_RETRIEVAL_DIAGNOSTIC_EXPOSURES);
 const TRACE_PREVIEW_LIMIT = 160;
 
 // ---------------------------------------------------------------------------
@@ -102,13 +106,52 @@ function parseFacts(raw: string | null): string[] | null {
  * available. Falls back to the original single-line format when neither
  * structured field exists.
  */
-function relatedSuffix(item: MemoryResult, clusterState?: ClusterCompressionState): string {
-	const relatedCount = clusterState?.compressedByRepresentative.get(item.id)?.size ?? 0;
-	return relatedCount > 0 ? ` (+${relatedCount} related)` : "";
+type PackCompressionMode = "off" | "compact" | "ids";
+
+const PACK_COMPRESSION_MODE_ENV = "CODEMEM_PACK_COMPRESSION";
+const DEFAULT_PACK_COMPRESSION_MODE: PackCompressionMode = "compact";
+
+function parsePackCompressionMode(value: string | undefined): PackCompressionMode | null {
+	const normalized = value?.trim().toLowerCase();
+	if (!normalized) return null;
+	if (["0", "false", "none", "off", "disabled"].includes(normalized)) return "off";
+	if (["compact", "compact-only", "compact_only", "default"].includes(normalized)) return "compact";
+	if (["1", "true", "on", "ids", "all", "legacy"].includes(normalized)) return "ids";
+	return null;
 }
 
-function formatItem(item: MemoryResult, clusterState?: ClusterCompressionState): string {
-	const header = `[${item.id}] (${item.kind}) ${item.title}${relatedSuffix(item, clusterState)}`;
+function resolvePackCompressionMode(explicit?: PackCompressionMode): PackCompressionMode {
+	return (
+		explicit ??
+		parsePackCompressionMode(process.env[PACK_COMPRESSION_MODE_ENV]) ??
+		DEFAULT_PACK_COMPRESSION_MODE
+	);
+}
+
+function relatedSuffix(
+	item: MemoryResult,
+	clusterState?: ClusterCompressionState,
+	options: { includeIds?: boolean } = {},
+): string {
+	const related = clusterState?.compressedByRepresentative.get(item.id);
+	const relatedCount = related?.size ?? 0;
+	if (relatedCount === 0) return "";
+	if (!options.includeIds) return ` (+${relatedCount} related)`;
+	const ids = [...(related ?? [])]
+		.sort((a, b) => a - b)
+		.map((id) => `[${id}]`)
+		.join(", ");
+	return ` (+${relatedCount} related: ${ids})`;
+}
+
+function formatItem(
+	item: MemoryResult,
+	clusterState?: ClusterCompressionState,
+	options: { includeRelatedIds?: boolean } = {},
+): string {
+	const header = `[${item.id}] (${item.kind}) ${item.title}${relatedSuffix(item, clusterState, {
+		includeIds: options.includeRelatedIds,
+	})}`;
 	const narrative = item.narrative || null;
 	const facts = parseFacts(item.facts);
 
@@ -135,10 +178,11 @@ function formatSection(
 	header: string,
 	items: MemoryResult[],
 	clusterState?: ClusterCompressionState,
+	options: { includeRelatedIds?: boolean } = {},
 ): string {
 	const heading = `## ${header}`;
 	if (items.length === 0) return `${heading}\n`;
-	return [heading, ...items.map((item) => formatItem(item, clusterState))].join("\n");
+	return [heading, ...items.map((item) => formatItem(item, clusterState, options))].join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -146,11 +190,14 @@ function formatSection(
 // ---------------------------------------------------------------------------
 
 const DEFAULT_COMPACT_DETAIL_COUNT = 3;
-const COMPACT_FOOTER = "Use `memory_get` or `memory_search` to fetch detail for any item by [ID].";
+const COMPACT_FOOTER =
+	"Use `memory_get` for one item, or `memory_get_observations(ids=[...])` for related IDs shown in the index.";
 
 /** Single-line index entry for compact mode. */
 function formatIndexLine(item: MemoryResult, clusterState?: ClusterCompressionState): string {
-	return `[${item.id}] (${item.kind}) ${item.title}${relatedSuffix(item, clusterState)}`;
+	return `[${item.id}] (${item.kind}) ${item.title}${relatedSuffix(item, clusterState, {
+		includeIds: true,
+	})}`;
 }
 
 /**
@@ -171,7 +218,9 @@ function renderCompactPack(
 	const detailItems = items.filter((item) => detailIds.has(item.id));
 	const detailSection =
 		detailItems.length > 0
-			? `## Detail\n${detailItems.map((item) => formatItem(item, clusterState)).join("\n\n")}`
+			? `## Detail\n${detailItems
+					.map((item) => formatItem(item, clusterState, { includeRelatedIds: true }))
+					.join("\n\n")}`
 			: "## Detail\n(no items)";
 
 	return `${indexSection}\n\n${detailSection}\n\n${COMPACT_FOOTER}`;
@@ -528,10 +577,12 @@ function candidateReasons(
 	return reasons.length > 0 ? reasons : ["included in retrieval pool"];
 }
 
-type PackArtifacts = {
+export type PackArtifacts = {
 	response: PackResponse;
 	trace: PackTrace;
 };
+
+type PackUsageBaselineRow = { metadata_json: string | null; tokens_read: number | null };
 
 type RawSemanticResult = Awaited<ReturnType<typeof semanticSearch>>[number];
 
@@ -712,6 +763,13 @@ function prioritizeDefaultResults(
 		if (!preferSummary) {
 			const recapDelta = Number(memoryLooksRecapLike(a)) - Number(memoryLooksRecapLike(b));
 			if (recapDelta !== 0) return recapDelta;
+			// Relevance wins before kind. A row that directly matches the query must
+			// not be displaced by a less-relevant row that merely has a
+			// higher-priority kind (e.g. a generic `decision` outranking the
+			// `feature` the user actually asked about). Kind/task-like ordering
+			// then breaks ties among comparably-relevant rows.
+			const overlapDelta = textOverlapScore(b, query) - textOverlapScore(a, query);
+			if (overlapDelta !== 0) return overlapDelta;
 			const taskLikeDelta = Number(itemLooksTaskLike(a)) - Number(itemLooksTaskLike(b));
 			if (taskLikeDelta !== 0) return taskLikeDelta;
 			const rank = (item: MemoryResult): number => {
@@ -729,6 +787,7 @@ function prioritizeDefaultResults(
 			};
 			const rankDelta = rank(a) - rank(b);
 			if (rankDelta !== 0) return rankDelta;
+			return 0;
 		}
 		const overlapDelta = textOverlapScore(b, query) - textOverlapScore(a, query);
 		if (overlapDelta !== 0) return overlapDelta;
@@ -887,15 +946,39 @@ function parseMetadataObject(value: unknown): Record<string, unknown> {
 	return getSummaryMetadata(value);
 }
 
+function validatePackDeltaBaselineIds(
+	store: StoreHandle,
+	ids: number[],
+	filters: MemoryFilters | null,
+): number[] | null {
+	if (ids.length === 0) return null;
+	const filterResult = buildFilterClausesWithContext(filters, ownershipFilterContext(store));
+	const placeholders = ids.map(() => "?").join(", ");
+	const joinClause = filterResult.joinSessions
+		? "JOIN sessions ON sessions.id = memory_items.session_id"
+		: "";
+	const rows = store.db
+		.prepare(
+			`SELECT memory_items.id
+			 FROM memory_items
+			 ${joinClause}
+			 WHERE ${["memory_items.active = 1", `memory_items.id IN (${placeholders})`, ...filterResult.clauses].join(" AND ")}`,
+		)
+		.all(...ids, ...filterResult.params) as Array<{ id: number }>;
+	const visibleIds = new Set(rows.map((row) => row.id));
+	if (visibleIds.size !== ids.length) return null;
+	return ids.filter((id) => visibleIds.has(id));
+}
+
 function isSummaryLike(item: Pick<MemoryResult, "kind" | "metadata">): boolean {
 	return isSummaryLikeMemory(item);
 }
 
 function findLatestSummaryLike(store: StoreHandle, filters?: MemoryFilters): MemoryResult | null {
-	const filterResult = buildFilterClausesWithContext(filters ?? null, {
-		actorId: store.actorId,
-		deviceId: store.deviceId,
-	});
+	const filterResult = buildFilterClausesWithContext(
+		filters ?? null,
+		ownershipFilterContext(store),
+	);
 	const whereParts = [
 		"memory_items.active = 1",
 		"(memory_items.kind = 'session_summary' OR json_extract(memory_items.metadata_json, '$.is_summary') = 1)",
@@ -919,51 +1002,58 @@ function findLatestSummaryLike(store: StoreHandle, filters?: MemoryFilters): Mem
 
 function getPackDeltaBaseline(
 	store: StoreHandle,
-	project: string | null,
+	filters: MemoryFilters | null,
 ): { previousPackIds: number[] | null; previousPackTokens: number | null } {
+	const project = filters?.project ?? null;
 	const projectBase = project ? projectBasename(project) : null;
 	const metaProjectExpr =
 		"CASE WHEN json_valid(metadata_json) = 1 THEN json_extract(metadata_json, '$.project') ELSE NULL END";
-	const rows = project
-		? (store.db
-				.prepare(
-					`SELECT metadata_json, tokens_read
-					 FROM usage_events
-					 WHERE event = 'pack'
-					   AND (${metaProjectExpr} = ? OR ${metaProjectExpr} = ?)
-					 ORDER BY created_at DESC
-					 LIMIT 25`,
-				)
-				.all(project, projectBase ?? project) as Array<{
-				metadata_json: string | null;
-				tokens_read: number | null;
-			}>)
-		: (store.db
-				.prepare(
-					`SELECT metadata_json, tokens_read
-					 FROM usage_events
-					 WHERE event = 'pack'
-					 ORDER BY created_at DESC
-					 LIMIT 25`,
-				)
-				.all() as Array<{ metadata_json: string | null; tokens_read: number | null }>);
+	let offset = 0;
+	while (offset < MAX_PACK_BASELINE_SCAN_ROWS) {
+		const batchLimit = Math.min(PACK_BASELINE_BATCH_SIZE, MAX_PACK_BASELINE_SCAN_ROWS - offset);
+		const rows = project
+			? (store.db
+					.prepare(
+						`SELECT metadata_json, tokens_read
+						 FROM usage_events
+						 WHERE event = 'pack'
+						   AND (${metaProjectExpr} = ? OR ${metaProjectExpr} = ?)
+						 ORDER BY created_at DESC
+						 LIMIT ? OFFSET ?`,
+					)
+					.all(project, projectBase ?? project, batchLimit, offset) as PackUsageBaselineRow[])
+			: (store.db
+					.prepare(
+						`SELECT metadata_json, tokens_read
+						 FROM usage_events
+						 WHERE event = 'pack'
+						 ORDER BY created_at DESC
+						 LIMIT ? OFFSET ?`,
+					)
+					.all(batchLimit, offset) as PackUsageBaselineRow[]);
+		if (rows.length === 0) break;
 
-	for (const row of rows) {
-		const metadata = parseMetadataObject(row.metadata_json);
-		if (project != null) {
-			const rowProject = typeof metadata.project === "string" ? metadata.project : null;
-			if (rowProject !== project && rowProject !== projectBase) continue;
+		for (const row of rows) {
+			const metadata = parseMetadataObject(row.metadata_json);
+			if (project != null) {
+				const rowProject = typeof metadata.project === "string" ? metadata.project : null;
+				if (rowProject !== project && rowProject !== projectBase) continue;
+			}
+			if (!("pack_item_ids" in metadata)) continue;
+
+			const { ids, valid } = coercePackItemIds(metadata.pack_item_ids);
+			if (!valid) continue;
+			const scopedIds = validatePackDeltaBaselineIds(store, ids, filters);
+			if (scopedIds == null) continue;
+
+			const previousTokens =
+				parseNonNegativeInt(metadata.pack_tokens) ?? parseNonNegativeInt(row.tokens_read);
+			if (previousTokens == null) continue;
+
+			return { previousPackIds: scopedIds, previousPackTokens: previousTokens };
 		}
-		if (!("pack_item_ids" in metadata)) continue;
 
-		const { ids, valid } = coercePackItemIds(metadata.pack_item_ids);
-		if (!valid) continue;
-
-		const previousTokens =
-			parseNonNegativeInt(metadata.pack_tokens) ?? parseNonNegativeInt(row.tokens_read);
-		if (previousTokens == null) continue;
-
-		return { previousPackIds: ids, previousPackTokens: previousTokens };
+		offset += rows.length;
 	}
 
 	return { previousPackIds: null, previousPackTokens: null };
@@ -1059,20 +1149,94 @@ function mergeResults(
 	limit: number,
 	query: string,
 	filters?: MemoryFilters,
-): { merged: MemoryResult[]; ftsCount: number; semanticCount: number } {
+): {
+	merged: MemoryResult[];
+	candidates: MemoryResult[];
+	semanticCandidates: MemoryResult[];
+	ftsCount: number;
+	semanticCount: number;
+} {
 	const seen = new Map<number, MemoryResult>();
 	for (const r of ftsResults) {
 		const existing = seen.get(r.id);
 		if (!existing || r.score > existing.score) seen.set(r.id, r);
 	}
+	const scopedSemanticResults = rehydrateScopedCandidateResults(store, semanticResults, filters);
 	let semanticCount = 0;
-	for (const r of semanticResults) {
+	for (const r of scopedSemanticResults) {
 		if (!seen.has(r.id)) semanticCount++;
 		const existing = seen.get(r.id);
 		if (!existing || r.score > existing.score) seen.set(r.id, r);
 	}
-	const merged = rerankResults(store, [...seen.values()], limit, filters, query);
-	return { merged, ftsCount: ftsResults.length, semanticCount };
+	const candidates = [...seen.values()];
+	const merged = rerankResults(store, candidates, limit, filters, query);
+	return {
+		merged,
+		candidates,
+		semanticCandidates: scopedSemanticResults,
+		ftsCount: ftsResults.length,
+		semanticCount,
+	};
+}
+
+function rehydrateScopedCandidateResults(
+	store: StoreHandle,
+	candidates: MemoryResult[],
+	filters?: MemoryFilters,
+): MemoryResult[] {
+	if (candidates.length === 0) return [];
+	const originalById = new Map<number, MemoryResult>();
+	for (const item of candidates) {
+		if (!Number.isSafeInteger(item.id) || item.id <= 0) continue;
+		if (!originalById.has(item.id)) originalById.set(item.id, item);
+	}
+	const ids = [...originalById.keys()];
+	if (ids.length === 0) return [];
+
+	const filterResult = buildFilterClausesWithContext(
+		filters ?? null,
+		ownershipFilterContext(store),
+	);
+	const joinClause = filterResult.joinSessions
+		? "JOIN sessions ON sessions.id = memory_items.session_id"
+		: "";
+	const scopedById = new Map<number, MemoryResult>();
+	for (let offset = 0; offset < ids.length; offset += MAX_SEMANTIC_REVALIDATION_IDS) {
+		const chunkIds = ids.slice(offset, offset + MAX_SEMANTIC_REVALIDATION_IDS);
+		const placeholders = chunkIds.map(() => "?").join(", ");
+		const rows = store.db
+			.prepare(
+				`SELECT memory_items.*
+				 FROM memory_items
+				 ${joinClause}
+				 WHERE ${["memory_items.active = 1", `memory_items.id IN (${placeholders})`, ...filterResult.clauses].join(" AND ")}`,
+			)
+			.all(...chunkIds, ...filterResult.params) as Array<Record<string, unknown>>;
+
+		for (const row of rows) {
+			const id = Number(row.id);
+			const original = originalById.get(id);
+			if (!original) continue;
+			const metadataJson = row.metadata_json == null ? null : String(row.metadata_json);
+			scopedById.set(id, {
+				id,
+				kind: canonicalMemoryKind(String(row.kind ?? "observation"), metadataJson),
+				title: String(row.title ?? ""),
+				body_text: String(row.body_text ?? ""),
+				confidence: Number(row.confidence ?? 0),
+				created_at: String(row.created_at ?? ""),
+				updated_at: String(row.updated_at ?? ""),
+				tags_text: String(row.tags_text ?? ""),
+				score: original.score,
+				session_id: Number(row.session_id),
+				metadata: fromJson(metadataJson),
+				narrative: row.narrative == null ? null : String(row.narrative),
+				facts: row.facts == null ? null : String(row.facts),
+			});
+		}
+	}
+
+	return ids.map((id) => scopedById.get(id)).filter((item): item is MemoryResult => !!item);
 }
 
 /**
@@ -1104,10 +1268,25 @@ function mergeFileRefCandidates(
 	);
 	const newIds = refCandidateIds.filter((id) => !existingIds.has(id));
 	if (newIds.length === 0) return results;
-	const refMemories = newIds
-		.map((id) => store.get(id))
-		.filter((m): m is NonNullable<typeof m> => m != null)
-		.map(toMemoryResult);
+	const refMemories = rehydrateScopedCandidateResults(
+		store,
+		newIds.map((id) => ({
+			id,
+			kind: "discovery",
+			title: "",
+			body_text: "",
+			confidence: 0,
+			created_at: "",
+			updated_at: "",
+			tags_text: "",
+			score: 0,
+			session_id: 0,
+			metadata: {},
+			narrative: null,
+			facts: null,
+		})),
+		filters,
+	);
 	return [...results, ...refMemories];
 }
 
@@ -1118,7 +1297,12 @@ function buildPackArtifacts(
 	tokenBudget: number | null = null,
 	filters?: MemoryFilters,
 	semanticResults?: MemoryResult[],
-	options: { recordUsage: boolean; compact?: boolean; compactDetailCount?: number } = {
+	options: {
+		recordUsage: boolean;
+		compact?: boolean;
+		compactDetailCount?: number;
+		compressionMode?: PackCompressionMode;
+	} = {
 		recordUsage: true,
 	},
 ): PackArtifacts {
@@ -1128,7 +1312,22 @@ function buildPackArtifacts(
 	let fallbackUsed = false;
 	let ftsCount = 0;
 	let semanticCount = 0;
-	let retrievalResults: MemoryResult[] = [];
+	const candidatePool: Array<{ item: MemoryResult; query: string }> = [];
+	const candidateIds = new Set<number>();
+	const captureTraceCandidates = (
+		query: string,
+		...candidateSets: readonly (readonly MemoryResult[])[]
+	): void => {
+		for (const candidates of candidateSets) {
+			for (const item of candidates) {
+				if (candidateIds.has(item.id)) continue;
+				candidateIds.add(item.id);
+				// Candidate order and diagnostics both follow the first query that exposed the row.
+				candidatePool.push({ item, query });
+			}
+		}
+	};
+	let supplementalObservationCandidates: MemoryResult[] = [];
 	let retrievalQuery = retrievalContext;
 	let results: MemoryResult[];
 	const taskMode = queryLooksLikeTasks(retrievalContext);
@@ -1140,6 +1339,7 @@ function buildPackArtifacts(
 		let taskResults = search(store, taskQuery, effectiveLimit, filters);
 		ftsCount = taskResults.length;
 		if (semanticResults && semanticResults.length > 0) {
+			captureTraceCandidates(taskQuery, taskResults);
 			const merge = mergeResults(
 				store,
 				taskResults,
@@ -1150,12 +1350,14 @@ function buildPackArtifacts(
 			);
 			taskResults = merge.merged;
 			semanticCount = merge.semanticCount;
+			captureTraceCandidates(retrievalContext, merge.semanticCandidates);
 		}
 		taskResults = mergeFileRefCandidates(store, taskResults, filters, effectiveLimit);
-		retrievalResults = [...taskResults];
+		captureTraceCandidates(taskQuery, taskResults);
 		if (taskResults.length === 0) {
 			fallbackUsed = true;
 			results = taskFallbackRecent(store, effectiveLimit, filters);
+			captureTraceCandidates(taskQuery, results);
 		} else {
 			const actionableTaskResults = taskResults.filter((item) => !isSummaryLike(item));
 			const recentTaskResults = filterRecentResults(
@@ -1180,6 +1382,7 @@ function buildPackArtifacts(
 		const topicalRecallQuery = [...queryContentTokens(recallQuery)].join(" ");
 		let recallResults = search(store, recallQuery, effectiveLimit, filters);
 		ftsCount = recallResults.length;
+		captureTraceCandidates(recallQuery, recallResults);
 		if (!preferSummary && topicalRecallQuery) {
 			const needsTopicalRetry =
 				recallResults.length === 0 ||
@@ -1188,6 +1391,7 @@ function buildPackArtifacts(
 				);
 			if (needsTopicalRetry) {
 				const topicalResults = search(store, topicalRecallQuery, effectiveLimit, filters);
+				captureTraceCandidates(topicalRecallQuery, topicalResults);
 				if (topicalResults.length > 0) {
 					recallResults = topicalResults;
 					ftsCount = topicalResults.length;
@@ -1196,9 +1400,9 @@ function buildPackArtifacts(
 			}
 		}
 		if (recallResults.length === 0) {
-			recallResults = search(store, RECALL_HINT_QUERY, effectiveLimit, filters).filter(
-				isSummaryLike,
-			);
+			const hintResults = search(store, RECALL_HINT_QUERY, effectiveLimit, filters);
+			captureTraceCandidates(RECALL_HINT_QUERY, hintResults);
+			recallResults = hintResults.filter(isSummaryLike);
 			ftsCount = recallResults.length;
 			retrievalQuery = RECALL_HINT_QUERY;
 		}
@@ -1213,9 +1417,10 @@ function buildPackArtifacts(
 			);
 			recallResults = merge.merged;
 			semanticCount = merge.semanticCount;
+			captureTraceCandidates(retrievalContext, merge.semanticCandidates);
 		}
 		recallResults = mergeFileRefCandidates(store, recallResults, filters, effectiveLimit);
-		retrievalResults = [...recallResults];
+		captureTraceCandidates(retrievalQuery, recallResults);
 		results = prioritizeRecallResults(
 			recallResults,
 			effectiveLimit,
@@ -1225,6 +1430,7 @@ function buildPackArtifacts(
 		if (results.length === 0) {
 			fallbackUsed = true;
 			results = recallFallbackRecent(store, effectiveLimit, filters);
+			captureTraceCandidates(retrievalQuery, results);
 		}
 		const anchor = preferSummary
 			? results[0]
@@ -1242,7 +1448,9 @@ function buildPackArtifacts(
 				filters ?? null,
 			);
 			if (timelineRows.length > 0) {
-				results = timelineRows.map(toMemoryResult);
+				const timelineResults = timelineRows.map(toMemoryResult);
+				captureTraceCandidates(retrievalQuery, timelineResults);
+				results = timelineResults;
 			}
 		}
 	} else {
@@ -1259,18 +1467,20 @@ function buildPackArtifacts(
 			results = prioritizeDefaultResults(merge.merged, effectiveLimit, retrievalContext);
 			ftsCount = merge.ftsCount;
 			semanticCount = merge.semanticCount;
-			retrievalResults = [...merge.merged];
+			captureTraceCandidates(retrievalContext, merge.candidates);
 		} else {
 			results = prioritizeDefaultResults(ftsResults, effectiveLimit, retrievalContext);
 			ftsCount = results.length;
-			retrievalResults = [...ftsResults];
+			captureTraceCandidates(retrievalContext, ftsResults);
 		}
 		results = mergeFileRefCandidates(store, results, filters, effectiveLimit);
+		captureTraceCandidates(retrievalContext, results);
 		results = prioritizeDefaultResults(results, effectiveLimit, retrievalContext);
 
 		if (results.length === 0) {
 			fallbackUsed = true;
 			results = store.recent(effectiveLimit, filters ?? null).map(toMemoryResult);
+			captureTraceCandidates(retrievalContext, results);
 		}
 	}
 
@@ -1304,6 +1514,9 @@ function buildPackArtifacts(
 					facts: s.facts,
 				},
 			];
+			// The fallback was evaluated for assembly even if budgeting later removes it.
+			// Candidate capture is ID-deduplicated, so surviving fallbacks are not counted twice.
+			captureTraceCandidates(retrievalQuery, summaryItems);
 		}
 	}
 
@@ -1330,7 +1543,7 @@ function buildPackArtifacts(
 			Math.max(effectiveLimit * 3, 10),
 			filters ?? null,
 		);
-		observationItems = recentObs.map((row) => ({
+		supplementalObservationCandidates = recentObs.map((row) => ({
 			id: row.id,
 			kind: row.kind,
 			title: row.title,
@@ -1345,6 +1558,7 @@ function buildPackArtifacts(
 			narrative: row.narrative ?? null,
 			facts: row.facts ?? null,
 		}));
+		observationItems = supplementalObservationCandidates;
 	}
 
 	if (observationItems.length === 0) {
@@ -1353,6 +1567,12 @@ function buildPackArtifacts(
 
 	// Sort observations by tag overlap with context, then by kind priority
 	observationItems = sortByTagOverlap(observationItems, context);
+	if (supplementalObservationCandidates.length > 0) {
+		// Trace supplemental candidates in the same deterministic order used by
+		// section assembly, before dedupe/compression/budget dispositions apply.
+		supplementalObservationCandidates = [...observationItems];
+		captureTraceCandidates(retrievalQuery, supplementalObservationCandidates);
+	}
 
 	// Exact dedup across all sections
 	const dedupeState: DedupeState = {
@@ -1364,19 +1584,26 @@ function buildPackArtifacts(
 	timelineItems = collapseExactDuplicates(timelineItems, dedupeState);
 	observationItems = collapseExactDuplicates(observationItems, dedupeState);
 
+	const compact = options.compact ?? false;
+	const compactDetailCount = options.compactDetailCount ?? DEFAULT_COMPACT_DETAIL_COUNT;
+	const compressionMode = resolvePackCompressionMode(options.compressionMode);
+	const compressRelated = compressionMode === "ids" || (compressionMode === "compact" && compact);
+
 	const clusterState: ClusterCompressionState = {
 		compressedByRepresentative: new Map(),
 		representativeByCompressedId: new Map(),
 		clusters: [],
 	};
-	const compressionPoolSeen = new Set<number>();
-	const compressionPool: MemoryResult[] = [];
-	for (const item of [...summaryItems, ...timelineItems, ...observationItems]) {
-		if (compressionPoolSeen.has(item.id)) continue;
-		compressionPoolSeen.add(item.id);
-		compressionPool.push(item);
+	if (compressRelated) {
+		const compressionPoolSeen = new Set<number>();
+		const compressionPool: MemoryResult[] = [];
+		for (const item of [...summaryItems, ...timelineItems, ...observationItems]) {
+			if (compressionPoolSeen.has(item.id)) continue;
+			compressionPoolSeen.add(item.id);
+			compressionPool.push(item);
+		}
+		compressClusters(compressionPool, modeLabel, clusterState);
 	}
-	compressClusters(compressionPool, modeLabel, clusterState);
 	const compressedSectionIds = new Set(flattenCompressedIds(clusterState));
 	summaryItems = summaryItems.filter((item) => !compressedSectionIds.has(item.id));
 	timelineItems = timelineItems.filter((item) => !compressedSectionIds.has(item.id));
@@ -1388,9 +1615,6 @@ function buildPackArtifacts(
 	// Compact mode flattens all items into a single list, budgets using
 	// index-line costs for items beyond the detail count, and renders a
 	// scannable Index + Detail layout instead of Summary/Timeline/Observations.
-
-	const compact = options.compact ?? false;
-	const compactDetailCount = options.compactDetailCount ?? DEFAULT_COMPACT_DETAIL_COUNT;
 
 	let budgetedSummary: MemoryResult[];
 	let budgetedTimeline: MemoryResult[];
@@ -1417,7 +1641,8 @@ function buildPackArtifacts(
 				const indexCost = estimateTokens(formatIndexLine(item, clusterState));
 				if (detailSlots > 0) {
 					// Detail items appear in both Index and Detail — charge both.
-					const fullCost = indexCost + estimateTokens(formatItem(item, clusterState));
+					const fullCost =
+						indexCost + estimateTokens(formatItem(item, clusterState, { includeRelatedIds: true }));
 					if (tokensUsed + fullCost <= tokenBudget) {
 						tokensUsed += fullCost;
 						budgetedItems.push(item);
@@ -1451,10 +1676,11 @@ function buildPackArtifacts(
 
 		if (tokenBudget != null && tokenBudget > 0) {
 			let tokensUsed = 0;
+			const formatOptions = { includeRelatedIds: compressionMode === "ids" };
 
 			budgetedSummary = [];
 			for (const item of summaryItems) {
-				const cost = estimateTokens(formatItem(item, clusterState));
+				const cost = estimateTokens(formatItem(item, clusterState, formatOptions));
 				if (tokensUsed + cost > tokenBudget) break;
 				tokensUsed += cost;
 				budgetedSummary.push(item);
@@ -1462,7 +1688,7 @@ function buildPackArtifacts(
 
 			budgetedTimeline = [];
 			for (const item of timelineItems) {
-				const cost = estimateTokens(formatItem(item, clusterState));
+				const cost = estimateTokens(formatItem(item, clusterState, formatOptions));
 				if (tokensUsed + cost > tokenBudget) break;
 				tokensUsed += cost;
 				budgetedTimeline.push(item);
@@ -1470,7 +1696,7 @@ function buildPackArtifacts(
 
 			budgetedObservations = [];
 			for (const item of observationItems) {
-				const cost = estimateTokens(formatItem(item, clusterState));
+				const cost = estimateTokens(formatItem(item, clusterState, formatOptions));
 				if (tokensUsed + cost > tokenBudget) break;
 				tokensUsed += cost;
 				budgetedObservations.push(item);
@@ -1478,9 +1704,15 @@ function buildPackArtifacts(
 		}
 
 		const sections = [
-			formatSection("Summary", budgetedSummary, clusterState),
-			formatSection("Timeline", budgetedTimeline, clusterState),
-			formatSection("Observations", budgetedObservations, clusterState),
+			formatSection("Summary", budgetedSummary, clusterState, {
+				includeRelatedIds: compressionMode === "ids",
+			}),
+			formatSection("Timeline", budgetedTimeline, clusterState, {
+				includeRelatedIds: compressionMode === "ids",
+			}),
+			formatSection("Observations", budgetedObservations, clusterState, {
+				includeRelatedIds: compressionMode === "ids",
+			}),
 		];
 		packText = sections.join("\n\n");
 	}
@@ -1561,10 +1793,7 @@ function buildPackArtifacts(
 		}
 	}
 
-	const { previousPackIds, previousPackTokens } = getPackDeltaBaseline(
-		store,
-		filters?.project ?? null,
-	);
+	const { previousPackIds, previousPackTokens } = getPackDeltaBaseline(store, filters ?? null);
 	const packDeltaAvailable = previousPackIds != null && previousPackTokens != null;
 	const previousSet = new Set(previousPackIds ?? []);
 	const currentSet = new Set(allItemIds);
@@ -1675,8 +1904,12 @@ function buildPackArtifacts(
 	const compressedIdSet = new Set(compressedIds);
 	const trimmedIdSet = new Set(trimmedIds);
 	const referenceNow = new Date();
-	const tracePool = retrievalResults.slice(0, TRACE_CANDIDATE_LIMIT);
-	const traceCandidates: PackTraceCandidate[] = tracePool.map((item, index) => {
+	const traceOwnership =
+		typeof store.buildOwnershipPredicate === "function"
+			? store.buildOwnershipPredicate()
+			: (item: MemoryResult) => store.memoryOwnedBySelf(item);
+	captureTraceCandidates(retrievalQuery, selectedItems);
+	const allTraceCandidates: PackTraceCandidate[] = candidatePool.map(({ item, query }, index) => {
 		const section = traceSection(item.id, sectionsById);
 		const disposition: PackTraceDisposition = section
 			? "selected"
@@ -1687,11 +1920,11 @@ function buildPackArtifacts(
 					: trimmedIdSet.has(item.id)
 						? "trimmed"
 						: "dropped";
-		const baseScores = scoreResult(store, item, filters, retrievalQuery, referenceNow);
+		const baseScores = scoreResult(store, item, filters, query, referenceNow, traceOwnership);
 		const scoredCandidate = {
 			...baseScores,
-			text_overlap: textOverlapScore(item, retrievalQuery),
-			tag_overlap: countOverlap(item.tags_text, queryContentTokens(retrievalQuery)),
+			text_overlap: textOverlapScore(item, query),
+			tag_overlap: countOverlap(item.tags_text, queryContentTokens(query)),
 		};
 		const roleInference = inferMemoryRole({
 			kind: item.kind,
@@ -1709,10 +1942,20 @@ function buildPackArtifacts(
 			reasons: candidateReasons(item, scoredCandidate, section, disposition),
 			disposition,
 			section,
+			artifact_class: readArtifactClass(item.metadata),
 			inferred_role: roleInference.role,
 			role_reason: roleInference.reason,
 		};
 	});
+	const selectedTraceCandidates = allTraceCandidates.filter(
+		(candidate) => candidate.disposition === "selected",
+	);
+	const diagnosticTraceCandidates = allTraceCandidates
+		.filter((candidate) => candidate.disposition !== "selected")
+		.slice(0, TRACE_CANDIDATE_LIMIT);
+	const traceCandidates = [...selectedTraceCandidates, ...diagnosticTraceCandidates].sort(
+		(left, right) => left.rank - right.rank,
+	);
 
 	const trace: PackTrace = {
 		version: 1,
@@ -1729,7 +1972,7 @@ function buildPackArtifacts(
 			reasons: modeReasons(context, modeLabel, filters),
 		},
 		retrieval: {
-			candidate_count: traceCandidates.length,
+			candidate_count: candidatePool.length,
 			candidates: traceCandidates,
 		},
 		assembly: {
@@ -1775,7 +2018,25 @@ export function buildMemoryPack(
 		recordUsage: true,
 		compact: renderOptions?.compact,
 		compactDetailCount: renderOptions?.compactDetailCount,
+		compressionMode: renderOptions?.compressionMode,
 	}).response;
+}
+
+export function buildMemoryPackWithTrace(
+	store: StoreHandle,
+	context: string,
+	limit = 10,
+	tokenBudget: number | null = null,
+	filters?: MemoryFilters,
+	semanticResults?: MemoryResult[],
+	renderOptions?: PackRenderOptions,
+): PackArtifacts {
+	return buildPackArtifacts(store, context, limit, tokenBudget, filters, semanticResults, {
+		recordUsage: true,
+		compact: renderOptions?.compact,
+		compactDetailCount: renderOptions?.compactDetailCount,
+		compressionMode: renderOptions?.compressionMode,
+	});
 }
 
 export function buildMemoryPackTrace(
@@ -1791,6 +2052,7 @@ export function buildMemoryPackTrace(
 		recordUsage: false,
 		compact: renderOptions?.compact,
 		compactDetailCount: renderOptions?.compactDetailCount,
+		compressionMode: renderOptions?.compressionMode,
 	}).trace;
 }
 
@@ -1821,9 +2083,13 @@ export async function buildMemoryPackAsync(
 	let semResults: MemoryResult[] = [];
 	const semanticQuery = sanitizeSearchQuery(context).clean_query;
 	try {
-		const raw = await semanticSearch(store.db, semanticQuery, limit, {
-			project: filters?.project,
-		});
+		const raw = await semanticSearch(
+			store.db,
+			semanticQuery,
+			limit,
+			filters ?? null,
+			ownershipFilterContext(store),
+		);
 		semResults = semanticMemoryResults(raw);
 	} catch {
 		// Semantic search failure is non-fatal — fall through to FTS-only
@@ -1833,7 +2099,39 @@ export async function buildMemoryPackAsync(
 		recordUsage: true,
 		compact: renderOptions?.compact,
 		compactDetailCount: renderOptions?.compactDetailCount,
+		compressionMode: renderOptions?.compressionMode,
 	}).response;
+}
+
+export async function buildMemoryPackWithTraceAsync(
+	store: StoreHandle & { db: Database },
+	context: string,
+	limit = 10,
+	tokenBudget: number | null = null,
+	filters?: MemoryFilters,
+	renderOptions?: PackRenderOptions,
+): Promise<PackArtifacts> {
+	let semResults: MemoryResult[] = [];
+	const semanticQuery = sanitizeSearchQuery(context).clean_query;
+	try {
+		const raw = await semanticSearch(
+			store.db,
+			semanticQuery,
+			limit,
+			filters ?? null,
+			ownershipFilterContext(store),
+		);
+		semResults = semanticMemoryResults(raw);
+	} catch {
+		// Semantic search failure is non-fatal — fall through to FTS-only.
+	}
+
+	return buildPackArtifacts(store, context, limit, tokenBudget, filters, semResults, {
+		recordUsage: true,
+		compact: renderOptions?.compact,
+		compactDetailCount: renderOptions?.compactDetailCount,
+		compressionMode: renderOptions?.compressionMode,
+	});
 }
 
 export async function buildMemoryPackTraceAsync(
@@ -1847,9 +2145,13 @@ export async function buildMemoryPackTraceAsync(
 	let semResults: MemoryResult[] = [];
 	const semanticQuery = sanitizeSearchQuery(context).clean_query;
 	try {
-		const raw = await semanticSearch(store.db, semanticQuery, limit, {
-			project: filters?.project,
-		});
+		const raw = await semanticSearch(
+			store.db,
+			semanticQuery,
+			limit,
+			filters ?? null,
+			ownershipFilterContext(store),
+		);
 		semResults = semanticMemoryResults(raw);
 	} catch {
 		// Semantic search failure is non-fatal — fall through to FTS-only
@@ -1859,5 +2161,6 @@ export async function buildMemoryPackTraceAsync(
 		recordUsage: false,
 		compact: renderOptions?.compact,
 		compactDetailCount: renderOptions?.compactDetailCount,
+		compressionMode: renderOptions?.compressionMode,
 	}).trace;
 }
