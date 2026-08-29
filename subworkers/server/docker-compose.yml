@@ -8,6 +8,7 @@ services:
     ports:
       - "5656:5656"
     environment:
+      - TZ=Africa/Casablanca
       - OPENCODE_SERVER_URL=http://127.0.0.1:5655
       - OPENCODE_WORKSPACE=/data
       - COMPOSE_PROJECT_DIR=/data/subworkers/server
@@ -21,8 +22,11 @@ services:
       - ${HOME}/EliaAI/subworkers/server/app/config:/data/config:rw
       - ${HOME}/EliaAI/subworkers:/data/subworkers:rw
       - ${HOME}/EliaAI/subworkers/logs:/data/logs:rw
-      # Share configuration only. Never share OpenCode's SQLite data/cache
-      # with the host: the TUI and this server may run concurrently.
+      # Persist container opencode sessions across docker rm / colima stop.
+      # Host TUI uses ~/.local/share/opencode — container uses this bind-mount
+      # (separate file, no concurrent corruption). Fixes kill_docker wipe.
+      - ${HOME}/EliaAI/subworkers/server/opencode-data:/root/.local/share/opencode:rw
+      # Share configuration only. Never share the *same* DB file with host TUI.
       - ${HOME}/.config/opencode:/root/.config/opencode:rw
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:5656/health && curl -sf http://localhost:5655/global/health"]
