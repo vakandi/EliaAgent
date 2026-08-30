@@ -58,7 +58,7 @@ class TestDefaultMCPServers:
 class TestOpenCodeClientInit:
     def test_default_url(self) -> None:
         client = OpenCodeClient()
-        assert client._base_url == "http://127.0.0.1:4096"
+        assert client._base_url == "http://127.0.0.1:5655"
 
     def test_custom_url(self) -> None:
         client = OpenCodeClient(base_url="http://localhost:8080")

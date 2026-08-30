@@ -3,6 +3,9 @@ services:
     build: .
     container_name: elia-subworker-srv
     restart: unless-stopped
+    # Cap container memory so a runaway opencode/uvicorn can't exhaust the
+    # host (the entrypoint auto-restarts opencode after a cgroup OOM-kill).
+    mem_limit: 4g
     env_file:
       - .env
     ports:
@@ -15,13 +18,14 @@ services:
       - CONFIG_DIR=/data/config
       - SUBWORKERS_DIR=/data/subworkers
       - LOG_DIR=/data/logs
-      - PROXY_ENABLED=false
+      - PROXY_ENABLED=true
       - OPENCODE_CONFIG=/root/.config/opencode/opencode.json
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${HOME}/EliaAI/subworkers/server/app/config:/data/config:rw
       - ${HOME}/EliaAI/subworkers:/data/subworkers:rw
       - ${HOME}/EliaAI/subworkers/logs:/data/logs:rw
+      - ${HOME}/EliaAI/setup/proxies.txt:/data/proxies.txt:ro
       # Persist container opencode sessions across docker rm / colima stop.
       # Host TUI uses ~/.local/share/opencode — container uses this bind-mount
       # (separate file, no concurrent corruption). Fixes kill_docker wipe.

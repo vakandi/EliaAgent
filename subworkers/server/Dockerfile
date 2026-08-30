@@ -37,6 +37,7 @@ RUN apt-get update && \
         tzdata \
         procps \
         unzip \
+        tini \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js + npm + npx for MCP servers and parallel-browser-mcp
@@ -71,6 +72,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY app/ ./app/
+COPY app/proxy-patch.js /app/proxy-patch.js
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
@@ -79,4 +81,7 @@ EXPOSE 5656 5655
 HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
     CMD curl -sf http://localhost:5656/health && curl -sf http://localhost:5655/global/health || exit 1
 
+# tini as PID 1: reaps orphaned/zombie children and forwards signals to the
+# whole process group (-g) so `docker stop` shuts opencode down cleanly.
+ENTRYPOINT ["/usr/bin/tini", "-g", "--"]
 CMD ["/app/entrypoint.sh"]

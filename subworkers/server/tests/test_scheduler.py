@@ -152,6 +152,43 @@ class TestAddRemove:
 
 # ── Trigger now ─────────────────────────────────────────────────────────
 
+
+class TestScheduledFire:
+    """Scheduled fires must register in _running so /status reports running."""
+
+    @pytest.mark.asyncio
+    async def test_scheduled_fire_tracks_running(self, scheduler: SubworkerScheduler, run_fn: AsyncMock) -> None:
+        async def slow_run(*_args, **_kwargs):
+            await asyncio.sleep(0.2)
+            return None
+
+        run_fn.side_effect = slow_run
+        await scheduler.start()
+        config = _make_config()
+        scheduler.add_subworker(config)
+        task = asyncio.create_task(scheduler._scheduled_fire(config))
+        await asyncio.sleep(0.05)
+        assert scheduler.get_status()["jobs"][0]["running"] is True
+        assert "test-sub" in scheduler.get_running()
+        inner = scheduler._running.get("test-sub")
+        if inner:
+            await inner
+        await task
+        assert scheduler.get_status()["jobs"][0]["running"] is False
+        await scheduler.stop()
+
+    @pytest.mark.asyncio
+    async def test_scheduled_fire_skips_when_already_running(self, scheduler: SubworkerScheduler, run_fn: AsyncMock) -> None:
+        await scheduler.start()
+        config = _make_config()
+        first = asyncio.create_task(scheduler._scheduled_fire(config))
+        await asyncio.sleep(0.02)
+        await scheduler._scheduled_fire(config)
+        await first
+        run_fn.assert_called_once()
+        await scheduler.stop()
+
+
 class TestTriggerNow:
     """Tests for manual immediate triggers."""
 

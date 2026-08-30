@@ -46,7 +46,8 @@ if ! tmux has-session -t "$SERVER_SESSION" 2>/dev/null; then
     fi
 fi
 
-# ── 2. Ensure Docker daemon (Colima) is running ─────────────────────────
+# ── 2. Ensure Docker daemon (Colima) + subworker container are running ─
+# Always ensure docker is up, even if tmux session already exists (fixes stale down state)
 if ! docker info >/dev/null 2>&1; then
     echo "[EliaUI] Docker daemon not reachable — starting Colima..."
     colima start --runtime docker 2>&1 | tail -3
@@ -54,6 +55,12 @@ if ! docker info >/dev/null 2>&1; then
     if ! docker info >/dev/null 2>&1; then
         echo "[EliaUI] FATAL: Docker daemon still not reachable after colima start"
     fi
+fi
+# Ensure subworker container is up (handles SubWorkerKill down without restart)
+if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${SUBWORKER_CONTAINER}$"; then
+    echo "[EliaUI] Subworker container not running — starting..."
+    (cd ~/EliaAI/subworkers/server && docker-compose up -d 2>/dev/null || docker compose up -d 2>/dev/null || true)
+    sleep 3
 fi
 
 # ── 3. Create 3-panel tmux layout ────────────────────────────────────────
@@ -93,4 +100,9 @@ if [[ "$INSIDE_TMUX" == "false" ]]; then
     TMUX= tmux new-session -A -s "$SESSION"
 else
     echo "[EliaUI] Sessions ready. Attach: tmux attach -t $SESSION"
+fi
+
+# Keep Terminal window open after attach exits
+if [[ "$INSIDE_TMUX" == "false" ]]; then
+  exec zsh
 fi

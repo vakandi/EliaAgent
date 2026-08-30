@@ -1,7 +1,7 @@
 # Subworkers System
 
 **Date:** 29 August 2026  
-**Version:** 4.1 — TZ + persistence + manual Continue
+**Version: 4.2 — per-session proxy rotation — TZ + persistence + manual Continue
 
 > Technical documentation for the autonomous subworker agent system.
 >
@@ -601,7 +601,7 @@ Container: `elia-subworker-srv`, `restart: unless-stopped`, ports **5656** (Fast
 | `server/app/config/server.json` | Port (5656), OpenCode server URL (http://127.0.0.1:4096), health-check interval, max restarts, alert settings |
 | `server/app/config/subworkers.json` | All subworker definitions: `name`, `enabled`, `schedule` (`interval` = hours+minute / `cron`), `agent_id`, `max_retries`, `timeout_minutes`, `mcp_servers`, `notify_discord` |
 
-`subworkers.json` currently defines **14 subworkers** (refund-hunter, mirorpay-community-organic, mirrorpay-telegram, bene2luxe-promoter, bene2luxe-suppliers, cobou-promoter, mirorpay-seo, reddit-saas-scraper, teleorbit-community-organic, teleorbit-seo, tempack-dev, tiktok-content, vcam-community-organic, vcam-seo).
+`subworkers.json` currently defines **14 subworkers** (example-agent, your-brand-promoter, your-brand-suppliers, your-agency-promoter, your-saas-seo, your-saas-telegram, your-saas-scraper, your-other-brand-organic, your-other-brand-seo, your-dev-agent, your-content-agent, your-video-agent-organic, your-video-agent-seo).
 
 ### 8.4 API (localhost, Bearer $ELIA_AUTH_TOKEN)
 
@@ -655,15 +655,46 @@ Container opencode DB (`/root/.local/share/opencode/opencode.db` inside `elia-su
 
 | Failure point | Cause | Fix (verified) |
 |---------------|-------|----------------|
-| Scheduler session map lost | `_last_session_ids` was in-memory dict, wiped on container recreation | Persisted to `logs/scheduler_state.json` (bind-mounted → host `/data/logs/`); loaded at startup, saved after every run — verified `refund-hunter` still 5 sessions after `docker restart` |
+| Scheduler session map lost | `_last_session_ids` was in-memory dict, wiped on container recreation | Persisted to `logs/scheduler_state.json` (bind-mounted → host `/data/logs/`); loaded at startup, saved after every run — verified `example-agent` still 5 sessions after `docker restart` |
 | Old sessions unreachable via API | `list_sessions()` without limit → server returns only 100 most recent | Routes now `list_sessions(limit=200)` + filter `agent==agent_id OR directory startswith /data/subworkers/{name}` (container path) → finds running session even when `x-opencode-directory` header used |
 | Stale ID after DB wipe | `scheduler_state.json` pointed to `ses_fb4dcb...` from 01:30 which 404s after DB recreate | `GET /sessions/{name}` now catches 404, tries `get_running_session_id()` before 500; `GET /sessions/{name}/list` always merges `running_sid` + `scheduler_sid` into list |
 | Only 1 session shown after restart | Container DB was ephemeral (no volume) → `down` wiped 2.9M DB, only stale fallback remained | Added volume `opencode-data:/root/.local/share/opencode:rw` — verified `opencode-data/opencode.db` persists 2.8M across `docker restart` |
 | Container shows UTC 01:30 when host is 02:30 | No `TZ` set, `tzdata` installed but default UTC | `Dockerfile` + `docker-compose.yml` set `TZ=Africa/Casablanca` — verified `docker exec date` (`02:39 +01`) matches host `date` |
 
 State files:
-- `logs/scheduler_state.json` on host (`/data/logs/` in container), written atomically (tmp + rename) after each run. Verified `{"refund-hunter":"ses_fb2de82a…"}` persists.
+- `logs/scheduler_state.json` on host (`/data/logs/` in container), written atomically (tmp + rename) after each run. Verified `{"example-agent":"ses_fb2de82a…"}` persists.
 - `server/opencode-data/opencode.db` (2.8M) — **do NOT delete** unless you want to wipe all container sessions; host DB (`~/.local/share/opencode`) is untouched.
+
+### 8.8 Per-Session Proxy Rotation (LLM Egress via Residential Proxies) — ★ CRITICAL
+
+> **Why this exists:** Free OpenCode Zen models (`opencode/muse-spark-1.2-contributor-free` via `openrouter.ai`) are rate-limited per IP. 14 agents firing at 16:00 on the same IP = instant 429. Per-request proxy rotation gives each concurrent session a **different residential egress IP**, so the fleet scales linearly.
+
+**Verified in production Docker `elia-subworker-srv` (30/08):** `example-agent` → `<proxy-ip>`, `your-saas-seo` → `<proxy-ip>` (distinct via round-robin); `curl -x http://127.0.0.1:3128 https://api.ipify.org` → `<proxy-ip>` vs direct `<direct-ip>`; forward log `CONNECT opencode.ai:443 via <proxy>` proves LLM egress is proxied. Pool direct `httpx` also `PASS`.
+
+| Aspect | Detail |
+|--------|--------|
+| **Pool** | `~/EliaAI/setup/proxies.txt` (100 `IP:PORT:USER:PASS \|last:…`), health-checked via `switch-proxy.sh` (`wget` + `api.ipify.org`); dead proxies auto-skipped. Mounted **read-only** into container at `/data/proxies.txt:ro` (`docker-compose.yml`). |
+| **Mechanism** | **Node forward proxy on `127.0.0.1:3128`** (`app/forward-proxy.js`, `http` + `net` `CONNECT` handling). Pool loaded at startup, `rr` round-robin per request. `entrypoint.sh` sets `HTTP_PROXY=http://127.0.0.1:3128` + `NO_PROXY=localhost,127.0.0.1,::1` before starting `opencode serve --port 5655` (binary). Every `fetch`/`CONNECT` from opencode (Bun) goes through the local proxy -> next residential proxy. No `fetch({proxy})` patch, no `BUN_PRELOAD`, no plugin. |
+| **Why forward proxy** | Bun's `fetch({proxy})` patch via `BUN_PRELOAD` requires running opencode from source (`bun --preload ... src/index.ts serve`) which produced `<defunct>` zombies (uvicorn as PID1 never reaped, `manage_process=False` never restarted). Plugin approach (`globalThis.fetch` patch inside opencode) runs after provider `fetch` is cached -> too late. Forward proxy is the only stable per-request isolation that works with the **release binary** + Effect fibers at 14 concurrent. |
+| **Per-request isolation** | Each `CONNECT`/`request` gets `pool[rr++ % pool.length]`. 14 agents at 16:00 -> 14 different upstream `Proxy-Authorization` headers, no restart, no `HTTP_PROXY` race (local proxy is stable, upstream rotates). `localhost` correctly bypasses via `NO_PROXY` (httpx respects it, so `127.0.0.1:5655` health/session calls are direct). |
+| **Bypass** | `localhost`/`127.0.0.1`/`::1` never proxied (httpx `NO_PROXY`, forward proxy never sees them). |
+| **Docker wiring** | `docker-compose.yml` adds `- ${HOME}/EliaAI/setup/proxies.txt:/data/proxies.txt:ro` + `mem_limit: 4g` + `tini -g` as PID1; `Dockerfile` installs `tini` + `nodejs` + `opencode v1.18.25`; `entrypoint.sh` starts `node forward-proxy.js` -> sets `HTTP_PROXY` -> starts `opencode serve` in supervisor loop (`while true; opencode serve ... || sleep 2`) + `wait` (bash reaps, tini reaps bash). No per-run `opencode` restart. |
+| **Zombie fix** | Previous `exec uvicorn` made uvicorn PID1 parent of opencode -> `<defunct>` never reaped, `HealthManager manage_process=False` never restarted. Now `tini -g` is PID1 + entrypoint supervisor loop auto-restarts opencode in 2s on OOM/crash. Verified `ps aux` no defunct after `pkill -9 opencode`. |
+| **Routes resilience** | `subworkers.py` `/list` timeout `5s->10s` + warning log, `/sessions` catches `OpenCodeConnectionError` -> 200 empty not 500. Fixes "1 session 0 msg" when opencode is slow (DB list 70s). |
+| **Logs** | `forward-proxy.log` at `/data/logs/forward-proxy.log` (host `~/EliaAI/subworkers/logs/forward-proxy.log`) -> `CONNECT opencode.ai:443 via <proxy>` + `CONNECT models.opencode.ai via <proxy>`. `docker exec elia-subworker-srv cat /data/logs/forward-proxy.log` to tail. |
+| **Failure mode** | Fallback is direct IP `<direct-ip>` (fail-open) if pool empty or forward proxy down. |
+| **Test in prod** | `docker exec elia-subworker-srv curl -x http://127.0.0.1:3128 -s https://api.ipify.org` -> `<proxy-ip>` vs `curl -s https://api.ipify.org` -> `<direct-ip>` (distinct); `docker exec elia-subworker-srv cat /data/logs/forward-proxy.log | grep opencode.ai` shows `CONNECT opencode.ai:443 via <proxy-ip>` etc. |
+
+**To re-verify:**
+```bash
+docker exec elia-subworker-srv cat /data/logs/forward-proxy.log | tail -20  # every CONNECT opencode.ai via <proxy>
+curl -x http://127.0.0.1:3128 -s https://api.ipify.org; echo " via proxy"
+curl -s https://api.ipify.org; echo " direct"
+curl http://localhost:5656/health
+curl -s -X POST http://localhost:5656/trigger/your-saas-seo -H "Authorization: Bearer $ELIA_AUTH_TOKEN"
+```
+
+> **Do NOT use `shell.env` for LLM proxy, do NOT use `fetch({proxy})` patch or plugin (zombie + too late). The Node forward proxy on `127.0.0.1:3128` with `HTTP_PROXY` is the only stable per-request isolation that works with the release binary at 14 concurrent.**
 
 ---
 

@@ -5,6 +5,7 @@ Orchestrates: health check → invoke OpenCode via HTTP → capture output → v
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import random
 import re
@@ -267,6 +268,52 @@ class SubworkerRunner:
             reinjections += 1
         return reinjections
 
+    def _assign_proxy_for_session(self, session_id: str) -> str | None:
+        """Pick next proxy round-robin and record it in /data/proxy-map.json.
+
+        proxy-patch.js (bun --preload) reads this map per fetch to route the
+        session's LLM egress through its assigned proxy. No forward proxy.
+        """
+        try:
+            pool_path = Path("/data/proxies.txt")
+            map_path = Path("/data/proxy-map.json")
+            idx_path = Path("/tmp/proxy-idx.txt")
+            if not pool_path.exists():
+                log.warning("runner.proxy no pool file", subworker=self._config.name)
+                return None
+            lines = [l.split("|")[0].strip() for l in pool_path.read_text().splitlines() if l.split("|")[0].strip()]
+            pool = []
+            for line in lines:
+                parts = line.split(":")
+                if len(parts) >= 4:
+                    ip, port, user, pwd = parts[0], parts[1], parts[2], parts[3]
+                    pool.append(f"http://{user}:{pwd}@{ip}:{port}")
+            if not pool:
+                log.warning("runner.proxy empty pool", subworker=self._config.name)
+                return None
+            try:
+                idx = int(idx_path.read_text().strip()) if idx_path.exists() else 0
+            except Exception:
+                idx = 0
+            proxy = pool[idx % len(pool)]
+            idx_path.write_text(str(idx + 1))
+            try:
+                map_data = json.loads(map_path.read_text()) if map_path.exists() else {}
+            except Exception:
+                map_data = {}
+            map_data[session_id] = proxy
+            if len(map_data) > 500:
+                map_data = dict(list(map_data.items())[-500:])
+            map_path.write_text(json.dumps(map_data))
+            log.info(
+                "runner.proxy subworker=%s session=%s proxy=%s idx=%d/%d",
+                self._config.name, session_id, proxy[:45] + "...", idx, len(pool),
+            )
+            return proxy
+        except Exception as e:
+            log.warning("runner.proxy failed", subworker=self._config.name, error=str(e))
+            return None
+
     async def _execute_single_attempt(
         self,
         attempt_num: int,
@@ -282,6 +329,13 @@ class SubworkerRunner:
         timeout = self._config.timeout_minutes * 60
 
         log.info("runner.invoke subworker=%s attempt=%d session=%s", self._config.name, attempt_num, session_id or "new")
+
+        # Per-session proxy assignment (direct, no plugin, no forward proxy).
+        # Picks next proxy from /data/proxies.txt round-robin and records it in
+        # /data/proxy-map.json {sessionID: proxy}; the bun preload (proxy-patch.js)
+        # reads that map per fetch to route the session's LLM egress.
+        if session_id:
+            self._assign_proxy_for_session(session_id)
 
         start = time.time()
         try:
@@ -330,6 +384,7 @@ class SubworkerRunner:
                     session_id = sess.get("id") or ""
                     if not session_id:
                         raise OpenCodeSessionError("No session ID returned from create_session")
+                    self._assign_proxy_for_session(session_id)
                     try:
                         from app.main import get_scheduler
                         get_scheduler().set_running_session_id(self._config.name, session_id)
