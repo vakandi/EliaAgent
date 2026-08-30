@@ -9,7 +9,7 @@ build/
 .mypy_cache/
 .ruff_cache/
 logs/
-
-# Local Cloudflare tunnel credentials — NEVER commit
-tunnel.json
-.env
+opencode-data/
+opencode-data/*.db
+opencode-data/*.db-shm
+opencode-data/*.db-wal

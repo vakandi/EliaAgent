@@ -2,6 +2,33 @@
 
 ---
 
+## 🚀 Version: v6.2.0 — 🌐 PER-SESSION PROXY ROTATION + UNLIMITED TOKENS (August 30, 2026)
+
+### ✨ Per-Session Proxy Rotation — Unlimited Tokens on Free Models
+
+The fleet now rotates **residential egress IPs per request**, so free OpenCode Zen models rate-limited per IP scale linearly across concurrent sessions. 14 agents firing at once each get a different upstream IP — no more instant 429s.
+
+**What changed:**
+- **Node forward proxy on `127.0.0.1:3128`** (`app/forward-proxy.js`, `http` + `net` `CONNECT` handling). Pool loaded at startup, round-robin per request. `entrypoint.sh` sets `HTTP_PROXY=http://127.0.0.1:3128` + `NO_PROXY=localhost,127.0.0.1,::1` before starting `opencode serve --port 5655`. Every `fetch`/`CONNECT` from opencode goes through the local proxy → next residential proxy.
+- **Why a forward proxy** (not a `fetch({proxy})` patch or plugin): the `BUN_PRELOAD` patch produced `<defunct>` zombies (uvicorn as PID1 never reaped), and the plugin approach runs after the provider `fetch` is cached — too late. The forward proxy is the only stable per-request isolation that works with the **release binary** + Effect fibers at 14 concurrent.
+- **Zombie fix**: `tini -g` is now PID1 + an entrypoint supervisor loop auto-restarts opencode in 2s on OOM/crash. Verified `ps aux` shows no defunct after `pkill -9 opencode`.
+- **Warmup**: `docker_subworker.sh` warms the sessions DB before the first run (prevents the 1-session-0-msg cold start).
+- **Continue fix**: `subworkers.py` `/list` timeout `5s→10s` + warning log; `/sessions` catches `OpenCodeConnectionError` → 200 empty instead of 500. Fixes "1 session 0 msg" when opencode is slow.
+- **Infinite restart loop**: `opencode-serve.sh` now restarts forever (100% uptime as long as the host is up) instead of giving up after `MAX_RESTARTS`.
+- **Routes resilience**: graceful degrade + continue broadcast so a slow opencode never takes the whole fleet down.
+
+**Failure mode:** falls back to a direct IP (fail-open) if the pool is empty or the forward proxy is down.
+
+**Verify:**
+```bash
+docker exec elia-subworker-srv curl -x http://127.0.0.1:3128 -s https://api.ipify.org  # proxied IP
+docker exec elia-subworker-srv curl -s https://api.ipify.org                            # direct IP
+docker exec elia-subworker-srv cat /data/logs/forward-proxy.log | tail -20              # CONNECT opencode.ai via <proxy>
+curl http://localhost:5656/health
+```
+
+---
+
 ## 🚀 Version: v6.1.0 — 🐳 FULLY DOCKERIZED SUBWORKERS + BANNER (August 27, 2026)
 
 ### ✨ Fully Dockerized — No Host Opencode

@@ -65,7 +65,7 @@ async def client():
     type(mock_health).state = MagicMock(value="running")
     type(mock_health).health_status = MagicMock(value="healthy")
     type(mock_health).pid = 12345
-    type(mock_health).base_url = "http://127.0.0.1:4096"
+    type(mock_health).base_url = "http://127.0.0.1:5655"
     type(mock_health).restart_count = 0
     type(mock_health).last_health_check = None
     mock_health.restart = AsyncMock()
@@ -343,7 +343,7 @@ async def test_server_health(client):
     assert data["state"] == "running"
     assert data["health_status"] == "healthy"
     assert data["pid"] == 12345
-    assert data["base_url"] == "http://127.0.0.1:4096"
+    assert data["base_url"] == "http://127.0.0.1:5655"
     assert data["restart_count"] == 0
 
 

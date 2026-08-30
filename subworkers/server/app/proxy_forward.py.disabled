@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""
+Tiny forward proxy for per-session LLM egress.
+Listens on 127.0.0.1:3128, reads /data/proxy-map.json {sessionID: proxyUrl}
+and forwards each request via the session's proxy (or round-robin if no session).
+Set HTTP_PROXY=http://127.0.0.1:3128 for opencode.
+Logs to /data/logs/proxy-forward.log
+"""
+import asyncio, json, pathlib, logging
+from aiohttp import web, ClientSession
+import time
+
+LOG = pathlib.Path("/data/logs/proxy-forward.log")
+MAP = pathlib.Path("/data/proxy-map.json")
+POOL = pathlib.Path("/data/proxies.txt")
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
+
+def load_pool():
+    if not POOL.exists():
+        return []
+    out=[]
+    for l in POOL.read_text().splitlines():
+        core=l.split("|")[0].strip()
+        if not core: continue
+        parts=core.split(":")
+        if len(parts)<4: continue
+        ip,port,user,pwd=parts[0],parts[1],parts[2],parts[3]
+        out.append(f"http://{user}:{pwd}@{ip}:{port}")
+    return out
+
+pool=load_pool()
+rr=0
+
+async def handle(request):
+    global rr
+    # Determine target URL from request path
+    # For forward proxy, the request url is absolute (http://host/path)
+    url = str(request.url)
+    # If it's a health check or local, bypass
+    if "127.0.0.1" in url or "localhost" in url:
+        async with ClientSession() as sess:
+            async with sess.request(request.method, url, headers=dict(request.headers), data=await request.read()) as resp:
+                return web.Response(status=resp.status, headers=dict(resp.headers), body=await resp.read())
+
+    # Try to find session proxy from map (we use a simple heuristic: check X-Session-ID header or fallback to round-robin)
+    # Since opencode's fetch doesn't send session ID, we use round-robin per request as fallback,
+    # but the Python subworker server will write the current session's proxy to /tmp/current-proxy.txt before each session
+    # and the forward proxy will read it.
+    cur_proxy = None
+    try:
+        if pathlib.Path("/tmp/current-proxy.txt").exists():
+            cur_proxy = pathlib.Path("/tmp/current-proxy.txt").read_text().strip()
+    except: pass
+
+    if not cur_proxy:
+        # Round-robin fallback
+        if pool:
+            cur_proxy = pool[rr % len(pool)]
+            rr+=1
+
+    # Log
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(LOG, "a") as f:
+        f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {request.method} {url[:80]} via {cur_proxy[:40] if cur_proxy else 'direct'}\n")
+
+    # Forward via proxy if set
+    if cur_proxy:
+        # Use aiohttp with proxy
+        async with ClientSession() as sess:
+            try:
+                async with sess.request(request.method, url, headers=dict(request.headers), data=await request.read(), proxy=cur_proxy, timeout=30) as resp:
+                    return web.Response(status=resp.status, headers=dict(resp.headers), body=await resp.read())
+            except Exception as e:
+                logging.error(f"proxy {cur_proxy} failed {e}, fallback direct")
+                async with ClientSession() as sess2:
+                    async with sess2.request(request.method, url, headers=dict(request.headers), data=await request.read(), timeout=30) as resp2:
+                        return web.Response(status=resp2.status, headers=dict(resp2.headers), body=await resp2.read())
+    else:
+        async with ClientSession() as sess:
+            async with sess.request(request.method, url, headers=dict(request.headers), data=await request.read(), timeout=30) as resp:
+                return web.Response(status=resp.status, headers=dict(resp.headers), body=await resp.read())
+
+app = web.Application()
+app.router.add_route("*", "/{tail:.*}", handle)
+
+if __name__ == "__main__":
+    print(f"Forward proxy pool {len(pool)} listening 127.0.0.1:3128")
+    web.run_app(app, host="127.0.0.1", port=3128)

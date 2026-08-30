@@ -131,18 +131,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         subworker_count=len(_config_manager.subworkers),
     )
 
-    # Health manager — tracks the already-running OpenCode server (5655).
-    # We do NOT start it: the server is managed by opencode-serve.sh.
-    # Host must come from OPENCODE_SERVER_URL: inside the bridged container
-    # 127.0.0.1 is the container itself, not the host where opencode runs.
+    # Health manager — tracks the OpenCode server (5655).
+    # In Docker the process is owned by entrypoint.sh (auto-restart loop +
+    # shell reaping), so manage_process stays False: the monitor only tracks
+    # health and broadcasts status. Set MANAGE_OPENCODE_PROCESS=true to let
+    # HealthManager own the subprocess instead — requires removing the
+    # opencode start from entrypoint.sh to avoid a port conflict.
     from urllib.parse import urlparse
 
     _opencode_url = urlparse(os.getenv("OPENCODE_SERVER_URL", "http://127.0.0.1:5655"))
+    _manage_process = os.getenv("MANAGE_OPENCODE_PROCESS", "false").lower() in ("1", "true", "yes")
     _health_manager = HealthManager(
         port=_opencode_url.port or 5655,
         host=_opencode_url.hostname or "127.0.0.1",
         work_dir=str(_SUBWORKERS_DIR),
-        manage_process=False,
+        manage_process=_manage_process,
     )
 
     from app.routes.websocket import ws_manager as _ws_mgr
@@ -152,7 +155,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await _ws_mgr.broadcast_status_update()
 
     _health_manager.on_health_change(_on_health_change)
-    await _health_manager.start_external_monitor()
+    if _manage_process:
+        await _health_manager.start_with_monitor()
+    else:
+        await _health_manager.start_external_monitor()
 
     # Scheduler — one job per subworker, manual triggers supported.
     # state_file lives in LOG_DIR (bind-mounted) so it survives docker nuke.

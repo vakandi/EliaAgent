@@ -194,7 +194,8 @@ main() {
     local restart_count=0
     local current_delay=$INITIAL_RESTART_DELAY
     
-    while [[ $restart_count -lt $MAX_RESTARTS ]]; do
+    # Infinite restart loop — 100% uptime as long as the host is up.
+    while true; do
         start_server_process
         
         log "Waiting for server to become healthy..."
@@ -240,12 +241,7 @@ main() {
         
         restart_count=$((restart_count + 1))
         
-        if [[ $restart_count -ge $MAX_RESTARTS ]]; then
-            log "ERROR: Max restarts ($MAX_RESTARTS) reached - giving up"
-            break
-        fi
-        
-        log "Restarting in ${current_delay}s (attempt $restart_count/$MAX_RESTARTS)..."
+        log "Restarting in ${current_delay}s (attempt $restart_count)..."
         sleep "$current_delay"
         
         current_delay=$((current_delay * 2))

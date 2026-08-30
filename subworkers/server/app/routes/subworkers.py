@@ -479,7 +479,7 @@ async def get_subworker_sessions(
         raise HTTPException(status_code=404, detail=f"Subworker '{name}' not found")
 
     import os
-    from app.utils.exceptions import OpenCodeError
+    from app.utils.exceptions import OpenCodeConnectionError, OpenCodeError
     from app.utils.opencode_client import OpenCodeClient
 
     server_url = os.environ.get("OPENCODE_SERVER_URL", "http://127.0.0.1:5655")
@@ -489,7 +489,11 @@ async def get_subworker_sessions(
             ws_dir = _effective_workspace(sw)
             try:
                 all_sessions = await client.list_sessions(limit=200)
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    "sessions.opencode_unreachable name=%s error=%s",
+                    name, str(exc),
+                )
                 all_sessions = []
             matching = [
                 s for s in all_sessions
@@ -513,6 +517,15 @@ async def get_subworker_sessions(
 
         try:
             raw_messages = await client.list_messages(session_id, limit=limit)
+        except OpenCodeConnectionError as exc:
+            # OpenCode server unreachable (down / restarting) — degrade
+            # gracefully to 0 messages instead of a 500 so the TopBar shows
+            # an empty state, not an error.
+            logger.warning(
+                "sessions.opencode_unreachable name=%s session_id=%s error=%s",
+                name, session_id, str(exc),
+            )
+            return SessionResponse(name=name, session_id=session_id, messages=[], total_messages=0)
         except OpenCodeError as exc:
             if getattr(exc, "status_code", None) == 404:
                 try:
@@ -597,7 +610,7 @@ def _effective_workspace(sw) -> str:
     container paths; opencode sessions carry host paths)."""
     import os as _os
 
-    root = _os.environ.get("OPENCODE_WORKSPACE", "/Users/vakandi/EliaAI")
+    root = _os.environ.get("OPENCODE_WORKSPACE", "~/EliaAI")
     workspace = sw.workspace
     if not workspace:
         try:
@@ -640,9 +653,13 @@ async def list_subworker_sessions(name: str) -> SessionListResponse:
 
     all_sessions: list[dict] = []
     try:
-        async with OpenCodeClient(server_url, default_timeout=5.0) as client:
+        async with OpenCodeClient(server_url, default_timeout=10.0) as client:
             all_sessions = await client.list_sessions(limit=200)
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "sessions.list_opencode_unreachable name=%s error=%s",
+            name, str(exc),
+        )
         all_sessions = []
 
     ws_dir = _effective_workspace(sw)
@@ -725,6 +742,17 @@ async def continue_session(
             logger.warning("session.continue_timeout name=%s session_id=%s", name, session_id)
         else:
             raise HTTPException(status_code=502, detail=f"OpenCode error: {exc}") from exc
+
+    # Mark as running so TopBar shows LIVE and warmup works (fixes 0-msg -> Continue with no livestream)
+    try:
+        from app.main import get_scheduler
+        from app.routes.websocket import ws_manager
+        get_scheduler().set_running_session_id(name, session_id)
+        # Broadcast like scheduler's on_run_start does
+        await ws_manager.broadcast({"event": "subworker_started", "name": name})
+        await ws_manager.broadcast_status_update()
+    except Exception as e:
+        logger.warning("session.continue_broadcast_failed name=%s error=%s", name, str(e))
 
     logger.info("session.continued name=%s session_id=%s message_len=%d", name, session_id, len(content))
     return ContinueResponse(
