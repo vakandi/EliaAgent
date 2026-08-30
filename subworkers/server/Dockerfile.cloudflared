@@ -1,0 +1,7 @@
+FROM cloudflare/cloudflared:latest AS src
+FROM alpine:latest
+RUN apk add --no-cache ca-certificates
+COPY --from=src /usr/local/bin/cloudflared /usr/local/bin/cloudflared
+COPY scripts/cloudflared-watch.sh /usr/local/bin/cloudflared-watch.sh
+RUN chmod +x /usr/local/bin/cloudflared-watch.sh
+ENTRYPOINT ["/bin/sh", "/usr/local/bin/cloudflared-watch.sh"]

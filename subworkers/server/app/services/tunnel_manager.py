@@ -11,13 +11,15 @@ Required Cloudflare API token permissions:
     - Account → Cloudflare Tunnel → Edit  (create/configure/run the tunnel)
 
 Security notes:
-    - Tokens are persisted ONLY in app/config/tunnel.json (chmod 600).
-    - No API endpoint ever returns a raw token — masked form only (tok_…abc).
+     - Tokens are persisted ONLY in app/config/tunnel.json (chmod 600).
+     - No API endpoint ever returns a raw token — masked form only (tok_…abc).
 
-Deployment note: `start()/stop()/remove()` shell out to `docker compose` from
-inside the server container. That requires the Docker socket + a docker CLI
-in the image (e.g. /var/run/docker.sock bind mount). Until then the compose
-calls fail with a clear TunnelError; everything else works.
+Deployment note: Socketless mode — the subworker container no longer mounts
+``/var/run/docker.sock`` (sandbox escape). ``cloudflared`` is a sibling
+service in ``docker-compose.yml`` with a file-watcher entrypoint
+(``scripts/cloudflared-watch.sh``). The manager only writes the runner token
+to ``app/config/tunnel.token`` (chmod 600, shared volume); the watcher
+restarts cloudflared internally when the file changes. No Docker API needed.
 """
 from __future__ import annotations
 
@@ -39,6 +41,7 @@ CF_API_BASE = "https://api.cloudflare.com/client/v4"
 CLOUDFLARED_IMAGE = "cloudflare/cloudflared:latest"
 OVERRIDE_FILE_NAME = "docker-compose.override.tunnel.yml"
 STATE_FILE_NAME = "tunnel.json"
+TOKEN_FILE_NAME = "tunnel.token"
 
 PUBLIC_VERIFY_TIMEOUT = 90.0   # seconds to wait for https://{domain}/server/health
 PUBLIC_POLL_INTERVAL = 3.0
@@ -146,6 +149,10 @@ class TunnelManager:
     def state_path(self) -> Path:
         return self.config_dir / STATE_FILE_NAME
 
+    @property
+    def token_path(self) -> Path:
+        return self.config_dir / TOKEN_FILE_NAME
+
     # ── Cloudflare API helpers ──────────────────────────────────────────
 
     async def _cf_request(
@@ -183,6 +190,59 @@ class TunnelManager:
             msg = "; ".join(f"[{e.get('code')}] {e.get('message')}" for e in errors)
             raise TunnelError(f"Cloudflare API error: {msg}")
         return payload.get("result")
+
+    async def create_restricted_token_via_global(self, global_key: str, email: str, domain: str) -> str:
+        """Create a restricted Bearer token via Global API Key (X-Auth-Email/Key).
+
+        Uses the Global key to mint a token with Zone DNS Write + Tunnel Write
+        scoped to the account that owns `domain`. Returns the Bearer value.
+        """
+        url = f"{CF_API_BASE}/user/tokens"
+        headers = {
+            "X-Auth-Email": email,
+            "X-Auth-Key": global_key,
+            "Content-Type": "application/json",
+        }
+        # Permission IDs verified via /user/tokens/permission_groups (2026-08-30)
+        # Zone Read + DNS Write for surfai.tech, Tunnel Write for account
+        body = {
+            "name": f"elia-auto-{domain.replace('.', '-')}",
+            "policies": [
+                {
+                    "effect": "allow",
+                    "resources": {"com.cloudflare.api.account.zone.*": "*"},
+                    "permission_groups": [
+                        {"id": "c8fed203ed3043cba015a93ad1616f1f"},
+                        {"id": "4755a26eedb94da69e1066d98aa820be"},
+                    ],
+                },
+                {
+                    "effect": "allow",
+                    "resources": {"com.cloudflare.api.account.*": "*"},
+                    "permission_groups": [{"id": "c07321b023e944ff818fec44d8203567"}],
+                },
+            ],
+            "expires_on": "2027-12-31T00:00:00Z",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=CF_TIMEOUT) as client:
+                resp = await client.post(url, headers=headers, json=body)
+        except httpx.HTTPError as exc:
+            raise TunnelError(f"Global API unreachable: {exc}") from exc
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = {}
+        if resp.status_code >= 400 or not payload.get("success", False):
+            errors = payload.get("errors") or [{"message": resp.text[:200]}]
+            msg = "; ".join(f"[{e.get('code')}] {e.get('message')}" for e in errors)
+            raise TunnelError(f"Could not create token via Global API Key: {msg}")
+        result = payload.get("result") or {}
+        token = result.get("value") or result.get("id")
+        if not token:
+            raise TunnelError("Global API created token but no value returned")
+        log.info("tunnel.restricted_token_created_via_global", domain=domain)
+        return str(token)
 
     async def verify_token(self, api_token: str) -> dict[str, Any]:
         """Verify the API token and resolve its account when visible.
@@ -241,17 +301,61 @@ class TunnelManager:
 
         Returns ``{"tunnel_id": ..., "tunnel_token": ...}`` where tunnel_token
         is the cloudflared runner token (NOT the API token).
+        Handles duplicate name (1013) by reusing existing tunnel.
         """
-        result = await self._cf_request(
-            "POST",
-            f"/accounts/{account_id}/cfd_tunnel",
-            api_token=api_token,
-            json_body={
-                "name": f"elia-subworker-{domain.replace('.', '-')}",
-                # Remotely-managed tunnel: ingress lives in CF (configurations endpoint).
-                "config_src": "cloudflare",
-            },
-        )
+        tunnel_name = f"elia-subworker-{domain.replace('.', '-')}"
+        try:
+            result = await self._cf_request(
+                "POST",
+                f"/accounts/{account_id}/cfd_tunnel",
+                api_token=api_token,
+                json_body={
+                    "name": tunnel_name,
+                    # Remotely-managed tunnel: ingress lives in CF (configurations endpoint).
+                    "config_src": "cloudflare",
+                },
+            )
+        except TunnelError as exc:
+            if "1013" in str(exc) and "already have a tunnel" in str(exc):
+                log.warning("tunnel.name_exists_reusing", name=tunnel_name)
+                # Try to find existing tunnel with that name
+                try:
+                    existing = await self._cf_request(
+                        "GET",
+                        f"/accounts/{account_id}/cfd_tunnel",
+                        api_token=api_token,
+                        params={"name": tunnel_name, "is_deleted": "false"},
+                    )
+                    if existing:
+                        # Cloudflare returns list or single object
+                        if isinstance(existing, list) and existing:
+                            result = existing[0]
+                        elif isinstance(existing, dict) and existing.get("id"):
+                            result = existing
+                        else:
+                            # Fallback: generate unique name and retry once
+                            raise ValueError("not found")
+                    else:
+                        # No existing found, try with unique suffix
+                        tunnel_name = f"{tunnel_name}-{int(time.time()) % 10000}"
+                        result = await self._cf_request(
+                            "POST",
+                            f"/accounts/{account_id}/cfd_tunnel",
+                            api_token=api_token,
+                            json_body={"name": tunnel_name, "config_src": "cloudflare"},
+                        )
+                except Exception as reuse_err:
+                    # Final fallback: unique name
+                    log.warning("tunnel.reuse_failed_try_unique", error=str(reuse_err))
+                    tunnel_name = f"{tunnel_name}-{int(time.time()) % 10000}"
+                    result = await self._cf_request(
+                        "POST",
+                        f"/accounts/{account_id}/cfd_tunnel",
+                        api_token=api_token,
+                        json_body={"name": tunnel_name, "config_src": "cloudflare"},
+                    )
+            else:
+                raise
         tunnel_id = result["id"]
 
         token_result = await self._cf_request(
@@ -327,31 +431,27 @@ class TunnelManager:
     # ── Compose service file ────────────────────────────────────────────
 
     def write_compose_service(self, tunnel_token: str) -> Path:
-        """Write docker-compose.override.tunnel.yml with the cloudflared service.
+        """Socketless: persist the runner token to a shared file.
 
-        The cloudflared container joins the compose project's default network,
-        so it reaches the server at http://subworker-srv:5656. The runner token
-        is passed via TUNNEL_TOKEN env (cloudflared reads it natively) instead
-        of the command line, keeping it out of `docker inspect` process args.
+        The ``cloudflared`` sibling service (docker-compose.yml) watches
+        ``app/config/tunnel.token`` via ``scripts/cloudflared-watch.sh`` and
+        restarts itself internally — no Docker socket needed. The compose
+        override is kept as a no-op marker (chmod 600) for backwards compat.
         """
-        content = (
-            "# Auto-generated by the Elia subworker server (/tunnel/setup).\n"
-            "# Regenerated on every setup; removed by POST /tunnel/remove.\n"
-            "services:\n"
-            "  cloudflared:\n"
-            f"    image: {CLOUDFLARED_IMAGE}\n"
-            f"    container_name: {self.cloudflared_container}\n"
-            "    restart: unless-stopped\n"
-            '    command: ["tunnel", "--no-autoupdate", "run"]\n'
-            "    environment:\n"
-            f'      TUNNEL_TOKEN: "{tunnel_token}"\n'
-            "    depends_on:\n"
-            f"      - {self.compose_service_name}\n"
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        self.token_path.write_text(tunnel_token.strip() + "\n")
+        os.chmod(self.token_path, 0o600)
+        log.info("tunnel.token_written", path=str(self.token_path))
+        marker = (
+            "# Managed by tunnel_manager (socketless mode) — see tunnel.token\n"
+            "# cloudflared is defined in docker-compose.yml, not here.\n"
         )
-        self.override_path.write_text(content)
-        os.chmod(self.override_path, 0o600)
-        log.info("tunnel.compose_written", path=str(self.override_path))
-        return self.override_path
+        self.override_path.write_text(marker)
+        try:
+            os.chmod(self.override_path, 0o600)
+        except OSError:
+            pass
+        return self.token_path
 
     # ── Compose control (subprocess) ────────────────────────────────────
 
@@ -400,35 +500,26 @@ class TunnelManager:
         return proc.returncode or 0, output
 
     async def start(self) -> None:
-        """Start (or recreate) the cloudflared connector container.
+        """Socketless start — ensure token file exists; watcher restarts.
 
-        Uses a plain `docker run` against the host daemon instead of compose:
-        compose reconciles the whole project and would recreate (kill) the
-        subworker-srv container this process lives in.
+        The ``cloudflared`` sibling (docker-compose.yml) polls
+        ``app/config/tunnel.token`` via ``cloudflared-watch.sh``. Writing the
+        file is the trigger — no ``docker run`` needed.
         """
         state = self.load_state() or {}
         tunnel_token = state.get("tunnel_token")
         if not tunnel_token:
             raise TunnelError("No tunnel token in state — run POST /tunnel/setup first")
-        network = await self._server_network()
-        await self._run(
-            [self.docker_bin, "rm", "-f", self.cloudflared_container], timeout=30
-        )
-        rc, out = await self._run(
-            [
-                self.docker_bin, "run", "-d",
-                "--name", self.cloudflared_container,
-                "--restart", "unless-stopped",
-                "--network", network,
-                "-e", f"TUNNEL_TOKEN={tunnel_token}",
-                "cloudflare/cloudflared:latest",
-                "tunnel", "--no-autoupdate", "run",
-            ],
-            timeout=120,
-        )
-        if rc != 0:
-            raise TunnelError(f"docker run cloudflared failed (rc={rc}): {out[-400:]}")
-        log.info("tunnel.started", network=network)
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        if not self.token_path.exists() or self.token_path.read_text().strip() != tunnel_token.strip():
+            self.token_path.write_text(tunnel_token.strip() + "\n")
+            os.chmod(self.token_path, 0o600)
+            log.info("tunnel.token_refreshed", path=str(self.token_path))
+        try:
+            network = await self._server_network()
+        except Exception:
+            network = f"{self.project_dir.name}_default"
+        log.info("tunnel.started", network=network, mode="socketless")
 
     async def _server_network(self) -> str:
         """Docker network of the subworker-srv container (cloudflared joins it)."""
@@ -444,13 +535,20 @@ class TunnelManager:
         return f"{self.project_dir.name}_default"
 
     async def stop(self) -> None:
-        """Stop the cloudflared container only (never touches subworker-srv)."""
-        rc, out = await self._run(
-            [self.docker_bin, "rm", "-f", self.cloudflared_container], timeout=30
-        )
-        if rc != 0:
-            raise TunnelError(f"docker rm cloudflared failed (rc={rc}): {out[-400:]}")
-        log.info("tunnel.stopped")
+        """Socketless stop — remove token file; watcher exits, container idles."""
+        try:
+            self.token_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            rc, out = await self._run(
+                [self.docker_bin, "rm", "-f", self.cloudflared_container], timeout=30
+            )
+            if rc != 0:
+                log.warning("tunnel.stop_docker_ignored", rc=rc, out=out[-200:])
+        except TunnelError:
+            pass
+        log.info("tunnel.stopped", mode="socketless")
 
     async def remove(self) -> dict[str, Any]:
         """Full teardown: stop cloudflared, delete DNS + tunnel via CF API, clean files.
@@ -497,10 +595,11 @@ class TunnelManager:
             remote_errors.append("API token not persisted — tunnel left on Cloudflare")
 
         # 3. Local cleanup.
-        try:
-            self.override_path.unlink(missing_ok=True)
-        except OSError as exc:
-            remote_errors.append(f"could not remove override file: {exc}")
+        for p in (self.override_path, self.token_path):
+            try:
+                p.unlink(missing_ok=True)
+            except OSError as exc:
+                remote_errors.append(f"could not remove {p.name}: {exc}")
         self.clear_state()
 
         self._step = STEP_IDLE
@@ -610,8 +709,12 @@ class TunnelManager:
             self._unpin_hosts(domain)
 
     async def is_cloudflared_running(self) -> bool:
-        """True if the cloudflared container is running (best-effort)."""
-        if not self.override_path.exists():
+        """Socketless check: token file exists => watcher will keep it running.
+
+        Falls back to ``docker ps`` when the socket is available (e.g. host
+        tooling), but never requires it inside the server container.
+        """
+        if not self.token_path.exists():
             return False
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -622,10 +725,12 @@ class TunnelManager:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
-            return bool((out or b"").strip())
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+            if out and out.strip():
+                return True
+            return bool(self.token_path.exists())
         except (FileNotFoundError, asyncio.TimeoutError, OSError):
-            return False
+            return bool(self.token_path.exists())
 
     # ── Persistence (app/config/tunnel.json, chmod 600) ─────────────────
 

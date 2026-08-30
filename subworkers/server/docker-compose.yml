@@ -21,7 +21,12 @@ services:
       - PROXY_ENABLED=true
       - OPENCODE_CONFIG=/root/.config/opencode/opencode.json
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      # SECURITY: Docker socket intentionally NOT mounted. Mounting it here
+      # gave any subworker agent (running as root in this container) full
+      # host compromise via `docker run -v /:/host`. The tunnel manager's
+      # cloudflared container runs independently with restart: unless-stopped,
+      # so the tunnel stays up without the socket. Tunnel start/stop/remove
+      # via the API now fail gracefully (TunnelError) instead of escalating.
       - ${HOME}/EliaAI/subworkers/server/app/config:/data/config:rw
       - ${HOME}/EliaAI/subworkers:/data/subworkers:rw
       - ${HOME}/EliaAI/subworkers/logs:/data/logs:rw
@@ -38,3 +43,15 @@ services:
       timeout: 5s
       retries: 3
       start_period: 30s
+
+  cloudflared:
+    build:
+      context: .
+      dockerfile: Dockerfile.cloudflared
+    image: server-cloudflared:latest
+    container_name: elia-cloudflared
+    restart: unless-stopped
+    depends_on:
+      - subworker-srv
+    volumes:
+      - ${HOME}/EliaAI/subworkers/server/app/config:/data/config:ro

@@ -28,6 +28,17 @@ function nextProxy(){
 }
 
 const server=http.createServer((req,res)=>{
+  const url = req.url || "";
+  if (url.includes("127.0.0.1") || url.includes("localhost") || url.includes("::1")) {
+    try {
+      const u = new URL(url);
+      const opts = {host: u.hostname, port: u.port || 80, method: req.method, path: u.pathname + u.search, headers: req.headers};
+      const pr = http.request(opts, prs=>{res.writeHead(prs.statusCode, prs.headers); prs.pipe(res);});
+      pr.on('error',e=>{res.writeHead(502); res.end(e.message);});
+      req.pipe(pr);
+      return;
+    } catch {}
+  }
   const p=nextProxy();
   if(!p){ res.writeHead(502); res.end('no pool'); return; }
   console.log(`[forward] ${req.method} ${req.url.slice(0,60)} via ${p.host}`);
@@ -49,6 +60,18 @@ const server=http.createServer((req,res)=>{
 });
 
 server.on('connect', (req, clientSocket, head)=>{
+  const url = req.url || "";
+  if (url.includes("127.0.0.1") || url.includes("localhost") || url.includes("::1")) {
+    const [host, port] = url.split(":");
+    const srv = net.connect(parseInt(port) || 443, host, ()=>{
+      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      if (head && head.length) srv.write(head);
+      srv.pipe(clientSocket); clientSocket.pipe(srv);
+    });
+    srv.on('error',()=>clientSocket.end());
+    clientSocket.on('error',()=>srv.end());
+    return;
+  }
   const p=nextProxy();
   if(!p){ clientSocket.end('HTTP/1.1 502 no pool\r\n\r\n'); return; }
   console.log(`[forward] CONNECT ${req.url} via ${p.host}`);

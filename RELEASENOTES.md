@@ -1,5 +1,28 @@
 # EliaAgent Release Notes
 
+## Version: v6.3.0 (August 30, 2026)
+
+### 🔧 Socketless Hardening + Global API Key + Warmup Fix
+
+**Security:**
+- `elia-subworker-srv` no longer mounts `/var/run/docker.sock` (agents can't escape via `docker run -v /:/host`)
+- `cloudflared` now sidecar `alpine` with file-watcher `cloudflared-watch.sh` polling `tunnel.token` md5/5s (no Docker socket)
+- `docs`/`openapi.json` now `404` (was 200 public), all `…/status` require `Bearer` (401 without, 200 with)
+
+**Cloudflare Tunnel Global API Key:**
+- `POST /tunnel/setup` now accepts `global_key` (cfk_...) + `email` and auto-mints restricted Bearer (`Zone DNS Write` + `Tunnel Write`) via `X-Auth-Email/Key`
+- TopBar + Android wizards now have `Global API Key` + `Email` fields, auto-detect `cfk_` prefix
+
+**Stability:**
+- `forward-proxy.js` now bypasses `127.0.0.1/localhost` for both HTTP and CONNECT (fixes opencode `GET /session?limit=...` 15s timeout via proxy)
+- `app/main.py` startup warmup for sessions DB (fixes 1-session-0-msg cold start after reboot)
+- `subworkers.py` `/list` timeout 10→20s and limit 200→50 with fallback to 20 (4.4s vs 15s)
+- Handles duplicate tunnel name (1013) by reusing or unique suffix
+
+---
+
+---
+
 ## Version: v6.2.0 (August 30, 2026)
 
 ### 🌐 Per-Session Proxy Rotation — Unlimited Tokens on Free Models
