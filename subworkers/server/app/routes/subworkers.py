@@ -610,7 +610,7 @@ def _effective_workspace(sw) -> str:
     container paths; opencode sessions carry host paths)."""
     import os as _os
 
-    root = _os.environ.get("OPENCODE_WORKSPACE", "~/EliaAI")
+    root = _os.environ.get("OPENCODE_WORKSPACE", "/Users/vakandi/EliaAI")
     workspace = sw.workspace
     if not workspace:
         try:
@@ -653,8 +653,15 @@ async def list_subworker_sessions(name: str) -> SessionListResponse:
 
     all_sessions: list[dict] = []
     try:
-        async with OpenCodeClient(server_url, default_timeout=10.0) as client:
-            all_sessions = await client.list_sessions(limit=200)
+        async with OpenCodeClient(server_url, default_timeout=20.0) as client:
+            # Use smaller limit for cold DB (200 times out 15s, 10 is 4.4s). Fetch 50 then filter; if still slow, fallback to 20.
+            try:
+                all_sessions = await client.list_sessions(limit=50)
+            except Exception as e:
+                if "timed out" in str(e).lower():
+                    all_sessions = await client.list_sessions(limit=20)
+                else:
+                    raise
     except Exception as exc:
         logger.warning(
             "sessions.list_opencode_unreachable name=%s error=%s",

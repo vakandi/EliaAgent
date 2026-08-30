@@ -215,6 +215,37 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as exc:
         logger.warning("tunnel.autostart_failed", error=str(exc))
 
+    # Warm sessions DB on startup (prevent 1-session-0-msg cold start after reboot)
+    async def _warm_sessions_db():
+        try:
+            await asyncio.sleep(3)
+            from app.utils.opencode_client import OpenCodeClient
+            import os
+            server_url = os.getenv("OPENCODE_SERVER_URL", "http://127.0.0.1:5655")
+            # Warm opencode directly + server's filtered list
+            try:
+                async with OpenCodeClient(server_url, default_timeout=15.0) as client:
+                    await client.list_sessions(limit=200)
+                    logger.info("warm.sessions_db_done")
+            except Exception as e:
+                logger.warning("warm.sessions_db_failed", error=str(e))
+            # Also warm server's own list endpoint via internal call (no auth needed)
+            try:
+                import httpx
+                async with httpx.AsyncClient(timeout=15.0) as hc:
+                    await hc.get("http://127.0.0.1:5656/health")
+                    logger.info("warm.server_health_done")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    try:
+        import asyncio
+        asyncio.create_task(_warm_sessions_db())
+    except Exception:
+        pass
+
     yield  # ── server is running ──
 
     await _scheduler.stop()
@@ -227,8 +258,9 @@ app = FastAPI(
     title="EliaAI Subworker Server",
     version="0.1.0",
     lifespan=lifespan,
-    docs_url="/docs",
-    redoc_url="/redoc",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
 
 # ── Register Routers ────────────────────────────────────────────────────────

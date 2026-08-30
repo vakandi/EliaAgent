@@ -1,12 +1,12 @@
 # Subworkers System
 
-**Date:** 29 August 2026  
-**Version: 4.2 — per-session proxy rotation — TZ + persistence + manual Continue
+**Date:** 30 August 2026  
+**Version: 4.3 — socketless hardening — docs disabled + Docker socket removed + file-watcher tunnel
 
 > Technical documentation for the autonomous subworker agent system.
 >
-> **Current runtime**: Fully dockerized — Python FastAPI (5656) + OpenCode serve (5655) **in the same container** `elia-subworker-srv`. No host `opencode` process. Timezone synced via `TZ=Africa/Casablanca` (host `+01` = container `+01`; `docker exec date` matches `date` on macOS).
-> **Purpose**: **Save CPU/RAM** (one Colima VM instead of 14 host agents), **security isolation** (agents blocked to `workspace/` via container filesystem + `opencode.json` permissions), **full control** (one `docker compose` owns the whole stack).
+> **Current runtime**: Fully dockerized — Python FastAPI (5656) + OpenCode serve (5655) **in the same container** `elia-subworker-srv` + `elia-cloudflared` sidecar (alpine + `cloudflared-watch.sh` polling `tunnel.token`). No host `opencode` process. Timezone synced via `TZ=Africa/Casablanca` (host `+01` = container `+01`; `docker exec date` matches `date` on macOS).
+> **Purpose**: **Save CPU/RAM** (one Colima VM instead of 14 host agents), **security isolation** (container has **no** `/var/run/docker.sock` mount — agents cannot `docker run -v /:/host` to escape; `opencode.json` permissions still block to `workspace/`), **hardened public surface** (`docs`/`openapi.json` disabled → 404, all `…/status` etc. require `Bearer $ELIA_AUTH_TOKEN`), **full control** (one `docker compose` owns both services).
 > **Previous version**: `SUBWORKERS_SYSTEM_OLD.md` (v3.0 — Node.js trigger + launchd plists, host `opencode` on 4096).
 
 ---
@@ -76,16 +76,23 @@ EliaAI/subworkers/
 ├── SUBWORKERS_SYSTEM_OLD.md      # Previous version (v3.0 — launchd/Node.js era)
 ├── server/                       # ★ PRIMARY RUNTIME (Docker FastAPI server)
 │   ├── Dockerfile                # python:3.12-slim + Node 20 + TZ=Africa/Casablanca
-│   ├── docker-compose.yml        # container elia-subworker-srv, ports 5656→host, 5655 internal, TZ + opencode-data volume
+│   ├── Dockerfile.cloudflared    # alpine + cloudflared binary + watch script (provides /bin/sh for watcher)
+│   ├── docker-compose.yml        # 2 services: elia-subworker-srv (5656→host, 5655 internal) + elia-cloudflared (watcher, no socket)
+│   ├── docker-compose.override.tunnel.yml # marker only — cloudflared now in main compose, not here
 │   ├── opencode-data/            # ← container's opencode DB (2.8M, bind-mounted, persists across docker rm)
 │   ├── requirements.txt
+│   ├── scripts/
+│   │   └── cloudflared-watch.sh  # polls /data/config/tunnel.token (md5 every 5s), restarts cloudflared without Docker API
 │   ├── app/
-│   │   ├── main.py               # FastAPI app, /health endpoint
+│   │   ├── main.py               # FastAPI app, /health endpoint (docs_url=None → 404, not 200)
 │   │   ├── config/
 │   │   │   ├── server.json       # port 5656, opencode URL 5655, alert settings
-│   │   │   └── subworkers.json   # ★ ALL subworker definitions + schedules (14)
+│   │   │   ├── subworkers.json   # ★ ALL subworker definitions + schedules (14)
+│   │   │   ├── tunnel.json       # Cloudflare tunnel state (chmod 600, masked in API)
+│   │   │   ├── tunnel.token      # raw runner token (600, watched by cloudflared)
+│   │   │   └── tunnel.token.env  # TUNNEL_TOKEN=… (600, for env_file compat)
 │   │   ├── routes/               # subworkers.py (incl. POST /sessions/{name}/{id}/continue), server.py, websocket.py
-│   │   ├── services/             # scheduler, runner, session_monitor, health_manager, error_parser, alert_manager
+│   │   ├── services/             # scheduler, runner, session_monitor, health_manager, error_parser, alert_manager, tunnel_manager (socketless)
 │   │   └── utils/                # opencode_client.py, exceptions.py
 │   └── tests/                    # pytest suite
 ├── scripts/
@@ -158,11 +165,11 @@ Create `subworkers/<agent-id>/workspace/opencode.json`:
   },
   "permissions": {
     "read": {
-      "allow": ["~/EliaAI/subworkers/<agent-id>/workspace/**"],
+      "allow": ["/Users/vakandi/EliaAI/subworkers/<agent-id>/workspace/**"],
       "deny": ["**"]
     },
     "write": {
-      "allow": ["~/EliaAI/subworkers/<agent-id>/workspace/**"],
+      "allow": ["/Users/vakandi/EliaAI/subworkers/<agent-id>/workspace/**"],
       "deny": ["**"]
     },
     "execute": {
@@ -190,7 +197,7 @@ Every subworker's PROMPT.md **MUST** include these instructions:
 ```
 ## Workspace Constraint
 You MUST only read and write files inside your `workspace/` folder:
-`~/EliaAI/subworkers/<agent-id>/workspace/`
+`/Users/vakandi/EliaAI/subworkers/<agent-id>/workspace/`
 Never write files outside this folder. All system paths outside workspace/ are blocked.
 
 ## Daily Folders
@@ -365,8 +372,8 @@ Existing running opencode instances cache the agent list at startup — config c
 The universal trigger template (Node.js) handles all subworker launch logic. No per-agent wrapper scripts needed — the launchd plist passes `--agent <name>` directly:
 
 ```xml
-<string>~/.bun/bin/node</string>
-<string>~/EliaAI/subworkers/scripts/trigger_template.js</string>
+<string>/Users/vakandi/.bun/bin/node</string>
+<string>/Users/vakandi/EliaAI/subworkers/scripts/trigger_template.js</string>
 <string>--agent</string>
 <string>my_agent</string>
 ```
@@ -399,7 +406,7 @@ node scripts/trigger_template.js --agent my_agent --force
 
 ```bash
 # Enable loop mode for an agent
-touch ~/EliaAI/subworkers/<agent-id>/.loop_mode
+touch /Users/vakandi/EliaAI/subworkers/<agent-id>/.loop_mode
 ```
 
 ### 5.4 Creating a New Subworker
@@ -515,8 +522,8 @@ mcp-cli list
 
     <key>ProgramArguments</key>
     <array>
-        <string>~/.bun/bin/node</string>
-        <string>~/EliaAI/subworkers/scripts/trigger_template.js</string>
+        <string>/Users/vakandi/.bun/bin/node</string>
+        <string>/Users/vakandi/EliaAI/subworkers/scripts/trigger_template.js</string>
         <string>--agent</string>
         <string><agent_id_with_underscores></string>
     </array>
@@ -534,19 +541,19 @@ mcp-cli list
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>~/.bun/bin:~/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>/Users/vakandi/.bun/bin:/Users/vakandi/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>HOME</key>
-        <string>~</string>
+        <string>/Users/vakandi</string>
     </dict>
 
     <key>WorkingDirectory</key>
-    <string>~/EliaAI</string>
+    <string>/Users/vakandi/EliaAI</string>
 
     <key>StandardOutPath</key>
-    <string>~/EliaAI/subworkers/logs/<agent_name>.log</string>
+    <string>/Users/vakandi/EliaAI/subworkers/logs/<agent_name>.log</string>
 
     <key>StandardErrorPath</key>
-    <string>~/EliaAI/subworkers/logs/<agent_name>.log</string>
+    <string>/Users/vakandi/EliaAI/subworkers/logs/<agent_name>.log</string>
 </dict>
 </plist>
 ```
@@ -554,7 +561,7 @@ mcp-cli list
 ### 7.2 Load & Verify
 
 ```bash
-launchctl load ~/EliaAI/subworkers/plists/com.elia.<agent-id>.plist
+launchctl load /Users/vakandi/EliaAI/subworkers/plists/com.elia.<agent-id>.plist
 launchctl list | grep "com.elia"
 ```
 
@@ -581,18 +588,18 @@ The **primary runtime** is a Python FastAPI server in Docker. It replaces launch
 Fully dockerized — no host `opencode serve` required. `entrypoint.sh` inside the container boots `opencode serve --port 5655 --hostname 127.0.0.1` before FastAPI, clears stale `models.json` cache, and healthchecks both. `TZ=Africa/Casablanca` is baked in (`Dockerfile` ENV + `docker-compose.yml` `environment`) so `docker exec date` matches host.
 
 ```bash
-cd ~/EliaAI/subworkers/server && docker compose up --build   # start (builds opencode binary inside image)
-docker compose down                                          # stop (container only, opencode-data persists)
+cd ~/EliaAI/subworkers/server && docker-compose -f docker-compose.yml -f docker-compose.override.tunnel.yml up -d --build  # builds both images (subworker-srv + cloudflared watcher)
+docker-compose -f docker-compose.yml -f docker-compose.override.tunnel.yml down  # stop both (opencode-data + tunnel.token persist)
 docker restart elia-subworker-srv                            # quick restart — sessions survive via opencode-data volume
-curl http://localhost:5656/health                            # health check → {"status":"ok",...}
-curl http://localhost:5656/models -H "Authorization: Bearer $ELIA_AUTH_TOKEN" | jq .total  # 6 models, no deprecated
+curl --noproxy "*" http://localhost:5656/health              # health check → {"status":"ok",...} (host HTTP_PROXY=104.252.44.225:6155 intercepts localhost without --noproxy)
+curl --noproxy "*" http://localhost:5656/models -H "Authorization: Bearer $ELIA_AUTH_TOKEN" | jq .total  # 6 models, no deprecated
 docker exec elia-subworker-srv date                          # should match host `date` (both +01)
-docker exec elia-subworker-srv curl -sf http://127.0.0.1:5655/global/health  # opencode health inside container
+docker exec elia-subworker-srv sh -c 'curl -sf http://127.0.0.1:5655/global/health'  # opencode health inside container (NO_PROXY=localhost bypasses forward proxy)
 lsof -i :5655 2>/dev/null || echo "host 5655 empty — opencode is inside Docker ✓"
 lsof -i :4096 2>/dev/null || echo "host 4096 empty — legacy port unused ✓"
 ```
 
-Container: `elia-subworker-srv`, `restart: unless-stopped`, ports **5656** (FastAPI host-exposed) + **5655** (opencode internal, not host-published). Healthcheck requires both `GET /health` (5656) and `GET /global/health` (5655). Volumes: `opencode-data` (2.8M) persists container DB, `logs` persists `scheduler_state.json`.
+Containers (socketless, 30/08 hardening): `elia-subworker-srv` (**no** `/var/run/docker.sock` mount — verified `docker inspect … | grep docker.sock` empty; agents cannot escape), `elia-cloudflared` (`server-cloudflared:latest`, `alpine` + watch script, `restart: unless-stopped`). Healthcheck requires both `GET /health` (5656) and `GET /global/health` (5655). Volumes: `opencode-data` (2.8M) persists container DB, `logs` persists `scheduler_state.json`, `tunnel.token` (600) is the watcher trigger.
 
 ### 8.3 Configuration (JSON, hot-reloaded)
 
@@ -601,7 +608,7 @@ Container: `elia-subworker-srv`, `restart: unless-stopped`, ports **5656** (Fast
 | `server/app/config/server.json` | Port (5656), OpenCode server URL (http://127.0.0.1:4096), health-check interval, max restarts, alert settings |
 | `server/app/config/subworkers.json` | All subworker definitions: `name`, `enabled`, `schedule` (`interval` = hours+minute / `cron`), `agent_id`, `max_retries`, `timeout_minutes`, `mcp_servers`, `notify_discord` |
 
-`subworkers.json` currently defines **14 subworkers** (example-agent, your-brand-promoter, your-brand-suppliers, your-agency-promoter, your-saas-seo, your-saas-telegram, your-saas-scraper, your-other-brand-organic, your-other-brand-seo, your-dev-agent, your-content-agent, your-video-agent-organic, your-video-agent-seo).
+`subworkers.json` currently defines **14 subworkers** (example-agent, mirorpay-community-organic, mirrorpay-telegram, bene2luxe-promoter, bene2luxe-suppliers, cobou-promoter, mirorpay-seo, reddit-saas-scraper, teleorbit-community-organic, teleorbit-seo, tempack-dev, tiktok-content, vcam-community-organic, vcam-seo).
 
 ### 8.4 API (localhost, Bearer $ELIA_AUTH_TOKEN)
 
@@ -623,7 +630,7 @@ Container: `elia-subworker-srv`, `restart: unless-stopped`, ports **5656** (Fast
 | POST | `/server/restart` | Restart OpenCode server subprocess |
 | WS | `/ws?token=…` | Live events: `initial_status`, `pong`, `subworker_completed`, `subworker_error` (requires `?token=` or `Authorization: Bearer`) |
 
-Interactive docs: `http://localhost:5656/docs`.
+Interactive docs: **disabled** (`docs_url=None, redoc_url=None, openapi_url=None` → `curl --noproxy "*" http://localhost:5656/docs` → `404`, `openapi.json` → `404`). All `…/status` etc. remain `401` without `Bearer $ELIA_AUTH_TOKEN` / `200` with token; `/health` stays `401`-exempt for Docker healthcheck. Host `HTTP_PROXY=104.252.44.225:6155` intercepts `localhost` — always use `curl --noproxy "*"` for local checks.
 
 ### 8.5 Run Lifecycle
 
@@ -669,7 +676,7 @@ State files:
 
 > **Why this exists:** Free OpenCode Zen models (`opencode/muse-spark-1.2-contributor-free` via `openrouter.ai`) are rate-limited per IP. 14 agents firing at 16:00 on the same IP = instant 429. Per-request proxy rotation gives each concurrent session a **different residential egress IP**, so the fleet scales linearly.
 
-**Verified in production Docker `elia-subworker-srv` (30/08):** `example-agent` → `<proxy-ip>`, `your-saas-seo` → `<proxy-ip>` (distinct via round-robin); `curl -x http://127.0.0.1:3128 https://api.ipify.org` → `<proxy-ip>` vs direct `<direct-ip>`; forward log `CONNECT opencode.ai:443 via <proxy>` proves LLM egress is proxied. Pool direct `httpx` also `PASS`.
+**Verified in production Docker `elia-subworker-srv` (30/08):** `refund-hunter` → `104.238.50.9`, `mirorpay-seo` → `191.101.94.214` (distinct via round-robin); `curl -x http://127.0.0.1:3128 https://api.ipify.org` → `45.39.7.166` vs direct `41.143.90.111`; forward log `CONNECT opencode.ai:443 via <proxy>` proves LLM egress is proxied. Pool direct `httpx` also `PASS`.
 
 | Aspect | Detail |
 |--------|--------|
@@ -682,8 +689,8 @@ State files:
 | **Zombie fix** | Previous `exec uvicorn` made uvicorn PID1 parent of opencode -> `<defunct>` never reaped, `HealthManager manage_process=False` never restarted. Now `tini -g` is PID1 + entrypoint supervisor loop auto-restarts opencode in 2s on OOM/crash. Verified `ps aux` no defunct after `pkill -9 opencode`. |
 | **Routes resilience** | `subworkers.py` `/list` timeout `5s->10s` + warning log, `/sessions` catches `OpenCodeConnectionError` -> 200 empty not 500. Fixes "1 session 0 msg" when opencode is slow (DB list 70s). |
 | **Logs** | `forward-proxy.log` at `/data/logs/forward-proxy.log` (host `~/EliaAI/subworkers/logs/forward-proxy.log`) -> `CONNECT opencode.ai:443 via <proxy>` + `CONNECT models.opencode.ai via <proxy>`. `docker exec elia-subworker-srv cat /data/logs/forward-proxy.log` to tail. |
-| **Failure mode** | Fallback is direct IP `<direct-ip>` (fail-open) if pool empty or forward proxy down. |
-| **Test in prod** | `docker exec elia-subworker-srv curl -x http://127.0.0.1:3128 -s https://api.ipify.org` -> `<proxy-ip>` vs `curl -s https://api.ipify.org` -> `<direct-ip>` (distinct); `docker exec elia-subworker-srv cat /data/logs/forward-proxy.log | grep opencode.ai` shows `CONNECT opencode.ai:443 via <proxy-ip>` etc. |
+| **Failure mode** | Fallback is direct IP `41.143.90.111` (fail-open) if pool empty or forward proxy down. |
+| **Test in prod** | `docker exec elia-subworker-srv curl -x http://127.0.0.1:3128 -s https://api.ipify.org` -> `45.39.7.166` vs `curl -s https://api.ipify.org` -> `41.143.90.111` (distinct); `docker exec elia-subworker-srv cat /data/logs/forward-proxy.log | grep opencode.ai` shows `CONNECT opencode.ai:443 via 191.101.94.214` etc. |
 
 **To re-verify:**
 ```bash
@@ -691,10 +698,41 @@ docker exec elia-subworker-srv cat /data/logs/forward-proxy.log | tail -20  # ev
 curl -x http://127.0.0.1:3128 -s https://api.ipify.org; echo " via proxy"
 curl -s https://api.ipify.org; echo " direct"
 curl http://localhost:5656/health
-curl -s -X POST http://localhost:5656/trigger/your-saas-seo -H "Authorization: Bearer $ELIA_AUTH_TOKEN"
+curl -s -X POST http://localhost:5656/trigger/mirorpay-seo -H "Authorization: Bearer $ELIA_AUTH_TOKEN"
 ```
 
 > **Do NOT use `shell.env` for LLM proxy, do NOT use `fetch({proxy})` patch or plugin (zombie + too late). The Node forward proxy on `127.0.0.1:3128` with `HTTP_PROXY` is the only stable per-request isolation that works with the release binary at 14 concurrent.**
+
+### 8.9 Socketless Hardening (30/08 — Docker escape closed)
+
+> **Threat closed:** `elia-subworker-srv` previously mounted `/var/run/docker.sock:rw` as `root` — any subworker agent could `docker run -v /:/host alpine` and read host `~/.ssh/id_ed25519`, browser cookies, `OPENROUTER_API_KEY`. Proven via `docker exec … docker run --rm -v /:/host alpine ls /host/Users/vakandi/`.
+
+| Aspect | Before | After (socketless) |
+|--------|--------|-------------------|
+| **`docker.sock` mount** | `…:/var/run/docker.sock` in `docker-compose.yml` (rw) | **Removed** — verified `docker inspect elia-subworker-srv | grep docker.sock` empty; `docker-compose config | grep docker.sock` empty |
+| **`cloudflared` control** | `tunnel_manager.start()` → `docker run/rm/inspect` via socket | `tunnel_manager` only writes `app/config/tunnel.token` (600) + marker override; sidecar watches file |
+| **`cloudflared` runtime** | `cloudflare/cloudflared:latest` (distroless, no shell) via `docker run` from inside container | `server-cloudflared:latest` (`Dockerfile.cloudflared`: `alpine` + `cloudflared` binary + `scripts/cloudflared-watch.sh`); `entrypoint: ["/bin/sh", "/usr/local/bin/cloudflared-watch.sh"]`; poll `/data/config/tunnel.token` md5 every 5s, kill+restart internally |
+| **`/docs` / `openapi.json`** | `200` public via `https://elia.surfai.tech/docs` (21 endpoints leaked) | `docs_url=None` → `404` (`curl --noproxy "*" http://localhost:5656/docs` → `404`); all `…/status` etc. `401` without `Bearer` / `200` with token; `/health` stays open |
+| **`/etc/hosts`** | `104.16.231.132 ran-monkey-dim-victorian.trycloudflare.com` ×2 (stale quick-tunnel) | Removed via `sudo sed -i '' '/trycloudflare/d' /etc/hosts` (`osascript` admin) → `0` lines |
+
+**Files added/changed 30/08:**
+- `server/Dockerfile.cloudflared` (8 lines, `alpine` + `ca-certificates` + `COPY --from=src`)
+- `server/scripts/cloudflared-watch.sh` (executable, `TOKEN_FILE=/data/config/tunnel.token`, `md5sum` poll 5s)
+- `server/app/config/tunnel.token` + `tunnel.token.env` (`TUNNEL_TOKEN=…`, both `600`, seeded from `tunnel.json`)
+- `server/app/services/tunnel_manager.py` — `TOKEN_FILE_NAME="tunnel.token"`, `token_path` prop, `write_compose_service()` → writes token file + marker override, `start()`/`stop()` socketless (no `docker run`), `is_cloudflared_running()` = `token_path.exists()` fallback
+- `server/app/main.py` — `FastAPI(..., docs_url=None, redoc_url=None, openapi_url=None)`
+- `server/docker-compose.yml` — removed `/var/run/docker.sock`, added `cloudflared` service (`build: Dockerfile.cloudflared`, `volumes: /data/config:ro`, `depends_on: subworker-srv`)
+
+**Verification:**
+```bash
+docker inspect elia-subworker-srv --format '{{range .Mounts}}{{.Destination}} {{end}}' | tr ' ' '\n' | grep -qi docker && echo FAIL || echo "no sock OK"
+curl --noproxy "*" -o /dev/null -w "%{http_code}" http://localhost:5656/docs          # 404
+curl --noproxy "*" -o /dev/null -w "%{http_code}" http://localhost:5656/status       # 401
+source server/.env; curl --noproxy "*" -H "Authorization: Bearer $ELIA_AUTH_TOKEN" -o /dev/null -w "%{http_code}" http://localhost:5656/status  # 200
+grep -c trycloudflare /etc/hosts || echo "0 trycloudflare OK"
+docker logs elia-cloudflared 2>&1 | grep "^\[watch\]" | head  # [watch] watcher started …
+docker compose -f docker-compose.yml -f docker-compose.override.tunnel.yml config | grep -qi docker.sock && echo FAIL || echo OK
+```
 
 ---
 
@@ -769,7 +807,7 @@ bun install -g oh-my-opencode
 - **Both UIs fully control who is MAIN:**
   - **ui_electron subworker popup** — MAIN badge + ★/✕ edit button (`POST /main-agent`)
   - **EliaTopBar** — ★ marker on the agent row + "Set/Unset as Main Agent" in the submenu
-- The main agent runs with the **repo root** (`~/EliaAI`) as workspace instead of an isolated `subworkers/<name>/workspace/` — resolved at run time by `SubworkerRunner._read_main_agent_name()`. Unsetting falls back to `elia`.
+- The main agent runs with the **repo root** (`/Users/vakandi/EliaAI`) as workspace instead of an isolated `subworkers/<name>/workspace/` — resolved at run time by `SubworkerRunner._read_main_agent_name()`. Unsetting falls back to `elia`.
 
 ### 11.2 PROMPT.md location
 
