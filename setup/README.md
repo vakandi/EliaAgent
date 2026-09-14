@@ -378,9 +378,9 @@ curl http://localhost:5656/health                            # health check
 **Configure schedules** in `subworkers/server/app/config/subworkers.json` — each subworker has a `schedule_type` (cron, interval, or manual) and `schedule` expression. Toggle enabled/disabled via ColimaBar menu bar or the API:
 
 ```bash
-curl -X POST http://localhost:5656/enable/refund-hunter     # enable
-curl -X POST http://localhost:5656/disable/refund-hunter    # disable
-curl -X POST http://localhost:5656/trigger/refund-hunter    # run now
+curl -X POST http://localhost:5656/enable/my-agent     # enable
+curl -X POST http://localhost:5656/disable/my-agent    # disable
+curl -X POST http://localhost:5656/trigger/my-agent    # run now
 ```
 
 **Main agent (Elia)** voice/UI triggers still use `trigger_template.js` directly — not the Docker server.
