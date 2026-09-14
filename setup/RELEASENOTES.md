@@ -187,7 +187,7 @@ This release includes a comprehensive scrub of all sensitive data for the public
 - **Open allowlist** — Custom agents join teams by default
 - **Rebuild script** — `scripts/rebuild-oh-my-openagent.sh` for oh-my-openagent rebuilds
 - **Clean templates** — All business references replaced with generic placeholders
-- **4 generic subworker examples** — refund-hunter, social-media, code-review, data-pipeline
+- **4 generic subworker examples** — your-example-agent, social-media, code-review, data-pipeline
 
 ### Companion Repos
 

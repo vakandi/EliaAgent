@@ -100,7 +100,7 @@ The script writes `comments.xml`, `commentsExtended.xml`, `commentsIds.xml`, `co
 A local converter at `~/EliaAI/tools/md_to_docx.js` converts markdown to a styled DOCX (headings, tables with DXA widths, bullet lists, inline bold/italic/links/code, horizontal rules). Tables follow the gotcha rules above (ShadingType.CLEAR, WidthType.DXA, columnWidths).
 
 ```bash
-cd ~/EliaAI/subworkers/refund-hunter/workspace/docx-node && NODE_PATH=./node_modules node ~/EliaAI/tools/md_to_docx.js input.md output.docx
+cd ~/EliaAI/subworkers/my-agent/workspace/docx-node && NODE_PATH=./node_modules node ~/EliaAI/tools/md_to_docx.js input.md output.docx
 ```
 
 Style: header white bg + bold text, zebra striping, 1pt grey borders, cell padding. The script outputs `{"success":true,"file":"…","blocks":N}`.
@@ -124,4 +124,4 @@ Appending to an existing doc with formatted tables is not supported by the Googl
 
 ## Dependencies
 
-`docx` (npm, preinstalled at `~/EliaAI/subworkers/refund-hunter/workspace/docx-node/node_modules` — install only if `require('docx')` fails) · `pandoc` · LibreOffice (`soffice`) · `pdftoppm` (Poppler) · Google Workspace OAuth (`~/.config/gws/oauth_credentials.json`)
+`docx` (npm, preinstalled at `~/EliaAI/subworkers/my-agent/workspace/docx-node/node_modules` — install only if `require('docx')` fails) · `pandoc` · LibreOffice (`soffice`) · `pdftoppm` (Poppler) · Google Workspace OAuth (`~/.config/gws/oauth_credentials.json`)

@@ -676,7 +676,7 @@ State files:
 
 > **Why this exists:** Free OpenCode Zen models (`opencode/muse-spark-1.2-contributor-free` via `openrouter.ai`) are rate-limited per IP. 14 agents firing at 16:00 on the same IP = instant 429. Per-request proxy rotation gives each concurrent session a **different residential egress IP**, so the fleet scales linearly.
 
-**Verified in production Docker `elia-subworker-srv` (30/08):** `refund-hunter` → `104.238.50.9`, `mirorpay-seo` → `191.101.94.214` (distinct via round-robin); `curl -x http://127.0.0.1:3128 https://api.ipify.org` → `45.39.7.166` vs direct `41.143.90.111`; forward log `CONNECT opencode.ai:443 via <proxy>` proves LLM egress is proxied. Pool direct `httpx` also `PASS`.
+**Verified in production Docker `elia-subworker-srv` (30/08):** `example-agent` → `104.238.50.9`, `mirorpay-seo` → `191.101.94.214` (distinct via round-robin); `curl -x http://127.0.0.1:3128 https://api.ipify.org` → `45.39.7.166` vs direct `41.143.90.111`; forward log `CONNECT opencode.ai:443 via <proxy>` proves LLM egress is proxied. Pool direct `httpx` also `PASS`.
 
 | Aspect | Detail |
 |--------|--------|

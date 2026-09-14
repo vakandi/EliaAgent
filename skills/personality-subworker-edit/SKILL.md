@@ -19,7 +19,7 @@ Available subworker personalities (matching `subworkers/<name>/`):
 - `your-saas-seo`
 - `mirrorpay-telegram`
 - `reddit-saas-scraper`
-- `refund-hunter`
+- `your-example-agent`
 - `your-telecom-community-organic`
 - `your-telecom-seo`
 - `vcam-community-organic`

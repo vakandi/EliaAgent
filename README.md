@@ -34,7 +34,7 @@ EliaAgent turns OpenCode into a **self-managed fleet of autonomous subworkers** 
 | 🌍 **Remote access** | Built-in Cloudflare Tunnel wizard — reach your fleet from anywhere, protected by a shared auth token |
 | ∞ **Unlimited tokens** | Free OpenCode Zen models + rotating residential proxies = effectively unlimited autonomous work (see [Proxy Rotation](#-unlimited-tokens--proxy-rotation)) |
 
-> 💡 The flagship proof: `refund-hunter` has been hunting e-commerce refund policies **every day for months**, writing reports to Google Docs and handing off state to its next shift — without a single human prompt.
+> 💡 The flagship proof: production subworkers run **every day for months**, writing reports and handing off state to the next shift — without a single human prompt.
 
 ---
 

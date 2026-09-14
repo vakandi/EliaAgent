@@ -376,7 +376,7 @@ Le fichier `.omo/omo.jsonc` utilisait le format oh-my-openagent (423 lignes, ave
 
 - System agents: sisyphus, sisyphus-junior, hephaestus, prometheus, oracle, metis, momus, atlas, explore, librarian, multimodal-looker
 - Business agents: elia, your-agent, your-agent, your-agent, your-brand, your-agency, your-saas, tiktok-youtube-auto, tiktok-content, your-saas, account-verification, your-saas, your-saas, markov, markov-fundamental-analyst, markov-technical-analyst
-- Subworkers: your-promoter, your-brand-promoter, your-brand-suppliers, your-telegram, your-saas-assistant, your-saas-community-organic, your-saas-seo, googlebot, reddit-saas-scraper, roger, your-telecom-seo, your-telecom-community-organic, your-community, your-seo, refund-hunter, prompt-enhancer
+- Subworkers: your-promoter, your-brand-promoter, your-brand-suppliers, your-telegram, your-saas-assistant, your-saas-community-organic, your-saas-seo, googlebot, reddit-saas-scraper, roger, your-telecom-seo, your-telecom-community-organic, your-community, your-seo, your-example-agent, prompt-enhancer
 
 ### Pourquoi pas de `prompt_append` dans `oh-my-openagent.jsonc`
 
