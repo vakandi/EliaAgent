@@ -20,6 +20,8 @@ services:
       - LOG_DIR=/data/logs
       - PROXY_ENABLED=true
       - OPENCODE_CONFIG=/root/.config/opencode/opencode.json
+      - IDLE_TIMEOUT=300
+      - IDLE_CHECK_INTERVAL=30
     volumes:
       # SECURITY: Docker socket intentionally NOT mounted. Mounting it here
       # gave any subworker agent (running as root in this container) full
@@ -37,6 +39,15 @@ services:
       - ${HOME}/EliaAI/subworkers/server/opencode-data:/root/.local/share/opencode:rw
       # Share configuration only. Never share the *same* DB file with host TUI.
       - ${HOME}/.config/opencode:/root/.config/opencode:rw
+      # Host MCP parity — same mcp-cli inside as outside (read-only so
+      # agents can't overwrite host secrets).
+      - ${HOME}/.config/mcp/mcp_servers.json:/root/.config/mcp/mcp_servers.json:ro
+      # Host MCP code (~/Documents, read-only) — exposes host Documents at
+      # the IDENTICAL path so the mounted mcp_servers.json resolves without
+      # copies or config edits. Source == destination on purpose: point the
+      # left side at your own folder, or delete these lines if you don't
+      # want host MCPs in-container. uv-based (.venv) and macOS-binary
+      # servers stay host-only by design (see docs §8.10).
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:5656/health && curl -sf http://localhost:5655/global/health"]
       interval: 10s

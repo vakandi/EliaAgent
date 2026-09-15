@@ -76,6 +76,18 @@ COPY app/proxy-patch.js /app/proxy-patch.js
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
+# uv (astral) — lets uv-based MCP servers from the mounted host config
+# spawn in-container. Last layers on purpose: keeps cache on rebuilds.
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
+    ln -sf /root/.local/bin/uv /usr/local/bin/uv && \
+    ln -sf /root/.local/bin/uvx /usr/local/bin/uvx
+ENV PATH="/root/.local/bin:${PATH}"
+
+# agent-browser CLI (headless Linux) + headless Chromium with OS deps —
+# agents browse without any host browser wrapper or profile.
+RUN npm install -g agent-browser && \
+    npx -y playwright install --with-deps chromium
+
 EXPOSE 5656 5655
 
 HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
