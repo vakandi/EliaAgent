@@ -1,7 +1,7 @@
 # Subworkers System
 
-**Date:** 30 August 2026  
-**Version: 4.3 — socketless hardening — docs disabled + Docker socket removed + file-watcher tunnel
+**Date:** 15 September 2026  
+**Version: 4.4 — host MCP parity — Documents RO mount + uv layer, tier list verified
 
 > Technical documentation for the autonomous subworker agent system.
 >
@@ -504,6 +504,10 @@ pkill -f mcp && mcp-cli &
 mcp-cli list
 ```
 
+> **Container note:** this same file is bind-mounted read-only into
+> `elia-subworker-srv` (`/root/.config/mcp/mcp_servers.json:ro`), with host
+> `~/Documents` alongside it — see §8.10 for which servers run where.
+
 ---
 
 ## 7. LaunchAgent Setup (LEGACY)
@@ -644,6 +648,12 @@ Interactive docs: **disabled** (`docs_url=None, redoc_url=None, openapi_url=None
 6. On failure: retry with exponential backoff; on session crash: resume with `--continue`
 7. Real-time updates broadcast via WebSocket; logs → `logs/runs/{name}/YYYYMMDD_HHMMSS.log`
 
+### 8.5b Concurrency (no waiting list by design)
+
+- `MAX_CONCURRENT_RUNS` caps simultaneous subworker executions (semaphore in `app/services/scheduler.py`). Default is **2** — anything above the cap queues invisibly (`running:true`, no session yet).
+- The fleet is designed for full parallelism: each run gets its own opencode session + isolated `workspace/`, and per-request proxy rotation gives each concurrent session a different egress IP (§8.8). So the cap is set to **100** via `docker-compose.yml` (`MAX_CONCURRENT_RUNS=100`) — effectively no queue for the 20-agent fleet.
+- Raising the cap increases concurrent load on the container-local opencode server (5655) and the 4 GB container memory limit — watch both before going above 100.
+
 > **Fully dockerized — no host `opencode` process.** The container's `entrypoint.sh` boots `opencode serve --port 5655` **inside the same container** before FastAPI, so `OPENCODE_SERVER_URL` is `http://127.0.0.1:5655` (container-local). `oh-my-openagent` plugins, `~/.config/opencode/`, and `~/.config/omo/` are bind-mounted read-only into the container and loaded by the container's opencode at startup. Host `opencode` is not used and should not be running on 4096/5655.
 
 ### 8.6 Tests & Dev
@@ -733,6 +743,30 @@ grep -c trycloudflare /etc/hosts || echo "0 trycloudflare OK"
 docker logs elia-cloudflared 2>&1 | grep "^\[watch\]" | head  # [watch] watcher started …
 docker compose -f docker-compose.yml -f docker-compose.override.tunnel.yml config | grep -qi docker.sock && echo FAIL || echo OK
 ```
+
+### 8.10 Host MCP Parity (Documents mount + uv) — 15/09
+
+Agents shelling out to `mcp-cli call ...` inside the container now see the
+same servers as the host — zero copies, zero config edits.
+
+| Piece | Where | What |
+|-------|-------|------|
+| Global config | `docker-compose.yml` → `/root/.config/mcp/mcp_servers.json:ro` | Same `mcp-cli` server list inside as outside (pre-existing mount) |
+| Host code | `docker-compose.yml` → `${HOME}/Documents:${HOME}/Documents:ro` | Host `~/Documents` (mcps_server, zernio, Markov…) at the IDENTICAL path, so config paths resolve. A bind-mount is pure path mapping — macOS paths are just strings to Linux. Source == destination on purpose so other repo users' own paths resolve too (re-point the left side or delete the lines) |
+| `uv` runtime | `Dockerfile` (last layer, cache-preserving) | Astral installer + `/usr/local/bin` symlinks, so uv-based servers can spawn |
+
+**Verified 15/09 inside `elia-subworker-srv` (read-only calls):** `parallel-browser-mcp get_sessions → []`, `deploymates-dashboard list_sprints {"team_id": 3}` → real sprints, `zernio zernio_get_accounts` → 4/4 accounts.
+
+**Tier list (kept simple on purpose):**
+
+| Tier | Status | Why |
+|------|--------|-----|
+| npx-based (parallel-browser, reddit…) | ✅ work | nothing needed |
+| plain `python3` + container deps (deploymates…) | ✅ work | `Documents` mount only |
+| node script at host path (zernio…) | ✅ work | `Documents` mount only |
+| uv-based (discord, vision, twitter…) | ❌ host-only | macOS `.venv` can't execute on Linux; per-server shadowing (tmpfs → noexec, named volumes + egg-info stand-ins) tried and reverted — too complex for the value |
+| macOS-binary (`.venv` pythons, nvm node: whatsapp, gmail…) | ❌ host-only | needs container-native rebuild, out of scope |
+| headless browser (`agent-browser` CLI) | ✅ works | npm package + Playwright ARM64 Chromium baked in image (`Dockerfile`); host wrapper (darwin binary + `/Applications` Chrome + macOS profile) NOT portable — agents run headless with an in-container profile |
 
 ---
 

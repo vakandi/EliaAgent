@@ -1,5 +1,39 @@
 # EliaAgent Release Notes
 
+## Version: v6.4.0 (September 15, 2026)
+
+### 🚀 Host MCP Parity + Full-Parallel Fleet + Headless Browser
+
+**No more tool excuses:**
+- Host `~/Documents` mounted read-only at the identical path — every `npx`,
+  plain-`python3`, and node MCP server resolves in-container with zero copies
+  and zero config edits; `uv` runtime added to the image
+- Verified live inside the container: parallel-browser sessions, dashboard
+  sprints, multi-account social stats — read-only calls tested green
+- `agent-browser` CLI (headless) + Playwright ARM64 Chromium baked into the
+  image — agents browse without any host browser wrapper or profile
+- Tier list documented (`SUBWORKERS_SYSTEM.md` §8.10): `uv`-based and
+  macOS-binary servers stay host-only by design
+
+**Full parallelism (the "same process" bug):**
+- `MAX_CONCURRENT_RUNS` raised to 100 — scheduled agents no longer queue
+  invisibly behind a cap of 2 (`running:true` with no session); each run gets
+  its own opencode session + isolated workspace + rotated egress IP, so the
+  whole fleet fires at the same slot without stepping on each other
+
+**Fresh-start recovery:**
+- Full Docker nuke path verified (VM disk 98% → 0% free): scheduler state,
+  session DB, and run logs all survive via bind-mounts; stack rebuilds clean
+  with `docker-compose up -d --build`
+
+**Idle cleaner (new `app/services/idle_cleanup.py`):**
+- When all enabled subworkers sit idle past `IDLE_TIMEOUT` (300s), the server
+  kills stale `parallel-browser-mcp` + headless Chrome processes that eat
+  container RAM — no more OOM-kills from leftover browser instances; opencode
+  restarts automatically if cleanups pile up (`IDLE_CHECK_INTERVAL=30`)
+
+---
+
 ## Version: v6.3.0 (August 30, 2026)
 
 ### 🔧 Socketless Hardening + Global API Key + Warmup Fix

@@ -23,6 +23,7 @@ from app.routes.server import router as server_router
 from app.routes.tunnel import router as tunnel_router
 from app.routes.websocket import router as ws_router
 from app.services.health_manager import DEFAULT_HOST, DEFAULT_PORT, HealthManager
+from app.services.idle_cleanup import IdleCleanupManager
 from app.services.runner import SubworkerRunner
 from app.services.scheduler import SubworkerScheduler
 
@@ -203,6 +204,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         job_count=len(_config_manager.subworkers),
     )
 
+    # Idle cleanup — kills stale parallel-browser-mcp + Chrome processes
+    # when all enabled subworkers are idle for IDLE_TIMEOUT seconds.
+    _idle_cleanup = IdleCleanupManager(
+        _scheduler,
+        _health_manager,
+        idle_timeout=int(os.environ.get("IDLE_TIMEOUT", "300")),
+        check_interval=int(os.environ.get("IDLE_CHECK_INTERVAL", "30")),
+    )
+    await _idle_cleanup.start()
+    logger.info("idle_cleanup.started")
+
     # Tunnel permanence — a previously configured tunnel must survive any
     # docker restart / down-up cycle: bring cloudflared back automatically.
     try:
@@ -248,6 +260,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     yield  # ── server is running ──
 
+    await _idle_cleanup.stop()
     await _scheduler.stop()
     logger.info("server.shutdown")
 
