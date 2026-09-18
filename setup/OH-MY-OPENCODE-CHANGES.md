@@ -791,3 +791,183 @@ grep -c "hard-reject" ~/.bun/install/global/node_modules/oh-my-opencode/dist/ind
 | `packages/team-core/src/types.ts` | Registry: removed all `eligible` entries, kept `hard-reject` + `conditional` only |
 | `packages/team-core/src/member-parser.ts` | `translateMemberError`: unknown agents pass through (open-allowlist) |
 | `packages/team-core/src/team-registry/validator.ts` | `UNKNOWN_SUBAGENT_MESSAGE`: updated to denylist wording |
+---
+
+## Fix #14 (August 28, 2026) — Patch the copy opencode ACTUALLY loads
+
+**Critical discovery:** prior fixes edited the global bun install
+(`~/.bun/install/global/node_modules/oh-my-opencode`) and the source tree
+(`setup/oh-my-openagent`), but the bare `"oh-my-openagent"` plugin entry in
+`~/.config/opencode/opencode.json` resolves to opencode's **own package cache**:
+
+```
+~/.cache/opencode/packages/node_modules/oh-my-openagent/dist/index.js
+(version 4.19.4 — a published npm copy, NOT the local dev source at version 4.17.0)
+```
+
+That cached `dist/index.js` (mtimes Aug 1) still contained the OLD allowlist bug:
+
+```js
+const eligibility = AGENT_ELIGIBILITY_REGISTRY[member.subagent_type];
+if (!eligibility) {
+  throw new TeamSpecValidationError(UNKNOWN_SUBAGENT_MESSAGE.replace("<name>", member.subagent_type),
+    "UNKNOWN_SUBAGENT_TYPE", "subagent_type", member.name);
+}
+if (eligibility.verdict === "hard-reject") { throw ... }
+```
+
+So any custom agent (your-agent / your-agent / your-agent / elia / your-promoter …) NOT in
+`AGENT_ELIGIBILITY_REGISTRY` was thrown as `UNKNOWN_SUBAGENT_TYPE` and could never join
+a team — silently explaining why team mode kept failing despite the global/source fixes.
+
+**Fix applied:** surgically removed the `if (!eligibility) { throw UNKNOWN_SUBAGENT_TYPE }`
+block from the cached `dist/index.js`, leaving only the denylist check:
+`if (eligibility && eligibility.verdict === "hard-reject") { throw ... }`.
+
+Backup saved alongside as `index.js.bak-<timestamp>`. Verified with `node --check`
+(SYNTAX OK) and confirmed the validator body matches the fixed source.
+
+**Two other registry use-sites checked and left as-is (correct for the test scenario):**
+- `lifecycle-create-tool.ts` team_create caller check: `callerRegistryEntry?.verdict === "hard-reject"`
+  — unknown callers (e.g. `sisyphus`) pass as allowed to create teams. OK.
+- `resolve-caller-team-lead.ts`: `if (!eligibility || … === "hard-reject")` returns
+  `isEligibleForTeamLead: false` for unknown agents — but `sisyphus` is `eligible`, so the
+  sisyphus-lead test scenario is unaffected. OK.
+
+> ⚠️ GOTCHA: this cache is managed by opencode and may be re-materialized/overwritten on a
+> future package reinstall. To re-apply after any reinstall, re-run the same edit, or better,
+> point the plugin entry at the fixed local dev build. Rebuilding the 4.17.0 source alone does
+> NOT help because opencode loads the published 4.19.4.
+
+---
+
+## Fix #15 — Team Mode: Real Agent Names + `availableAgents` on `team_create` (2026-08-31)
+
+### Symptom
+
+Team Mode was described as "perfect, all agents have `muse-spark` model" but in practice every member ran as `sisyphus`:
+
+- `team_create({ inline_spec: { members: [{ subagent_type: "your-agent" }] } })` either failed historically with `Unknown subagent_type 'your-agent'` (allowlist era) or succeeded only after falling back to `kind: "category"` — which always routes through `sisyphus-junior` by design, so all members collapsed to the same agent.
+- No discovery: `team_create` returned only `{ teamRunId, runtimeState }` and its `subagent_type` description said `Any non-hard-reject agent is eligible by default` with zero custom examples. LLM had to guess → guessed `sisyphus`.
+- Verified 2026-08-31 smoke test: 6 custom members (`your-agent`, `your-agent`, `markov-fundamental-analyst`, `your-agent`, `your-saas-community-organic`, `googlebot`) now spawn correctly, but still no `availableAgents` in the tool output before this fix.
+
+### Root Cause — three layers
+
+| Layer | File | Before |
+|-------|------|--------|
+| Eligibility docs | `packages/team-core/src/types.ts` `AGENT_ELIGIBILITY_REGISTRY` comment + `packages/omo-opencode/src/features/team-mode/AGENTS.md` table | Said `eligible: sisyphus, atlas, sisyphus-junior — Three only` — reader assumes customs illegal, even though code is open-allowlist (only 7 `hard-reject` + 1 `conditional` blocked, unknowns pass) |
+| Tool description | `packages/omo-opencode/src/features/team-mode/tools/lifecycle-create-tool.ts` `subagent_type` field | `Required for subagent_type members. Any non-hard-reject agent is eligible by default.` — true but not actionable, no custom names |
+| Tool output | `lifecycle-create-tool.ts` `execute` return | `JSON.stringify({ teamRunId, runtimeState })` — no agent discovery, so `task`-style error message `Available: ...` was the only discovery path (on failure, not success) |
+
+- `AGENT_DISPLAY_NAMES` hardcodes 13 names (`sisyphus`…`council-member`); `getAgentConfigKey`/`normalizeAgentForPrompt` fall back to `trim().toLowerCase()` for unknowns, so `your-agent` survives but loses display mapping — not a blocker.
+- `team-runtime/resolve-member.ts` → `subagent-agent-match.ts` already enumerates live agents via `client.app.agents()` + `mergeWithClaudeCodeAgents(dir)` (`subagent-discovery.ts`) and matches with `findCallableAgentMatch`. If custom is registered in `opencode.json` (`agent.your-agent` etc., all `opencode/muse-spark-1.2-contributor-free` today), it resolves. `kind: "category"` path is intentionally hard-wired to `sisyphus-junior` — not a bug, but explains why the `category` workaround always produced `sisyphus-junior`.
+
+### Fix Applied
+
+**1. New helper `packages/omo-opencode/src/features/team-mode/team-runtime/available-agents.ts`**
+
+```ts
+export async function getAvailableAgentsForTeam(client, directory, userCategories)
+  -> { availableAgents: [{ name, displayName, mode, model }], availableCategories: string[] }
+```
+
+Merges `client.app.agents()` + `loadUserAgents()` + `loadProjectAgents()` via `mergeWithClaudeCodeAgents`, filters `hidden` + `hard-reject` (`AGENT_ELIGIBILITY_REGISTRY[lower] === "hard-reject"`), sorts by name. Catches `client.app.agents()` failures → `[]`.
+
+**2. `lifecycle-create-tool.ts` — input docs + output**
+
+```diff
+- subagent_type: "...Any non-hard-reject agent is eligible by default."
++ subagent_type: "...Any non-hard-reject agent is eligible, including custom agents from opencode.json (e.g. your-agent, elia, your-agent, your-agent, your-brand). Hard-reject agents (oracle, librarian, explore, multimodal-looker, metis, momus, prometheus) are blocked — use task() instead."
+...
++ const { availableAgents, availableCategories } = await getAvailableAgentsForTeam(client, projectRoot, executorConfig?.userCategories).catch(() => ({availableAgents:[], availableCategories:[]}))
++ return JSON.stringify({ teamRunId, runtimeState: sanitizeRuntimeState(runtimeState), availableAgents, availableCategories })
+```
+
+**3. `lifecycle-inline-spec.ts`**
+
+```diff
+- TEAM_CREATE_USAGE = "team_create requires exactly one of teamName or inline_spec. Use ... members: [{ name: \"worker\", category: \"quick\" }] })."
++ TEAM_CREATE_USAGE = "... members: [{ name: \"worker\", category: \"quick\" }, { name: \"backend-dev\", subagent_type: \"your-agent\" }] }). subagent_type accepts any non-hard-reject agent including custom agents (your-agent, elia, your-agent, your-agent, your-brand). Returns {teamRunId, runtimeState, availableAgents, availableCategories}."
+```
+
+Error message for invalid `inline_spec` also shows second example with `your-agent`.
+
+**4. `packages/team-core/src/types.ts` + `AGENTS.md`**
+
+- Added `// @allow` public-API doc above `AGENT_ELIGIBILITY_REGISTRY`: open-allowlist, custom examples, `task()` fallback for hard-reject.
+- `AGENTS.md` eligibility table: replaced `eligible: Three only` with `open: any custom or builtin not listed below — e.g. your-agent, elia…` + note that `team_create` returns `availableAgents`.
+- Member kinds example added `your-agent` subagent_type member.
+
+### Design Decisions
+
+- Additive return shape only (`availableAgents`, `availableCategories` new keys) — no breaking change for existing `teamRunId`/`runtimeState` parsers.
+- Denylist stays 7 `hard-reject` + 1 `conditional`; no `eligible` entries. Custom agents need only be in `~/.config/opencode/opencode.json` (`agent.<name>` + `~/.config/opencode/agents/<name>.md`) to be discovered — no registry edit.
+- Discovery on success, not just on `Unknown agent` error — avoids trial-and-error.
+
+### Build & QA
+
+- `bun run typecheck` (tsgo) — PASS (full workspace, including `team-core` + `omo-opencode`).
+- `bun test ./packages/omo-opencode/src/features/team-mode/tools/lifecycle.test.ts` — 3 pre-existing failures on `main` (unrelated to this change, same count before/after), `team-core` helper still TODO for dedicated test.
+- Live smoke test 2026-08-31: `team_create` inline_spec with 6 customs (`your-agent`, `your-agent`, `markov-fundamental-analyst`, `your-agent`, `your-saas-community-organic`, `googlebot`) → all 7 runtimes `status: running` with correct `subagent_type`; broadcast + `team_task_create` + shutdown/approve/delete succeeded. `availableAgents` not yet in running cache (requires `npm install -g oh-my-openagent` cache bust + opencode restart); eligibility itself verified.
+
+### Files Modified
+
+| File | Change |
+|------|--------|
+| `packages/omo-opencode/src/features/team-mode/team-runtime/available-agents.ts` | **New** — discovery helper |
+| `packages/omo-opencode/src/features/team-mode/tools/lifecycle-create-tool.ts` | Docs + `availableAgents` output |
+| `packages/omo-opencode/src/features/team-mode/tools/lifecycle-inline-spec.ts` | Usage string + error example |
+| `packages/team-core/src/types.ts` | Registry doc (`// @allow`) |
+| `packages/omo-opencode/src/features/team-mode/AGENTS.md` | Eligibility table + member example |
+
+### Rebuild & Deploy
+
+Same as Fix #14 `scripts/rebuild-oh-my-openagent.sh` (clears `~/.cache/opencode/packages/oh-my-openagent*`, builds ESM bundle, patches shim, deploys to bun cache + global). Restart opencode to pick up new `team_create` output shape.
+
+### Remaining TODO
+
+- Add dedicated `available-agents.test.ts` (mock `client.app.agents()` + `loadUserAgents`).
+- Consider also returning `availableAgents` from `team_list`/`team_status` for consistency (deferred).
+
+> ⚠️ Same GOTCHA as Fix #14: the `~/.cache/opencode/packages/node_modules/oh-my-openagent/dist/index.js` copy is the one opencode loads (4.19.4). Re-apply this fix there after any `npm` cache regeneration or point plugin entry to fixed local build.
+
+---
+
+## Fix #16 — Team Mode: Multiple Teams per Session (2026-09-18)
+
+### Symptom
+
+Second `team_create` from the same lead session denied: `team_create denied: session is already a participant of team ...`. Verified absent upstream too (5.0.0-beta.72, same guard + same single-entry Map) — nothing to import. Plan: `docs/2026-09-18/team-multi-team-plan.md`.
+
+### Root Cause — two guards + single-entry registry
+
+| Location | Block |
+|----------|-------|
+| `team-session-registry.ts` (`Map<string, TeamSessionEntry>`) | 2nd `registerTeamSession(leadSessionId)` overwrote the 1st |
+| `tools/lifecycle-create-tool.ts:94-96` | tool-level denial for any participant session |
+| `hooks/team-tool-gating/hook.ts:102-108` | hook-level denial before the tool (missed by first plan draft) |
+
+### Fix Applied
+
+- **Registry → array**: `Map<string, TeamSessionEntry[]>`, new `lookupTeamSessions()`, `lookupTeamSession(id, teamRunId?)`, scoped `unregisterTeamSession(id, teamRunId?)`. Identical re-register deduped. Synchronous (spawn-race invariant kept).
+- **Create guard → member-only**: deny iff session is a non-leader member of any team (`agentType !== "leader"` excludes lead-reuse entries). Exact-duplicate retries stay idempotent via `findExistingRuntime` in `create.ts`.
+- **Hook → member-wins**: member entry anywhere denies (nested teams stay forbidden); lead/fresh sessions pass.
+- **`findParticipantRuntimes()`** (plural) added; singular kept as first-match wrapper. `resolveParticipant` and `resolveTeamRuntimeDetails` scoped by `teamRunId`. `member-session-resolution`, tasks, messaging, shutdown, query, live-delivery verified multi-ready, unchanged.
+- **Tests**: registry multi-entry/dedup/scoped-unregister; 2nd team allowed; member denial (tool + hook); lead 2nd-team allowed. `completion.test.ts` expectation flipped (unknown child status is NOT idle, fix #4).
+
+### Pretequis retrouvé en cours de route
+
+Fixes #1–#10 were GONE from the tree (re-sync wiped them: timeout back to 2s, consecutive 1, no `eventProcessorDied`). Re-applied before this fix. Deviations: #3 log uses literal `30s` (no `as any`, repo ban); #8/#9 reuse `getSessionId()` from `event-session-ids.ts` (`isMainSessionEvent` no longer existed, recreated).
+
+### Verification
+
+- `bun test` team-mode 4 files: 72 pass, 3 fail — same 3 pre-existing on pristine tree (stash-verified, cf. Fix #15).
+- `bun test cli/run`: 196/196. `bun run typecheck`: PASS.
+- Deployed plugin bundle (multi-team markers ×3 locations) + rebuilt CLI bundles (`eventProcessorDied` in both). Backups: `/tmp/omo-backup-20260918/`. Evidence: `setup/oh-my-openagent/.omo/evidence/20260918-multi-team/unit-gates.md`.
+- `scripts/rebuild-oh-my-openagent.sh` died at preflight (stale `oh-my-opencode@*` cache pattern); pattern extended to `oh-my-openagent@*`, manual deploy used.
+
+### Follow-up — hook target-aware resolution + live test (same day)
+
+**Found live:** `team_task_create` on teams B/C denied (`not a participant`) while team A worked — the gating hook resolved only the FIRST matching team, so every universal tool (`team_task_*`, `team_send_message`, `team_status`, `team_delete`…) ran against team A. Fix: `resolveParticipant(sessionID, config, teamRunId?)` — with an explicit `teamRunId` it resolves that team's role directly (registry entry, else that team's runtime); without it, member-wins across all teams. Deployed bundle #2, opencode restarted.
+
+**Live test 3 teams (one session):** `multi-test-a/b/c` created (3 `teamRunId`), one file task each → `/tmp/multiteam-a/b/c.txt` all exact, all tasks completed, closure sequence per team (request + approve + delete), `team_list` → `[]`. Multi-team verified end-to-end; nested teams still denied.
