@@ -1,0 +1,15 @@
+# Residential proxy pool — PLACEHOLDER.
+#
+# The qwen forward proxy reads this file at /data/proxies.txt inside the
+# `qwen` container (see docker-compose.yml) and rotates LRU, oldest-unused
+# first, with a forced swap every 4 minutes and on any 429.
+# Copy to ./proxies.txt and fill with real entries.
+# NEVER commit a filled proxies.txt — it holds host:port:user:pass.
+#
+# Line format: host:port:user:pass      (text after a `|` is ignored)
+# Unparsable and blank lines are skipped. An empty pool is NOT fatal: the
+# proxy fails open and uses a direct connection.
+#
+# --- EXAMPLE (documentation IPs — not a working proxy) ---
+198.51.100.10:8000:REPLACE_WITH_USER:REPLACE_WITH_PASS
+198.51.100.11:8000:REPLACE_WITH_USER:REPLACE_WITH_PASS

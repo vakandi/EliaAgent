@@ -1,0 +1,139 @@
+name: subworkers-qwen
+
+# EliaAI subworkers-qwen — Qwen-variant side-by-side stack.
+# Ground rule: NOTHING here touches EliaAI/subworkers/ (server, compose, DB,
+# logs, tunnel), elia-subworker-srv / elia-cloudflared containers, or the
+# live ports. Rollback = delete this folder.
+#
+# Port map: shim 5676 HTTP; qwen 4170 loopback-only (never published except
+# to the shim via the internal network); proxy-local 18898 lives on the host.
+
+services:
+  shim:
+    build: ./shim
+    container_name: elia-subworker-qwen-shim
+    restart: unless-stopped
+    # Measured budget: qwen peak 464MiB for 15 sessions, shim is plain FastAPI.
+    mem_limit: 2g
+    memswap_limit: 2g
+    env_file:
+      - ./shim/.env
+    environment:
+      - TZ=Africa/Casablanca
+      - PORT=5676
+      - QWEN_URL=http://qwen:4170
+      - CONFIG_DIR=/data/config
+      - SUBWORKERS_DIR=/data/subworkers-qwen
+      - LOG_DIR=/data/logs
+      - MAX_CONCURRENT_RUNS=8
+      # Same egress as the host (proven working path): everything via the
+      # host zen gateway; loopback + compose peers bypass it.
+      - HTTP_PROXY=http://host.docker.internal:18898
+      - HTTPS_PROXY=http://host.docker.internal:18898
+      - http_proxy=http://host.docker.internal:18898
+      - https_proxy=http://host.docker.internal:18898
+      - NO_PROXY=localhost,127.0.0.1,::1,qwen,shim
+      - no_proxy=localhost,127.0.0.1,::1,qwen,shim
+    ports:
+      - "127.0.0.1:5676:5676"
+    volumes:
+      # SECURITY: Docker socket intentionally NOT mounted (same rationale as
+      # the current server compose — a compromised agent must not reach the
+      # host daemon). Tunnel start/stop via the API fails gracefully instead.
+      - ./shim/app/config:/data/config:rw
+      - ./workspaces:/data/subworkers-qwen:rw
+      - ./logs:/data/logs:rw
+      - ./shim/app/config/subworkers.json:/data/config/subworkers.json:ro
+      # Runbook + system doc referenced by rewritten PROMPT paths (verified
+      # secret-free: placeholders only). Read-only like everything static.
+      - ./docs:/data/subworkers-qwen/docs:ro
+      # NOTE (2026-09-20): host .config + auth bind-mounts REMOVED — the
+      # mounted host plugins/config poison in-container runs (72s Bad Gateway
+      # deaths). Engine runs clean-HOME keyless (proven PONG26 in 4.4s).
+      # If logins are ever needed in-container, copy single files instead.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:5676/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      - qwen
+
+  qwen:
+    build: ./qwen
+    container_name: elia-qwen-srv
+    restart: unless-stopped
+    mem_limit: 2g
+    memswap_limit: 2g
+    env_file:
+      - ./qwen/.env
+    environment:
+      - TZ=Africa/Casablanca
+    # Native Qwen key (DASHSCOPE_API_KEY) reaches the daemon via env_file
+    # ./qwen/.env only — deliberately NOT repeated here: an `environment:`
+    # entry would override the env_file value with the host's (usually
+    # empty). See qwen/.env NATIVE block for the zero-code-change light-up.
+    # Internal-only: reachable via the compose network (shim QWEN_URL);
+    # NO host publish — avoids clashing with the qwen-case test container
+    # (:4170) and keeps the daemon off the host. Debug via shim or exec.
+    expose:
+      - "4170"
+    volumes:
+      - ./workspaces/workspace-digest:/srv/case/workspace-digest:rw
+      - ./workspaces/seo-auditor:/srv/case/seo-auditor:rw
+      - ./workspaces/claims-monitor:/srv/case/claims-monitor:rw
+      - ./workspaces/app-factory:/srv/case/app-factory:rw
+      - ./workspaces/qa-gate:/srv/case/qa-gate:rw
+      - ./workspaces/storefront-social:/srv/case/storefront-social:rw
+      - ./workspaces/supplier-scout:/srv/case/supplier-scout:rw
+      - ./workspaces/supplier-research:/srv/case/supplier-research:rw
+      - ./workspaces/agency-social:/srv/case/agency-social:rw
+      - ./workspaces/vuln-researcher:/srv/case/vuln-researcher:rw
+      - ./workspaces/payments-risk:/srv/case/payments-risk:rw
+      - ./workspaces/elia:/srv/case/elia:rw
+      - ./workspaces/community-telegram:/srv/case/community-telegram:rw
+      - ./workspaces/community-social:/srv/case/community-social:rw
+      - ./workspaces/supplier-scout-eu:/srv/case/supplier-scout-eu:rw
+      - ./workspaces/community-research:/srv/case/community-research:rw
+      - ./workspaces/sweep-claims-monitor:/srv/case/sweep-claims-monitor:rw
+      - ./workspaces/store-claims-monitor:/srv/case/store-claims-monitor:rw
+      - ./workspaces/product-engager:/srv/case/product-engager:rw
+      - ./workspaces/product-seo:/srv/case/product-seo:rw
+      - ./workspaces/dev-helper:/srv/case/dev-helper:rw
+      - ./workspaces/test-agent:/srv/case/test-agent:rw
+      - ./workspaces/short-video-content:/srv/case/short-video-content:rw
+      - ./workspaces/mobile-engager:/srv/case/mobile-engager:rw
+      - ./workspaces/mobile-seo:/srv/case/mobile-seo:rw
+      - qwen-sessions:/srv/case/.qwen-sessions:rw
+      # SAME residential pool as live Elia (read-only): container-local
+      # forward-proxy.js rotates it (LRU + 4-min timer, no quarantine).
+      - ${HOME}/EliaAI/setup/proxies.txt:/data/proxies.txt:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf -H \"Authorization: Bearer $$QWEN_SERVER_TOKEN\" http://localhost:4170/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: elia-qwen-cloudflared
+    restart: unless-stopped
+    depends_on:
+      - shim
+    environment:
+      - TZ=Africa/Casablanca
+    # Same sidecar pattern as elia-cloudflared: shim binds loopback, the
+    # watcher below starts cloudflared when tunnel.token appears (written by
+    # POST /tunnel/setup). No Docker socket anywhere. Start explicitly:
+    #   docker compose --profile tunnel up -d cloudflared
+    entrypoint: ["sh", "/scripts/cloudflared-watch.sh"]
+    volumes:
+      - ./scripts/cloudflared-watch.sh:/scripts/cloudflared-watch.sh:ro
+      - ./shim/app/config:/data/config:rw
+    profiles: ["tunnel"]
+
+volumes:
+  qwen-sessions:
+  shim-opencode-data:

@@ -1,0 +1,44 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "zen-free": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "zen-free (proxy-local gateway)",
+      "options": {
+        "baseURL": "http://host.docker.internal:18898/zen/v1",
+        "apiKey": "public"
+      },
+      "models": {
+        "muse-spark-1.3-contributor-free": { "name": "muse-spark-1.3-contributor-free" },
+        "muse-spark-1.2-contributor-free": { "name": "muse-spark-1.2-contributor-free" },
+        "big-pickle": { "name": "big-pickle" },
+        "jev-1.13-free": { "name": "jev-1.13-free" },
+        "deepseek-v4-flash-free": { "name": "deepseek-v4-flash-free" },
+        "mimo-v2.5-free": { "name": "mimo-v2.5-free" },
+        "ling-3.0-flash-fin-free": { "name": "ling-3.0-flash-fin-free" },
+        "nemotron-3-ultra-free": { "name": "nemotron-3-ultra-free" },
+        "nemotron-3.5-lightning-free": { "name": "nemotron-3.5-lightning-free" }
+      }
+    }
+  },
+  "mcp": {
+    "context7": {
+      "type": "local",
+      "command": ["npx", "-y", "@upstash/context7-mcp"],
+      "enabled": true
+    },
+    "duckduckgo": {
+      "type": "local",
+      "command": ["npx", "-y", "duckduckgo-mcp-server"],
+      "enabled": true
+    },
+    "parallel-browser-mcp": {
+      "type": "local",
+      "command": ["npx", "-y", "parallel-browser-mcp@latest"],
+      "enabled": true,
+      "environment": {
+        "BROWSER_MCP_CONFIG": "{\"defaultProvider\":\"playwright\",\"providers\":{\"playwright\":{\"launchOptions\":{\"headless\":true}}}}"
+      }
+    }
+  }
+ }
