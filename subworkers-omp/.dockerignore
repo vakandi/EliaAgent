@@ -1,0 +1,16 @@
+# Build context is the repo root; the image needs only the Bun workspace
+# closure + the omp-server/ entrypoint. (The classic builder reads THIS file;
+# Dockerfile.dockerignore documents the same intent for buildx.)
+.git/
+**/node_modules/
+**/dist/
+**/target/
+**/.cache/
+**/*.node
+subworkers/
+omp-server/data/
+omp-server/crates/
+omp-server/assets/
+omp-server/nix/
+omp-server/docs/
+!omp-server/packages/natives/native/pi_natives.linux-*.node

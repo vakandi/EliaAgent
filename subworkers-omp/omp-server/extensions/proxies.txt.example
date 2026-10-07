@@ -1,0 +1,16 @@
+# Residential proxy pool for the proxy-local extension — PLACEHOLDER.
+#
+# Copy to omp-server/extensions/proxies.txt (this exact directory: the extension
+# resolves `${EXT_DIR}/proxies.txt`) and fill with real entries. NEVER commit a
+# filled proxies.txt — it holds host:port:user:pass credentials.
+#
+# Line format (the ` |` cells after the first are optional metadata):
+#   host:port:user:pass |last:YYYY-MM-DD HH:MM:SS |dur:12s
+#
+# `last:` is what the LRU rotation sorts on — the oldest-unused entry is handed to
+# the next run, so N concurrent runs spread across N distinct egress IPs.
+# Blank lines and unparsable lines are skipped.
+#
+# --- EXAMPLE (documentation IPs — not a working proxy) ---
+198.51.100.10:8000:REPLACE_WITH_USER:REPLACE_WITH_PASS
+198.51.100.11:8000:REPLACE_WITH_USER:REPLACE_WITH_PASS |last:2026-10-07 09:00:00 |dur:8s

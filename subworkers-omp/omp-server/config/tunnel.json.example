@@ -1,0 +1,13 @@
+{
+  "_comment": "PLACEHOLDER — copy to tunnel.json and fill from your own Cloudflare account. NEVER commit a filled tunnel.json: it holds a live API token and a tunnel token.",
+  "domain": "your-agent-host.example.com",
+  "tunnel_id": "00000000-0000-0000-0000-000000000000",
+  "account_id": "00000000000000000000000000000000",
+  "zone_id": "00000000000000000000000000000000",
+  "record_id": "00000000000000000000000000000000",
+  "api_token": "REPLACE_WITH_CLOUDFLARE_API_TOKEN",
+  "tunnel_token": "REPLACE_WITH_CLOUDFLARE_TUNNEL_TOKEN",
+  "note": "The tunnel sidecar reads only config/tunnel.token (chmod 600); tunnel.json is the server-side record POST /tunnel/setup writes.",
+  "created_at": null,
+  "updated_at": null
+}

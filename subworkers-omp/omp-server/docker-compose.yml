@@ -1,0 +1,79 @@
+services:
+  omp-server:
+    build:
+      context: ..
+      dockerfile: omp-server/Dockerfile
+    ports:
+      - "5677:5677"
+    environment:
+      HOST: 0.0.0.0
+      PROXY_LOCAL_NO_SPAWN: "1"
+      ELIA_PROXY_LOG: /srv/omp-server/data/proxy-local.log
+      ELIA_AUTH_TOKEN: ${ELIA_AUTH_TOKEN:?set ELIA_AUTH_TOKEN}
+      MAX_CONCURRENT_RUNS: "8"
+      STALL_TIMEOUT_S: ${STALL_TIMEOUT_S:-300}
+      MAX_RUN_S: ${MAX_RUN_S:-3600}
+      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
+    env_file:
+      - path: ./.env
+        required: false
+    mem_limit: 6g
+    volumes:
+      - ./data:/srv/omp-server/data
+      - ../subworkers:/srv/omp-server/subworkers:rw
+      # Repo skills for all subworkers (SDK ancestor scan finds subworkers/.omp/skills).
+      - ../.omp/skills:/srv/omp-server/subworkers/.omp/skills:ro
+      - ./config:/srv/omp-server/config:rw
+      # Your subworker workspaces. This is where PROMPT.md + memory live per agent.
+      - ${SUBWORKERS_DIR:-${HOME}/elia/subworkers}:/data/subworkers:ro
+      # Personas + models + MCP config for OMP. Mounted :rw so a persona or model
+      # edit goes live on the next run with no rebuild.
+      - ${HOME}/.omp/agent:/root/.omp/agent:rw
+      # Host MCP registry (read-only: agents must not be able to overwrite host secrets).
+      - ${HOME}/.config/mcp/mcp_servers.json:/root/.config/mcp/mcp_servers.json:ro
+      # proxy-local extension inputs (residential forward for the free model tier).
+      - ${HOME}/.proxychains.conf:/root/.proxychains.conf:ro
+
+      # ── OPTIONAL: your own MCP servers ─────────────────────────────────────
+      # mcp-cli itself is BAKED into the image (linux build) — never bind-mount the
+      # host ~/.local/bin/mcp-cli here: it is a macOS Mach-O and fails with
+      # "exec format error" inside the container.
+      #
+      # python/node stdio servers resolve host-absolute paths, so mount them at the
+      # SAME path inside the container:
+      #   - ${HOME}/mcps:/Users/you/mcps:ro
+      #
+      # A server that persists state MUST get its state dir re-mounted :rw (the
+      # deeper path wins, server code stays :ro) — otherwise the write fails EROFS
+      # and the agent does the work then forgets it recorded:
+      #   - ${HOME}/mcps/<server>/history:/Users/you/mcps/<server>/history:rw
+      #
+      # Any OAuth token mount MUST be :rw — libraries refresh the token in place and
+      # a headless container cannot run the interactive re-auth fallback:
+      #   - ${HOME}/.config/gws:/root/.config/gws:rw
+      #
+      # A browser-profile mount is usually a DIFFERENT platform build than the
+      # container's runtime needs; keep the container's own copy instead:
+      #   - ${HOME}/.patchright-browsers:/root/.patchright-browsers:rw
+    # Hide host global skills: subworkers see ONLY repo .omp/skills.
+    tmpfs:
+      - /root/.omp/agent/skills
+    restart: unless-stopped
+    # NOTE: no docker.sock mount — tunnel sidecar (tunnelWatch.sh) runs on the host.
+
+  # Cloudflare tunnel sidecar — same contract as live server-cloudflared:
+  # consumes the runner token written by POST /tunnel/setup to
+  # omp-server/config/tunnel.token (chmod 600). Opt-in: only starts with
+  # `docker compose --profile tunnel up -d` (or start.sh --with-tunnel),
+  # so a missing token never crash-loops the default stack.
+  # No docker.sock mount anywhere.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run --token-file /etc/cloudflared/token
+    volumes:
+      - ./config/tunnel.token:/etc/cloudflared/token:ro
+    depends_on:
+      - omp-server
+    restart: unless-stopped
+    profiles:
+      - tunnel
