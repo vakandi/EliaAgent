@@ -1,5 +1,193 @@
 # EliaAgent Release Notes
 
+## Version: v6.5.0 (October 7, 2026)
+
+### 🔀 Harness Parity — the same fleet on two more engines
+
+The reference server runs OpenCode inside FastAPI. That was the only engine.
+This release adds **two more harnesses that speak the identical TopBar
+contract**, so the same agent registry, schedules, personas and clients run
+unchanged on a different runtime:
+
+- **`subworkers-qwen/`** — a lighter side-by-side stack. A FastAPI **shim** on
+  `:5676` that drives `opencode run --format json` as a subprocess, with a Qwen
+  daemon kept as a dormant sidecar on internal `:4170`. Same 25-agent shape,
+  same routes, smaller footprint.
+- **`subworkers-omp/`** — a **Bun/TypeScript** re-implementation of the server
+  on the [omp](https://github.com/can1357/oh-my-pi) SDK (`createAgentSession`).
+  **Zero Python.** Listens on `:5677`.
+
+Both are side-by-side. The reference server keeps running on `:5655`/`:5656`,
+and neither new harness touches it.
+
+```bash
+cd subworkers-qwen && docker-compose up -d --force-recreate shim qwen
+cd subworkers-omp && ./install.sh && ./start.sh --docker
+# then: EliaTopBar -> Change Server URL -> http://127.0.0.1:5677  (or :5676)
+```
+
+**What is *not* committed here.** `subworkers-omp` ships the Elia wrapper layer
+only — upstream omp (`omp-server/packages`, `crates`, `assets`, ~180 MB, MIT) is
+fetched by `install.sh` at the pinned ref `78b7531` via sparse checkout, so the
+public repo stays at 408 KB instead of 184 MB. Pass `--skip-upstream` if you
+already have the checkout. Agent workspaces, prompts, personas, memories, the
+auth store and the session DB are excluded from both harnesses; both ship a
+randomized 5-agent registry and one worked example so the schema is obvious.
+
+---
+
+### Compatibility matrix
+
+Verified by reading the shipped routers, not by assumption.
+
+**Transport**
+
+- Reference: FastAPI + uvicorn on `:5656`, `opencode serve` on `:5655`
+- `subworkers-qwen`: FastAPI + uvicorn on `:5676`, engine = `opencode run`
+  subprocess, `qwen` daemon internal `:4170` (expose-only), forward proxy
+  internal `:3128`, attest shim internal `:3129`
+- `subworkers-omp`: `Bun.serve` on `:5677`, engine = omp SDK in-process
+
+**Auth** — identical on all three
+
+- HTTP: `Authorization: Bearer <token>` or `X-Elia-Token: <token>`
+- WebSocket: `?token=` or the two headers above (omp also accepts
+  `Sec-WebSocket-Protocol`)
+- Exempt: `/health` only. Empty `ELIA_AUTH_TOKEN` disables the check — loopback only.
+
+**REST routes** — reference, qwen and omp all implement
+
+`GET /health` · `GET /server/health` · `GET /status` · `GET /status/{name}` ·
+`PUT /status/{name}` · `POST /trigger/{name}` · `POST /enable/{name}` ·
+`POST /disable/{name}` · `POST /config/reload` · `GET /logs/{name}` ·
+`GET /sessions/{name}` · `GET /sessions/{name}/list` ·
+`POST /sessions/{name}/{id}/continue` · `GET /sessions/{name}/{id}/events` ·
+`GET /models` · `GET/POST /main-agent` · `POST /server/restart` ·
+`POST /server/cleanup` · `GET /tunnel/status` · `POST /tunnel/check` ·
+`POST /tunnel/setup` · `POST /tunnel/stop` · `POST /tunnel/remove` · `WS /ws`
+
+Harness-specific extras (not required by the client):
+
+- omp only: `POST /sessions/{name}/{id}/stop`, `POST /test/frames/{name}`
+  (synthetic `text|reasoning|tool` frames, no engine, no credentials)
+- qwen only: `GET /daemon/status`, `POST /check`, `POST /setup`, `POST /stop`,
+  `POST /remove`
+
+**WebSocket events** — where the two harnesses actually differ
+
+| Event | reference | qwen | omp |
+|---|---|---|---|
+| `initial_status` | ✅ | ✅ | ✅ |
+| `run_log` (+ `field`) | ✅ | ✅ | ✅ |
+| `run_banner` | ✅ | ✅ | ✅ |
+| `subworker_completed` | ✅ | ✅ | ✅ |
+| `status_update` | ✅ | ❌ | ✅ |
+| `subworker_started` | ✅ | ❌ | ✅ |
+| `subworker_success` | ✅ | ❌ | ✅ |
+| `subworker_cancelled` | ✅ | ❌ | ✅ |
+| `subworker_error` | ✅ | ⚠️ `subworker_failed` | ✅ |
+| `models_version` | ✅ | ❌ | ✅ |
+| `pong` | ✅ | ❌ | ✅ |
+
+**Read that table before pointing TopBar at `:5676`.** The qwen shim's routes are
+a path-for-path mirror, but its event vocabulary is not: it emits five event
+names, not eleven. Clients that render *live agent state* from `status_update`
+or *run outcome colour* from `subworker_success` will fall back to polling
+`GET /status` and will paint a failed run with the completed-run styling.
+`subworkers-omp` is the parity-complete one. This is a documented gap in the
+harness, not in the contract — `SubworkerManager.swift` remains the client of
+record.
+
+**Registry schema** — identical in all three `subworkers.json`
+
+`name` · `enabled` · `schedule{type: interval|every|cron, hours, minute, days,
+every, expression}` · `prompt_file` · `workspace` · `agent_id` · `model` ·
+`variant` · `max_retries` · `timeout_minutes` · `proxy_enabled` · `mcp_servers[]`
+· `notify_discord`. `days` is cron convention, `0 = Sunday`.
+
+**Models** — the provider id differs by harness, and getting it wrong fails silently
+
+- Reference + qwen: `opencode/<model>` through the baked `opencode.json`
+  (`provider: zen-free`)
+- omp: `zen-free/<model>` from your own `~/.omp/agent/models.yml`
+- **An unknown model id is not an error.** The run starts, completes in seconds
+  and emits zero frames, because the turn falls back to the default provider
+  model. Triage in this order: `data/frames/<session>.jsonl` (prompts only?) →
+  `/root/.omp/logs/omp.*.log` (which `provider/model` actually ran?) → the
+  registry entry. Never blame a provider key before that chain.
+- omp: an entry on `opencode/*` rather than `zen-free/*` is a known live-config
+  bug fixed in the shipped template.
+
+**Scheduler** — omp adds cron; all three support `interval`, `every`, and
+clock-aligned hours. `next_run` persists in `data/state.json`.
+
+**Concurrency and admission**
+
+- reference: `MAX_CONCURRENT_RUNS=100`; over-cap runs previously queued invisibly
+- qwen: `MAX_CONCURRENT_RUNS=8` (default)
+- omp: `MAX_CONCURRENT_RUNS=8`, hard cap 100 → over cap answers HTTP **202**
+  `{"status":"queued_429"}`. `admitRun()` fsyncs the run record **before**
+  responding, so a 202 is durable, not advisory.
+
+**Stall and run ceilings** — same two knobs, same names
+
+`STALL_TIMEOUT_S` (300) with no frames → mark failed + error banner + notify.
+`MAX_RUN_S` (3600) absolute → mark failed. Neither harness uses an RSS-cap gate;
+the container `mem_limit` is the only memory guard (a cap gate fought the OOM
+killer and lost).
+
+**Proxy rotation**
+
+- reference: Node forward proxy on `127.0.0.1:3128`, round-robin per request
+- qwen: same shape, plus a 4-minute forced LRU swap and `POST /__rotate`; a 429
+  rotates egress and retries once, then reports `queued_429`
+- omp: **in-process** `extensions/proxy-local.ts`, vendored and loaded per
+  worker — no forwarding daemon, no extra container. Oldest-unused entry wins,
+  forced 4-minute swap, and after a rate-limit error it swaps proxy *and* sends
+  a continuation message so the run carries on. Model traffic is proxied; agent
+  tool shells stay direct. Pool: `omp-server/extensions/proxies.txt`
+  (`host:port:user:pass |last:<ts>`). Empty pool fails open to direct.
+- All three fail open when the pool is empty or the proxy is down.
+
+**Tunnel** — socketless everywhere
+
+No `docker.sock` mount in any of the three. Cloudflared is a sidecar polling
+`config/tunnel.token` (mode 600) on an md5/5s file watcher. A missing token never
+crash-loops the default stack: the sidecar is opt-in (`--profile tunnel`, or
+`start.sh --with-tunnel`). Docker socket access would let any agent
+`docker run -v /:/host alpine` and read host SSH keys and cookies.
+
+**Frame model** — one shape across harnesses
+
+`field ∈ text | reasoning | tool`. Tool frames carry **name + status only, never
+payloads**. An abrupt SSE close is a clean EOF, never a 500.
+
+**Secrets layout**
+
+- reference / qwen: `.env` (mode 600), gitignored
+- omp: `omp-server/.env`, `config/tunnel.json`, `config/tunnel.token`,
+  `extensions/proxies.txt`, `data/` — all gitignored; `.example` files shipped
+  for each
+
+---
+
+### Upgrade notes
+
+- **Nothing to migrate.** Both harnesses are additive. Existing
+  `subworkers/server/` deployments, configs, workspaces and sessions are
+  untouched by this release.
+- `install.sh` gained `--skip-upstream`. Without it, `install.sh` fetches
+  upstream omp on first run; with an existing checkout it detects the source and
+  skips the clone. Existing installs are unaffected.
+- The shipped `subworkers.json` in both new harnesses is a **randomized
+  5-agent template**. Replace it with your own registry — it is not the
+  production roster.
+- **Model ids in the templates are examples.** Validate each one against your
+  `opencode.json` / `models.yml` before enabling an agent, per the silent-fallback
+  behaviour above.
+
+---
+
 ## Version: v6.4.0 (September 15, 2026)
 
 ### 🚀 Host MCP Parity + Full-Parallel Fleet + Headless Browser
