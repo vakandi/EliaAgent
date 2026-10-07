@@ -1,6 +1,6 @@
 # EliaAgent Release Notes
 
-## Version: v6.5.0 (October 7, 2026)
+## Version: v6.6.0 (October 7, 2026)
 
 ### 🔀 Harness Parity — the same fleet on two more engines
 
