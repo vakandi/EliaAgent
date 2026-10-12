@@ -1,15 +1,32 @@
-.venv/
-__pycache__/
-*.pyc
+# Rust
+/target/
+**/*.rs.bk
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Env / secrets
 .env
-*.egg-info/
-dist/
-build/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-logs/
-opencode-data/
-opencode-data/*.db
-opencode-data/*.db-shm
-opencode-data/*.db-wal
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# TypeScript reference implementation (1.1GB) — read-only reference, never committed
+.old/
+
+# Plugin (omo) runtime state written into the repo root during test runs
+.omo/
+
+# Working scratchpad / notepad
+.ulw/

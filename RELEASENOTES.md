@@ -1,5 +1,76 @@
 # EliaAgent Release Notes
 
+## Version: v7.0.0 (October 12, 2026)
+
+### 🦀 The fleet moves to Rust
+
+This is a ground-up replacement of the server core, and the first release where
+the runtime is **no longer Python or Docker at all**.
+
+Through v6, the session engine under every subworker was **TypeScript**. Three
+design choices in it were the problem:
+
+- conversation history was held **in RAM** for the life of the session
+- the full tool schema set was **re-derived on every LLM step**
+- per-directory instance state (MCP servers, LSP servers, plugins) was
+  **unbounded and never evicted** — every new directory paid the full cost again
+
+Docker did not fix that. It **contained** it. v6's README advertised "4 GB RAM ≈
+thousands of sessions" because a cgroup had to be allocated to stop the process
+from taking the machine with it.
+
+On a MacBook Pro M5, five teams of five agents pinned the CPU at **99%** and the
+laptop became unusable. That was the ceiling — not the workload.
+
+**v7 replaces the engine with a Rust server** (OpenCodeRust, 21 crates under
+`subworkers/server/crates/`). History spills to SQLite. Request bodies stream.
+Tool schemas are cached per `(model, tool-set)`. Instance state is pooled by
+config hash with LRU+TTL eviction. One static binary, no container runtime, no
+Colima, no cgroup memory cap — and nothing left to leak.
+
+### 📊 Measured: 100 concurrent sessions
+
+Reproduce with `subworkers/server/scripts/loadtest.py --n 100` — it fires N
+sessions at the server simultaneously and samples RSS every 250 ms.
+
+- **78 MB peak RSS** (from a 15 MB baseline)
+- **0.63 MB growth per session** — 1.3% of a 6 GB budget
+- **RSS returns to 18 MB after the run** — memory is released, not retained
+- **CPU**: a single 75% spike at the instant all 100 fire, then 0% idle
+  (~1.9% average across the run)
+
+For scale: the TypeScript engine's *worst measured single session* was 290 MB.
+100 Rust sessions cost 63 MB.
+
+**⚠️ The caveat, stated plainly.** That run used an isolated config with no API
+key, so every prompt returned `401` and streaming tool calls were never
+exercised. The 78 MB covers **session creation and dispatch**, not full
+conversation history. Sessions carrying long transcripts will cost more. We
+publish the number we measured, not a flattering one we didn't.
+
+### 🔧 Changed
+
+- `install_subworkers.sh` now checks the Rust toolchain and runs
+  `cargo build --release`. No Colima, no `docker-compose build`.
+- `start_subworkers.sh` launches the Rust binary directly in tmux.
+- `kill_subwokers_dockers.sh` removed.
+- The Python/FastAPI server, its Dockerfile, compose files, entrypoint and
+  `requirements.txt` are gone from `subworkers/server/`.
+- Removed `tunnel.token`, `tunnel.token.env` and `app/mcp_servers.json`, which
+  were tracked in git and should never have been.
+
+### ⚠️ Breaking
+
+- **Requires the Rust toolchain** (`rustup`). This is a real prerequisite change
+  for anyone installing from source.
+- **Port contract unchanged** — the fleet still answers on `:5656`, and clients
+  (EliaTopBar, EliaAndroidApp, Electron UI) need no changes.
+- Sessions created by v6's TypeScript engine are not readable by the Rust
+  engine's in-memory layout. Long-running fleets should expect to re-seed
+  workspaces from their handoff files.
+
+---
+
 ## Version: v6.6.0 (October 7, 2026)
 
 ### 🔀 Harness Parity — the same fleet on two more engines

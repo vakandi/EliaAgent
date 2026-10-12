@@ -2,15 +2,18 @@
 # start_subworkers.sh — start the full subworker stack in tmux.
 # Same proven flow as ~/Desktop/EliaUI.command:
 #   session "opencode-serve" : OpenCode server (port 4096), crash-isolated
-#   session "elia-ui"        : 3 panels — Docker subworker logs / Discord bot / Electron UI
-#
-# The Docker container is persistent: killing this launcher does NOT stop it.
+#   session "elia-ui"        : 3 panels — Rust server logs / Discord bot / Electron UI
+
+set -euo pipefail
 
 SESSION="elia-ui"
 SERVER_SESSION="opencode-serve"
+SUBWORKER_SESSION="elia-subworker-srv"
 SUBWORKER_HEALTH_URL="http://localhost:5656/health"
 
 ELIA_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+LOG_FILE="$ELIA_ROOT/logs/subworkers-rust.log"
+mkdir -p "$ELIA_ROOT/logs"
 
 INSIDE_TMUX=false
 if [[ -n "$TMUX" ]]; then
@@ -45,31 +48,25 @@ if ! tmux has-session -t "$SERVER_SESSION" 2>/dev/null; then
     fi
 fi
 
-# ── 2. Ensure Docker daemon (Colima) is running ─────────────────────────
-if ! docker info >/dev/null 2>&1; then
-    echo "[subworkers] Docker daemon not reachable — starting Colima..."
-    colima start --runtime docker 2>&1 | tail -3
-    sleep 3
-    if ! docker info >/dev/null 2>&1; then
-        echo "[subworkers] FATAL: Docker daemon still not reachable after colima start"
-        exit 1
-    fi
+# ── 2. Ensure the Rust release binary exists ─────────────────────────────
+RUST_BIN="$ELIA_ROOT/subworkers/server/target/release/opencode"
+if [[ ! -x "$RUST_BIN" ]]; then
+    echo "[subworkers] First run — building the Rust release binary..."
+    (cd "$ELIA_ROOT/subworkers/server" && cargo build --release --bin opencode)
 fi
+[[ -x "$RUST_BIN" ]] || { echo "[subworkers] FATAL: build produced no binary"; exit 1; }
 
-# ── 3. Build container image if missing ─────────────────────────────────
-if ! docker images --format '{{.Repository}}' | grep -q "server-subworker-srv"; then
-    echo "[subworkers] First run — building subworker server image..."
-    (cd "$ELIA_ROOT/subworkers/server" && docker-compose build)
-fi
-
-# ── 4. Ensure the subworker server container is up ───────────────────────
+# ── 3. Ensure the subworker server is up ─────────────────────────────────
 if ! is_subworker_server_healthy; then
-    echo "[subworkers] Starting elia-subworker-srv container..."
-    (cd "$ELIA_ROOT/subworkers/server" && docker-compose up -d)
+    echo "[subworkers] Starting elia-subworker-srv (Rust, port 5656)..."
+    tmux kill-session -t "$SUBWORKER_SESSION" 2>/dev/null || true
+    tmux new-session -d -s "$SUBWORKER_SESSION" -n "Subworkers"
+    tmux send-keys -t "$SUBWORKER_SESSION" \
+        "cd $ELIA_ROOT/subworkers/server && ./target/release/opencode serve --port 5656 --hostname 127.0.0.1 2>&1 | tee -a $LOG_FILE" Enter
     sleep 3
 fi
 
-# ── 5. Create 3-panel tmux layout ────────────────────────────────────────
+# ── 4. Create 3-panel tmux layout ────────────────────────────────────────
 if ! tmux has-session -t "$SESSION" 2>/dev/null; then
     tmux new-session -d -s "$SESSION" -n "EliaAI"
     tmux set-option -t "$SESSION" mouse on
@@ -78,8 +75,8 @@ if ! tmux has-session -t "$SESSION" 2>/dev/null; then
     tmux bind-key -T copy-mode-vi MouseDrag1Pane select-pane \; send -X begin-selection
     tmux bind-key -T copy-mode-vi MouseDragEnd1Pane send -X copy-pipe-and-cancel "pbcopy"
 
-    # Pane 0 (top): Docker subworker logs
-    tmux send-keys -t "$SESSION":0.0 "cd $ELIA_ROOT && ./scripts/docker_subworker.sh" Enter
+    # Pane 0 (top): Rust subworker server logs
+    tmux send-keys -t "$SESSION":0.0 "tail -f $LOG_FILE" Enter
     sleep 1
 
     # Pane 1 (middle): Discord bot
@@ -93,11 +90,11 @@ if ! tmux has-session -t "$SESSION" 2>/dev/null; then
     sleep 1
     tmux send-keys -t "$SESSION":0.2 "cd $ELIA_ROOT/ui_electron && npm start" Enter
 
-    # Resize: Docker logs gets 35%, Discord 35%, Electron 30%
+    # Resize: server logs gets 35%, Discord 35%, Electron 30%
     tmux resize-pane -t "$SESSION":0.0 -y 35%
     tmux resize-pane -t "$SESSION":0.1 -y 35%
 
-    # Select the Docker logs pane first
+    # Select the server logs pane first
     tmux select-pane -t "$SESSION":0.0
 fi
 

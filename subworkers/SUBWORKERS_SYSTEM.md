@@ -1,7 +1,7 @@
 # Subworkers System
 
 **Date:** 15 September 2026  
-**Version: 4.4 — host MCP parity — Documents RO mount + uv layer, tier list verified
+**Version: 4.5 — discord in-container via boot-seeded venv (cve-hunter dotenv fix)
 
 > Technical documentation for the autonomous subworker agent system.
 >
@@ -595,7 +595,7 @@ Fully dockerized — no host `opencode serve` required. `entrypoint.sh` inside t
 cd ~/EliaAI/subworkers/server && docker-compose -f docker-compose.yml -f docker-compose.override.tunnel.yml up -d --build  # builds both images (subworker-srv + cloudflared watcher)
 docker-compose -f docker-compose.yml -f docker-compose.override.tunnel.yml down  # stop both (opencode-data + tunnel.token persist)
 docker restart elia-subworker-srv                            # quick restart — sessions survive via opencode-data volume
-curl --noproxy "*" http://localhost:5656/health              # health check → {"status":"ok",...} (host HTTP_PROXY=104.252.44.225:6155 intercepts localhost without --noproxy)
+curl --noproxy "*" http://localhost:5656/health              # health check → {"status":"ok",...} (a host HTTP_PROXY intercepts localhost without --noproxy)
 curl --noproxy "*" http://localhost:5656/models -H "Authorization: Bearer $ELIA_AUTH_TOKEN" | jq .total  # 6 models, no deprecated
 docker exec elia-subworker-srv date                          # should match host `date` (both +01)
 docker exec elia-subworker-srv sh -c 'curl -sf http://127.0.0.1:5655/global/health'  # opencode health inside container (NO_PROXY=localhost bypasses forward proxy)
@@ -612,7 +612,7 @@ Containers (socketless, 30/08 hardening): `elia-subworker-srv` (**no** `/var/run
 | `server/app/config/server.json` | Port (5656), OpenCode server URL (http://127.0.0.1:4096), health-check interval, max restarts, alert settings |
 | `server/app/config/subworkers.json` | All subworker definitions: `name`, `enabled`, `schedule` (`interval` = hours+minute / `cron`), `agent_id`, `max_retries`, `timeout_minutes`, `mcp_servers`, `notify_discord` |
 
-`subworkers.json` currently defines **14 subworkers** (example-agent, mirorpay-community-organic, mirrorpay-telegram, bene2luxe-promoter, bene2luxe-suppliers, cobou-promoter, mirorpay-seo, reddit-saas-scraper, teleorbit-community-organic, teleorbit-seo, tempack-dev, tiktok-content, vcam-community-organic, vcam-seo).
+`subworkers.json` is a plain list — one entry per agent. The production fleet defines ~25; yours defines as many as you want.
 
 ### 8.4 API (localhost, Bearer $ELIA_AUTH_TOKEN)
 
@@ -634,7 +634,7 @@ Containers (socketless, 30/08 hardening): `elia-subworker-srv` (**no** `/var/run
 | POST | `/server/restart` | Restart OpenCode server subprocess |
 | WS | `/ws?token=…` | Live events: `initial_status`, `pong`, `subworker_completed`, `subworker_error` (requires `?token=` or `Authorization: Bearer`) |
 
-Interactive docs: **disabled** (`docs_url=None, redoc_url=None, openapi_url=None` → `curl --noproxy "*" http://localhost:5656/docs` → `404`, `openapi.json` → `404`). All `…/status` etc. remain `401` without `Bearer $ELIA_AUTH_TOKEN` / `200` with token; `/health` stays `401`-exempt for Docker healthcheck. Host `HTTP_PROXY=104.252.44.225:6155` intercepts `localhost` — always use `curl --noproxy "*"` for local checks.
+Interactive docs: **disabled** (`docs_url=None, redoc_url=None, openapi_url=None` → `curl --noproxy "*" http://localhost:5656/docs` → `404`, `openapi.json` → `404`). All `…/status` etc. remain `401` without `Bearer $ELIA_AUTH_TOKEN` / `200` with token; `/health` stays `401`-exempt for Docker healthcheck. A host `HTTP_PROXY` intercepts `localhost` — always use `curl --noproxy "*"` for local checks.
 
 ### 8.5 Run Lifecycle
 
@@ -686,7 +686,7 @@ State files:
 
 > **Why this exists:** Free OpenCode Zen models (`opencode/muse-spark-1.2-contributor-free` via `openrouter.ai`) are rate-limited per IP. 14 agents firing at 16:00 on the same IP = instant 429. Per-request proxy rotation gives each concurrent session a **different residential egress IP**, so the fleet scales linearly.
 
-**Verified in production Docker `elia-subworker-srv` (30/08):** `example-agent` → `104.238.50.9`, `mirorpay-seo` → `191.101.94.214` (distinct via round-robin); `curl -x http://127.0.0.1:3128 https://api.ipify.org` → `45.39.7.166` vs direct `41.143.90.111`; forward log `CONNECT opencode.ai:443 via <proxy>` proves LLM egress is proxied. Pool direct `httpx` also `PASS`.
+**Verified in production:** two concurrent agents resolved to two distinct egress IPs via round-robin, the forward log recorded `CONNECT opencode.ai:443 via <proxy>` proving LLM egress is proxied, and a direct pool request passed.
 
 | Aspect | Detail |
 |--------|--------|
@@ -699,8 +699,8 @@ State files:
 | **Zombie fix** | Previous `exec uvicorn` made uvicorn PID1 parent of opencode -> `<defunct>` never reaped, `HealthManager manage_process=False` never restarted. Now `tini -g` is PID1 + entrypoint supervisor loop auto-restarts opencode in 2s on OOM/crash. Verified `ps aux` no defunct after `pkill -9 opencode`. |
 | **Routes resilience** | `subworkers.py` `/list` timeout `5s->10s` + warning log, `/sessions` catches `OpenCodeConnectionError` -> 200 empty not 500. Fixes "1 session 0 msg" when opencode is slow (DB list 70s). |
 | **Logs** | `forward-proxy.log` at `/data/logs/forward-proxy.log` (host `~/EliaAI/subworkers/logs/forward-proxy.log`) -> `CONNECT opencode.ai:443 via <proxy>` + `CONNECT models.opencode.ai via <proxy>`. `docker exec elia-subworker-srv cat /data/logs/forward-proxy.log` to tail. |
-| **Failure mode** | Fallback is direct IP `41.143.90.111` (fail-open) if pool empty or forward proxy down. |
-| **Test in prod** | `docker exec elia-subworker-srv curl -x http://127.0.0.1:3128 -s https://api.ipify.org` -> `45.39.7.166` vs `curl -s https://api.ipify.org` -> `41.143.90.111` (distinct); `docker exec elia-subworker-srv cat /data/logs/forward-proxy.log | grep opencode.ai` shows `CONNECT opencode.ai:443 via 191.101.94.214` etc. |
+| **Failure mode** | Fail-open: falls back to a direct egress IP if the pool is empty or the forward proxy is down. |
+| **Test in prod** | `curl -x http://127.0.0.1:3128 -s https://api.ipify.org` vs `curl -s https://api.ipify.org` — the two must differ; then `grep opencode.ai logs/forward-proxy.log` shows `CONNECT opencode.ai:443 via <proxy-ip>`. |
 
 **To re-verify:**
 ```bash
@@ -708,7 +708,7 @@ docker exec elia-subworker-srv cat /data/logs/forward-proxy.log | tail -20  # ev
 curl -x http://127.0.0.1:3128 -s https://api.ipify.org; echo " via proxy"
 curl -s https://api.ipify.org; echo " direct"
 curl http://localhost:5656/health
-curl -s -X POST http://localhost:5656/trigger/mirorpay-seo -H "Authorization: Bearer $ELIA_AUTH_TOKEN"
+curl -s -X POST http://localhost:5656/trigger/my-agent -H "Authorization: Bearer $ELIA_AUTH_TOKEN"
 ```
 
 > **Do NOT use `shell.env` for LLM proxy, do NOT use `fetch({proxy})` patch or plugin (zombie + too late). The Node forward proxy on `127.0.0.1:3128` with `HTTP_PROXY` is the only stable per-request isolation that works with the release binary at 14 concurrent.**
@@ -723,7 +723,7 @@ curl -s -X POST http://localhost:5656/trigger/mirorpay-seo -H "Authorization: Be
 | **`cloudflared` control** | `tunnel_manager.start()` → `docker run/rm/inspect` via socket | `tunnel_manager` only writes `app/config/tunnel.token` (600) + marker override; sidecar watches file |
 | **`cloudflared` runtime** | `cloudflare/cloudflared:latest` (distroless, no shell) via `docker run` from inside container | `server-cloudflared:latest` (`Dockerfile.cloudflared`: `alpine` + `cloudflared` binary + `scripts/cloudflared-watch.sh`); `entrypoint: ["/bin/sh", "/usr/local/bin/cloudflared-watch.sh"]`; poll `/data/config/tunnel.token` md5 every 5s, kill+restart internally |
 | **`/docs` / `openapi.json`** | `200` public via `https://elia.surfai.tech/docs` (21 endpoints leaked) | `docs_url=None` → `404` (`curl --noproxy "*" http://localhost:5656/docs` → `404`); all `…/status` etc. `401` without `Bearer` / `200` with token; `/health` stays open |
-| **`/etc/hosts`** | `104.16.231.132 ran-monkey-dim-victorian.trycloudflare.com` ×2 (stale quick-tunnel) | Removed via `sudo sed -i '' '/trycloudflare/d' /etc/hosts` (`osascript` admin) → `0` lines |
+| **`/etc/hosts`** | `<tunnel-ip> <tunnel-host>.trycloudflare.com` x2 (stale quick-tunnel) | Removed via `sudo sed -i '' '/trycloudflare/d' /etc/hosts` (`osascript` admin) → `0` lines |
 
 **Files added/changed 30/08:**
 - `server/Dockerfile.cloudflared` (8 lines, `alpine` + `ca-certificates` + `COPY --from=src`)
@@ -764,9 +764,20 @@ same servers as the host — zero copies, zero config edits.
 | npx-based (parallel-browser, reddit…) | ✅ work | nothing needed |
 | plain `python3` + container deps (deploymates…) | ✅ work | `Documents` mount only |
 | node script at host path (zernio…) | ✅ work | `Documents` mount only |
-| uv-based (discord, vision, twitter…) | ❌ host-only | macOS `.venv` can't execute on Linux; per-server shadowing (tmpfs → noexec, named volumes + egg-info stand-ins) tried and reverted — too complex for the value |
+| uv-based — discord-server-mcp | ✅ works | boot-seeded venv (§8.11): `entrypoint.sh` installs `httpx + mcp[cli]==1.25.0 + dotenv` into `/tmp/discord-mcp-venv` (named volume), countering `uv run --no-sync` |
+| uv-based — others (vision, twitter…) | ❌ host-only | macOS `.venv` can't execute on Linux; per-server shadowing (tmpfs → noexec, named volumes + egg-info stand-ins) tried and reverted — too complex for the value |
 | macOS-binary (`.venv` pythons, nvm node: whatsapp, gmail…) | ❌ host-only | needs container-native rebuild, out of scope |
 | headless browser (`agent-browser` CLI) | ✅ works | npm package + Playwright ARM64 Chromium baked in image (`Dockerfile`); host wrapper (darwin binary + `/Applications` Chrome + macOS profile) NOT portable — agents run headless with an in-container profile |
+
+---
+
+### 8.11 discord-server-mcp In-Container (cve-hunter dotenv fix — 18/09)
+
+> **Symptom:** in-container agent reported *"Discord MCP server is broken (missing dotenv module)"* — `GET /sessions/cve-hunter` showed the complaint verbatim, reports channel empty 24h.
+> **Root cause:** the server spawns via `uv run --no-sync --project <host discord>` with `UV_PROJECT_ENVIRONMENT=/tmp/discord-mcp-venv`, so uv never installs project deps (`dotenv`, `httpx`, `mcp`) into that venv; `/tmp` wipes it on every `docker rm`. System python had `dotenv 1.2.3` but the MCP never uses it.
+> **Fix (3 pieces):** `entrypoint.sh` boot-seeds the venv (idempotent import check → `uv venv` if missing → `uv pip install httpx + mcp[cli]==1.25.0 + dotenv`); `docker-compose.yml` adds named volume `discord-mcp-venv:/tmp/discord-mcp-venv:rw` so the seed survives recreates.
+> **PIN — `mcp[cli]==1.25.0` exact (host working version):** `>=1.25.0` resolves to mcp 2.x, which removed `FastMCP` (`src/server.py` imports `from mcp.server.fastmcp import FastMCP`) → `ModuleNotFoundError`. Never relax without migrating the server to `MCPServer`.
+> **Verify:** `docker exec elia-subworker-srv /tmp/discord-mcp-venv/bin/python -c "import dotenv, httpx; from mcp.server.fastmcp import FastMCP"`. Takes effect on rebuild/recreate (`docker-compose up --build -d` — kills live runs). Host `mcp_servers.json` untouched on purpose (shared with host TUI).
 
 ---
 

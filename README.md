@@ -1,17 +1,18 @@
 <p align="center">
-  <img src="assets/banner.png" alt="EliaAgent Subworkers — Autonomous AI agent fleet" width="100%">
+  <img src="assets/banner.png" alt="EliaAgent Subworkers — Autonomous AI agent fleet, Rust core" width="100%">
 </p>
 
 <p align="center">
   <strong>A fleet of autonomous AI agents that runs your digital life 24/7.</strong><br>
-  Scheduled · Monitored · Self-healing · Unlimited tokens
+  Rust core · Scheduled · Monitored · Self-healing · Unlimited tokens
 </p>
 
 <p align="center">
   <a href="#-quick-start"><img src="https://img.shields.io/badge/install-2_commands-22C55E?style=flat-square" alt="Quick Start"></a>
+  <img src="https://img.shields.io/badge/core-Rust-DEA584?style=flat-square&logo=rust&logoColor=white" alt="Rust">
+  <img src="https://img.shields.io/badge/runtime-no_Docker_no_container-brightgreen?style=flat-square" alt="No Docker">
   <img src="https://img.shields.io/badge/platform-macOS_|_Linux-lightgrey?style=flat-square" alt="Platform">
-  <img src="https://img.shields.io/badge/Docker-FastAPI-2496ED?style=flat-square&logo=docker&logoColor=white" alt="Docker">
-  <img src="https://img.shields.io/badge/RAM-4GB_≈_thousands_of_sessions-8B5CF6?style=flat-square" alt="RAM">
+  <img src="https://img.shields.io/badge/RAM-78MB_@_100_concurrent_sessions-8B5CF6?style=flat-square" alt="Measured RSS">
   <img src="https://img.shields.io/badge/license-MIT-10B981?style=flat-square" alt="License">
 </p>
 
@@ -21,14 +22,14 @@
 
 One AI agent is an assistant. A **fleet** is an employee base.
 
-EliaAgent turns OpenCode into a **self-managed fleet of autonomous subworkers** — each with its own personality, workspace, schedule and memory — driven by a Python FastAPI server in Docker:
+EliaAgent turns OpenCode into a **self-managed fleet of autonomous subworkers** — each with its own personality, workspace, schedule and memory — driven by a **Rust** server (OpenCodeRust, 21 crates):
 
 | | What you get |
 |--|--|
 | 🕐 **Schedules, not prompts** | Every hour from 9h to 18h, weekdays only, weekends off, cron expressions — set it and forget it |
-| 🐳 **4 GB RAM ≈ thousands of sessions** | The Docker runtime isolates and contains OpenCode's known memory leaks that previously caused CPU/RAM blowups |
+| 🦀 **Rust core, no container runtime** | No Docker, no Colima, no cgroup memory cap. One static binary. Memory returns to baseline after load |
 | ♻️ **Self-healing runs** | Provider outage mid-task? The server detects the transient error, waits a randomized delay, nudges the same session with *"continue the tasks"* — work resumes where it stopped |
-| 🔁 **Exponential-backoff retries** | Crashed or timed-out runs retry automatically; session state survives full container nukes |
+| 🔁 **Exponential-backoff retries** | Crashed or timed-out runs retry automatically; session state survives a full restart |
 | 📡 **Realtime everything** | REST API + WebSocket events — live status, streaming logs, reasoning, tool calls |
 | 🖥️ **First-class clients** | [EliaTopBar](https://github.com/vakandi/Elia-Topbar) (macOS menu bar) & [EliaAndroidApp](https://github.com/vakandi/EliaAndroidApp) (mobile) |
 | 🌍 **Remote access** | Built-in Cloudflare Tunnel wizard — reach your fleet from anywhere, protected by a shared auth token |
@@ -38,14 +39,49 @@ EliaAgent turns OpenCode into a **self-managed fleet of autonomous subworkers** 
 
 ---
 
+## 🦀 Why v7 Is Rust
+
+Through v6, the session engine under the fleet was **TypeScript**. It held conversation
+history in RAM, re-derived the full tool schema set on every LLM step, and kept
+per-directory instance state (MCP servers, LSP servers, plugins) unbounded and never
+evicted. The Docker runtime was there to *contain* that — the README claimed "4 GB RAM ≈
+thousands of sessions" because a cgroup had to be allocated to stop it.
+
+It wasn't enough. On a MacBook Pro M5, **five teams of five agents pinned the CPU at 99%**
+and the machine became unusable. That was the limit, not the workload.
+
+v7 replaces that engine with a Rust server. Conversation history spills to SQLite, the
+request body streams, tool schemas are cached per `(model, tool-set)`, and instance state
+is pooled by config hash with LRU+TTL eviction. No container, no cgroup, no leak to contain.
+
+### Measured: 100 concurrent sessions
+
+Reproduce with `scripts/loadtest.py --n 100`, which fires N sessions at the server at once
+and samples RSS every 250 ms.
+
+- **78 MB peak RSS**, from a 15 MB baseline
+- **0.63 MB growth per session** — 1.3% of a 6 GB budget
+- **RSS returns to 18 MB after load** — the memory is released, not retained
+- **CPU**: one 75% spike at the instant all 100 fire, then 0% idle (~1.9% average across the run)
+
+100 sessions cost 63 MB. The TypeScript engine's *worst measured single session* was 290 MB.
+
+> ⚠️ **Caveat, stated plainly:** that run used an isolated config with no API key, so every
+> prompt returned `401` and streaming tool calls were never exercised. The 78 MB figure
+> covers **session creation and dispatch**, not full conversation history. Sessions holding
+> long histories will cost more. We publish the number we actually measured rather than a
+> flattering one we didn't.
+
+---
+
 ## 🚀 Quick Start
 
 ```bash
 git clone https://github.com/vakandi/EliaAgent.git
 cd EliaAgent/subworkers
 
-./install_subworkers.sh    # prerequisites + config + Docker image
-./start_subworkers.sh      # opencode server + Docker stack + UI in tmux
+./install_subworkers.sh    # checks Rust toolchain + builds the release binary
+./start_subworkers.sh      # opencode server + Rust subworker server + UI in tmux
 ```
 
 Health check:
@@ -61,7 +97,7 @@ Then install a client to control the fleet: **[EliaTopBar](https://github.com/va
 
 | Requirement | Notes |
 |-------------|-------|
-| macOS (Colima) or Linux (Docker) | 4 GB RAM allocated is plenty |
+| macOS or Linux | No container runtime. A few hundred MB of RAM is enough |
 | [OpenCode](https://opencode.ai) | The agent engine — free Zen models, no paid APIs |
 | tmux | For the launcher sessions |
 | Optional: Discord bot | One panel of the default layout |
@@ -164,17 +200,17 @@ curl -X POST http://localhost:5656/config/reload
         │  WebSocket /ws + REST :5656
         ▼
  ┌────────────────────────────────────────────┐
- │  elia-subworker-srv (Docker, FastAPI)      │
- │  ├── APScheduler ← subworkers.json         │
+ │  elia-subworker-srv  (Rust, single binary)  │
+ │  ├── Scheduler ← subworkers.json            │
  │  ├── SubworkerRunner                       │
  │  │     ├── provider-error auto-recovery    │
  │  │     ├── retries + exponential backoff   │
  │  │     └── HealthManager (auto-restart)    │
  │  └── SessionMonitor (2s polling)           │
  └──────────────┬─────────────────────────────┘
-                │ HTTP (host network)
+                │ HTTP (127.0.0.1)
                 ▼
-      opencode serve :4096  (HOST process)
+      opencode serve :4096  (Rust)
                 │
     ┌───────────┼───────────┐
     ▼           ▼           ▼
@@ -246,7 +282,7 @@ Every session feeds a per-agent SQLite memory: decisions, bug fixes, discoveries
 |---------|-----|
 | Client shows *Disconnected* | Server URL must be `http://localhost:5656` (not 8080) |
 | Schedule didn't fire | Check entry in `subworkers.json` (`enabled: true`) then `POST /config/reload` |
-| Container down | `cd subworkers/server && docker-compose up -d --build` |
+| Server down | `tmux attach -t elia-subworker-srv`, or rerun `./start_subworkers.sh` |
 | OpenCode server dead | `POST /server/restart` or restart via launcher |
 | Auth errors (401) | Match `ELIA_AUTH_TOKEN` between server `.env` and client |
 | Missed runs while laptop slept | Harmless — next slot fires when awake |
