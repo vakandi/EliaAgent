@@ -31,7 +31,7 @@ EliaAgent turns OpenCode into a **self-managed fleet of autonomous subworkers** 
 | ♻️ **Self-healing runs** | Provider outage mid-task? The server detects the transient error, waits a randomized delay, nudges the same session with *"continue the tasks"* — work resumes where it stopped |
 | 🔁 **Exponential-backoff retries** | Crashed or timed-out runs retry automatically; session state survives a full restart |
 | 📡 **Realtime everything** | REST API + WebSocket events — live status, streaming logs, reasoning, tool calls |
-| 🖥️ **First-class clients** | [EliaTopBar](https://github.com/vakandi/Elia-Topbar) (macOS menu bar) & [EliaAndroidApp](https://github.com/vakandi/EliaAndroidApp) (mobile) |
+| 🖥️ **First-class clients** | [RuCode Chat](https://github.com/vakandi/rucode-chat) (macOS full chat) · [EliaTopBar](https://github.com/vakandi/Elia-Topbar) (macOS menu bar) · [EliaAndroidApp](https://github.com/vakandi/EliaAndroidApp) (mobile) |
 | 🌍 **Remote access** | Built-in Cloudflare Tunnel wizard — reach your fleet from anywhere, protected by a shared auth token |
 | ∞ **Unlimited tokens** | Free OpenCode Zen models + rotating residential proxies = effectively unlimited autonomous work (see [Proxy Rotation](#-unlimited-tokens--proxy-rotation)) |
 
@@ -74,6 +74,20 @@ and samples RSS every 250 ms.
 
 ---
 
+## 🖥️ RuCode Chat — the native desktop chat client
+
+[RuCode Chat](https://github.com/vakandi/rucode-chat) is the full chat surface for the fleet. It is a macOS SwiftUI app forked from [Enchanted](https://github.com/gluonfield/enchanted) and rewired to the newest OpenCodeRust control API through Bun control. EliaTopBar stays the menu-bar control panel; RuCode Chat is where you open a session, stream a conversation, pick an agent, attach files, and manage history.
+
+- **Native, not a web wrapper** — SwiftUI on macOS 14+, built with the Command Line Tools. No Electron, no bundled browser, no second JavaScript runtime to keep alive.
+- **Built for the Rust core** — consumes the engine's part deltas directly, reconnects without re-sending the prompt, and reconciles every turn with the SQLite-backed transcript.
+- **Built for thousands of sessions** — the Rust server owns the session store; the client keeps a lightweight local index and fetches a transcript only when you open that session. Idle CPU stays effectively at zero.
+- **Chat features that matter** — model and agent pickers, markdown and code highlighting, file attachments by absolute path, editable and reorderable prompt cards, pinned sessions, and collapsible session folders.
+- **Same fleet, same token** — talks to Bun control on `127.0.0.1:5656`, the Rust child on `4096`, and uses the shared `ELIA_AUTH_TOKEN`.
+
+Use it alongside the other clients: EliaTopBar for glanceable control, EliaAndroidApp for mobile, and RuCode Chat when you want the full conversation.
+
+---
+
 ## 🚀 Quick Start
 
 ```bash
@@ -91,7 +105,7 @@ curl http://localhost:5656/health
 # {"status":"ok","timestamp":"...","uptime":...}
 ```
 
-Then install a client to control the fleet: **[EliaTopBar](https://github.com/vakandi/Elia-Topbar)** (menu bar: trigger, enable/disable, edit schedules with a visual picker, live log viewer per agent).
+Then install a client to control the fleet: **[EliaTopBar](https://github.com/vakandi/Elia-Topbar)** (menu bar: trigger, enable/disable, edit schedules with a visual picker, live log viewer per agent), or **[RuCode Chat](https://github.com/vakandi/rucode-chat)** for the full native chat experience (streaming conversations, history, attachments, editable prompt cards). **[EliaAndroidApp](https://github.com/vakandi/EliaAndroidApp)** covers mobile.
 
 ### Requirements
 
@@ -196,7 +210,7 @@ curl -X POST http://localhost:5656/config/reload
 ## 🏗️ Architecture
 
 ```
- EliaTopBar / EliaAndroidApp / Electron UI          ← realtime clients
+ RuCode Chat / EliaTopBar / EliaAndroidApp / Electron UI   ← realtime clients
         │  WebSocket /ws + REST :5656
         ▼
  ┌────────────────────────────────────────────┐
